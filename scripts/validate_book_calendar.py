@@ -33,12 +33,26 @@ from datetime import datetime, timezone
 # deserialises these with chrono's RFC 3339 parser, which does not: a
 # calendar Python accepted but Rust rejects is exactly the failure this
 # script exists to prevent.
-RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+# At most 6 fractional digits: `fromisoformat` silently truncates beyond
+# microseconds while chrono keeps nanoseconds, and every instant is
+# compared on `ceil_secs`. A decision at `T.0000001` would round to `T`
+# here but to `T+1` in the runtime, moving the window end by a second and
+# flipping the flatten and overlap checks. The generator emits no
+# fractional part at all, so rejecting is the honest response.
+RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$")
+RFC3339_TOO_PRECISE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7,}(Z|[+-]\d{2}:\d{2})$")
 
 
 def ts(v, what):
     if not isinstance(v, str):
         raise SystemExit(f"{what} must be a string timestamp, got {v!r}")
+    if RFC3339_TOO_PRECISE.match(v):
+        raise SystemExit(
+            f"{what} has more than 6 fractional digits: {v!r}. Python truncates below "
+            "microseconds while the runtime keeps nanoseconds, so the two would round to "
+            "different seconds; write the instant with at most microsecond precision.")
     if not RFC3339.match(v):
         raise SystemExit(
             f"{what} is not an RFC 3339 timestamp (YYYY-MM-DDTHH:MM:SSZ): {v!r}")

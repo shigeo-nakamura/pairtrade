@@ -79,6 +79,22 @@ class ValidatorTests(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=name):
                 vbc.validate(write(mutate(fn)))
 
+    def test_sub_microsecond_precision_is_rejected(self):
+        """fromisoformat truncates below microseconds while chrono keeps
+        nanoseconds, and every instant is compared on ceil_secs -- so the
+        two would round to different seconds."""
+        import copy
+        d = copy.deepcopy(GOOD)
+        d["entries"][0]["decision_at"] = "2026-09-15T13:29:00.0000001Z"
+        with self.assertRaises(SystemExit) as cm:
+            vbc.validate(write(d))
+        self.assertIn("fractional digits", str(cm.exception))
+        # microsecond precision is fine, and ceils to the next second
+        d["entries"][0]["decision_at"] = "2026-09-15T13:29:00.000001Z"
+        vbc.validate(write(d))
+        t = vbc.ts("2026-09-15T13:29:00.000001Z", "x")
+        self.assertEqual(vbc.ceil_secs(t), vbc.ceil_secs(vbc.ts("2026-09-15T13:29:01Z", "x")))
+
     def test_duplicate_json_keys_are_rejected(self):
         """json.load keeps the last value; serde rejects the file."""
         for text in (
