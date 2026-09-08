@@ -37,8 +37,8 @@ Use UTC throughout.
 | symbol | market_id | price_decimals | size_decimals | min_base_amount | min_quote_amount | last price | role in `engine-b-live` |
 |---|---|---|---|---|---|---|---|
 | SNDK | 139 | 2 | 4 | 0.0050 | 10 USD | 1715.49 | `us_primary` (the only traded symbol) |
-| SKHY | 216 | 2 | 4 | 0.0500 | 10 USD | 173.41 | `kr_primary` (signal only, never ordered) |
-| SKHYNIXUSD | 161 | 3 | 3 | 0.007 | 10 USD | 1257.494 | KR candidate (#872 recommends over SKHY) |
+| SKHY | 216 | 2 | 4 | 0.0500 | 10 USD | 173.41 | KR candidate (superseded by SKHYNIXUSD, #872) |
+| SKHYNIXUSD | 161 | 3 | 3 | 0.007 | 10 USD | 1257.494 | `kr_primary` (signal only, never ordered) |
 | MU | 164 | 2 | 4 | 0.0100 | 10 USD | 998.52 | US candidate |
 | SOXL | 197 | 2 | 4 | 0.0500 | 10 USD | 115.77 | control symbol |
 | NVDA | 110 | 3 | 3 | 0.035 | 10 USD | 230.421 | control symbol |

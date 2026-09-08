@@ -2,7 +2,7 @@
   "_comment": "Engine B live-experiment binary config (bot-strategy#866). Read via ENGINE_B_LIVE_* environment variables, not this file directly -- systemd EnvironmentFile= is the actual config-loading path (see deploy/engine-b-live.service). This file documents the intended production values so they are reviewable in a PR diff rather than only living in an on-host env file.",
   "ENGINE_B_LIVE_INSTANCE_ID": "engine-b-live",
   "ENGINE_B_LIVE_DRY_RUN": "true",
-  "ENGINE_B_LIVE_KR_PRIMARY": "SKHY",
+  "ENGINE_B_LIVE_KR_PRIMARY": "SKHYNIXUSD",
   "ENGINE_B_LIVE_US_PRIMARY": "SNDK",
   "ENGINE_B_LIVE_CONTROL_SYMBOLS": "SOXL,NVDA,EWY,USDKRW",
   "ENGINE_B_LIVE_LOT_USD": "100",
