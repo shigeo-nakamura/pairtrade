@@ -21,9 +21,9 @@ use debot::arcus_spot::{
     ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
     ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
     ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream,
-    ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger,
-    ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
-    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotQuoteUnavailable, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
+    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 #[cfg(test)]
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent, ArcusSpotHold};
@@ -1387,7 +1387,7 @@ fn decline_unsupported_route(
     event: &ArcusSpotRuntimeEvent,
     plan: &ArcusSpotRotationPlan,
 ) -> Result<()> {
-    record_declined_route(config, event, plan);
+    record_undispatched_plan(config, event, plan, UNSUPPORTED_ROUTE_REASON, None);
     eprintln!(
         "[arcus-route] declined a would-rotate plan: recommended venue {:?} is not one of the \
          validated Arcus/Rialto routes this executor may dispatch; nothing was submitted",
@@ -1396,13 +1396,93 @@ fn decline_unsupported_route(
     write_live_tick_event(event)
 }
 
-fn record_declined_route(
+/// Hold a would-rotate plan whose venue could not quote it, and exit
+/// successfully.
+///
+/// Mirrors `decline_unsupported_route`: record what the undispatched plan
+/// was, say so on stderr, emit the tick's event on stdout, and leave the
+/// checkpoint alone so the next observation re-evaluates from the same
+/// history. Nothing was signed or submitted, so there is no ledger state to
+/// unwind -- only this invocation's own pending-plan file, which describes a
+/// dispatch that never happened.
+fn hold_on_unavailable_quote(
     config: &ArcusSpotExecuteOnceConfig,
     event: &ArcusSpotRuntimeEvent,
     plan: &ArcusSpotRotationPlan,
+    pending_plan_path: &Path,
+    pending_plan_bytes: &[u8],
+    unavailable: &ArcusSpotQuoteUnavailable,
+) -> Result<()> {
+    let detail = unavailable.to_string();
+    record_undispatched_plan(
+        config,
+        event,
+        plan,
+        QUOTE_UNAVAILABLE_REASON,
+        Some(detail.as_str()),
+    );
+    remove_own_pending_plan(pending_plan_path, pending_plan_bytes);
+    eprintln!(
+        "[arcus-quote] held a would-rotate plan: {detail}; nothing was submitted, and the next \
+         tick re-evaluates from a fresh observation",
+    );
+    write_live_tick_event(event)
+}
+
+/// Remove the pending-plan file this invocation wrote -- and only that file.
+///
+/// The plan is written while the checkpoint lock is held and this hold
+/// happens after that lock is dropped, so an overlapping tick may already
+/// have replaced the file with a plan of its own. That newer plan may still
+/// be dispatched, and it is the only evidence `auto-resume` would have for a
+/// `Submitted`-but-unconfirmed swap, so deleting it would destroy exactly
+/// what the file exists for. Compare the bytes first and leave anything this
+/// invocation did not write alone. A failure to clean up is reported and
+/// ignored: an orphaned plan makes `state-verify-exact` disagree with an
+/// older backup, which is worth a line of output but is not worth failing an
+/// otherwise clean hold over.
+fn remove_own_pending_plan(path: &Path, expected: &[u8]) {
+    match fs::read(path) {
+        Ok(current) if current == expected => {
+            if let Err(error) = fs::remove_file(path) {
+                eprintln!(
+                    "[arcus-quote] failed to remove the undispatched pending plan {}: {error}",
+                    path.display(),
+                );
+            }
+        }
+        Ok(_) => eprintln!(
+            "[arcus-quote] left {} in place: it no longer holds this tick's plan",
+            path.display(),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "[arcus-quote] failed to read the pending plan {} before cleaning it up: {error}",
+            path.display(),
+        ),
+    }
+}
+
+/// Why a would-rotate plan was built and then not dispatched.
+///
+/// Records written before bot-strategy#967 carry no `reason` field at all,
+/// and every one of them is an `unsupported_route`: that was the only way a
+/// plan reached this log. Offline readers should treat a missing `reason`
+/// as `unsupported_route` rather than as unknown.
+const UNSUPPORTED_ROUTE_REASON: &str = "unsupported_route";
+const QUOTE_UNAVAILABLE_REASON: &str = "quote_unavailable";
+
+fn record_undispatched_plan(
+    config: &ArcusSpotExecuteOnceConfig,
+    event: &ArcusSpotRuntimeEvent,
+    plan: &ArcusSpotRotationPlan,
+    reason: &str,
+    detail: Option<&str>,
 ) {
     let record = serde_json::json!({
         "declined_at": event.observed_at,
+        "reason": reason,
+        "detail": detail,
         "sequence": event.sequence,
         "pair": event.pair,
         "z_score": event.z_score,
@@ -1422,7 +1502,7 @@ fn record_declined_route(
         "token_b_reference_price_usd": event.token_b_reference_price_usd.map(|p| p.to_string()),
     });
     if let Err(error) = append_declined_route(config, &record) {
-        eprintln!("[arcus-route] failed to record the declined route: {error:#}");
+        eprintln!("[arcus-route] failed to record the undispatched {reason} plan: {error:#}");
     }
 }
 
@@ -4405,9 +4485,30 @@ async fn main() -> Result<()> {
                 .validate_plan_consistent_with_state(&plan)
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
-            let attempt = executor
-                .execute_plan_once(&plan, &plan_config_digest)
-                .await?;
+            let attempt = match executor.execute_plan_once(&plan, &plan_config_digest).await {
+                Ok(attempt) => attempt,
+                // The venue could not quote and said so before this dispatch
+                // touched anything (bot-strategy#967). Like an unsupported
+                // recommended route (#817), that is an ordinary outcome of
+                // asking a market for a price, not a fault of this bot, and
+                // reporting it as a failed unit is exactly the noise a real
+                // fault would have to stand out from. Every other error --
+                // including a retryable one raised after submission, where an
+                // attempt exists to reconcile -- still fails the run.
+                Err(error) => {
+                    return match error.downcast_ref::<ArcusSpotQuoteUnavailable>() {
+                        Some(unavailable) => hold_on_unavailable_quote(
+                            &config,
+                            &event,
+                            &plan,
+                            &pending_plan_path,
+                            &plan_bytes,
+                            unavailable,
+                        ),
+                        None => Err(error),
+                    };
+                }
+            };
             let attempt = finalize_reconciled_attempt(
                 &config,
                 &mut executor,
@@ -7207,6 +7308,140 @@ runtime:
         assert_eq!(row["token_a_reference_price_usd"], "200");
         assert_eq!(row["token_b_reference_price_usd"], "100");
         assert_eq!(row["sequence"], serde_json::json!(41));
+    }
+
+    /// The same evidence, for the other reason a would-rotate plan never
+    /// gets dispatched (bot-strategy#967): the venue could not quote it.
+    /// `reason` is what tells the two apart at readout time, so a hold that
+    /// stopped stamping it would silently be counted as an unsupported
+    /// route.
+    #[test]
+    fn a_quote_unavailable_hold_is_recorded_and_clears_its_own_pending_plan() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "rialto".to_string();
+        let event = undispatched_plan_event(&config, &plan);
+        let pending_plan_path = live_tick_pending_plan_path(&config).unwrap();
+        let plan_bytes = b"this invocation's own pending plan".to_vec();
+        write_private_regular_file_atomic(&pending_plan_path, &plan_bytes).unwrap();
+
+        let unavailable = ArcusSpotQuoteUnavailable {
+            venue: "rialto",
+            detail: "Arcus Spot HTTP 422 (http, retryable=true): NO_QUOTES".to_string(),
+        };
+        hold_on_unavailable_quote(
+            &config,
+            &event,
+            &plan,
+            &pending_plan_path,
+            &plan_bytes,
+            &unavailable,
+        )
+        .unwrap();
+
+        assert!(
+            !pending_plan_path.exists(),
+            "a plan that was never dispatched must not be left as recovery evidence",
+        );
+        let raw = fs::read_to_string(declined_route_log_path(&config).unwrap()).unwrap();
+        let row: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(row["reason"], "quote_unavailable");
+        assert_eq!(row["detail"], unavailable.to_string());
+        assert_eq!(row["recommended_venue"], "rialto");
+        assert_eq!(row["z_score"], serde_json::json!(2.9));
+    }
+
+    /// An unsupported route keeps its own reason, so the two undispatched
+    /// families stay separable in one file.
+    #[test]
+    fn a_declined_route_is_stamped_with_its_own_reason() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+
+        let mut plan = rotation_plan("entry_signal");
+        plan.venue = "lifi".to_string();
+        let event = undispatched_plan_event(&config, &plan);
+
+        decline_unsupported_route(&config, &event, &plan).unwrap();
+
+        let raw = fs::read_to_string(declined_route_log_path(&config).unwrap()).unwrap();
+        let row: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(row["reason"], "unsupported_route");
+        assert_eq!(row["detail"], serde_json::Value::Null);
+    }
+
+    /// A concurrent tick writes its plan to the same fixed path after this
+    /// invocation dropped the checkpoint lock. That plan may still be
+    /// dispatched and is the only `auto-resume` evidence for it, so a hold
+    /// here must not delete it.
+    #[test]
+    fn a_hold_leaves_a_pending_plan_it_did_not_write() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+
+        let plan = rotation_plan("entry_signal");
+        let event = undispatched_plan_event(&config, &plan);
+        let pending_plan_path = live_tick_pending_plan_path(&config).unwrap();
+        let newer = b"a later tick's pending plan".to_vec();
+        write_private_regular_file_atomic(&pending_plan_path, &newer).unwrap();
+
+        hold_on_unavailable_quote(
+            &config,
+            &event,
+            &plan,
+            &pending_plan_path,
+            b"this invocation's own pending plan",
+            &ArcusSpotQuoteUnavailable {
+                venue: "rialto",
+                detail: "NO_QUOTES".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&pending_plan_path).unwrap(), newer);
+    }
+
+    /// A would-rotate event for a plan that reached the dispatch seam.
+    fn undispatched_plan_event(
+        config: &ArcusSpotExecuteOnceConfig,
+        plan: &ArcusSpotRotationPlan,
+    ) -> ArcusSpotRuntimeEvent {
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let runtime = store.load_existing(&config.runtime).unwrap();
+        ArcusSpotRuntimeEvent {
+            sequence: 41,
+            observed_at: fixture_now(),
+            pair: "NVDA/AMD".to_string(),
+            mode: ArcusSpotRuntimeMode::Live,
+            token_a_reference_price_usd: Some(Decimal::from(200)),
+            token_b_reference_price_usd: Some(Decimal::from(100)),
+            relative_log_price: Some(0.5),
+            z_score: Some(2.9),
+            inventory_before: runtime.state().inventory,
+            inventory_after: runtime.state().inventory,
+            regime_before: ArcusSpotRegime::Neutral,
+            regime_after: ArcusSpotRegime::Neutral,
+            risk_before: None,
+            risk_after: None,
+            decision: ArcusSpotDecision::WouldRotate { plan: plan.clone() },
+        }
     }
 
     fn persist_test_live_tick_plan(
