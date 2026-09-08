@@ -189,8 +189,9 @@ def would_rotate_index(events: Iterable[dict[str, Any]]) -> dict[tuple, list[dic
     return index
 
 
-def match_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
-                ) -> dict[str, Any]:
+def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
+               ) -> dict[str, Any] | None:
+    """The would-rotate observation this dispatch was built from, if present."""
     intent = attempt.get("intent") or {}
     key = (
         str(intent.get("venue", "")).lower(),
@@ -204,17 +205,13 @@ def match_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]
         if event_stream.parse_timestamp(event["observed_at"]) <= prepared_at
     ]
     if not candidates:
-        raise ActivityLedgerError(
-            f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or before "
-            f"{attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- the event "
-            "window probably does not cover this swap")
+        return None
     # The plan a dispatch was built from is the newest matching observation,
     # the same rule live-tick's own staleness check applies.
     return max(candidates, key=lambda event: event_stream.parse_timestamp(event["observed_at"]))
 
 
-def swap_from_attempt(attempt: dict[str, Any],
-                      index: dict[tuple, list[dict[str, Any]]]) -> Swap:
+def swap_from_attempt(attempt: dict[str, Any], event: dict[str, Any]) -> Swap:
     intent = attempt["intent"]
     pre = attempt.get("pre_balances")
     post = attempt.get("post_balances")
@@ -222,7 +219,6 @@ def swap_from_attempt(attempt: dict[str, Any],
         raise ActivityLedgerError(
             f"ledger sequence {attempt['sequence']}: reconciled attempt without both balance "
             "snapshots")
-    event = match_event(attempt, index)
     plan = event["decision"]["plan"]
 
     sell_decimals = token_decimals(
@@ -265,32 +261,67 @@ def swap_from_attempt(attempt: dict[str, Any],
     )
 
 
+def reconciled_attempts(ledger: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every attempt whose swap is on chain and reconciled, wherever it sits.
+
+    `active` is not only a work-in-progress slot. `reconcile_confirmed` can
+    durably persist Reconciled and the process then exit before the runtime
+    commit archives the attempt into `history`, which is exactly why the
+    Reconciled arm of `resume_status_and_reconcile` exists
+    (`src/arcus_spot/live_executor.rs`). That swap really happened, so reading
+    only `history` would drop a completed rotation from the totals *and* from
+    the not-covered list -- silently understating activity and cost at the one
+    seam the runtime documents. An attempt is in exactly one of the two slots
+    (archiving moves it), so this cannot double-count.
+    """
+    history = ledger.get("history")
+    if not isinstance(history, list):
+        raise ActivityLedgerError("execution ledger has no history array")
+    attempts = list(history)
+    active = ledger.get("active")
+    if isinstance(active, dict):
+        attempts.append(active)
+    return [attempt for attempt in attempts if attempt.get("phase") == "reconciled"]
+
+
 def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
                      window: tuple[datetime, datetime],
                      ) -> tuple[list[Swap], list[int]]:
     """Price every reconciled swap the event window actually covers.
 
+    Coverage is decided by the *pricing event*, not by the dispatch clock.
+    live-tick commits a would-rotate event before dispatching the swap that
+    event describes (`src/bin/arcus_spot_execute_once.rs`), so `dispatched_at`
+    is always later than the marks the swap was priced at. Gating on the
+    dispatch time therefore always excluded the final swap of any export whose
+    last record is the very event that produced it -- the exact marks were
+    present, and the swap was dropped anyway.
+
     The ledger outlives any one window -- it still holds the NVDA/AMD probe's
     swaps -- and a swap whose marks are not in the given segments cannot be
     priced. Those are returned by sequence instead of being dropped, so a
     report always says which part of the ledger it does not cover; a swap
-    *inside* the window that matches no event stays a hard error, because then
-    something really is missing.
+    dispatched *inside* the window that matches no event stays a hard error,
+    because then something really is missing.
     """
-    history = ledger.get("history")
-    if not isinstance(history, list):
-        raise ActivityLedgerError("execution ledger has no history array")
     start, end = window
     swaps: list[Swap] = []
     out_of_window: list[int] = []
-    for attempt in history:
-        if attempt.get("phase") != "reconciled":
-            continue
-        dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
-        if not start <= dispatched_at <= end:
+    for attempt in reconciled_attempts(ledger):
+        event = find_event(attempt, index)
+        if event is None:
+            dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
+            if start <= dispatched_at <= end:
+                raise ActivityLedgerError(
+                    f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or "
+                    f"before {attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- "
+                    "the event window probably does not cover this swap")
             out_of_window.append(int(attempt["sequence"]))
             continue
-        swaps.append(swap_from_attempt(attempt, index))
+        if not start <= event_stream.parse_timestamp(event["observed_at"]) <= end:
+            out_of_window.append(int(attempt["sequence"]))
+            continue
+        swaps.append(swap_from_attempt(attempt, event))
     swaps.sort(key=lambda swap: (swap.at, swap.sequence))
     return swaps, sorted(out_of_window)
 

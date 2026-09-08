@@ -70,13 +70,13 @@ def observe_event(sequence, when):
 
 def attempt(sequence, when, *, sell, buy, sell_quantity, buy_quantity,
             phase="reconciled", decimals=18, gas_before=WEI, gas_after=WEI,
-            sell_before="10", buy_before="10"):
+            sell_before="10", buy_before="10", dispatched=None):
     sold = Decimal(sell_before) - Decimal(sell_quantity)
     bought = Decimal(buy_before) + Decimal(buy_quantity)
     return {
         "sequence": sequence,
         "prepared_at": stamp(when),
-        "dispatched_at": stamp(when),
+        "dispatched_at": stamp(dispatched or when),
         "phase": phase,
         "intent": {
             "venue": "rialto",
@@ -97,8 +97,9 @@ def attempt(sequence, when, *, sell, buy, sell_quantity, buy_quantity,
     }
 
 
-def report_for(events, history, **kwargs):
-    return ledger_tool.build_report({"history": history}, events, CEILING, NO_GAS, **kwargs)
+def report_for(events, history, active=None, **kwargs):
+    ledger = {"history": history, "active": active}
+    return ledger_tool.build_report(ledger, events, CEILING, NO_GAS, **kwargs)
 
 
 ENTRY_AT = datetime(2026, 9, 4, 14, 17, tzinfo=timezone.utc)
@@ -177,6 +178,48 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, [old] + history)
         self.assertEqual(report["ledger_swaps_outside_window"], [5])
         self.assertEqual(report["totals"]["swaps"], 2)
+
+    def test_a_swap_dispatched_after_its_own_last_event_is_still_priced(self):
+        """Coverage follows the marks, not the dispatch clock.
+
+        live-tick commits the would-rotate event and only then dispatches the
+        swap, so when the export ends on that event the dispatch is always
+        later than the window's end. Gating on `dispatched_at` dropped the
+        closing swap -- and with it the whole round trip -- even though the
+        exact pricing event was right there in the verified stream.
+        """
+        events, history = baseline_round_trip()
+        history[1] = attempt(9, EXIT_AT, sell="SPY", buy="QQQ",
+                             sell_quantity="0.323269", buy_quantity="0.346345",
+                             dispatched=EXIT_AT + timedelta(seconds=3))
+        report = report_for(events, history)
+
+        self.assertEqual(report["ledger_swaps_outside_window"], [])
+        self.assertEqual(report["totals"]["swaps"], 2)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+
+    def test_a_reconciled_attempt_still_in_active_is_counted(self):
+        """The runtime can durably reconcile and exit before archiving.
+
+        `resume_status_and_reconcile` documents that seam: the swap is on
+        chain and reconciled while the attempt is still in `active`. Reading
+        only `history` would report the closing leg as if it never happened.
+        """
+        events, history = baseline_round_trip()
+        report = report_for(events, history[:1], active=history[1])
+
+        self.assertEqual(report["totals"]["swaps"], 2)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+        self.assertGreater(report["totals"]["cost_usd"], 0)
+
+    def test_a_non_reconciled_active_attempt_is_ignored(self):
+        events, history = baseline_round_trip()
+        pending = attempt(9, EXIT_AT, sell="SPY", buy="QQQ", sell_quantity="0.323269",
+                          buy_quantity="0.346345", phase="submitted")
+        report = report_for(events, history[:1], active=pending)
+
+        self.assertEqual(report["totals"]["swaps"], 1)
+        self.assertEqual(report["totals"]["round_trips"], 0)
 
     def test_a_swap_inside_the_window_with_no_matching_event_is_an_error(self):
         events, history = baseline_round_trip()
