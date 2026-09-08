@@ -2054,39 +2054,57 @@ impl Engine {
             return;
         }
         self.last_status_write = now;
-        let legs: serde_json::Map<String, serde_json::Value> = self
-            .state
-            .legs
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
-            .collect();
-        let status = serde_json::json!({
-            "ts": now,
-            "bot": BOT,
-            "instance_id": self.cfg.instance_id,
-            "dry_run": self.cfg.dry_run,
-            "mode": self.state.mode,
-            "armed_at": self.state.armed_at,
-            "exited_at": self.state.exited_at,
-            "exit_reason": self.state.exit_reason,
-            "halted": self.state.halted,
-            "halt_reason": self.state.halt_reason,
-            "kill_switch": kill,
-            "realized_pnl_total_usd": self.state.realized_pnl_total_usd,
-            "cycles": self.state.cycles,
-            "tranches_done": self.state.tranches_done,
-            "tranches_remaining": self.state.tranches_remaining,
-            "tranche_spot_usd": self.state.tranche_spot_usd,
-            "tranche_perp_usd": self.state.tranche_perp_usd,
-            "last_tranche_date": self.state.last_tranche_date,
-            "config_fp": self.cfg.fingerprint(),
-            "margin": self.last_margin,
-            "legs": legs,
-        });
+        let status = status_value(&self.cfg, &self.state, &self.last_margin, now, kill);
         if let Err(e) = persist_json(&self.cfg.status_path, &status) {
             log::warn!("[STATUS] write failed: {e:?}");
         }
     }
+}
+
+/// The monitoring projection, built apart from the write so it can be
+/// asserted without an Engine and its two venue connectors.
+fn status_value(
+    cfg: &Config,
+    state: &State,
+    margin: &Option<MarginSnapshot>,
+    now: u64,
+    kill: bool,
+) -> serde_json::Value {
+    let legs: serde_json::Map<String, serde_json::Value> = state
+        .legs
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::to_value(v).unwrap_or_default()))
+        .collect();
+    serde_json::json!({
+        "ts": now,
+        "bot": BOT,
+        "instance_id": cfg.instance_id,
+        "dry_run": cfg.dry_run,
+        "mode": state.mode,
+        "armed_at": state.armed_at,
+        "exited_at": state.exited_at,
+        "exit_reason": state.exit_reason,
+        "halted": state.halted,
+        "halt_reason": state.halt_reason,
+        "kill_switch": kill,
+        "realized_pnl_total_usd": state.realized_pnl_total_usd,
+        "cycles": state.cycles,
+        "tranches_done": state.tranches_done,
+        "tranches_remaining": state.tranches_remaining,
+        "tranche_spot_usd": state.tranche_spot_usd,
+        "tranche_perp_usd": state.tranche_perp_usd,
+        "last_tranche_date": state.last_tranche_date,
+        "config_fp": cfg.fingerprint(),
+        "margin": margin,
+        // The configured book, which `legs` only describes once a tranche
+        // has filled. A monitor checking that its buy & hold anchor covers
+        // the whole book has nothing to check against before ARM
+        // otherwise, and an anchor missing a leg is not a partial
+        // benchmark but a different portfolio: the whole spot allocation
+        // goes into the legs it does list (bot-strategy#963).
+        "configured_symbols": cfg.symbols,
+        "legs": legs,
+    })
 }
 
 #[tokio::main]
@@ -2167,6 +2185,38 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_reports_the_configured_book_before_any_leg_exists() {
+        let cfg = test_config();
+        let mut state = State::default();
+
+        // Pre-ARM: `legs` is empty, so a monitor validating that its buy &
+        // hold anchor covers the whole book has nothing to check against
+        // unless the configured universe is reported (bot-strategy#963).
+        let before = status_value(&cfg, &state, &None, 1_788_810_248, false);
+        assert_eq!(before["legs"].as_object().unwrap().len(), 0);
+        assert_eq!(
+            before["configured_symbols"],
+            serde_json::json!(["BTC", "ETH"])
+        );
+
+        // It stays the configured universe once legs open, rather than
+        // tracking whichever legs happen to be filled.
+        state.legs.insert("BTC".into(), LegState::default());
+        let after = status_value(&cfg, &state, &None, 1_788_810_248, false);
+        assert_eq!(after["legs"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            after["configured_symbols"],
+            serde_json::json!(["BTC", "ETH"])
+        );
+
+        // The rest of the projection is unchanged by the extraction.
+        assert_eq!(after["bot"], BOT);
+        assert_eq!(after["ts"], 1_788_810_248u64);
+        assert_eq!(after["dry_run"], true);
+        assert_eq!(after["config_fp"], cfg.fingerprint());
+    }
 
     #[test]
     fn exit_rule_is_strictly_below_level() {
