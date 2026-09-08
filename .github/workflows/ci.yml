@@ -8,7 +8,17 @@ on:
       - "Cargo.lock"
       - "build.rs"
       - ".github/workflows/**"
-      # configs/** lives in deploy-configs.yml's trigger list — that
+      # The one configs/ exception (bot-strategy#952): a book instance's
+      # config and its calendar are validated by `Scheduler::build` in
+      # `cargo test --lib book::schedule`, which lives here, and the pair
+      # is only ever changed together. Without this a config-only push
+      # (a wider signal_grace_secs, a regenerated calendar) would reach
+      # the hosts having been checked for nothing but generator
+      # agreement, and fail at the next install instead. These files
+      # change roughly monthly, so paying for the build is the cheaper
+      # side of the trade.
+      - "configs/book/**"
+      # The rest of configs/** lives in deploy-configs.yml's trigger list — that
       # workflow handles config-only pushes in 30 s. ci.yml's heavy
       # arm64 Rust build only fires when actual code or workflow
       # files change. A combined push that touches both src/ and

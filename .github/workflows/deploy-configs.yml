@@ -56,13 +56,14 @@ jobs:
           python3 debot/scripts/exdiv_signal_producer.py calendar \
             --events debot/configs/book/exdiv-events.json \
             --out debot/configs/book/exdiv-lighter.calendar.json --check
-          # The calendar's own rules (serde shape, duplicate keys,
-          # timestamps, flatten/overlap windows) are checked by
-          # `book_runtime --validate --calendar` -- in Rust CI over the
-          # committed pair, and again on the host with the staged binary
-          # before install_book_runtime.sh promotes anything
-          # (bot-strategy#952). This job only has to keep the generated
-          # file in step with the human events file above.
+          # The calendar's own rules (serde shape, duplicate keys, blank
+          # or absent entries, timestamps, flatten/overlap windows against
+          # the config's own signal_grace_secs) are checked by
+          # `Scheduler::build` -- in ci.yml, which is triggered on
+          # configs/book/** for exactly this reason, and again on the host
+          # with the staged binary before install_book_runtime.sh promotes
+          # anything (bot-strategy#952). This job only has to keep the
+          # generated file in step with the human events file above.
           bash debot/scripts/test_book_signal_fetch.sh
           bash debot/scripts/test_s3_object_present.sh
           bash debot/scripts/test_fetch_book_bundle.sh
