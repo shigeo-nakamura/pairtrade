@@ -87,15 +87,24 @@
 //!   *better* of two candidates -- that freeze is still #872's job. The
 //!   check is fail-closed as of bot-strategy#916: an unreadable
 //!   endpoint blocks the entry instead of waving it through.
-//! - `OpenPosition` (the in-flight entry/exit state) is in-memory only,
-//!   not persisted to `state_path` -- a crash or restart between entry and
-//!   exit loses track of the open position in this process's own state.
-//!   `RiskState.last_session_date` prevents re-entering a day already
-//!   acted on, but does not resume tracking an existing position for its
-//!   scheduled exit. After any restart, check the real Lighter account
-//!   position directly rather than trusting this process's state file.
+//! - `OpenPosition` is persisted to `state_path` as
+//!   `RiskState.open_position` and reconciled against the exchange's own
+//!   position on the first tick after a start (`reconcile_startup`,
+//!   bot-strategy#917): a matching position is resumed for its scheduled
+//!   exit, one the exchange holds that the record does not explain is
+//!   adopted for immediate close *and* halts new entries, and a persisted
+//!   position the exchange no longer holds halts too (it was closed at a
+//!   price this process never saw, so its PnL is unbooked). No entry goes
+//!   out before that comparison succeeds; a failing `get_positions()`
+//!   keeps entries blocked rather than letting one through blind. Under
+//!   DRY_RUN the exchange is not the authority -- the simulated position
+//!   is resumed from state, and a real position on the account is only
+//!   reported, never adopted.
 //! - No SIGTERM-graceful-close handling: `systemctl stop` does not
-//!   reduce-only-close an open position.
+//!   reduce-only-close an open position. It now logs and notifies exactly
+//!   what stays open and leaves the persisted record for the next start
+//!   to resume (bot-strategy#917), but flattening on shutdown is still
+//!   the operator's call.
 //! - `maybe_capture_t0` locks in `day.t0_prices` on the first tick at or
 //!   after `t0` that actually has a *usable* (fresh, current-generation)
 //!   price for both primaries, retries every tick until then, and never
@@ -565,6 +574,53 @@ struct RiskState {
     /// (pairtrade#275 Codex review).
     #[serde(default)]
     position_unconfirmed: bool,
+    /// The open position this process last knew about, persisted so a
+    /// restart between entry and exit can resume tracking it for its
+    /// scheduled exit instead of leaving it stranded on the exchange
+    /// (bot-strategy#917). `last_session_date` only stops the day being
+    /// re-entered; it says nothing about what is still open. Written on
+    /// every change to `EngineBLiveEngine.position` and cleared when the
+    /// exit books flat. Reconciled against the exchange's own position at
+    /// startup by `reconcile_startup` -- this record is a *claim*, never
+    /// evidence: the exchange decides.
+    #[serde(default)]
+    open_position: Option<PersistedPosition>,
+}
+
+/// `OpenPosition` reduced to what survives a restart. Deliberately a
+/// separate type rather than `#[derive(Serialize)]` on `OpenPosition`:
+/// `OrderSide` (dex-connector) is `Deserialize`-only, and the persisted
+/// record carries two things the in-memory one does not need -- the
+/// symbol it belongs to (so a config change to `us_primary` is detected
+/// rather than silently applied to someone else's position) and the
+/// session boundaries the exit was scheduled against.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct PersistedPosition {
+    symbol: String,
+    /// `"long"` / `"short"` (`OrderSide`'s own `Display`).
+    side: String,
+    entry_price: f64,
+    entry_price_estimated: bool,
+    size: f64,
+    open_size: f64,
+    realized_partial_pnl: f64,
+    entered_at_us: i64,
+    flatten_asap: bool,
+    /// UTC date (YYYY-MM-DD) of the session this position was entered
+    /// for. A restart on a later date resumes it as `flatten_asap`.
+    session_date: String,
+    /// `t2 + exit_deadline_secs` for that session, when the window was
+    /// known at entry. Past it, a resumed position is flattened at once
+    /// instead of waiting for a window that has already gone.
+    exit_deadline_us: Option<i64>,
+}
+
+fn side_from_str(s: &str) -> Option<OrderSide> {
+    match s.to_ascii_lowercase().as_str() {
+        "long" => Some(OrderSide::Long),
+        "short" => Some(OrderSide::Short),
+        _ => None,
+    }
 }
 
 fn load_state(path: &Path) -> RiskState {
@@ -742,6 +798,96 @@ fn opposite(side: OrderSide) -> OrderSide {
     match side {
         OrderSide::Long => OrderSide::Short,
         OrderSide::Short => OrderSide::Long,
+    }
+}
+
+/// Two position quantities agree if they differ by less than a part per
+/// million of the larger (plus an absolute floor for dust): the persisted
+/// f64 and the exchange's decimal are the same number rendered twice, so
+/// anything above this is a real divergence -- a fill, a partial close or
+/// an external order that happened while this process was down -- not
+/// rounding.
+fn sizes_agree(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-9 + 1e-6 * a.abs().max(b.abs())
+}
+
+/// What startup reconciliation decided about the account (bot-strategy#917).
+/// A pure function of (what we persisted, what the exchange reports) so the
+/// table below is testable without a connector.
+#[derive(Debug, Clone, PartialEq)]
+enum ReconcileAction {
+    /// Nothing tracked, exchange flat. The normal start.
+    Clean,
+    /// The persisted position is still there, unchanged: resume tracking
+    /// it. `flatten_asap` is true when its own exit window is unknown or
+    /// already past (a prior session, or past `exit_deadline_us`), in
+    /// which case `maybe_exit` closes it on the next tick instead of
+    /// waiting for today's `t2`.
+    Resume { flatten_asap: bool },
+    /// The exchange holds a position this process has no record of.
+    /// Adopted (so it gets closed) but halted: its origin is unknown.
+    AdoptUnknown,
+    /// We persisted a position and the exchange is flat. Something closed
+    /// it while we were down (operator, liquidation, another process) at a
+    /// price we never saw, so its PnL cannot be booked.
+    Vanished,
+    /// Both exist but disagree on symbol, side or quantity.
+    Mismatch { reason: String },
+}
+
+/// The reconciliation decision table. `today` is the current UTC date,
+/// `symbol` the instance's configured `us_primary`.
+fn reconcile_action(
+    persisted: Option<&PersistedPosition>,
+    live: Option<&ExchangePosition>,
+    symbol: &str,
+    today: &str,
+    now_us: i64,
+) -> ReconcileAction {
+    match (persisted, live) {
+        (None, None) => ReconcileAction::Clean,
+        (None, Some(_)) => ReconcileAction::AdoptUnknown,
+        (Some(_), None) => ReconcileAction::Vanished,
+        (Some(p), Some(live)) => {
+            if p.symbol != symbol {
+                return ReconcileAction::Mismatch {
+                    reason: format!(
+                        "persisted position is on {} but this instance trades {symbol}",
+                        p.symbol
+                    ),
+                };
+            }
+            let Some(side) = side_from_str(&p.side) else {
+                return ReconcileAction::Mismatch {
+                    reason: format!("persisted side {:?} is not long/short", p.side),
+                };
+            };
+            if side != live.side {
+                return ReconcileAction::Mismatch {
+                    reason: format!(
+                        "persisted side {side} but the exchange holds {} size={:.6}",
+                        live.side, live.size
+                    ),
+                };
+            }
+            // Compared against the *open* remainder, not the entry size:
+            // a partial exit already booked before the restart shrinks
+            // `open_size` and the exchange agrees with that, not with the
+            // original fill.
+            if !sizes_agree(p.open_size, live.size) {
+                return ReconcileAction::Mismatch {
+                    reason: format!(
+                        "persisted open_size={:.8} but the exchange holds {:.8}",
+                        p.open_size, live.size
+                    ),
+                };
+            }
+            let window_gone = p.session_date != today
+                || p.exit_deadline_us.is_some_and(|deadline| now_us > deadline);
+            ReconcileAction::Resume {
+                flatten_asap: p.flatten_asap || window_gone,
+            }
+        }
     }
 }
 
@@ -1337,6 +1483,11 @@ struct EngineBLiveEngine {
     /// Fill / flat confirmation awaiting the exchange (live only).
     pending: Option<PendingConfirm>,
     state: RiskState,
+    /// False until `reconcile_startup` has compared `state.open_position`
+    /// with the exchange's own position once (bot-strategy#917). No new
+    /// entry goes out while this is false: entering blind to what the
+    /// account already holds is how a restart doubles exposure.
+    reconciled: bool,
     last_status_write_us: i64,
     status_s3_mirror: Option<Arc<S3Mirror>>,
 }
@@ -1407,7 +1558,252 @@ impl EngineBLiveEngine {
     }
 
     fn entries_allowed(&self) -> bool {
-        !self.kill_switch_engaged() && !self.state.session_halted
+        !self.kill_switch_engaged() && !self.state.session_halted && self.reconciled
+    }
+
+    /// Mirror `self.position` into `state.open_position` and persist, so a
+    /// restart can resume tracking it (bot-strategy#917). Called from
+    /// every place that changes the position -- entry, adoption, partial
+    /// close, exit, the midnight carry-over flag -- and once more at the
+    /// end of each tick as a backstop. Writes only on an actual change:
+    /// the common case is an unchanged `None`.
+    fn persist_position(&mut self) {
+        let persisted = self.position.as_ref().map(|p| PersistedPosition {
+            symbol: self.cfg.us_primary_symbol.clone(),
+            side: p.side.to_string(),
+            entry_price: p.entry_price,
+            entry_price_estimated: p.entry_price_estimated,
+            size: p.size,
+            open_size: p.open_size,
+            realized_partial_pnl: p.realized_partial_pnl,
+            entered_at_us: p.entered_at_us,
+            flatten_asap: p.flatten_asap,
+            session_date: self.current_date.map(|d| d.to_string()).unwrap_or_default(),
+            exit_deadline_us: self
+                .window
+                .map(|(_t0, _t1, t2)| t2 + self.cfg.exit_deadline_secs * 1_000_000),
+        });
+        if self.state.open_position != persisted {
+            self.state.open_position = persisted;
+            atomic_write_json(&self.cfg.state_path, &self.state);
+        }
+    }
+
+    /// Compare the persisted position with the exchange's own once, before
+    /// this process is allowed to enter anything (bot-strategy#917).
+    ///
+    /// Under DRY_RUN the exchange is *not* the authority: this process
+    /// never sent the orders behind whatever the account holds, so it
+    /// resumes its own simulated position from state and only reports a
+    /// real position it can see but does not own. Live, the exchange
+    /// decides and `reconcile_action`'s table applies.
+    ///
+    /// A failed read leaves `reconciled` false: entries stay blocked and
+    /// the next tick retries. That is the fail-closed direction -- an
+    /// account we cannot read is not an account we can safely add to.
+    async fn reconcile_startup(&mut self, now_us: i64) {
+        let symbol = self.cfg.us_primary_symbol.clone();
+        let today = self.current_date.map(|d| d.to_string()).unwrap_or_default();
+        if self.cfg.dry_run {
+            match self.connector.get_positions().await {
+                Ok(positions) => {
+                    if let Some(live) = exchange_position_for(&positions, &symbol) {
+                        log::error!(
+                            "[RECONCILE] DRY_RUN, but the exchange holds {} {symbol} size={:.6} -- \
+                             this process did not open it and will not close it; check the account",
+                            live.side,
+                            live.size
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "[RECONCILE] DRY_RUN: get_positions failed ({e:?}); continuing on persisted \
+                     state alone"
+                ),
+            }
+            if let Some(p) = self.state.open_position.clone() {
+                let window_gone =
+                    p.session_date != today || p.exit_deadline_us.is_some_and(|d| now_us > d);
+                match self.restore_persisted(&p, p.flatten_asap || window_gone) {
+                    Ok(()) => log::warn!(
+                        "[RECONCILE] DRY_RUN: resumed the simulated {} {symbol} size={:.6} from \
+                         state (session {}, flatten_asap={})",
+                        p.side,
+                        p.open_size,
+                        p.session_date,
+                        p.flatten_asap || window_gone
+                    ),
+                    Err(reason) => {
+                        log::error!(
+                            "[RECONCILE] DRY_RUN: dropping unusable persisted position: {reason}"
+                        );
+                        self.state.open_position = None;
+                        atomic_write_json(&self.cfg.state_path, &self.state);
+                    }
+                }
+            }
+            self.reconciled = true;
+            return;
+        }
+        let positions = match self.connector.get_positions().await {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "[RECONCILE] get_positions failed ({e:?}); entries stay blocked until the \
+                     account can be read"
+                );
+                return;
+            }
+        };
+        let live = exchange_position_for(&positions, &symbol);
+        let persisted = self.state.open_position.clone();
+        let action = reconcile_action(persisted.as_ref(), live.as_ref(), &symbol, &today, now_us);
+        match action {
+            ReconcileAction::Clean => {
+                log::info!("[RECONCILE] account flat and nothing tracked -- clean start");
+            }
+            ReconcileAction::Resume { flatten_asap } => {
+                let p = persisted.expect("Resume implies a persisted position");
+                match self.restore_persisted(&p, flatten_asap) {
+                    Ok(()) => log::warn!(
+                        "[RECONCILE] resumed the open {} {symbol} size={:.6} entered {} \
+                         (session {}, flatten_asap={flatten_asap}) -- its scheduled exit is back \
+                         under management",
+                        p.side,
+                        p.open_size,
+                        p.entered_at_us,
+                        p.session_date
+                    ),
+                    Err(reason) => {
+                        // Only reachable if the record is corrupt in a way
+                        // the decision table cannot see (it validates side
+                        // and symbol first); treat it as unknown origin.
+                        log::error!("[RECONCILE] persisted record unusable ({reason})");
+                        self.adopt_from_exchange(
+                            live.as_ref().expect("Resume implies a live position"),
+                            now_us,
+                            &format!("unusable persisted record: {reason}"),
+                        );
+                    }
+                }
+            }
+            ReconcileAction::AdoptUnknown => {
+                let live = live.as_ref().expect("AdoptUnknown implies a live position");
+                self.adopt_from_exchange(
+                    live,
+                    now_us,
+                    "the exchange holds a position this process has no record of",
+                );
+            }
+            ReconcileAction::Mismatch { ref reason } => {
+                let live = live.as_ref().expect("Mismatch implies a live position");
+                self.adopt_from_exchange(live, now_us, reason);
+            }
+            ReconcileAction::Vanished => {
+                let p = persisted.expect("Vanished implies a persisted position");
+                let reason = format!(
+                    "position_vanished_while_down: tracked {} {symbol} size={:.6} entered {} but \
+                     the exchange is flat -- closed at a price this process never saw, so its PnL \
+                     is unbooked",
+                    p.side, p.open_size, p.entered_at_us
+                );
+                log::error!("[RECONCILE] {reason}");
+                self.state.open_position = None;
+                atomic_write_json(&self.cfg.state_path, &self.state);
+                self.halt_session(reason);
+            }
+        }
+        self.reconciled = true;
+    }
+
+    /// Rebuild `self.position` from a persisted record. `Err` only when
+    /// the record cannot be turned into a position at all (unparseable
+    /// side); the caller decides what that means.
+    fn restore_persisted(
+        &mut self,
+        p: &PersistedPosition,
+        flatten_asap: bool,
+    ) -> Result<(), String> {
+        let side = side_from_str(&p.side).ok_or_else(|| format!("side {:?}", p.side))?;
+        self.position = Some(OpenPosition {
+            side,
+            entry_price: p.entry_price,
+            entry_price_estimated: p.entry_price_estimated,
+            size: p.size,
+            open_size: p.open_size,
+            realized_partial_pnl: p.realized_partial_pnl,
+            entered_at_us: p.entered_at_us,
+            flatten_asap,
+        });
+        self.persist_position();
+        Ok(())
+    }
+
+    /// Take over a position the exchange reports but our own record does
+    /// not explain: track it so it gets closed (`flatten_asap`), and halt
+    /// so no *new* entry joins it until an operator has looked
+    /// (bot-strategy#917). The cost basis is the exchange's own
+    /// `avg_entry_price` when it has one, else the last WS mid -- and then
+    /// the booked PnL is flagged as an estimate.
+    fn adopt_from_exchange(&mut self, live: &ExchangePosition, now_us: i64, reason: &str) {
+        let ws_price = self
+            .exit_accounting_price(&self.cfg.us_primary_symbol)
+            .map(|(mid, _)| mid);
+        let (entry_price, entry_price_estimated) = match (live.entry_price, ws_price) {
+            (Some(e), _) => (e, false),
+            (None, Some(w)) => (w, true),
+            // No cost basis of any kind yet: still adopt (getting flat
+            // matters more than the PnL number), booking against the exit
+            // price itself once it closes.
+            (None, None) => (0.0, true),
+        };
+        log::error!(
+            "[RECONCILE] adopting {} {} size={:.6} for immediate close -- {reason}",
+            live.side,
+            self.cfg.us_primary_symbol,
+            live.size
+        );
+        self.position = Some(OpenPosition {
+            side: live.side,
+            entry_price,
+            entry_price_estimated,
+            size: live.size,
+            open_size: live.size,
+            realized_partial_pnl: 0.0,
+            entered_at_us: now_us,
+            flatten_asap: true,
+        });
+        self.persist_position();
+        self.halt_session(format!("reconcile_adopted_position: {reason}"));
+    }
+
+    /// SIGTERM / stop policy (bot-strategy#917): this prototype does not
+    /// reduce-only-close on shutdown, so say so loudly and leave the
+    /// persisted record behind for the next process to resume from --
+    /// never a close this process did not actually see.
+    fn note_shutdown_signal(&mut self, signal: &str) {
+        self.persist_position();
+        match self.position.as_ref() {
+            Some(p) => {
+                log::error!(
+                    "[SHUTDOWN] {signal}: {} {} size={:.6} is STILL OPEN and is NOT being closed \
+                     here; it is persisted and the next start resumes it (flatten_asap={})",
+                    p.side,
+                    self.cfg.us_primary_symbol,
+                    p.open_size,
+                    p.flatten_asap
+                );
+                send_notification(
+                    format!("Han Bridge SHUTDOWN with an open position ({signal})"),
+                    format!(
+                        "{} {} size={:.6} left open; no reduce-only was sent. Restart resumes it, \
+                         or flatten manually.",
+                        p.side, self.cfg.us_primary_symbol, p.open_size
+                    ),
+                );
+            }
+            None => log::warn!("[SHUTDOWN] {signal}: no open position tracked; exiting"),
+        }
     }
 
     /// Roll to a new UTC date's session window if the wall-clock date has
@@ -1437,6 +1833,11 @@ impl EngineBLiveEngine {
             if let Some(p) = self.position.as_mut() {
                 p.flatten_asap = true;
             }
+            // Carry the flag into the persisted record too, so a restart
+            // during the carry-over also flattens at once instead of
+            // waiting for a window that belongs to the previous session
+            // (bot-strategy#917).
+            self.persist_position();
             self.day.entered = true;
             self.day.skip_reason = Some("carried_over_position".to_string());
             self.state.last_session_date = Some(today.to_string());
@@ -2206,6 +2607,9 @@ impl EngineBLiveEngine {
         let price = pos.entry_price;
         let size = pos.size;
         self.position = Some(pos);
+        // Durable before anything else: from here on a restart resumes
+        // this position for its scheduled exit (bot-strategy#917).
+        self.persist_position();
         self.day.entered = true;
         // Persist immediately, matching the no-entry and exit paths:
         // without this, a restart between entry and exit finds
@@ -2873,6 +3277,12 @@ impl EngineBLiveEngine {
         let Some(pos) = self.position.take() else {
             return;
         };
+        // Clear the persisted record as part of booking the close, not at
+        // the end of the tick: a crash in between would otherwise leave a
+        // record of a position the exchange no longer holds, which the
+        // next start would read as `Vanished` and halt on
+        // (bot-strategy#917).
+        self.persist_position();
         let sign = match pos.side {
             OrderSide::Long => 1.0,
             OrderSide::Short => -1.0,
@@ -2960,6 +3370,11 @@ impl EngineBLiveEngine {
         let now = self.now();
         self.roll_day_if_needed(now);
         self.maybe_clear_halt();
+        // Before anything can enter: what does the account actually hold?
+        // Retried every tick until one read succeeds (bot-strategy#917).
+        if !self.reconciled {
+            self.reconcile_startup(now).await;
+        }
         self.maybe_capture_t0(now);
         if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
             self.try_adopt_unconfirmed(now).await;
@@ -2972,6 +3387,10 @@ impl EngineBLiveEngine {
             self.maybe_enter(now).await;
             self.maybe_exit(now).await;
         }
+        // Backstop for any path above that changed the position without
+        // persisting it itself (bot-strategy#917); a no-op when nothing
+        // changed.
+        self.persist_position();
         self.write_status_if_due(now);
     }
 
@@ -3065,16 +3484,18 @@ impl EngineBLiveEngine {
                 dry_run: self.cfg.dry_run,
                 has_position,
                 position_count,
-                // false exactly when today's `entered` flag was restored
-                // from persisted state after a restart -- our own
-                // in-memory `position` was lost in that case (never
-                // persisted, see KNOWN GAPS), so debot-dashboard's
-                // "positions_ready !== false means trustworthy" read must
-                // not be told otherwise.
+                // False until this process has compared the account with
+                // its own persisted record once (bot-strategy#917): before
+                // that the position list is this process's guess, and
+                // debot-dashboard's "positions_ready !== false means
+                // trustworthy" read must not be told otherwise. It used to
+                // be false for the whole day after any restart, because
+                // the position was in-memory only and could not be
+                // recovered at all; a successful reconcile now restores it.
                 // Not trustworthy while a sendTx is awaiting exchange
                 // confirmation either: the exchange may already differ from
                 // the in-memory list (pairtrade#275 Codex review).
-                positions_ready: !(self.day.restart_recovered
+                positions_ready: !(!self.reconciled
                     || self.state.position_unconfirmed
                     || self.pending.is_some()),
                 positions,
@@ -3240,9 +3661,23 @@ async fn main() -> Result<()> {
         position: None,
         pending: None,
         state,
+        // The first tick reconciles against the exchange before any entry
+        // is allowed (bot-strategy#917).
+        reconciled: false,
         last_status_write_us: 0,
         status_s3_mirror: S3Mirror::from_env(),
     };
+    if let Some(p) = engine.state.open_position.as_ref() {
+        log::warn!(
+            "[STARTUP] persisted open position: {} {} size={:.6} (session {}, flatten_asap={}) -- \
+             reconciling against the exchange before any entry",
+            p.side,
+            p.symbol,
+            p.open_size,
+            p.session_date,
+            p.flatten_asap
+        );
+    }
 
     // The feed runs in its own task rather than as an arm of the tick
     // loop's `select!` (pairtrade#289 Codex round 4): `tick()` awaits the
@@ -3261,13 +3696,34 @@ async fn main() -> Result<()> {
     );
 
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    // `systemctl stop`/`restart` sends SIGTERM. This prototype does not
+    // reduce-only-close on the way out (that is deliberate -- a close it
+    // cannot confirm is worse than a documented open position), so the
+    // handler exists to make the state durable and say plainly what is
+    // still open, instead of the process vanishing mid-tick
+    // (bot-strategy#917).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to install the SIGTERM handler")?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to install the SIGINT handler")?;
     loop {
-        tick_interval.tick().await;
-        if feed_closed.load(std::sync::atomic::Ordering::SeqCst) {
-            log::error!("[WS] price feed closed, exiting");
-            break;
+        tokio::select! {
+            _ = tick_interval.tick() => {
+                if feed_closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    log::error!("[WS] price feed closed, exiting");
+                    break;
+                }
+                engine.tick().await;
+            }
+            _ = sigterm.recv() => {
+                engine.note_shutdown_signal("SIGTERM");
+                break;
+            }
+            _ = sigint.recv() => {
+                engine.note_shutdown_signal("SIGINT");
+                break;
+            }
         }
-        engine.tick().await;
     }
 
     Ok(())
@@ -4202,6 +4658,9 @@ mod tests {
         /// is awaiting the exchange (pairtrade#289 rounds 4-5).
         #[allow(clippy::type_complexity)]
         on_get_positions: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Makes `get_positions` fail, standing in for an account this
+        /// process cannot read at startup (bot-strategy#917).
+        fail_get_positions: std::sync::atomic::AtomicBool,
     }
 
     impl StubConnector {
@@ -4267,6 +4726,14 @@ mod tests {
         async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, dex_connector::DexError> {
             if let Some(hook) = self.on_get_positions.lock().unwrap().as_ref() {
                 hook();
+            }
+            if self
+                .fail_get_positions
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(dex_connector::DexError::ServerResponse(
+                    "stub: account unreadable".to_string(),
+                ));
             }
             Ok(self
                 .positions
@@ -4491,6 +4958,10 @@ mod tests {
                 peak_equity: 1000.0,
                 ..RiskState::default()
             },
+            // The harness stands for an already-running process; the
+            // startup reconciliation has its own tests below, which set
+            // this back to false.
+            reconciled: true,
             last_status_write_us: 0,
             status_s3_mirror: None,
         };
@@ -5152,6 +5623,394 @@ mod tests {
         assert!(
             debug.contains("SKHY=190.0000@0.0s/gen0[ok]"),
             "unexpected: {debug}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Startup reconciliation (bot-strategy#917)
+    // -----------------------------------------------------------------
+
+    const TODAY: &str = "2026-09-08";
+
+    fn persisted_long(open_size: f64, session_date: &str) -> PersistedPosition {
+        PersistedPosition {
+            symbol: "SNDK".to_string(),
+            side: "long".to_string(),
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            size: open_size,
+            open_size,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            session_date: session_date.to_string(),
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        }
+    }
+
+    fn live_long(size: f64) -> ExchangePosition {
+        ExchangePosition {
+            side: OrderSide::Long,
+            size,
+            entry_price: Some(1756.92),
+        }
+    }
+
+    #[test]
+    fn reconcile_is_clean_when_nothing_is_tracked_and_the_account_is_flat() {
+        assert_eq!(
+            reconcile_action(None, None, "SNDK", TODAY, T2_US),
+            ReconcileAction::Clean
+        );
+    }
+
+    #[test]
+    fn reconcile_adopts_an_exchange_position_the_record_does_not_explain() {
+        assert_eq!(
+            reconcile_action(None, Some(&live_long(0.057)), "SNDK", TODAY, T2_US),
+            ReconcileAction::AdoptUnknown
+        );
+    }
+
+    #[test]
+    fn reconcile_flags_a_persisted_position_the_exchange_no_longer_holds() {
+        assert_eq!(
+            reconcile_action(
+                Some(&persisted_long(0.057, TODAY)),
+                None,
+                "SNDK",
+                TODAY,
+                T2_US
+            ),
+            ReconcileAction::Vanished
+        );
+    }
+
+    #[test]
+    fn reconcile_resumes_a_same_day_position_for_its_own_scheduled_exit() {
+        // Before t2: the position keeps its window, it is not flattened
+        // on sight.
+        assert_eq!(
+            reconcile_action(
+                Some(&persisted_long(0.057, TODAY)),
+                Some(&live_long(0.057)),
+                "SNDK",
+                TODAY,
+                T1_US + 60_000_000,
+            ),
+            ReconcileAction::Resume {
+                flatten_asap: false
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_resumes_a_position_whose_window_is_gone_as_flatten_asap() {
+        // Yesterday's session.
+        assert_eq!(
+            reconcile_action(
+                Some(&persisted_long(0.057, "2026-09-07")),
+                Some(&live_long(0.057)),
+                "SNDK",
+                TODAY,
+                T1_US,
+            ),
+            ReconcileAction::Resume { flatten_asap: true }
+        );
+        // Today, but past t2 + exit_deadline.
+        assert_eq!(
+            reconcile_action(
+                Some(&persisted_long(0.057, TODAY)),
+                Some(&live_long(0.057)),
+                "SNDK",
+                TODAY,
+                T2_US + 900_000_001,
+            ),
+            ReconcileAction::Resume { flatten_asap: true }
+        );
+        // Already flagged before the restart (midnight carry-over).
+        let mut carried = persisted_long(0.057, TODAY);
+        carried.flatten_asap = true;
+        assert_eq!(
+            reconcile_action(
+                Some(&carried),
+                Some(&live_long(0.057)),
+                "SNDK",
+                TODAY,
+                T1_US,
+            ),
+            ReconcileAction::Resume { flatten_asap: true }
+        );
+    }
+
+    #[test]
+    fn reconcile_reports_side_size_and_symbol_disagreements() {
+        let short = ExchangePosition {
+            side: OrderSide::Short,
+            size: 0.057,
+            entry_price: None,
+        };
+        let side = reconcile_action(
+            Some(&persisted_long(0.057, TODAY)),
+            Some(&short),
+            "SNDK",
+            TODAY,
+            T2_US,
+        );
+        assert!(
+            matches!(&side, ReconcileAction::Mismatch { reason } if reason.contains("side")),
+            "unexpected: {side:?}"
+        );
+        let size = reconcile_action(
+            Some(&persisted_long(0.057, TODAY)),
+            Some(&live_long(0.114)),
+            "SNDK",
+            TODAY,
+            T2_US,
+        );
+        assert!(
+            matches!(&size, ReconcileAction::Mismatch { reason } if reason.contains("open_size")),
+            "unexpected: {size:?}"
+        );
+        // A config change to us_primary must not silently apply the old
+        // symbol's record to the new symbol's position.
+        let symbol = reconcile_action(
+            Some(&persisted_long(0.057, TODAY)),
+            Some(&live_long(0.057)),
+            "MU",
+            TODAY,
+            T2_US,
+        );
+        assert!(
+            matches!(&symbol, ReconcileAction::Mismatch { reason } if reason.contains("SNDK")),
+            "unexpected: {symbol:?}"
+        );
+        // An unparseable side is a mismatch, never a silent resume.
+        let mut corrupt = persisted_long(0.057, TODAY);
+        corrupt.side = "sideways".to_string();
+        assert!(matches!(
+            reconcile_action(
+                Some(&corrupt),
+                Some(&live_long(0.057)),
+                "SNDK",
+                TODAY,
+                T2_US
+            ),
+            ReconcileAction::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn sizes_agree_only_within_a_part_per_million() {
+        assert!(sizes_agree(0.056918, 0.056918));
+        assert!(sizes_agree(0.056918, 0.056918 + 1e-11));
+        assert!(!sizes_agree(0.056918, 0.056918 + 1e-6));
+        assert!(!sizes_agree(0.056918, 0.113836));
+        // Dust on both sides still compares.
+        assert!(sizes_agree(0.0, 0.0));
+    }
+
+    /// The whole point of #917: a restart between entry and exit resumes
+    /// the position and closes it at its own t2, instead of leaving it
+    /// stranded on the exchange.
+    #[tokio::test]
+    async fn a_restart_resumes_the_persisted_position_and_exits_it_at_t2() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.position = None;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.state.last_session_date = Some(TODAY.to_string());
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        // A tick before t2: reconciled, tracked again, but not yet closed.
+        h.set_now(T1_US + 60_000_000);
+        h.observe_all(T1_US + 60_000_000, 190.0, 1760.0);
+        h.engine.tick().await;
+        assert!(h.engine.reconciled);
+        let resumed = h.engine.position.clone().expect("position resumed");
+        assert_eq!(resumed.side, OrderSide::Long);
+        assert!((resumed.open_size - 0.057).abs() < 1e-12);
+        assert!(!resumed.flatten_asap, "its own window is still ahead");
+        assert_eq!(h.connector.order_count(), 0, "nothing closes before t2");
+        // At t2 the resumed position exits like any other.
+        h.set_now(T2_US);
+        h.observe_all(T2_US, 190.0, 1769.1);
+        h.engine.tick().await;
+        assert_eq!(h.connector.order_count(), 1, "the resumed position exits");
+        {
+            let orders = h.connector.orders.lock().unwrap();
+            assert_eq!(orders[0].2, OrderSide::Short, "reduce-only close of a long");
+            assert!(orders[0].3, "reduce_only");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_account_blocks_entries_instead_of_guessing() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.connector
+            .fail_get_positions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        h.set_now(T1_US);
+        h.observe_all(T1_US, 190.0, 1760.0);
+        h.engine.tick().await;
+        assert!(
+            !h.engine.reconciled,
+            "a failed read must not count as reconciled"
+        );
+        assert!(!h.engine.entries_allowed());
+        assert_eq!(h.connector.order_count(), 0);
+        // Once the account can be read, the block lifts.
+        h.connector
+            .fail_get_positions
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        h.engine.tick().await;
+        assert!(h.engine.reconciled);
+        assert!(h.engine.entries_allowed());
+    }
+
+    #[tokio::test]
+    async fn an_unexplained_exchange_position_is_adopted_and_halts_entries() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.031", -1, Some("1700.00")));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        let adopted = h.engine.position.clone().expect("adopted");
+        assert_eq!(adopted.side, OrderSide::Short);
+        assert!(adopted.flatten_asap, "unknown origin closes at once");
+        assert!(h.engine.state.session_halted, "halt, do not add to it");
+        assert!(!h.engine.entries_allowed());
+        assert_eq!(
+            h.engine
+                .state
+                .open_position
+                .as_ref()
+                .map(|p| p.side.clone()),
+            Some("short".to_string()),
+            "the adoption is persisted too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_position_that_vanished_while_we_were_down_halts_and_clears() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        // Exchange flat.
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(h.engine.position.is_none());
+        assert!(h.engine.state.open_position.is_none(), "record cleared");
+        assert!(h.engine.state.session_halted);
+        let reason = h
+            .engine
+            .state
+            .session_halt_reason
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("position_vanished_while_down"),
+            "unexpected: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_resumes_its_own_simulated_position_and_never_adopts() {
+        let mut h = harness();
+        h.engine.cfg.dry_run = true;
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.state.last_session_date = Some(TODAY.to_string());
+        // A real position on the account that DRY_RUN did not open: it is
+        // reported, never taken over, and never doubled up on.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.900", -1, Some("1700.00")));
+        h.set_now(T1_US + 60_000_000);
+        h.engine.tick().await;
+        let resumed = h
+            .engine
+            .position
+            .clone()
+            .expect("simulated position resumed");
+        assert_eq!(resumed.side, OrderSide::Long, "ours, not the exchange's");
+        assert!((resumed.open_size - 0.057).abs() < 1e-12);
+        assert!(
+            !h.engine.state.session_halted,
+            "DRY_RUN does not halt on it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_persists_the_position_and_the_exit_clears_the_record() {
+        let mut h = harness();
+        h.engine.record_entry(
+            OpenPosition {
+                side: OrderSide::Long,
+                entry_price: 1756.92,
+                entry_price_estimated: false,
+                size: 0.057,
+                open_size: 0.057,
+                realized_partial_pnl: 0.0,
+                entered_at_us: T1_US,
+                flatten_asap: false,
+            },
+            0.0142,
+            100.0,
+            "",
+        );
+        let saved = h
+            .engine
+            .state
+            .open_position
+            .clone()
+            .expect("entry persists the position");
+        assert_eq!(saved.side, "long");
+        assert_eq!(saved.symbol, "SNDK");
+        assert_eq!(saved.session_date, TODAY);
+        assert_eq!(saved.exit_deadline_us, Some(T2_US + 900_000_000));
+        // It survives a reload of the state file, not just the in-memory copy.
+        assert_eq!(
+            load_state(&h.engine.cfg.state_path).open_position,
+            Some(saved)
+        );
+        h.engine.on_exit(1769.1, T2_US);
+        assert!(h.engine.state.open_position.is_none());
+        assert!(load_state(&h.engine.cfg.state_path).open_position.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_signal_leaves_the_open_position_recorded_and_says_so() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+        });
+        h.engine.note_shutdown_signal("SIGTERM");
+        // No close was invented, and the record is durable for the next
+        // process to resume from.
+        assert_eq!(h.connector.order_count(), 0);
+        assert_eq!(
+            load_state(&h.engine.cfg.state_path)
+                .open_position
+                .map(|p| p.open_size),
+            Some(0.057)
         );
     }
 }
