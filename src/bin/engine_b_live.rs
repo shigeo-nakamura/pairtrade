@@ -84,7 +84,9 @@
 //!   bot-strategy#872 comment 2026-09-04) guards against entering on a
 //!   symbol Lighter itself has gone `force_reduce_only` on or that has
 //!   fallen below `min_daily_volume_usd`, but it does not pick the
-//!   *better* of two candidates -- that freeze is still #872's job.
+//!   *better* of two candidates -- that freeze is still #872's job. The
+//!   check is fail-closed as of bot-strategy#916: an unreadable
+//!   endpoint blocks the entry instead of waving it through.
 //! - `OpenPosition` (the in-flight entry/exit state) is in-memory only,
 //!   not persisted to `state_path` -- a crash or restart between entry and
 //!   exit loses track of the open position in this process's own state.
@@ -94,22 +96,41 @@
 //!   position directly rather than trusting this process's state file.
 //! - No SIGTERM-graceful-close handling: `systemctl stop` does not
 //!   reduce-only-close an open position.
-//! - `capture_t0_if_due` locks in `day.t0_prices` on the *first* tick at
-//!   or after `t0`, complete or not, and (deliberately, see
-//!   `capture_t0_if_due_never_overwrites_an_existing_snapshot`) never
-//!   recaptures within the same process run. `RiskState.t0_prices`
-//!   recovery (bot-strategy#872 PR #266/#270, the 2026-09-04
-//!   silent-signal-loss fix) only helps a *second* same-day restart --
-//!   the very first restart between `t0` and `t1` of the day can still
-//!   land its first tick on an incomplete `latest_price` (missing
-//!   `kr_primary`/`us_primary`, e.g. right after a WS reconnect) with
-//!   nothing yet persisted to recover. That case now logs a clear
-//!   `[DAY] ... but is missing kr_primary=.../us_primary=... prices`
-//!   `WARN` instead of failing silently, but does not by itself recover
-//!   the day -- an operator who sees that WARN should manually restart
-//!   again (now that an incomplete snapshot is never persisted, a second
-//!   attempt gets a fresh, hopefully-complete capture instead of
-//!   re-trusting the bad one) rather than assume the gap fixes itself.
+//! - `maybe_capture_t0` locks in `day.t0_prices` on the first tick at or
+//!   after `t0` that actually has a *usable* (fresh, current-generation)
+//!   price for both primaries, retries every tick until then, and never
+//!   recaptures once set (see
+//!   `capture_t0_if_due_never_overwrites_an_existing_snapshot`). Past
+//!   `t0_capture_grace_secs` the day is abandoned with a recorded
+//!   `skip_reason` rather than snapshotting a mid-session price as if it
+//!   were the KRX open (bot-strategy#916; before that this captured
+//!   whatever `latest_price` held and only WARNed about it, leaving the
+//!   day running on a snapshot the WARN itself called suspect).
+//!   `RiskState.t0_prices` recovery (bot-strategy#872 PR #266/#270, the
+//!   2026-09-04 silent-signal-loss fix) still covers a same-day restart
+//!   after a good capture.
+//!
+//! ## Fail-closed inputs (bot-strategy#916)
+//!
+//! Every *entry* decision is made from `usable_prices`: observations
+//! that passed ingest validation (positive mid inside a two-sided,
+//! uncrossed book; a venue timestamp that is either plausible-and-recent
+//! or ignored as a broken clock), arrived on the current feed
+//! generation, and are no older than `max_price_staleness_secs`. A
+//! missing or unusable input never becomes an entry -- it becomes a
+//! retry inside the entry deadline and then a `skip_day` with a reason
+//! visible in the log and in `status.json`.
+//!
+//! The gates are one-directional on purpose: `maybe_exit` and
+//! `try_adopt_unconfirmed` read the last price raw (see
+//! `exit_accounting_price`), so a stale feed can never keep an open
+//! position from being closed or an unknown exposure from being adopted.
+//! Fail-closed on entry, fail-open on getting flat.
+//!
+//! The feed itself runs on its own task (`spawn_price_feed`) writing into
+//! a shared `PriceFeed`, not as an arm of the tick loop: `tick()` awaits
+//! the exchange for seconds at a time, and a `Lagged` queued behind it
+//! would not bump the generation until after the order had been sent.
 //!
 //! DRY_RUN must stay on until a human explicitly flips the `refuse_live`
 //! gate below (mirrors `robinhood_dipgrid.rs`'s pattern: flipping
@@ -284,6 +305,28 @@ struct EngineBLiveConfig {
     /// within ~1 s of the fill; 15 s leaves room for a WS hiccup without
     /// eating the 180 s entry window (bot-strategy#875 G-2).
     fill_confirm_timeout_secs: i64,
+    /// Maximum age (seconds) a price observation may have and still be
+    /// usable for an *entry* decision -- boundary capture (t0/t1), the
+    /// `compute_epsilon` inputs and the order-sizing price
+    /// (bot-strategy#916). Checked against local receive time, and also
+    /// against the venue's own timestamp when that timestamp is
+    /// plausible (see `price_obs_from_update`). The exit path never
+    /// consults it -- see `usable_prices`.
+    max_price_staleness_secs: i64,
+    /// How many consecutive failed `orderBookDetails` fetches are
+    /// tolerated before today's entry is abandoned outright rather than
+    /// retried again (bot-strategy#916). `entry_deadline_secs` already
+    /// bounds the retry *window*; this bounds the request count inside
+    /// it too (a 5 s tick over a 180 s deadline would otherwise allow 36
+    /// REST calls against a Standard-tier 60 req/min account -- see
+    /// `docs/engine-b-order-spec.md` G-5).
+    max_eligibility_attempts: u32,
+    /// How long after `t0` a first t0 capture may still be taken before
+    /// the day is abandoned, instead of snapshotting an ever-later price
+    /// as if it were the KRX open (bot-strategy#916). This is the hard
+    /// bound behind "never backfill a missing boundary with a later
+    /// price"; it replaces the previous soft `delay_secs > 300` WARN.
+    t0_capture_grace_secs: i64,
     lighter_rest_url: String,
     min_daily_volume_usd: f64,
     equity_usd_reference: f64,
@@ -367,6 +410,11 @@ impl EngineBLiveConfig {
             entry_deadline_secs: env_i64("ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
             exit_deadline_secs: env_i64("ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
             fill_confirm_timeout_secs: env_i64("ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS", 15),
+            // 30 s is the requirements doc's staleness bound for a
+            // boundary price (bot-strategy#916).
+            max_price_staleness_secs: env_i64("ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS", 30),
+            max_eligibility_attempts: env_u32("ENGINE_B_LIVE_MAX_ELIGIBILITY_ATTEMPTS", 6),
+            t0_capture_grace_secs: env_i64("ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS", 300),
             lighter_rest_url: env_string(
                 "ENGINE_B_LIVE_LIGHTER_REST_URL",
                 "https://mainnet.zklighter.elliot.ai",
@@ -498,6 +546,15 @@ struct RiskState {
     t0_snapshot_date: Option<String>,
     #[serde(default)]
     t0_prices: HashMap<String, f64>,
+    /// `DaySnapshot.skip_reason` for `last_session_date`'s day
+    /// (pairtrade#289 Codex round 3). Persisted beside the day marker so
+    /// a same-day restart restores *why* the day was settled, not only
+    /// that it was: `roll_day_if_needed` rebuilds `day.entered` from
+    /// `last_session_date`, and without this `status.json` would report
+    /// an already-decided day with `skip_reason: null`. `None` means the
+    /// day was settled by an entry rather than by a skip.
+    #[serde(default)]
+    last_session_skip_reason: Option<String>,
     /// A sendTx went out (or errored ambiguously) and the exchange position
     /// could not be read for the whole confirm window, so a live position
     /// may exist that this process does not track. Persisted (not
@@ -688,10 +745,247 @@ fn opposite(side: OrderSide) -> OrderSide {
     }
 }
 
+// ---------------------------------------------------------------------
+// Price freshness (bot-strategy#916). `latest_price` used to be a bare
+// `HashMap<String, f64>`: it kept the number and threw away *when* it
+// arrived and *what book* produced it, so a feed that stalled (or a
+// venue replaying an old snapshot -- exactly the failure the Phase 0
+// observer hit in bot-strategy#908 item 7) still looked like a live
+// price to every entry decision. Every observation now carries its
+// receive time, the venue's own timestamp and the feed generation it
+// arrived on, and every *entry* decision goes through `usable_prices`.
+// ---------------------------------------------------------------------
+
+/// How far *ahead* of local receive time a venue timestamp may be before
+/// it is treated as a broken clock rather than as skew. A timestamp from
+/// the future cannot be evidence of stale data, so beyond this it is
+/// ignored (the local receive clock alone applies) and logged. Old
+/// timestamps get no such leniency: see `venue_timestamp_us`.
+const EXCHANGE_TS_MAX_FUTURE_SKEW_US: i64 = 86_400_000_000; // 1 day
+
+/// Normalise `PriceUpdate.timestamp` to epoch micros by its magnitude.
+/// The field is documented as milliseconds (the Lighter WS path divides
+/// an alleged-microsecond `last_updated_at` by 1000), but a unit change
+/// upstream must not either brick the engine (every update rejected as
+/// decades stale) or, worse, get waved through as "no clock" -- a venue
+/// replaying a snapshot from *days* ago carries a perfectly valid old
+/// timestamp, and that is exactly the data this check exists to reject
+/// (pairtrade#289 Codex round 2). So: seconds / millis / micros are
+/// recognised by their epoch-range magnitude and converted; anything
+/// outside every plausible range is `None` (genuinely meaningless).
+fn venue_timestamp_us(raw: u64) -> Option<i64> {
+    // Epoch ranges for 2001-09..2286-11 in each unit: 1e9..1e10 s,
+    // 1e12..1e13 ms, 1e15..1e16 us. Disjoint, so magnitude is decisive.
+    let raw = raw as i128;
+    let us = match raw {
+        1_000_000_000..=9_999_999_999 => raw * 1_000_000,
+        1_000_000_000_000..=9_999_999_999_999 => raw * 1_000,
+        1_000_000_000_000_000..=9_999_999_999_999_999 => raw,
+        _ => return None,
+    };
+    i64::try_from(us).ok()
+}
+
+/// One accepted price observation, with everything needed to decide
+/// later whether it is still fit to trade on (bot-strategy#916).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PriceObs {
+    mid: f64,
+    best_bid: f64,
+    best_ask: f64,
+    /// Local wall clock when this update was accepted.
+    received_at_us: i64,
+    /// The venue's own timestamp, in micros, when it was plausible
+    /// enough to compare against (see `EXCHANGE_TS_PLAUSIBILITY_US`).
+    exchange_ts_us: Option<i64>,
+    /// Feed generation this arrived on. Anything from an older
+    /// generation is unusable: a `Lagged` broadcast means updates were
+    /// dropped, so what we hold may be arbitrarily behind the book.
+    generation: u64,
+}
+
+impl PriceObs {
+    fn age_secs(&self, now_us: i64) -> f64 {
+        (now_us - self.received_at_us) as f64 / 1_000_000.0
+    }
+
+    /// Fit to base an entry decision on: same feed generation, not
+    /// future-dated (a backwards clock step must fail closed, not
+    /// produce a negative age that passes every bound), and no older
+    /// than `max_staleness_secs` -- measured from local receipt *and*,
+    /// when the venue clock was plausible, from the venue's own
+    /// timestamp. Ingest only bounds the venue age at arrival; without
+    /// the second check here a quote that arrived 29 s late would stay
+    /// usable for another 30 s, i.e. an entry on ~59 s-old venue data
+    /// under a 30 s bound (pairtrade#289 Codex review).
+    fn is_usable(&self, now_us: i64, generation: u64, max_staleness_secs: i64) -> bool {
+        let bound_us = max_staleness_secs.saturating_mul(1_000_000);
+        self.generation == generation
+            && self.received_at_us <= now_us
+            && now_us - self.received_at_us <= bound_us
+            && self
+                .exchange_ts_us
+                .is_none_or(|ts_us| now_us - ts_us <= bound_us)
+    }
+
+    /// The older of the two ages this observation carries, for logs.
+    fn effective_age_secs(&self, now_us: i64) -> f64 {
+        let venue_age = self
+            .exchange_ts_us
+            .map(|ts_us| (now_us - ts_us) as f64 / 1_000_000.0)
+            .unwrap_or(f64::MIN);
+        self.age_secs(now_us).max(venue_age)
+    }
+}
+
+/// Validate one incoming `PriceUpdate` and turn it into a `PriceObs`.
+///
+/// `Err(reason)` means the update is not trustworthy and must be
+/// dropped rather than stored. Dropping (rather than storing a bad
+/// value) is what makes this fail closed: whatever was held before
+/// simply keeps ageing, and once it crosses `max_staleness_secs` every
+/// entry path stops finding a usable price for that symbol.
+///
+/// The book checks matter because `mid` is derived from the top of book
+/// (`(bid + ask) / 2` on the Lighter WS path): a crossed or one-sided
+/// book yields a mid that is not a tradeable price even though it is a
+/// positive, recent-looking number.
+fn price_obs_from_update(
+    update: &PriceUpdate,
+    received_at_us: i64,
+    generation: u64,
+    max_staleness_secs: i64,
+) -> Result<PriceObs, &'static str> {
+    let (Some(mid), Some(best_bid), Some(best_ask)) = (
+        update.mid_price.to_f64(),
+        update.best_bid.to_f64(),
+        update.best_ask.to_f64(),
+    ) else {
+        return Err("not_representable_as_f64");
+    };
+    if !(mid.is_finite() && best_bid.is_finite() && best_ask.is_finite()) {
+        return Err("non_finite");
+    }
+    if mid <= 0.0 {
+        return Err("non_positive_mid");
+    }
+    if best_bid <= 0.0 || best_ask <= 0.0 {
+        return Err("one_sided_book");
+    }
+    if best_bid >= best_ask {
+        return Err("crossed_or_locked_book");
+    }
+    if mid < best_bid || mid > best_ask {
+        // Cannot happen on the Lighter path (mid is the arithmetic
+        // midpoint of the same two levels) but is the invariant that
+        // makes "mid is a tradeable price" true for any venue whose mid
+        // is reported rather than derived.
+        return Err("mid_outside_book");
+    }
+    let exchange_ts_us = venue_timestamp_us(update.timestamp)
+        // Beyond this far in the future the clock is broken, not skewed;
+        // ignore it rather than reject the update (a future stamp cannot
+        // mean stale data).
+        .filter(|ts_us| ts_us - received_at_us <= EXCHANGE_TS_MAX_FUTURE_SKEW_US);
+    if let Some(ts_us) = exchange_ts_us {
+        // Any recognisable timestamp older than the bound -- 31 seconds
+        // or 3 weeks -- means the venue is handing us old data on a
+        // healthy-looking connection (the stale-snapshot shape of
+        // bot-strategy#908 item 7). Future-dated within the skew bound
+        // is accepted as clock skew.
+        if received_at_us - ts_us > max_staleness_secs.saturating_mul(1_000_000) {
+            return Err("exchange_timestamp_stale");
+        }
+    }
+    Ok(PriceObs {
+        mid,
+        best_bid,
+        best_ask,
+        received_at_us,
+        exchange_ts_us,
+        generation,
+    })
+}
+
+/// The price feed's shared view: the latest accepted observation per
+/// symbol, the last raw mid from *any* update, and the feed generation.
+///
+/// Owned by a dedicated task (`spawn_price_feed`) rather than updated
+/// from the main `select!` arm, so the broadcast keeps being drained
+/// while `tick()` is awaiting the exchange. Under the old shape a
+/// `Lagged` that happened *during* entry preparation (eligibility fetch,
+/// position read, set_leverage) sat queued behind the running `tick()`
+/// and could not bump `generation` until after the order had been sent,
+/// so the send-time freshness check would have accepted pre-lag
+/// observations as current (pairtrade#289 Codex round 4).
+///
+/// Guarded by a `std::sync::Mutex`: every critical section here is a few
+/// map operations with no `.await` inside, and the engine's accessors
+/// return owned values so no guard ever crosses an await point.
+#[derive(Debug, Default)]
+struct PriceFeed {
+    latest: HashMap<String, PriceObs>,
+    /// Last positive mid seen per symbol from any update, accepted or
+    /// rejected at ingest (bot-strategy#916). Exit accounting only: when
+    /// every update is being rejected (a venue replaying a stale
+    /// snapshot, say) `latest` can be empty and an open position must
+    /// still be closable with *some* mid to book against. Never read by
+    /// an entry decision.
+    last_raw_mid: HashMap<String, f64>,
+    /// Bumped every time the broadcast reports dropped updates
+    /// (`Lagged`). Observations from an older generation are never
+    /// usable for entry: after a drop, what we hold may be arbitrarily
+    /// behind the book, and only a fresh update per symbol clears that.
+    generation: u64,
+}
+
+impl PriceFeed {
+    /// Validate and store one update, or return why it was dropped.
+    /// Dropping (rather than storing a bad value) is what makes this
+    /// fail closed: whatever was held keeps ageing until it is stale.
+    fn ingest(
+        &mut self,
+        update: &PriceUpdate,
+        received_at_us: i64,
+        max_staleness_secs: i64,
+    ) -> Result<(), &'static str> {
+        if let Some(mid) = update.mid_price.to_f64().filter(|m| *m > 0.0) {
+            self.last_raw_mid.insert(update.symbol.clone(), mid);
+        }
+        let obs =
+            price_obs_from_update(update, received_at_us, self.generation, max_staleness_secs)?;
+        self.latest.insert(update.symbol.clone(), obs);
+        Ok(())
+    }
+
+    /// Returns the new generation.
+    fn note_lag(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    fn usable(&self, now_us: i64, max_staleness_secs: i64) -> HashMap<String, f64> {
+        self.latest
+            .iter()
+            .filter(|(_, obs)| obs.is_usable(now_us, self.generation, max_staleness_secs))
+            .map(|(symbol, obs)| (symbol.clone(), obs.mid))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DaySnapshot {
     t0_prices: Option<HashMap<String, f64>>,
     t1_prices: Option<HashMap<String, f64>>,
+    /// The feed generation `t1_prices` was captured on
+    /// (pairtrade#289 Codex round 5). t1 is meant to be "the price right
+    /// now, at the KRX close", so unlike t0 -- a historical boundary
+    /// reference -- it stops being valid the moment the feed drops
+    /// updates: the KR leg may be arbitrarily behind even if the US leg
+    /// has since re-reported. A generation change discards the capture
+    /// and forces a full recapture of *both* legs, and also blocks the
+    /// send if it happens during the entry awaits.
+    t1_generation: Option<u64>,
     entered: bool,
     exited: bool,
     /// True when `entered` was restored from `RiskState.last_session_date`
@@ -705,11 +999,18 @@ struct DaySnapshot {
     restart_recovered: bool,
     /// Set only once the Lighter `orderBookDetails` eligibility check has
     /// produced a *definitive* answer for today (a response that parsed,
-    /// whether it found both symbols eligible or not) -- deliberately
-    /// **not** set on a fetch/parse error, so a transient network blip
-    /// gets retried on the next 5s tick instead of permanently skipping
-    /// the one entry opportunity for the day on a single hiccup
-    /// (bot-strategy#872 PR #266 self-review, non-blocking finding).
+    /// whether it found both symbols eligible or not) -- **not** set on a
+    /// fetch/parse error, so a transient network blip gets retried on the
+    /// next 5 s tick rather than burning the day on one hiccup
+    /// (bot-strategy#872 PR #266 self-review).
+    ///
+    /// Entry is gated on this being `true` (bot-strategy#916): until a
+    /// response has actually been parsed, the gate's answer is unknown
+    /// and no order is sent. It used to fall through to the entry on a
+    /// fetch error -- a fail-open path that would trade straight through
+    /// a `force_reduce_only` market whenever the REST call happened to
+    /// fail. `eligibility_attempts` bounds how long that retry runs
+    /// before `skip_day` ends the day instead.
     eligibility_confirmed: bool,
     /// One entry per ineligible symbol found (`kr_primary`/`us_primary`,
     /// either or both) -- kept as a `Vec` rather than the first-match-wins
@@ -718,9 +1019,19 @@ struct DaySnapshot {
     /// at once) still surfaces both reasons in the log/status instead of
     /// silently dropping the second (bot-strategy#872 PR #266
     /// self-review). Non-empty means `maybe_enter` skips today's entry.
-    /// Stays empty on a fetch/parse failure (fail-open: see
-    /// `eligibility_confirmed`'s doc comment) -- see bot-strategy#872.
+    /// Stays empty on a fetch/parse failure -- that failure blocks entry
+    /// through `eligibility_confirmed` instead of through this list (see
+    /// bot-strategy#872, #916).
     ineligible_reasons: Vec<String>,
+    /// Why today produced no entry, once that is settled
+    /// (bot-strategy#916). Logged once, surfaced in `status.json`, and
+    /// set by `skip_day` for every terminal no-entry path, so a DRY_RUN
+    /// day that did nothing can be told apart from a day that was never
+    /// evaluated at all. `None` while the day is still live.
+    skip_reason: Option<String>,
+    /// Failed `orderBookDetails` fetches so far today, bounded by
+    /// `EngineBLiveConfig.max_eligibility_attempts` (bot-strategy#916).
+    eligibility_attempts: u32,
 }
 
 /// Snapshot `prices` into `day.t0_prices` the first time `now_us` reaches
@@ -979,6 +1290,18 @@ struct HanBridgeStatus {
     position_unconfirmed: bool,
     ineligible_reasons: Vec<String>,
     session_halt_reason: Option<String>,
+    /// Why today produced no entry, once settled (bot-strategy#916) --
+    /// lets a DRY_RUN day that did nothing be told apart from one still
+    /// waiting for its window.
+    skip_reason: Option<String>,
+    /// Symbols whose latest price is missing or too stale/pre-lag to
+    /// base an entry on right now (bot-strategy#916). Empty is the
+    /// healthy state; a non-empty list at t1 is why an entry did not
+    /// happen.
+    stale_or_missing_symbols: Vec<String>,
+    /// Current price-feed generation; increments on every broadcast
+    /// `Lagged` (dropped updates).
+    price_feed_generation: u64,
 }
 
 #[derive(Serialize)]
@@ -998,7 +1321,15 @@ struct EngineBLiveEngine {
     /// `bull_holder.rs`'s `Engine.http`) instead of a fresh `Client::new()`
     /// per call.
     http_client: Client,
-    latest_price: HashMap<String, f64>,
+    /// Shared with the price-feed task, which keeps draining the
+    /// broadcast while this engine is awaiting the exchange -- see
+    /// `PriceFeed`.
+    feed: Arc<std::sync::Mutex<PriceFeed>>,
+    /// Wall clock, injectable so the tests can drive the send-time
+    /// freshness re-check (which must read a *fresh* clock, not the
+    /// tick's start time -- pairtrade#289 Codex review) against
+    /// synthetic timestamps. Production uses `now_us`.
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     current_date: Option<NaiveDate>,
     window: Option<(i64, i64, i64)>, // (t0, t1, t2) us epoch for current_date
     day: DaySnapshot,
@@ -1011,6 +1342,38 @@ struct EngineBLiveEngine {
 }
 
 impl EngineBLiveEngine {
+    fn now(&self) -> i64 {
+        (self.clock)()
+    }
+
+    /// Mid to book an exit or an adoption against, in order of trust:
+    /// the validated observation, then the last raw mid from any update,
+    /// then none. Deliberately never gated on freshness -- see
+    /// `usable_prices` -- and deliberately never used for entry.
+    fn exit_accounting_price(&self, symbol: &str) -> Option<(f64, &'static str)> {
+        let feed = self.feed.lock().expect("price feed mutex");
+        if let Some(obs) = feed.latest.get(symbol) {
+            return Some((obs.mid, "ws_mid"));
+        }
+        feed.last_raw_mid
+            .get(symbol)
+            .copied()
+            .map(|mid| (mid, "raw_last_mid_rejected_at_ingest"))
+    }
+
+    fn feed_generation(&self) -> u64 {
+        self.feed.lock().expect("price feed mutex").generation
+    }
+
+    fn latest_obs(&self, symbol: &str) -> Option<PriceObs> {
+        self.feed
+            .lock()
+            .expect("price feed mutex")
+            .latest
+            .get(symbol)
+            .copied()
+    }
+
     fn kill_switch_engaged(&self) -> bool {
         self.cfg.kill_switch_path.exists()
     }
@@ -1075,7 +1438,9 @@ impl EngineBLiveEngine {
                 p.flatten_asap = true;
             }
             self.day.entered = true;
+            self.day.skip_reason = Some("carried_over_position".to_string());
             self.state.last_session_date = Some(today.to_string());
+            self.state.last_session_skip_reason = self.day.skip_reason.clone();
             atomic_write_json(&self.cfg.state_path, &self.state);
         }
         // Keyed off the *persisted* pnl_today_date, not the in-memory
@@ -1104,6 +1469,12 @@ impl EngineBLiveEngine {
             log::info!("[DAY] {today} already acted on before a restart; not re-entering");
             self.day.entered = true;
             self.day.restart_recovered = true;
+            // Restore *why* the day was settled, not only that it was
+            // (pairtrade#289 Codex round 3). Deliberately after the
+            // carry-over branch above, which sets its own reason.
+            if self.day.skip_reason.is_none() {
+                self.day.skip_reason = self.state.last_session_skip_reason.clone();
+            }
         }
         // Recover a t0 snapshot a prior run of this process already
         // captured and persisted today, rather than letting
@@ -1127,8 +1498,122 @@ impl EngineBLiveEngine {
         }
     }
 
-    fn snapshot_prices(&self) -> HashMap<String, f64> {
-        self.latest_price.clone()
+    /// Mid prices safe to base an *entry* decision on right now: accepted
+    /// at ingest, observed on the current feed generation, and no older
+    /// than `max_price_staleness_secs` (bot-strategy#916). Anything else
+    /// is dropped rather than returned stale, so every downstream
+    /// consumer -- t0/t1 capture, `compute_epsilon`'s inputs, the
+    /// order-sizing price -- fails closed by simply not finding the
+    /// symbol.
+    ///
+    /// Deliberately **not** used by the exit path or by
+    /// `try_adopt_unconfirmed`: an open position must stay closable (and
+    /// an unknown one must stay adoptable) even while the feed is stale.
+    /// The exit is sized from the exchange's own position, not from this
+    /// price -- the price only books PnL. Fail-closed on entry must never
+    /// mean fail-closed on getting flat.
+    fn usable_prices(&self, now_us: i64) -> HashMap<String, f64> {
+        self.usable_prices_with_generation(now_us).0
+    }
+
+    /// `usable_prices` plus the generation those prices were read on,
+    /// under ONE lock acquisition (pairtrade#289 Codex round 6). Taking
+    /// the generation and the prices separately is a race on the
+    /// multi-threaded runtime: the feed task can process a `Lagged` and
+    /// then a fresh US quote in between, so the generation compares equal
+    /// to the t1 capture while the price map already holds a post-lag
+    /// observation. Any decision that compares a generation against the
+    /// prices it is about to act on must use this.
+    fn usable_prices_with_generation(&self, now_us: i64) -> (HashMap<String, f64>, u64) {
+        let feed = self.feed.lock().expect("price feed mutex");
+        (
+            feed.usable(now_us, self.cfg.max_price_staleness_secs),
+            feed.generation,
+        )
+    }
+
+    /// Symbols whose latest observation is missing or not usable for an
+    /// entry decision right now. Drives both the human-readable log line
+    /// and `status.json`, so the two can never disagree.
+    fn stale_or_missing_symbols(&self, now_us: i64) -> Vec<String> {
+        let usable = self.usable_prices(now_us);
+        self.cfg
+            .all_symbols()
+            .into_iter()
+            .filter(|symbol| !usable.contains_key(symbol))
+            .collect()
+    }
+
+    /// One-line, per-symbol account of what the engine was actually
+    /// looking at when it made (or refused) a decision: price, age, feed
+    /// generation, staleness verdict (bot-strategy#916 -- "healthyな
+    /// DRY_RUNでdecisionに使った価格・時刻・鮮度・skip理由を確認できる").
+    fn freshness_debug(&self, now_us: i64) -> String {
+        // One lock for the whole line, so every symbol is described
+        // against the same generation.
+        let feed = self.feed.lock().expect("price feed mutex");
+        let generation = feed.generation;
+        let parts: Vec<String> = self
+            .cfg
+            .all_symbols()
+            .into_iter()
+            .map(|symbol| match feed.latest.get(&symbol) {
+                None => format!("{symbol}=never_observed"),
+                Some(obs) => {
+                    let verdict = if obs.generation != generation {
+                        "PRE_LAG"
+                    } else if obs.received_at_us > now_us {
+                        "FUTURE_DATED"
+                    } else if obs.effective_age_secs(now_us)
+                        > self.cfg.max_price_staleness_secs as f64
+                    {
+                        "STALE"
+                    } else {
+                        "ok"
+                    };
+                    format!(
+                        "{symbol}={:.4}@{:.1}s/gen{}[{verdict}]",
+                        obs.mid,
+                        obs.effective_age_secs(now_us),
+                        obs.generation
+                    )
+                }
+            })
+            .collect();
+        format!(
+            "gen={generation} staleness_bound={}s {}",
+            self.cfg.max_price_staleness_secs,
+            parts.join(" ")
+        )
+    }
+
+    /// Settle today as "no entry", with a reason, exactly once
+    /// (bot-strategy#916). Marks the day acted-on and persists
+    /// `last_session_date` the same way the entry-deadline path always
+    /// did, so a restart does not re-evaluate a day already decided.
+    ///
+    /// Touches entry state only: `position`/`pending` and the exit path
+    /// are untouched, so skipping an entry can never strand an open
+    /// position.
+    fn skip_day(&mut self, reason: String) {
+        if self.day.skip_reason.is_some() {
+            return;
+        }
+        log::warn!("[SKIP] {reason}");
+        self.day.skip_reason = Some(reason.clone());
+        self.day.entered = true;
+        self.mark_day_acted(Some(reason));
+    }
+
+    /// Record that `current_date` has been acted on -- entered, or
+    /// settled as a no-entry carrying `skip_reason` -- and persist both
+    /// facts in one write. Single writer for `last_session_date` so the
+    /// reason can never drift from the day marker it describes
+    /// (pairtrade#289 Codex round 3).
+    fn mark_day_acted(&mut self, skip_reason: Option<String>) {
+        self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        self.state.last_session_skip_reason = skip_reason;
+        atomic_write_json(&self.cfg.state_path, &self.state);
     }
 
     async fn submit_order(&self, side: OrderSide, size: f64, reduce_only: bool) -> Result<Decimal> {
@@ -1169,59 +1654,77 @@ impl EngineBLiveEngine {
     /// `compute_epsilon` return ~0.0 every day. Must run every tick
     /// regardless of `self.day.entered`/entry-window state.
     fn maybe_capture_t0(&mut self, now_us: i64) {
-        let was_none = self.day.t0_prices.is_none();
-        capture_t0_if_due(self.window, &mut self.day, now_us, &self.latest_price);
-        if !was_none {
+        if self.day.t0_prices.is_some() {
             return;
         }
-        let Some(prices) = self.day.t0_prices.clone() else {
-            return;
-        };
         let Some((t0, _, _)) = self.window else {
             return;
         };
+        if now_us < t0 {
+            return;
+        }
         let delay_secs = (now_us - t0) as f64 / 1_000_000.0;
+        // Only *usable* observations (bot-strategy#916): a stale or
+        // pre-lag price is not evidence of the KRX-open level just
+        // because the key is present in the map.
+        let prices = self.usable_prices(now_us);
         let complete = t0_snapshot_has_required_symbols(
             &prices,
             &self.cfg.kr_primary_symbol,
             &self.cfg.us_primary_symbol,
         );
+        // The grace bound applies to ANY capture, complete or not
+        // (pairtrade#289 Codex round 3). A feed that recovers at
+        // t0 + grace + 1 s hands us a perfectly complete snapshot -- of
+        // mid-session prices, which is exactly what this bound exists to
+        // refuse. Checking it only on the incomplete path let that late
+        // recovery through and persisted those prices as the KRX open.
+        if delay_secs > self.cfg.t0_capture_grace_secs as f64 {
+            let detail = self.freshness_debug(now_us);
+            let reason = if complete {
+                format!(
+                    "late_t0: fresh {}/{} prices only became usable {delay_secs:.0}s after t0 \
+                     (grace {}s); refusing to label a mid-session price as the KRX open -- {detail}",
+                    self.cfg.kr_primary_symbol,
+                    self.cfg.us_primary_symbol,
+                    self.cfg.t0_capture_grace_secs
+                )
+            } else {
+                format!(
+                    "no_usable_t0: no fresh {}/{} price within {}s of t0 -- {detail}",
+                    self.cfg.kr_primary_symbol,
+                    self.cfg.us_primary_symbol,
+                    self.cfg.t0_capture_grace_secs
+                )
+            };
+            self.skip_day(reason);
+            return;
+        }
         if !complete {
             // Gated on completeness, not `delay_secs`: a snapshot missing
             // kr_primary/us_primary is unusable to compute_epsilon
             // regardless of how soon after t0 it was taken (WS delivery
             // order across symbols is not guaranteed -- control_symbols
             // can easily arrive before the two primaries right after a
-            // (re)connect). Deliberately does NOT persist to RiskState:
-            // a future same-day restart must get another fresh-capture
-            // attempt, not silently recover this same incomplete map
-            // (PR #270 review finding).
-            log::warn!(
-                "[DAY] t0 snapshot captured {delay_secs:.0}s after t0 but is missing \
-                 kr_primary={}/us_primary={} prices -- not persisted, today's epsilon signal \
-                 will fail silently unless a later restart captures a complete one",
-                self.cfg.kr_primary_symbol,
-                self.cfg.us_primary_symbol
-            );
+            // (re)connect).
+            //
+            // Nothing partial is captured or persisted: the next tick
+            // tries again with whatever has arrived since, and
+            // `t0_capture_grace_secs` bounds how late that may still
+            // count as a t0. Past that bound the day is abandoned rather
+            // than backfilled with a mid-session price wearing a
+            // KRX-open label (bot-strategy#916; this replaces the old
+            // "capture whatever is there, WARN if it is incomplete or
+            // >300 s late" behaviour, which left the day running on a
+            // snapshot the WARN itself called suspect). The grace bound
+            // is enforced above, for complete and partial alike.
             return;
         }
-        if delay_secs > 300.0 {
-            // Complete, but captured well after t0 -- most likely a
-            // restart between t0 and t1 with nothing to recover from
-            // RiskState.t0_prices (e.g. the first-ever start of the day
-            // after t0, or a prior run that crashed before persisting).
-            // `latest_price` this late may already have drifted from the
-            // true KRX-open price even though every required key is
-            // present (bot-strategy#872 PR #266 follow-up, see
-            // RiskState.t0_snapshot_date's doc comment).
-            log::warn!(
-                "[DAY] t0 snapshot captured {delay_secs:.0}s after t0 with nothing to recover \
-                 from persisted state -- may not reflect the true KRX-open price; today's \
-                 epsilon signal is suspect"
-            );
-        } else {
-            log::info!("[DAY] t0 snapshot captured ({delay_secs:.0}s after t0)");
-        }
+        log::info!(
+            "[SIGNAL_INPUTS] t0 snapshot captured ({delay_secs:.0}s after t0) -- {}",
+            self.freshness_debug(now_us)
+        );
+        capture_t0_if_due(self.window, &mut self.day, now_us, &prices);
         if let Some(today) = self.current_date {
             self.state.t0_snapshot_date = Some(today.to_string());
             self.state.t0_prices = prices;
@@ -1242,11 +1745,15 @@ impl EngineBLiveEngine {
         let Some(live) = exchange_position_for(&positions, &self.cfg.us_primary_symbol) else {
             return;
         };
+        // Raw `latest_price`, not `usable_prices` (bot-strategy#916):
+        // adopting an exposure the exchange already reports is a
+        // get-flat path, and refusing to adopt on a stale feed would
+        // leave a real position untracked -- the opposite of safe. A
+        // stale mid only makes the *cost basis* an estimate, which
+        // `entry_price_estimated` already records.
         let ws_price = self
-            .latest_price
-            .get(&self.cfg.us_primary_symbol)
-            .copied()
-            .filter(|p| *p > 0.0);
+            .exit_accounting_price(&self.cfg.us_primary_symbol)
+            .map(|(mid, _)| mid);
         // Never adopt with a zero cost basis: without the exchange's
         // avg_entry_price and without a positive WS price yet (e.g. right
         // after a restart), wait for the next tick (pairtrade#275 Codex
@@ -1690,8 +2197,7 @@ impl EngineBLiveEngine {
         // in-memory OpenPosition after a restart (see
         // docs/engine-b-live-operations.md's Stop and recovery section)
         // -- it only prevents a second entry.
-        self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.mark_day_acted(None);
         log::info!(
             "[ENTRY] side={side} epsilon={epsilon:.5} price={price:.4} notional=${notional_usd:.0} size={size:.6}{note}"
         );
@@ -1710,8 +2216,7 @@ impl EngineBLiveEngine {
     fn record_no_position_today(&mut self) {
         self.position = None;
         self.day.entered = true;
-        self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.mark_day_acted(None);
     }
 
     async fn maybe_enter(&mut self, now_us: i64) {
@@ -1721,38 +2226,100 @@ impl EngineBLiveEngine {
         if self.day.entered || now_us < t1 {
             return;
         }
-        if let Some(pos) = &self.position {
-            // A position carried over from a previous session (its exit
-            // kept failing past exit_deadline, so the day rolled with it
-            // still open). Never open a second one on top of it and never
-            // re-label it as today's entry; the exit path keeps trying at
-            // today's t2 (pairtrade#275 review finding 1).
+        // A position carried over from a previous session (its exit kept
+        // failing past exit_deadline, so the day rolled with it still
+        // open). Never open a second one on top of it and never re-label
+        // it as today's entry; the exit path keeps trying at today's t2
+        // (pairtrade#275 review finding 1). Copied out of `self.position`
+        // before `skip_day` so the shared borrow ends first.
+        if let Some((side, size, held_secs)) = self
+            .position
+            .as_ref()
+            .map(|pos| (pos.side, pos.size, (now_us - pos.entered_at_us) / 1_000_000))
+        {
             log::warn!(
-                "[ENTRY] position from a previous session still open ({} size={:.6}, entered {}s \
-                 ago); no new entry today, exit path continues",
-                pos.side,
-                pos.size,
-                (now_us - pos.entered_at_us) / 1_000_000
+                "[ENTRY] position from a previous session still open ({side} size={size:.6}, \
+                 entered {held_secs}s ago); no new entry today, exit path continues"
             );
-            self.day.entered = true;
-            self.state.last_session_date = self.current_date.map(|d| d.to_string());
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            self.skip_day(format!(
+                "carried_over_position: {side} size={size:.6} open for {held_secs}s"
+            ));
             return;
         }
         if now_us > t1 + self.cfg.entry_deadline_secs * 1_000_000 {
-            if !self.day.entered {
-                log::warn!("[ENTRY] entry_deadline passed without a valid signal; skipping today");
-                self.day.entered = true; // don't keep re-evaluating
-                self.state.last_session_date = self.current_date.map(|d| d.to_string());
-                atomic_write_json(&self.cfg.state_path, &self.state);
-            }
+            let detail = self.freshness_debug(now_us);
+            self.skip_day(format!(
+                "entry_deadline: {}s passed after t1 without a valid signal -- t0={} t1={} \
+                 eligibility_confirmed={} -- {detail}",
+                self.cfg.entry_deadline_secs,
+                if self.day.t0_prices.is_some() {
+                    "captured"
+                } else {
+                    "MISSING"
+                },
+                if self.day.t1_prices.is_some() {
+                    "captured"
+                } else {
+                    "MISSING"
+                },
+                self.day.eligibility_confirmed
+            ));
             return;
         }
+        // A t1 captured before a feed lag is not a t1 any more: the KR
+        // leg feeding `compute_epsilon` may be arbitrarily behind even
+        // once the US leg has re-reported, and `t1_prices` is a bare
+        // map with no per-symbol metadata left to check (pairtrade#289
+        // Codex round 5). Discard the whole capture and take it again.
+        let (usable_now, generation_now) = self.usable_prices_with_generation(now_us);
+        if self.day.t1_generation.is_some_and(|g| g != generation_now) {
+            log::warn!(
+                "[ENTRY] discarding the t1 snapshot captured on feed generation {:?} (now \
+                 {generation_now}); recapturing both legs before any signal is computed",
+                self.day.t1_generation
+            );
+            self.day.t1_prices = None;
+            self.day.t1_generation = None;
+        }
         if self.day.t1_prices.is_none() {
-            self.day.t1_prices = Some(self.snapshot_prices());
+            // Same bar as t0 (bot-strategy#916): capture only usable
+            // observations, and only once both primaries are present.
+            // A partial t1 would silently feed compute_epsilon a
+            // control-symbol-only map; a stale one would compare the
+            // KRX close against a price from before the feed stalled.
+            // Returning here retries on the next 5 s tick, and the
+            // entry-deadline branch above is what eventually turns a
+            // feed that never recovers into an explicit skip.
+            let prices = usable_now;
+            if !t0_snapshot_has_required_symbols(
+                &prices,
+                &self.cfg.kr_primary_symbol,
+                &self.cfg.us_primary_symbol,
+            ) {
+                log::warn!(
+                    "[ENTRY] t1 reached but no fresh {}/{} price yet; retrying within the entry \
+                     deadline -- {}",
+                    self.cfg.kr_primary_symbol,
+                    self.cfg.us_primary_symbol,
+                    self.freshness_debug(now_us)
+                );
+                return;
+            }
+            log::info!(
+                "[SIGNAL_INPUTS] t1 snapshot captured on feed generation {generation_now} -- {}",
+                self.freshness_debug(now_us)
+            );
+            self.day.t1_prices = Some(prices);
+            self.day.t1_generation = Some(generation_now);
         }
         let (Some(t0_prices), Some(t1_prices)) = (&self.day.t0_prices, &self.day.t1_prices) else {
-            log::warn!("[ENTRY] t1 reached but t0 snapshot missing (process started after t0?); skipping today");
+            // t0 never captured. `maybe_capture_t0` keeps trying until
+            // `t0_capture_grace_secs` and then ends the day itself, so
+            // this only logs while that grace window is still open.
+            log::warn!(
+                "[ENTRY] t1 reached but t0 snapshot missing (process started after t0?); no entry \
+                 until a t0 exists or the day is abandoned"
+            );
             return;
         };
         let Some(epsilon) = compute_epsilon(
@@ -1765,14 +2332,11 @@ impl EngineBLiveEngine {
             return;
         };
         if epsilon.abs() < self.cfg.epsilon_threshold {
-            log::info!(
-                "[SIGNAL] |epsilon|={:.5} < threshold={:.5}; no entry today",
+            self.skip_day(format!(
+                "below_threshold: |epsilon|={:.5} < threshold={:.5}",
                 epsilon.abs(),
                 self.cfg.epsilon_threshold
-            );
-            self.day.entered = true;
-            self.state.last_session_date = self.current_date.map(|d| d.to_string());
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            ));
             return;
         }
         if !self.day.eligibility_confirmed {
@@ -1826,22 +2390,50 @@ impl EngineBLiveEngine {
                     }
                 }
                 Err(e) => {
-                    log::warn!(
-                        "[ELIGIBILITY] orderBookDetails fetch failed: {e:?}; will retry next tick \
-                         if still within the entry window, otherwise proceeding without the \
-                         eligibility gate today (fail-open)"
-                    );
+                    // Fail closed (bot-strategy#916): an unreadable
+                    // eligibility endpoint means the gate's answer is
+                    // unknown, and "unknown" must never be spent as
+                    // "eligible" -- this branch used to fall through to
+                    // the entry, so a REST failure would have traded
+                    // straight through a force_reduce_only market. Retry
+                    // on the next 5 s tick, bounded both by
+                    // `entry_deadline_secs` (the window) and by
+                    // `max_eligibility_attempts` (the request count, so a
+                    // hard-down endpoint is not hammered 36 times against
+                    // a 60 req/min account).
+                    self.day.eligibility_attempts += 1;
+                    if self.day.eligibility_attempts >= self.cfg.max_eligibility_attempts {
+                        self.skip_day(format!(
+                            "eligibility_unavailable: {} orderBookDetails attempts failed, last \
+                             error {e:?}",
+                            self.day.eligibility_attempts
+                        ));
+                    } else {
+                        log::warn!(
+                            "[ELIGIBILITY] orderBookDetails fetch failed (attempt {}/{}): {e:?}; \
+                             no entry until a response parses (fail-closed)",
+                            self.day.eligibility_attempts,
+                            self.cfg.max_eligibility_attempts
+                        );
+                    }
+                    return;
                 }
             }
         }
+        if !self.day.eligibility_confirmed {
+            // Unreachable in practice (the Ok arm sets it, the Err arm
+            // returns) but stated explicitly so a future edit to the
+            // match above cannot reintroduce the fail-open path by
+            // accident -- entry requires a *confirmed* answer, never a
+            // merely absent negative (bot-strategy#916).
+            log::warn!("[ENTRY] eligibility not confirmed for today; no entry");
+            return;
+        }
         if !self.day.ineligible_reasons.is_empty() {
-            log::warn!(
-                "[ENTRY] skipped: {}",
+            self.skip_day(format!(
+                "ineligible_symbol: {}",
                 self.day.ineligible_reasons.join("; ")
-            );
-            self.day.entered = true;
-            self.state.last_session_date = self.current_date.map(|d| d.to_string());
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            ));
             return;
         }
         if !self.entries_allowed() {
@@ -1854,16 +2446,6 @@ impl EngineBLiveEngine {
         } else {
             OrderSide::Short
         };
-        let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
-            log::error!(
-                "[ENTRY] no current price for {}; cannot size order",
-                self.cfg.us_primary_symbol
-            );
-            return;
-        };
-        if price <= 0.0 {
-            return;
-        }
         let notional_usd = self.cfg.lot_usd.min(self.cfg.max_notional_usd());
         if notional_usd < self.cfg.lot_usd {
             log::warn!(
@@ -1874,7 +2456,6 @@ impl EngineBLiveEngine {
                 self.cfg.leverage
             );
         }
-        let size = notional_usd / price;
 
         if !self.cfg.dry_run {
             // Exchange truth before we send anything (bot-strategy#875
@@ -1898,8 +2479,27 @@ impl EngineBLiveEngine {
                             self.cfg.us_primary_symbol,
                             existing.size
                         );
-                        let entry_price_estimated = existing.entry_price.is_none();
-                        let entry_price = existing.entry_price.unwrap_or(price);
+                        // Adoption is a get-flat path: never blocked by
+                        // the entry freshness gates, so the cost basis
+                        // falls back to whatever mid exists (see
+                        // `exit_accounting_price`) and is flagged.
+                        let (entry_price, entry_price_estimated) = match (
+                            existing.entry_price,
+                            self.exit_accounting_price(&self.cfg.us_primary_symbol),
+                        ) {
+                            (Some(e), _) => (e, false),
+                            (None, Some((mid, _))) => (mid, true),
+                            (None, None) => {
+                                log::warn!(
+                                    "[ENTRY] exchange holds {} {} size={:.6} but no entry price and \
+                                     no mid of any kind yet -- deferring adoption to the next tick",
+                                    existing.side,
+                                    self.cfg.us_primary_symbol,
+                                    existing.size
+                                );
+                                return;
+                            }
+                        };
                         self.record_entry(
                             OpenPosition {
                                 side: existing.side,
@@ -1939,6 +2539,60 @@ impl EngineBLiveEngine {
                 return;
             }
         }
+        // Sized immediately before the send, after every await above
+        // (eligibility fetch, position read, set_leverage), and against a
+        // *fresh* clock rather than the tick's start time `now_us`: those
+        // awaits can take seconds, so a quote near the staleness bound at
+        // tick start can be past it by now (bot-strategy#916 "送信直前に
+        // 鮮度を検査"; pairtrade#289 Codex review). Nothing below this
+        // point awaits anything before `submit_order`.
+        let send_now_us = self.now();
+        // The signal is only as good as the generation it was computed
+        // on. Checking the US price alone is not enough: one US update
+        // arriving on the new generation during the awaits above would
+        // satisfy `usable_prices` while epsilon still rests on a KR value
+        // captured before the drop (pairtrade#289 Codex round 5).
+        // One lock for both, so the generation cannot advance between
+        // the check and the price it authorises (Codex round 6).
+        let (usable_at_send, send_generation) = self.usable_prices_with_generation(send_now_us);
+        // The signal is only sendable while *every* leg it rests on is
+        // still live. Two ways that can stop being true while the awaits
+        // above run, and both must invalidate the whole capture:
+        //   - the feed dropped updates (generation moved), or
+        //   - a leg simply stopped reporting and aged past the staleness
+        //     bound with no lag at all (Codex round 7) -- the KR leg can
+        //     stall while the US leg keeps ticking, and checking only the
+        //     traded symbol would send an epsilon whose KR half is no
+        //     longer backed by a live observation.
+        // `t1_prices` is a bare map with no per-symbol metadata left, so
+        // the check has to be "are the underlying observations still
+        // usable", not "how old is the map".
+        let signal_legs_live = t0_snapshot_has_required_symbols(
+            &usable_at_send,
+            &self.cfg.kr_primary_symbol,
+            &self.cfg.us_primary_symbol,
+        );
+        if self.day.t1_generation != Some(send_generation) || !signal_legs_live {
+            log::warn!(
+                "[ENTRY] today's signal is no longer backed by live observations (t1 generation \
+                 {:?}, now {send_generation}; legs_live={signal_legs_live}); not sending -- t1 is \
+                 recaptured and epsilon recomputed on the next tick -- {}",
+                self.day.t1_generation,
+                self.freshness_debug(send_now_us)
+            );
+            self.day.t1_prices = None;
+            self.day.t1_generation = None;
+            return;
+        }
+        let Some(price) = usable_at_send.get(&self.cfg.us_primary_symbol).copied() else {
+            log::error!(
+                "[ENTRY] no fresh price for {} at send time; not sending this tick -- {}",
+                self.cfg.us_primary_symbol,
+                self.freshness_debug(send_now_us)
+            );
+            return;
+        };
+        let size = notional_usd / price;
         // At most ONE entry sendTx per session day (bot-strategy#875 G-4).
         // Whatever the outcome below -- accepted, timed out, 5xx, rate
         // limited, rejected -- `self.pending` is set and `day.entered`
@@ -1956,6 +2610,7 @@ impl EngineBLiveEngine {
         // not persisted (KNOWN GAPS): after such a restart the operator
         // checks the exchange, which is the documented recovery.
         self.state.last_session_date = self.current_date.map(|d| d.to_string());
+        self.state.last_session_skip_reason = None;
         if let Err(e) = atomic_write_json_checked(&self.cfg.state_path, &self.state) {
             // No durable marker, no order: sending now would make the
             // at-most-one guarantee depend on this process surviving.
@@ -1971,7 +2626,7 @@ impl EngineBLiveEngine {
         // eligibility fetch / position read / sendTx above can take
         // seconds, so a deadline based on it could already be expired
         // when `pending` is installed (pairtrade#275 Codex review).
-        let sent_at_us = crate::now_us(); // the `now_us` parameter shadows the fn
+        let sent_at_us = self.now(); // the `now_us` parameter shadows the fn
         if self.cfg.dry_run {
             match submit {
                 Ok(requested) => self.record_entry(
@@ -2050,9 +2705,54 @@ impl EngineBLiveEngine {
             }
             emergency
         };
-        let Some(price) = self.latest_price.get(&self.cfg.us_primary_symbol).copied() else {
-            return;
+        // Deliberately reads `latest_price` directly rather than
+        // `usable_prices` (bot-strategy#916): the entry-side freshness
+        // gates must never keep an open position from being closed. The
+        // exit is sized from the exchange's own position below; this
+        // price only books PnL, so a stale one costs accuracy, not
+        // safety. The age is logged so a PnL booked off a stale mid is
+        // identifiable after the fact.
+        //
+        // And when even that is empty (every update since a restart
+        // rejected at ingest, e.g. a venue replaying a stale snapshot),
+        // fall back to the last raw mid, and failing that to the entry
+        // price itself: the reduce-only is sent regardless, the only
+        // thing that degrades is which number the PnL is booked at, and
+        // the log says which (pairtrade#289 Codex review, P1).
+        let (price, price_source) = match self.exit_accounting_price(&self.cfg.us_primary_symbol) {
+            Some((price, source)) => (price, source),
+            None => {
+                log::error!(
+                    "[EXIT] no price of any kind seen for {} this process -- closing anyway; the \
+                     final remainder's PnL is booked at the entry price (i.e. 0) and must be \
+                     reconciled from the exchange fill",
+                    self.cfg.us_primary_symbol
+                );
+                (pos.entry_price, "entry_price_pnl_unknown")
+            }
         };
+        let feed_generation = self.feed_generation();
+        match self.latest_obs(&self.cfg.us_primary_symbol) {
+            Some(obs)
+                if obs.generation != feed_generation
+                    || obs.effective_age_secs(now_us)
+                        > self.cfg.max_price_staleness_secs as f64 =>
+            {
+                log::warn!(
+                    "[EXIT] booking PnL off a stale mid for {} (age={:.1}s, obs_gen={} \
+                     feed_gen={}); exit still proceeds, sized from the exchange position",
+                    self.cfg.us_primary_symbol,
+                    obs.effective_age_secs(now_us),
+                    obs.generation,
+                    feed_generation
+                );
+            }
+            Some(_) => {}
+            None => log::warn!(
+                "[EXIT] no validated price for {}; booking PnL at {price:.4} (source={price_source})",
+                self.cfg.us_primary_symbol
+            ),
+        }
         if self.cfg.dry_run {
             match self.submit_order(opposite(pos.side), pos.size, true).await {
                 Ok(_) => self.on_exit(price, now_us),
@@ -2145,7 +2845,7 @@ impl EngineBLiveEngine {
         self.pending = Some(PendingConfirm::Exit {
             exit_price: price,
             // Fresh clock after the send, same reason as the entry path.
-            deadline_us: crate::now_us() + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
+            deadline_us: self.now() + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
             saw_reading: false,
         });
     }
@@ -2208,8 +2908,7 @@ impl EngineBLiveEngine {
             );
         }
         self.day.exited = true;
-        self.state.last_session_date = self.current_date.map(|d| d.to_string());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.mark_day_acted(self.day.skip_reason.clone());
 
         append_pnl_log(
             &self.cfg.pnl_log_path,
@@ -2239,7 +2938,7 @@ impl EngineBLiveEngine {
     }
 
     async fn tick(&mut self) {
-        let now = now_us();
+        let now = self.now();
         self.roll_day_if_needed(now);
         self.maybe_clear_halt();
         self.maybe_capture_t0(now);
@@ -2325,6 +3024,7 @@ impl EngineBLiveEngine {
             kill_switch,
             calendar_version: self.calendar.calendar_version.clone(),
         };
+        let stale_or_missing_symbols = self.stale_or_missing_symbols(now_us);
         let han_bridge = HanBridgeStatus {
             kr_primary_symbol: self.cfg.kr_primary_symbol.clone(),
             us_primary_symbol: self.cfg.us_primary_symbol.clone(),
@@ -2333,6 +3033,9 @@ impl EngineBLiveEngine {
             position_unconfirmed: self.state.position_unconfirmed,
             ineligible_reasons: extra.eligibility_ineligible_reasons.clone(),
             session_halt_reason: extra.session_halt_reason.clone(),
+            skip_reason: self.day.skip_reason.clone(),
+            stale_or_missing_symbols,
+            price_feed_generation: self.feed_generation(),
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -2488,7 +3191,7 @@ async fn main() -> Result<()> {
         .context("failed to start connector")?;
     let connector: std::sync::Arc<dyn DexConnector + Send + Sync> = std::sync::Arc::new(connector);
 
-    let mut price_rx = connector
+    let price_rx = connector
         .subscribe_price_updates()
         .context("subscribe_price_updates failed")?;
 
@@ -2510,7 +3213,8 @@ async fn main() -> Result<()> {
         connector,
         calendar,
         http_client: Client::new(),
-        latest_price: HashMap::new(),
+        feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
+        clock: Arc::new(now_us),
         current_date: None,
         window: None,
         day: DaySnapshot::default(),
@@ -2521,34 +3225,91 @@ async fn main() -> Result<()> {
         status_s3_mirror: S3Mirror::from_env(),
     };
 
+    // The feed runs in its own task rather than as an arm of the tick
+    // loop's `select!` (pairtrade#289 Codex round 4): `tick()` awaits the
+    // exchange for seconds at a time, and a `Lagged` queued behind it
+    // would not bump the generation until after the order had been sent,
+    // so the send-time freshness check would accept pre-lag observations
+    // as current. With the feed on its own task, the generation moves
+    // while entry preparation is in flight and that check sees it.
+    let feed_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_price_feed(
+        price_rx,
+        engine.feed.clone(),
+        engine.clock.clone(),
+        engine.cfg.max_price_staleness_secs,
+        feed_closed.clone(),
+    );
+
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
-        tokio::select! {
-            update = price_rx.recv() => {
-                match update {
-                    Ok(PriceUpdate { symbol, mid_price, .. }) => {
-                        if let Some(price) = mid_price.to_f64() {
-                            if price > 0.0 {
-                                engine.latest_price.insert(symbol, price);
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("[WS] price feed lagged, dropped {n} updates");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::error!("[WS] price feed closed, exiting");
-                        break;
-                    }
-                }
-            }
-            _ = tick_interval.tick() => {
-                engine.tick().await;
-            }
+        tick_interval.tick().await;
+        if feed_closed.load(std::sync::atomic::Ordering::SeqCst) {
+            log::error!("[WS] price feed closed, exiting");
+            break;
         }
+        engine.tick().await;
     }
 
     Ok(())
+}
+
+/// Drain the price broadcast into `feed` for as long as it is open,
+/// independently of the tick loop. Sets `closed` when the sender is gone
+/// so the tick loop can exit -- the task itself never decides to stop the
+/// process.
+fn spawn_price_feed(
+    mut price_rx: tokio::sync::broadcast::Receiver<PriceUpdate>,
+    feed: Arc<std::sync::Mutex<PriceFeed>>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    max_staleness_secs: i64,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match price_rx.recv().await {
+                Ok(update) => {
+                    let received_at_us = clock();
+                    // Locked only for the map writes; nothing is awaited
+                    // while the guard is alive.
+                    let result = {
+                        let mut feed = feed.lock().expect("price feed mutex");
+                        feed.ingest(&update, received_at_us, max_staleness_secs)
+                    };
+                    if let Err(reason) = result {
+                        // Rejected, not stored: whatever was held for this
+                        // symbol keeps ageing, so a book that stays
+                        // untrustworthy turns into a stale-price skip
+                        // rather than into an entry on a bad mid
+                        // (bot-strategy#916).
+                        log::warn!(
+                            "[WS] {} price update rejected ({reason}): mid={} bid={} ask={} ts_ms={}",
+                            update.symbol,
+                            update.mid_price,
+                            update.best_bid,
+                            update.best_ask,
+                            update.timestamp
+                        );
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Dropped updates mean every price now held may be
+                    // arbitrarily behind the book. Bump the generation so
+                    // no entry decision uses a pre-lag observation until
+                    // that symbol reports again (bot-strategy#916).
+                    let generation = feed.lock().expect("price feed mutex").note_lag();
+                    log::warn!(
+                        "[WS] price feed lagged, dropped {n} updates -- feed generation now \
+                         {generation}; held prices are unusable for entry until re-observed"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2565,6 +3326,9 @@ mod tests {
             lot_usd: 100.0,
             leverage: 2,
             epsilon_threshold: 0.003,
+            max_price_staleness_secs: 30,
+            max_eligibility_attempts: 6,
+            t0_capture_grace_secs: 300,
             direction_multiplier: 1.0,
             signal_model: "diff".to_string(),
             entry_deadline_secs: 180,
@@ -3027,6 +3791,9 @@ mod tests {
                 position_unconfirmed: false,
                 ineligible_reasons: Vec::new(),
                 session_halt_reason: None,
+                skip_reason: None,
+                stale_or_missing_symbols: Vec::new(),
+                price_feed_generation: 0,
             },
         }
     }
@@ -3193,5 +3960,1106 @@ mod tests {
     fn opposite_flips_side() {
         assert_eq!(opposite(OrderSide::Long), OrderSide::Short);
         assert_eq!(opposite(OrderSide::Short), OrderSide::Long);
+    }
+
+    // -------------------------------------------------------------
+    // Price ingest validation + freshness (bot-strategy#916)
+    // -------------------------------------------------------------
+
+    fn update(mid: &str, bid: &str, ask: &str, timestamp_ms: u64) -> PriceUpdate {
+        PriceUpdate {
+            symbol: "SNDK".to_string(),
+            mid_price: Decimal::from_str(mid).unwrap(),
+            best_bid: Decimal::from_str(bid).unwrap(),
+            best_ask: Decimal::from_str(ask).unwrap(),
+            timestamp: timestamp_ms,
+        }
+    }
+
+    /// Local receive clock used by the ingest tests: 2026-09-08T00:00:00Z
+    /// in micros, with the matching millisecond value for the venue field.
+    const NOW_US: i64 = 1_788_825_600_000_000;
+    const NOW_MS: u64 = 1_788_825_600_000;
+
+    #[test]
+    fn ingest_accepts_a_healthy_two_sided_book() {
+        let obs = price_obs_from_update(&update("100.5", "100.0", "101.0", NOW_MS), NOW_US, 3, 30)
+            .expect("healthy book must be accepted");
+        assert_eq!(obs.mid, 100.5);
+        assert_eq!(obs.best_bid, 100.0);
+        assert_eq!(obs.best_ask, 101.0);
+        assert_eq!(obs.received_at_us, NOW_US);
+        assert_eq!(obs.generation, 3);
+        assert_eq!(obs.exchange_ts_us, Some(NOW_US));
+    }
+
+    #[test]
+    fn ingest_rejects_crossed_locked_one_sided_and_non_positive_books() {
+        // Crossed: bid above ask.
+        assert_eq!(
+            price_obs_from_update(&update("100.5", "101.0", "100.0", NOW_MS), NOW_US, 0, 30),
+            Err("crossed_or_locked_book")
+        );
+        // Locked: bid == ask. A mid is computable but there is no spread
+        // to cross, so it is not a book we will size an order against.
+        assert_eq!(
+            price_obs_from_update(&update("100.0", "100.0", "100.0", NOW_MS), NOW_US, 0, 30),
+            Err("crossed_or_locked_book")
+        );
+        // One-sided: no bid.
+        assert_eq!(
+            price_obs_from_update(&update("100.5", "0", "101.0", NOW_MS), NOW_US, 0, 30),
+            Err("one_sided_book")
+        );
+        // One-sided: no ask.
+        assert_eq!(
+            price_obs_from_update(&update("100.5", "100.0", "0", NOW_MS), NOW_US, 0, 30),
+            Err("one_sided_book")
+        );
+        // Non-positive mid (the only check the old ingest path had).
+        assert_eq!(
+            price_obs_from_update(&update("0", "100.0", "101.0", NOW_MS), NOW_US, 0, 30),
+            Err("non_positive_mid")
+        );
+        // Mid outside its own book: impossible on the Lighter path,
+        // guarded for any venue that reports rather than derives it.
+        assert_eq!(
+            price_obs_from_update(&update("105.0", "100.0", "101.0", NOW_MS), NOW_US, 0, 30),
+            Err("mid_outside_book")
+        );
+    }
+
+    #[test]
+    fn ingest_rejects_a_venue_timestamp_older_than_the_staleness_bound() {
+        // The bot-strategy#908 item 7 shape: a healthy-looking connection
+        // replaying an old snapshot. 10 minutes back, 30 s bound.
+        let stale_ms = NOW_MS - 600_000;
+        assert_eq!(
+            price_obs_from_update(&update("100.5", "100.0", "101.0", stale_ms), NOW_US, 0, 30),
+            Err("exchange_timestamp_stale")
+        );
+        // Just inside the bound is accepted.
+        let ok = price_obs_from_update(
+            &update("100.5", "100.0", "101.0", NOW_MS - 29_000),
+            NOW_US,
+            0,
+            30,
+        );
+        assert!(ok.is_ok(), "29s-old venue timestamp must pass a 30s bound");
+    }
+
+    #[test]
+    fn ingest_rejects_a_valid_venue_timestamp_from_days_ago() {
+        // A venue replaying a snapshot from last week carries a perfectly
+        // valid old timestamp. That is stale data, not a broken clock,
+        // and must be rejected -- not waved through on local age alone
+        // (pairtrade#289 Codex round 2).
+        let week_ago_ms = NOW_MS - 7 * 86_400_000;
+        assert_eq!(
+            price_obs_from_update(
+                &update("100.5", "100.0", "101.0", week_ago_ms),
+                NOW_US,
+                0,
+                30
+            ),
+            Err("exchange_timestamp_stale")
+        );
+    }
+
+    #[test]
+    fn venue_timestamp_units_are_recognised_by_magnitude() {
+        // seconds / millis / micros all normalise to the same instant
+        assert_eq!(venue_timestamp_us(NOW_MS / 1_000), Some(NOW_US));
+        assert_eq!(venue_timestamp_us(NOW_MS), Some(NOW_US));
+        assert_eq!(venue_timestamp_us(NOW_MS * 1_000), Some(NOW_US));
+        // ...so a stale stamp is caught whichever unit it arrives in
+        let stale_secs = (NOW_MS - 600_000) / 1_000;
+        assert_eq!(
+            price_obs_from_update(
+                &update("100.5", "100.0", "101.0", stale_secs),
+                NOW_US,
+                0,
+                30
+            ),
+            Err("exchange_timestamp_stale")
+        );
+        // outside every epoch range: meaningless, not a clock
+        assert_eq!(venue_timestamp_us(0), None);
+        assert_eq!(venue_timestamp_us(1_788_825), None);
+        assert_eq!(venue_timestamp_us(u64::MAX), None);
+    }
+
+    #[test]
+    fn ingest_ignores_a_meaningless_venue_clock_instead_of_failing_closed_forever() {
+        // A value outside every plausible epoch range is not a timestamp
+        // in any unit. That must degrade to "use the local receive
+        // clock", not reject every update for the life of the process.
+        let obs =
+            price_obs_from_update(&update("100.5", "100.0", "101.0", 1_788_825), NOW_US, 0, 30)
+                .expect("a meaningless venue clock must not reject the update");
+        assert_eq!(obs.exchange_ts_us, None);
+        // A stamp a year in the future is a broken clock, not stale
+        // data: ignored, update kept.
+        let far_future = price_obs_from_update(
+            &update("100.5", "100.0", "101.0", NOW_MS + 365 * 86_400_000),
+            NOW_US,
+            0,
+            30,
+        )
+        .expect("a far-future venue clock must not reject the update");
+        assert_eq!(far_future.exchange_ts_us, None);
+        // Clock skew a few seconds into the future is accepted as skew.
+        let future = price_obs_from_update(
+            &update("100.5", "100.0", "101.0", NOW_MS + 5_000),
+            NOW_US,
+            0,
+            30,
+        )
+        .expect("small forward skew must be accepted");
+        assert_eq!(future.exchange_ts_us, Some(NOW_US + 5_000_000));
+    }
+
+    #[test]
+    fn price_obs_is_usable_only_when_fresh_current_generation_and_not_future_dated() {
+        let obs = PriceObs {
+            mid: 100.0,
+            best_bid: 99.5,
+            best_ask: 100.5,
+            received_at_us: NOW_US,
+            exchange_ts_us: Some(NOW_US),
+            generation: 2,
+        };
+        assert!(obs.is_usable(NOW_US, 2, 30));
+        assert!(
+            obs.is_usable(NOW_US + 30_000_000, 2, 30),
+            "exactly at the bound is usable"
+        );
+        assert!(
+            !obs.is_usable(NOW_US + 30_000_001, 2, 30),
+            "one micro past the bound is stale"
+        );
+        assert!(
+            !obs.is_usable(NOW_US, 3, 30),
+            "an observation from before a feed lag is never usable"
+        );
+        assert!(
+            !obs.is_usable(NOW_US - 1, 2, 30),
+            "a future-dated observation (backwards clock step) must fail closed"
+        );
+        // Arrived 29 s after the venue stamped it: usable for 1 more
+        // second, not for another 30 (pairtrade#289 Codex review).
+        let late = PriceObs {
+            received_at_us: NOW_US + 29_000_000,
+            ..obs
+        };
+        assert!(late.is_usable(NOW_US + 30_000_000, 2, 30));
+        assert!(
+            !late.is_usable(NOW_US + 31_000_000, 2, 30),
+            "venue age must be bounded at decision time, not only at ingest"
+        );
+        // No plausible venue clock: only the local age counts.
+        let no_venue_clock = PriceObs {
+            exchange_ts_us: None,
+            ..late
+        };
+        assert!(no_venue_clock.is_usable(NOW_US + 59_000_000, 2, 30));
+    }
+
+    // -------------------------------------------------------------
+    // Engine-level fail-closed behaviour (bot-strategy#916).
+    //
+    // These drive the real `maybe_capture_t0` / `maybe_enter` /
+    // `maybe_exit` against a stub connector that counts `create_order`
+    // calls, so "no order was sent" is asserted against the send itself
+    // rather than against an intermediate flag.
+    // -------------------------------------------------------------
+
+    #[derive(Default)]
+    struct StubConnector {
+        orders: std::sync::Mutex<Vec<(String, Decimal, OrderSide, bool)>>,
+        positions: std::sync::Mutex<Vec<PositionSnapshot>>,
+        /// Runs inside `get_positions`, standing in for whatever the
+        /// feed task does to the shared `PriceFeed` while `maybe_enter`
+        /// is awaiting the exchange (pairtrade#289 rounds 4-5).
+        #[allow(clippy::type_complexity)]
+        on_get_positions: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl StubConnector {
+        fn order_count(&self) -> usize {
+            self.orders.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DexConnector for StubConnector {
+        async fn start(&self) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn restart(&self, _max_retries: i32) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn set_leverage(
+            &self,
+            _symbol: &str,
+            _leverage: u32,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn get_ticker(
+            &self,
+            _symbol: &str,
+            _test_price: Option<Decimal>,
+        ) -> Result<dex_connector::TickerResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_ticker")
+        }
+        async fn get_filled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::FilledOrdersResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_filled_orders")
+        }
+        async fn get_canceled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::CanceledOrdersResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_canceled_orders")
+        }
+        async fn get_open_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::OpenOrdersResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_open_orders")
+        }
+        async fn get_balance(
+            &self,
+            _symbol: Option<&str>,
+        ) -> Result<dex_connector::BalanceResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_balance")
+        }
+        async fn get_combined_balance(
+            &self,
+        ) -> Result<dex_connector::CombinedBalanceResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_combined_balance")
+        }
+        async fn get_positions(&self) -> Result<Vec<PositionSnapshot>, dex_connector::DexError> {
+            if let Some(hook) = self.on_get_positions.lock().unwrap().as_ref() {
+                hook();
+            }
+            Ok(self
+                .positions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| PositionSnapshot {
+                    symbol: p.symbol.clone(),
+                    size: p.size,
+                    sign: p.sign,
+                    entry_price: p.entry_price,
+                })
+                .collect())
+        }
+        async fn get_last_trades(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::LastTradesResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_last_trades")
+        }
+        async fn get_order_book(
+            &self,
+            _symbol: &str,
+            _depth: usize,
+        ) -> Result<dex_connector::OrderBookSnapshot, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call get_order_book")
+        }
+        async fn clear_filled_order(
+            &self,
+            _symbol: &str,
+            _trade_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn clear_all_filled_orders(&self) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn clear_canceled_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn clear_all_canceled_orders(&self) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn create_order(
+            &self,
+            symbol: &str,
+            size: Decimal,
+            side: OrderSide,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            self.orders
+                .lock()
+                .unwrap()
+                .push((symbol.to_string(), size, side, reduce_only));
+            Ok(dex_connector::CreateOrderResponse {
+                order_id: "stub".to_string(),
+                exchange_order_id: None,
+                ordered_price: Decimal::ZERO,
+                ordered_size: size,
+                client_order_id: None,
+            })
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn create_advanced_trigger_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _trigger_px: Decimal,
+            _limit_px: Option<Decimal>,
+            _order_style: dex_connector::TriggerOrderStyle,
+            _slippage_bps: Option<u32>,
+            _tpsl: dex_connector::TpSl,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call create_advanced_trigger_order")
+        }
+        async fn create_order_taker_ioc(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _slippage_bps: u32,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call create_order_taker_ioc")
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn modify_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+            _side: OrderSide,
+            _target_total_size: Decimal,
+            _open_remaining_size: Decimal,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not call modify_order")
+        }
+        async fn cancel_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn cancel_all_orders(
+            &self,
+            _symbol: Option<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn cancel_orders(
+            &self,
+            _symbol: Option<String>,
+            _order_ids: Vec<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn close_all_positions(
+            &self,
+            _symbol: Option<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn clear_last_trades(&self, _symbol: &str) -> Result<(), dex_connector::DexError> {
+            Ok(())
+        }
+        async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+            false
+        }
+        async fn sign_evm_65b(&self, _message: &str) -> Result<String, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not sign EVM messages")
+        }
+        async fn sign_evm_65b_with_eip191(
+            &self,
+            _message: &str,
+        ) -> Result<String, dex_connector::DexError> {
+            unimplemented!("engine_b_live does not sign EVM messages")
+        }
+        fn subscribe_price_updates(
+            &self,
+        ) -> Result<tokio::sync::broadcast::Receiver<PriceUpdate>, dex_connector::DexError>
+        {
+            unimplemented!("the test drives latest_price directly")
+        }
+    }
+
+    struct Harness {
+        engine: EngineBLiveEngine,
+        connector: Arc<StubConnector>,
+        /// What `engine.now()` returns; tests move it explicitly so the
+        /// send-time re-check is exercised against synthetic timestamps.
+        clock: Arc<std::sync::atomic::AtomicI64>,
+        // Kept alive for the lifetime of the harness: dropping it removes
+        // the state/status/pnl files the engine writes.
+        _dir: tempfile::TempDir,
+    }
+
+    /// t0 = 2026-09-08T00:00Z, t1 = +6.5 h (KRX close), t2 = +13.5 h
+    /// (US cash open) -- the real window shape for a session day.
+    const T0_US: i64 = 1_788_825_600_000_000;
+    const T1_US: i64 = T0_US + 23_400_000_000;
+    const T2_US: i64 = T1_US + 25_200_000_000;
+
+    /// `dry_run: false` so the send actually reaches the stub connector:
+    /// under DRY_RUN `submit_order` returns before touching it, and every
+    /// "no order was sent" assertion would pass for the wrong reason.
+    fn harness() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(StubConnector::default());
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(T0_US));
+        let clock_for_engine = clock.clone();
+        let mut cfg = fixture_config();
+        cfg.dry_run = false;
+        cfg.state_path = dir.path().join("state.json");
+        cfg.status_path = dir.path().join("status.json");
+        cfg.pnl_log_path = dir.path().join("pnl.jsonl");
+        // Unroutable: any eligibility fetch fails fast and offline. Tests
+        // that need the gate satisfied set `eligibility_confirmed`.
+        cfg.lighter_rest_url = "http://127.0.0.1:1".to_string();
+        let engine = EngineBLiveEngine {
+            cfg,
+            connector: connector.clone(),
+            calendar: TradingCalendar {
+                calendar_version: "test".to_string(),
+                sessions: HashMap::new(),
+            },
+            http_client: Client::new(),
+            feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
+            clock: Arc::new(move || clock_for_engine.load(std::sync::atomic::Ordering::SeqCst)),
+            current_date: Some(NaiveDate::from_ymd_opt(2026, 9, 8).unwrap()),
+            window: Some((T0_US, T1_US, T2_US)),
+            day: DaySnapshot::default(),
+            position: None,
+            pending: None,
+            state: RiskState {
+                session_start_equity: 1000.0,
+                peak_equity: 1000.0,
+                ..RiskState::default()
+            },
+            last_status_write_us: 0,
+            status_s3_mirror: None,
+        };
+        Harness {
+            engine,
+            connector,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    impl Harness {
+        fn set_now(&self, now_us: i64) {
+            self.clock
+                .store(now_us, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Put one observation in the feed as if it had been accepted at
+        /// `received_at_us` on generation `generation`.
+        fn observe_at(&mut self, symbol: &str, mid: f64, received_at_us: i64, generation: u64) {
+            self.engine.feed.lock().unwrap().latest.insert(
+                symbol.to_string(),
+                PriceObs {
+                    mid,
+                    best_bid: mid * 0.999,
+                    best_ask: mid * 1.001,
+                    received_at_us,
+                    exchange_ts_us: Some(received_at_us),
+                    generation,
+                },
+            );
+        }
+
+        /// Every subscribed symbol observed at `received_at_us` on the
+        /// engine's current generation.
+        fn observe_all(&mut self, received_at_us: i64, kr: f64, us: f64) {
+            let generation = self.engine.feed_generation();
+            self.observe_at("SKHY", kr, received_at_us, generation);
+            self.observe_at("SNDK", us, received_at_us, generation);
+            self.observe_at("SOXL", 100.0, received_at_us, generation);
+            self.observe_at("NVDA", 200.0, received_at_us, generation);
+        }
+    }
+
+    #[test]
+    fn t0_capture_waits_rather_than_locking_in_a_partial_snapshot() {
+        let mut h = harness();
+        // Only control symbols have arrived -- the WS-delivery-order case.
+        h.observe_at("SOXL", 100.0, T0_US, 0);
+        h.observe_at("NVDA", 200.0, T0_US, 0);
+        h.engine.maybe_capture_t0(T0_US + 1_000_000);
+        assert!(
+            h.engine.day.t0_prices.is_none(),
+            "a snapshot without both primaries must not be captured"
+        );
+        assert!(
+            h.engine.day.skip_reason.is_none(),
+            "still inside the grace window"
+        );
+        // The primaries arrive a minute later, still inside the grace
+        // window: that is the capture.
+        h.observe_all(T0_US + 60_000_000, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US + 60_000_000);
+        let captured = h
+            .engine
+            .day
+            .t0_prices
+            .clone()
+            .expect("capture once complete");
+        assert_eq!(captured.get("SKHY"), Some(&180.0));
+        assert_eq!(captured.get("SNDK"), Some(&1700.0));
+    }
+
+    #[test]
+    fn t0_capture_never_uses_a_stale_price_and_abandons_the_day_past_the_grace_window() {
+        let mut h = harness();
+        // Both primaries present but observed well before t0 and long
+        // since gone stale -- the "feed died before the boundary" case.
+        h.observe_all(T0_US - 3_600_000_000, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US + 1_000_000);
+        assert!(
+            h.engine.day.t0_prices.is_none(),
+            "stale prices must not be captured as the KRX open"
+        );
+        assert!(h.engine.day.skip_reason.is_none());
+        // Past the grace window the day is abandoned outright rather than
+        // backfilled from a much later price.
+        h.engine
+            .maybe_capture_t0(T0_US + (h.engine.cfg.t0_capture_grace_secs + 1) * 1_000_000);
+        assert!(h.engine.day.t0_prices.is_none());
+        let reason = h
+            .engine
+            .day
+            .skip_reason
+            .clone()
+            .expect("day must be abandoned");
+        assert!(
+            reason.starts_with("no_usable_t0"),
+            "unexpected skip reason: {reason}"
+        );
+        assert!(
+            h.engine.day.entered,
+            "an abandoned day must not be re-evaluated"
+        );
+    }
+
+    #[test]
+    fn t0_capture_refuses_a_complete_snapshot_that_only_became_fresh_after_the_grace() {
+        // The feed recovers at t0 + grace + 1 s: both primaries now have
+        // perfectly fresh observations, and that is exactly the case the
+        // grace bound exists to refuse -- they are mid-session prices,
+        // not the KRX open (pairtrade#289 Codex round 3).
+        let mut h = harness();
+        let late = T0_US + (h.engine.cfg.t0_capture_grace_secs + 1) * 1_000_000;
+        h.observe_all(late, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(late);
+        assert!(
+            h.engine.day.t0_prices.is_none(),
+            "a complete but late snapshot must not become t0"
+        );
+        assert!(
+            h.engine.state.t0_prices.is_empty(),
+            "and must not be persisted for a later restart to recover"
+        );
+        let reason = h
+            .engine
+            .day
+            .skip_reason
+            .clone()
+            .expect("day must be abandoned");
+        assert!(
+            reason.starts_with("late_t0"),
+            "unexpected skip reason: {reason}"
+        );
+        // One second earlier, the same snapshot is accepted.
+        let mut h2 = harness();
+        let in_time = T0_US + h2.engine.cfg.t0_capture_grace_secs * 1_000_000;
+        h2.observe_all(in_time, 180.0, 1700.0);
+        h2.engine.maybe_capture_t0(in_time);
+        assert!(
+            h2.engine.day.t0_prices.is_some(),
+            "inside the grace it is still a valid t0"
+        );
+        assert!(h2.engine.day.skip_reason.is_none());
+    }
+
+    #[test]
+    fn a_settled_days_skip_reason_survives_a_same_day_restart() {
+        // roll_day_if_needed rebuilds `entered` from last_session_date;
+        // the reason must come back with it or status.json reports an
+        // already-decided day with skip_reason: null (pairtrade#289
+        // Codex round 3).
+        let mut h = harness();
+        h.engine
+            .skip_day("below_threshold: |epsilon|=0.00010 < threshold=0.00300".to_string());
+        let persisted = load_state(&h.engine.cfg.state_path);
+        assert_eq!(persisted.last_session_date.as_deref(), Some("2026-09-08"));
+        assert!(persisted
+            .last_session_skip_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("below_threshold")));
+        // A fresh process on the same day, same state file.
+        let mut h2 = harness();
+        h2.engine.cfg.state_path = h.engine.cfg.state_path.clone();
+        h2.engine.state = persisted;
+        h2.engine.current_date = None;
+        h2.engine.roll_day_if_needed(T1_US + 60_000_000);
+        assert!(h2.engine.day.entered && h2.engine.day.restart_recovered);
+        assert!(
+            h2.engine
+                .day
+                .skip_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("below_threshold")),
+            "the reason must be restored, got {:?}",
+            h2.engine.day.skip_reason
+        );
+        // A day settled by an entry carries no reason.
+        let mut h3 = harness();
+        h3.engine.mark_day_acted(None);
+        let after_entry = load_state(&h3.engine.cfg.state_path);
+        assert!(after_entry.last_session_skip_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn entry_sends_nothing_while_the_t1_prices_are_stale() {
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        assert!(h.engine.day.t0_prices.is_some());
+        // Feed stalled an hour before the KRX close.
+        h.observe_all(T1_US - 3_600_000_000, 190.0, 1700.0);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "a stale t1 must not be captured"
+        );
+        assert_eq!(h.connector.order_count(), 0);
+        assert!(h.engine.position.is_none());
+    }
+
+    #[tokio::test]
+    async fn entry_sends_nothing_until_symbols_are_re_observed_after_a_feed_lag() {
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        // Fresh by the clock, but observed before the broadcast reported
+        // dropped updates: what we hold may be arbitrarily behind.
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.feed.lock().unwrap().note_lag();
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert!(h.engine.day.t1_prices.is_none());
+        assert_eq!(h.connector.order_count(), 0);
+        // Re-observed on the new generation, the same tick would proceed.
+        h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 2_000_000);
+        h.engine.maybe_enter(T1_US + 2_000_000).await;
+        assert!(
+            h.engine.day.t1_prices.is_some(),
+            "re-observed prices must unblock the same day"
+        );
+        assert_eq!(
+            h.connector.order_count(),
+            1,
+            "positive control: the gates above are what blocked the send, not the fixture"
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_sends_nothing_when_the_eligibility_endpoint_cannot_be_read() {
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        // A KR move with the US leg flat: |epsilon| well over the 0.003
+        // threshold, so only the eligibility gate can stop this.
+        h.observe_all(T1_US, 190.0, 1700.0);
+        for attempt in 1..=h.engine.cfg.max_eligibility_attempts {
+            h.engine
+                .maybe_enter(T1_US + attempt as i64 * 5_000_000)
+                .await;
+            assert_eq!(
+                h.connector.order_count(),
+                0,
+                "no order may be sent while eligibility is unknown (attempt {attempt})"
+            );
+        }
+        let reason = h
+            .engine
+            .day
+            .skip_reason
+            .clone()
+            .expect("the day must be abandoned once the attempts are spent");
+        assert!(
+            reason.starts_with("eligibility_unavailable"),
+            "unexpected skip reason: {reason}"
+        );
+        assert!(!h.engine.day.eligibility_confirmed);
+    }
+
+    #[tokio::test]
+    async fn entry_sends_nothing_when_the_price_goes_stale_between_signal_and_send() {
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        // t1 captured from fresh prices, then the feed stalls before the
+        // order is sized: the send-time re-check is the last gate. The
+        // tick *started* 1 s after t1 (every price fresh by that clock);
+        // by the time the awaits are done the wall clock says 120 s, and
+        // that is the clock the re-check must read (pairtrade#289 Codex
+        // review).
+        h.engine.day.t1_prices = Some(h.engine.usable_prices(T1_US));
+        h.set_now(T1_US + 120_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 0);
+        assert!(h.engine.position.is_none());
+    }
+
+    #[tokio::test]
+    async fn exit_still_closes_when_every_update_was_rejected_at_ingest() {
+        // A restart into a venue replaying a stale snapshot: nothing ever
+        // passes ingest, `latest_price` stays empty, `last_raw_mid` holds
+        // whatever the rejected updates carried. The reduce-only must go
+        // out regardless (pairtrade#289 Codex review, P1).
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            entry_price_estimated: true,
+            size: 0.058,
+            open_size: 0.058,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: -1,
+                entry_price: None,
+            });
+        h.engine
+            .feed
+            .lock()
+            .unwrap()
+            .last_raw_mid
+            .insert("SNDK".to_string(), 1690.0);
+        assert!(h.engine.feed.lock().unwrap().latest.is_empty());
+        h.set_now(T1_US + 60_000_000);
+        h.engine.maybe_exit(T1_US + 60_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            1,
+            "exit must not depend on a validated price"
+        );
+        {
+            let orders = h.connector.orders.lock().unwrap();
+            assert_eq!(orders[0].2, OrderSide::Long, "reduce-only close of a short");
+            assert!(orders[0].3);
+        }
+        // And with no mid of any kind at all, still closes.
+        let mut h2 = harness();
+        h2.engine.position = h.engine.position.clone();
+        h2.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: -1,
+                entry_price: None,
+            });
+        h2.set_now(T1_US + 60_000_000);
+        h2.engine.maybe_exit(T1_US + 60_000_000).await;
+        assert_eq!(
+            h2.connector.order_count(),
+            1,
+            "no price at all must not strand exposure"
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_sends_nothing_when_the_feed_lags_during_the_entry_awaits() {
+        // The eligibility fetch / position read / set_leverage awaits can
+        // take seconds. A `Lagged` during them means everything held may
+        // be behind the book, and because the feed runs on its own task
+        // the generation moves while those awaits are in flight -- the
+        // send-time check must see it (pairtrade#289 Codex round 4).
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        let feed = h.engine.feed.clone();
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            feed.lock().unwrap().note_lag();
+        }));
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a lag observed during entry preparation must block the send"
+        );
+        assert!(h.engine.position.is_none());
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "the pre-lag t1 must be discarded, not reused"
+        );
+        // Re-observed on the new generation, the next tick proceeds.
+        *h.connector.on_get_positions.lock().unwrap() = None;
+        h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
+        h.set_now(T1_US + 2_000_000);
+        h.engine.maybe_enter(T1_US + 2_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_partial_refresh_after_a_lag_does_not_revive_a_stale_t1() {
+        // The nastier shape of the same bug: the feed lags during the
+        // entry awaits and the *US* leg re-reports on the new generation
+        // before the send. `usable_prices` is then satisfied for the
+        // traded symbol while epsilon still rests on a KR value captured
+        // before the drop, so the generation of the signal itself has to
+        // be the gate (pairtrade#289 Codex round 5).
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        let feed = h.engine.feed.clone();
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            let mut f = feed.lock().unwrap();
+            let generation = f.note_lag();
+            // only the US leg comes back on the new generation
+            f.latest.insert(
+                "SNDK".to_string(),
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.0,
+                    best_ask: 1701.0,
+                    received_at_us: T1_US + 1_000_000,
+                    exchange_ts_us: Some(T1_US + 1_000_000),
+                    generation,
+                },
+            );
+        }));
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a fresh US price does not make a pre-lag KR signal sendable"
+        );
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "the stale t1 must be discarded"
+        );
+        assert!(
+            !h.engine.day.entered,
+            "the day is still open for a recomputed signal"
+        );
+        // Both legs back on the current generation: recaptured and sent.
+        *h.connector.on_get_positions.lock().unwrap() = None;
+        h.observe_all(T1_US + 2_000_000, 190.0, 1700.0);
+        h.set_now(T1_US + 2_000_000);
+        h.engine.maybe_enter(T1_US + 2_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_kr_leg_blocks_the_send_even_without_a_feed_lag() {
+        // No `Lagged` at all: the US leg keeps ticking through the entry
+        // awaits while the KR leg simply stops reporting and ages past
+        // the staleness bound. The generation still matches, so only a
+        // per-leg liveness check catches it (pairtrade#289 Codex round 7).
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        let feed = h.engine.feed.clone();
+        let bound_us = h.engine.cfg.max_price_staleness_secs * 1_000_000;
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            // Only SNDK comes back, well after the KR leg went stale.
+            let mut f = feed.lock().unwrap();
+            f.latest.insert(
+                "SNDK".to_string(),
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.0,
+                    best_ask: 1701.0,
+                    received_at_us: T1_US + bound_us + 2_000_000,
+                    exchange_ts_us: Some(T1_US + bound_us + 2_000_000),
+                    generation: 0,
+                },
+            );
+        }));
+        // Wall clock at send time is past the KR observation's bound.
+        h.set_now(T1_US + bound_us + 2_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.engine.feed_generation(),
+            0,
+            "this case has no feed lag -- the generation gate cannot be what catches it"
+        );
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a stale KR leg must block the send even though the traded symbol is fresh"
+        );
+        assert!(
+            h.engine.day.t1_prices.is_none(),
+            "the stale signal must be discarded"
+        );
+        assert!(!h.engine.day.entered);
+        // Both legs live again: recaptured and sent.
+        *h.connector.on_get_positions.lock().unwrap() = None;
+        let later = T1_US + bound_us + 3_000_000;
+        h.observe_all(later, 190.0, 1700.0);
+        h.set_now(later);
+        h.engine.maybe_enter(later).await;
+        assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn entry_proceeds_when_every_input_is_fresh() {
+        let mut h = harness();
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            1,
+            "the fixture must be able to produce an entry, or every no-send \
+             assertion above proves nothing"
+        );
+        let orders = h.connector.orders.lock().unwrap();
+        let (symbol, _size, side, reduce_only) = &orders[0];
+        assert_eq!(symbol, "SNDK");
+        assert_eq!(*side, OrderSide::Long, "KR outperformed, epsilon > 0");
+        assert!(!*reduce_only);
+    }
+
+    #[tokio::test]
+    async fn exit_still_closes_on_a_stale_price() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            size: 0.058,
+            open_size: 0.058,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: 1,
+                entry_price: Some(Decimal::from_str("1700").unwrap()),
+            });
+        // The only price we have is hours old and from before a feed lag:
+        // unusable for any entry, and deliberately still good enough to
+        // get flat on.
+        h.observe_at("SNDK", 1710.0, T1_US, 0);
+        h.engine.feed.lock().unwrap().generation = 5;
+        h.set_now(T2_US + 1_000_000);
+        h.engine.maybe_exit(T2_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            1,
+            "a stale feed must never strand an open position"
+        );
+        let orders = h.connector.orders.lock().unwrap();
+        let (symbol, _size, side, reduce_only) = &orders[0];
+        assert_eq!(symbol, "SNDK");
+        assert_eq!(*side, OrderSide::Short, "reduce-only close of a long");
+        assert!(*reduce_only);
+    }
+
+    #[test]
+    fn usable_prices_and_their_generation_come_from_one_lock() {
+        // The pair must always describe the same instant: a generation
+        // that says "current" alongside prices from before the lag is
+        // exactly the race this accessor exists to remove
+        // (pairtrade#289 Codex round 6).
+        let mut h = harness();
+        h.observe_all(T1_US, 190.0, 1700.0);
+        let (prices, generation) = h.engine.usable_prices_with_generation(T1_US);
+        assert_eq!(generation, 0);
+        assert_eq!(prices.len(), 4);
+        h.engine.feed.lock().unwrap().note_lag();
+        let (prices, generation) = h.engine.usable_prices_with_generation(T1_US);
+        assert_eq!(
+            generation, 1,
+            "the reported generation must move with the feed"
+        );
+        assert!(
+            prices.is_empty(),
+            "and the prices reported with it must already exclude the pre-lag ones"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_stale_symbols_and_the_skip_reason() {
+        let mut h = harness();
+        h.observe_all(T1_US, 190.0, 1700.0);
+        assert!(h.engine.stale_or_missing_symbols(T1_US).is_empty());
+        // 60 s later, past the 30 s bound, every symbol is stale.
+        let stale = h.engine.stale_or_missing_symbols(T1_US + 60_000_000);
+        assert_eq!(stale.len(), 4);
+        assert!(stale.contains(&"SKHY".to_string()));
+        assert!(stale.contains(&"SNDK".to_string()));
+        // A symbol that never arrived is reported too.
+        h.engine.feed.lock().unwrap().latest.remove("SNDK");
+        assert!(h
+            .engine
+            .stale_or_missing_symbols(T1_US)
+            .contains(&"SNDK".to_string()));
+        let debug = h.engine.freshness_debug(T1_US);
+        assert!(debug.contains("SNDK=never_observed"), "unexpected: {debug}");
+        assert!(
+            debug.contains("SKHY=190.0000@0.0s/gen0[ok]"),
+            "unexpected: {debug}"
+        );
     }
 }

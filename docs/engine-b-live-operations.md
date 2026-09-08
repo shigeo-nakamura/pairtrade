@@ -58,8 +58,58 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   `kr_primary`/`us_primary` is `force_reduce_only`, not `status=active`, or
   below `ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD` (default `100000`, same
   placeholder value as `engine_b_phase0.py`'s `MIN_DAILY_VOLUME_USD` --
-  keep both in sync until #872 freezes a data-driven value). Fails open
-  (proceeds without the gate, logged as a warning) on a fetch/parse error.
+  keep both in sync until #872 freezes a data-driven value). **Fails
+  closed** (bot-strategy#916): a fetch/parse error blocks the entry and is
+  retried on the next 5 s tick, bounded by
+  `ENGINE_B_LIVE_MAX_ELIGIBILITY_ATTEMPTS` (default 6) and by the entry
+  deadline; once the attempts are spent the day is skipped with
+  `skip_reason=eligibility_unavailable`. It used to fail *open* -- a single
+  REST hiccup would have traded straight through a `force_reduce_only`
+  market.
+- **Fail-closed signal inputs** (bot-strategy#916): every entry decision
+  reads only price observations that passed ingest validation (positive mid
+  inside a two-sided, uncrossed book; a venue timestamp that is either
+  plausible-and-recent or discarded as a broken clock), arrived on the
+  current price-feed generation (a broadcast `Lagged` bumps it, so nothing
+  observed before dropped updates is reused), and are no older than
+  `ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS` (default 30). Consequences:
+  - `t0`/`t1` are snapshotted only once both primaries have a usable price;
+    a partial or stale snapshot is never captured or persisted.
+  - The `t0` capture is bounded by `ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS`
+    (default 300) after KRX open, whether or not a usable snapshot exists
+    by then: nothing usable ends the day with `skip_reason=no_usable_t0`,
+    and a snapshot that only *becomes* usable past the bound (a feed
+    recovering at t0+301 s) ends it with `skip_reason=late_t0`. Neither is
+    backfilled as if it were the open.
+  - The order-sizing price is re-checked immediately before the send, not
+    reused from the `t1` capture (the eligibility fetch and position read in
+    between are awaits). So is the signal itself: immediately before the
+    send, **every leg it rests on must still be a live observation** —
+    same feed generation *and* inside the staleness bound, read under one
+    lock. Either a lag or a leg that simply stops reporting (the KR feed
+    stalling while the US feed keeps ticking) discards the whole `t1`
+    capture and recomputes epsilon on the next tick; a fresh US price
+    never makes a stale KR value sendable. `t0` is exempt — it is a
+    historical boundary reference, not a current price.
+  - Every terminal no-entry path records a `skip_reason`, logged as
+    `[SKIP] ...` and surfaced in `status.json` under `han_bridge`, alongside
+    `stale_or_missing_symbols` and `price_feed_generation`. It is persisted
+    to `risk_state.json` as `last_session_skip_reason` beside
+    `last_session_date`, so a same-day restart restores why the day was
+    settled, not only that it was.
+  - **These gates are entry-only.** `maybe_exit` and the unconfirmed-position
+    adoption path read the last price raw, so a stale feed can never keep an
+    open position from being closed or an unknown exposure from being
+    adopted. The feed runs on its own task writing into a shared
+    `PriceFeed`, not as an arm of the tick loop, so a `Lagged` during the
+    seconds a tick spends awaiting the exchange bumps the generation while
+    entry preparation is still in flight and the send-time check sees it.
+    A PnL booked off a stale mid is logged as such; if *every*
+    update has been rejected at ingest (e.g. a venue replaying a stale
+    snapshot after a restart) the close still goes out and the PnL is
+    booked off the last raw mid, or as a last resort off the entry price
+    with `source=entry_price_pnl_unknown` in the log -- reconcile that one
+    from the exchange fill.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
   `docs/engine-b-order-spec.md` §4 -- introduced by pairtrade#272, so the
   file is absent until that PR merges): a live entry is only recorded once
