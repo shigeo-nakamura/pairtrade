@@ -448,10 +448,16 @@ impl ArcusSpotLiveTickEventPublisher {
     /// Append the already-staged event and remove the recovery sidecar only
     /// after the stream fsync succeeds.
     pub fn commit(&self, event: &ArcusSpotRuntimeEvent) -> Result<ArcusSpotLiveTickEventRecord> {
-        let (_, pending) = self
+        let (document, _) = self
             .load_pending()?
             .context("Arcus pending event is missing before stream commit")?;
-        if pending != *event {
+        // Compare the canonical bytes `stage` hashed, not a struct rebuilt
+        // from them: a float that does not survive a JSON round-trip must
+        // not turn an exact, already-checkpointed publication into a
+        // rejected tick (bot-strategy#953).
+        let event_json = serde_json::to_string(event)
+            .context("failed to serialize Arcus event for stream commit")?;
+        if sha256_prefixed(event_json.as_bytes()) != document.event_sha256 {
             bail!("Arcus pending event does not match the checkpointed event");
         }
         let record = self.stream.append(event)?;
@@ -886,6 +892,40 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// bot-strategy#953: serde_json's default float parser is best-effort
+    /// (last-ULP drift on ~11% of doubles), so a commit that compares the
+    /// reloaded pending event against the in-memory one as a struct rejected
+    /// ~7% of live ticks. Values below fail `x == parse(print(x))` under the
+    /// default parser; the commit must accept them.
+    #[test]
+    fn commit_accepts_an_event_whose_floats_do_not_survive_default_parsing() {
+        let dir = tempdir().unwrap();
+        let publisher = publisher(dir.path());
+        publisher
+            .stream()
+            .append(&event(10, "2026-08-25T00:02:00Z"))
+            .unwrap();
+        let mut pending = event(11, "2026-08-25T00:17:00Z");
+        pending.relative_log_price = Some(-0.9905569655657787);
+        pending.z_score = Some(-1.9059887127868558);
+        publisher.stage(&pending).unwrap();
+
+        let record = publisher.commit(&pending).unwrap();
+
+        assert_eq!(
+            record.event_sha256,
+            sha256_prefixed(serde_json::to_string(&pending).unwrap().as_bytes())
+        );
+        assert!(!publisher.pending_path().exists());
+        let tail = publisher
+            .stream()
+            .latest_verified_record()
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail.event, pending);
+        assert_eq!(tail.event.z_score, Some(-1.9059887127868558));
     }
 
     #[test]

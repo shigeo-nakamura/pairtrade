@@ -6,7 +6,8 @@ build = "build.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
-serde_json = "1.0"
+# float_roundtrip: exact f64 JSON round-trips (checkpointed histories, durable events; bot-strategy#953)
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 async-trait = "0.1.68"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
