@@ -67,6 +67,13 @@ def validate(path, grace_secs: int = DEFAULT_GRACE_SECS):
     extra_top = set(d) - {"calendar_version", "entries"}
     if extra_top:
         raise SystemExit(f"unknown top-level calendar key(s): {sorted(extra_top)}")
+    # CalendarFile.calendar_version is `#[serde(default)] String`: absent is
+    # fine (it defaults to ""), but a number or an explicit null fails to
+    # deserialize, so the installer would promote a file the runtime cannot
+    # parse on its next restart.
+    if "calendar_version" in d and not isinstance(d["calendar_version"], str):
+        raise SystemExit(
+            f"calendar_version must be a string when present, got {d['calendar_version']!r}")
     if not d["entries"]:
         raise SystemExit("calendar has no entries; the instance would never decide")
     seen, parsed = set(), []

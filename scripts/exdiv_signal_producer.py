@@ -91,6 +91,12 @@ PREV_CLOSE_OFFSETS_SECS = (-60, -120, -180, -300, -600)
 HOST_STATUS_MAX_AGE_SECS = 900          # a status older than this is a dead runtime
 MIN_FRESH_ROWS = 3
 FRESH_OB_SECS = 90.0
+# `ob_age_secs` says how stale the book was WHEN THE ROW WAS WRITTEN, and
+# the row-age bound in `fresh` cannot reject anything inside a 6-minute
+# lookback window. So a logger that recorded three rows and then stalled
+# would still pass MIN_FRESH_ROWS and size the order from a book minutes
+# old. Require the newest sample itself to be recent.
+MAX_LAST_ROW_AGE_SECS = 120.0
 
 GROSS_USD = 8000.0                      # sizing.gross_notional_usd
 MAX_LEG_USD = 2000.0
@@ -351,6 +357,36 @@ def latest_mid(win):
     return xs[-1] if xs else None
 
 
+def _by_minute(win):
+    out = {}
+    for r in win:
+        m = mid(r)
+        if m is not None:
+            out[r["_t"].replace(second=0, microsecond=0)] = m
+    return out
+
+
+def latest_mid_pair(win, ctl_win):
+    """The event and control mids at the latest minute BOTH were sampled.
+
+    Taking each leg's own last row would compare, say, the event at 09:27
+    against its control at 09:25 whenever one leg dropped a sample, and
+    the market movement in between would be read as relative premarket
+    movement -- the same error the T-1 references avoid by pairing.
+    Returns (event_mid, control_mid, minute) or (None, None, None)."""
+    a, b = _by_minute(win), _by_minute(ctl_win)
+    common = sorted(set(a) & set(b))
+    if not common:
+        return None, None, None
+    t = common[-1]
+    return a[t], b[t], t
+
+
+def last_row_age_secs(win, cutoff: datetime):
+    """Seconds between the newest sample in `win` and the decision."""
+    return (cutoff - max(r["_t"] for r in win)).total_seconds() if win else None
+
+
 def _mid_at(rows_prev, sym: str, target: datetime):
     xs = [mid(r) for r in rows_prev
           if r.get("symbol") == sym and r["_t"].hour == target.hour
@@ -422,6 +458,13 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     if len(win) < MIN_FRESH_ROWS:
         out["skip"] = "no_fresh_book"
         return out
+    age = last_row_age_secs(win, cutoff)
+    out["last_row_age_secs"] = round(age, 1)
+    if age > MAX_LAST_ROW_AGE_SECS:
+        # Rows exist but the feed stopped: everything below would be
+        # measured on a book that is minutes old.
+        out["skip"] = "book_stalled"
+        return out
     sp = st.median([spread_bps(r) for r in win])
     l1 = st.median([v for v in (l1_usd(r) for r in win) if v is not None] or [0.0])
     m = st.median([mid(r) for r in win])
@@ -439,9 +482,14 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
         return out
     ctl = hedge or "US500"
     ctl_win = window_rows(rows_t, ctl, cutoff, start)
+    ctl_age = last_row_age_secs(ctl_win, cutoff)
+    out["control_last_row_age_secs"] = round(ctl_age, 1) if ctl_age is not None else None
     if hedge:
         if len(ctl_win) < MIN_FRESH_ROWS:
             out["skip"] = "hedge_no_fresh_book"
+            return out
+        if ctl_age > MAX_LAST_ROW_AGE_SECS:
+            out["skip"] = "hedge_book_stalled"
             return out
         hsp = st.median([spread_bps(r) for r in ctl_win])
         out["hedge_spread_bps"] = round(hsp, 2)
@@ -460,7 +508,14 @@ def evaluate_event(ev: dict, rows_t, rows_prev, cutoff: datetime, prev_day: date
     # is also the honest measure of "can we still capture it": it is what
     # we would transact at.
     ev_ref_mid, ctl_ref_mid = close_mid_pair(rows_prev, sym, ctl, prev_day, cal_path)
-    ev_now, ctl_now = latest_mid(win), latest_mid(ctl_win)
+    ev_now, ctl_now, paired_minute = latest_mid_pair(win, ctl_win)
+    if paired_minute is not None:
+        out["premarket_paired_minute"] = paired_minute.strftime("%Y-%m-%dT%H:%M:00Z")
+        # The paired minute is what the gate actually measures at, so it is
+        # the one that has to be recent, not merely the event's own newest
+        # row (already checked above).
+        if (cutoff - paired_minute).total_seconds() > MAX_LAST_ROW_AGE_SECS:
+            ev_now = ctl_now = None
     if ev_ref_mid and ev_now and ctl_ref_mid and ctl_now:
         adj = (ev_now / ev_ref_mid - 1) * 1e4 - (ctl_now / ctl_ref_mid - 1) * 1e4
         out["premarket_adj_move_bps"] = round(adj, 2)

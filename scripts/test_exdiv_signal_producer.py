@@ -523,6 +523,52 @@ class SignalTests(unittest.TestCase):
         e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
         self.assertEqual(e["skip"], "hedge_no_fresh_book")
 
+    def test_a_stalled_logger_does_not_trade_on_an_old_book(self):
+        """Three rows then silence still satisfies MIN_FRESH_ROWS, and the
+        row-age bound in `fresh` cannot reject anything inside a 6-minute
+        window, so the newest sample itself has to be recent."""
+        t0 = NOW.replace(minute=23, second=0)
+        stalled = ([r for r in base_rows() if r["symbol"] != "SPY"]
+                   + series("SPY", t0, 3, bid=659.97, ask=660.03))   # 09:23-09:25 only
+        e = xp.build_signal(EVENTS[:1], D, stalled, prev_rows(), NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "book_stalled")
+        self.assertGreater(e["last_row_age_secs"], xp.MAX_LAST_ROW_AGE_SECS)
+        # mutation control: the row-count gate alone would have passed it
+        self.assertGreaterEqual(e["n_rows"], xp.MIN_FRESH_ROWS)
+        # a stalled HEDGE is caught too, with its own reason
+        stalled_hedge = ([r for r in base_rows() if r["symbol"] != "US500"]
+                         + series("US500", t0, 3, bid=6599.9, ask=6600.1, bid_sz=20, ask_sz=20))
+        e = xp.build_signal(EVENTS[:1], D, stalled_hedge, prev_rows(), NOW)["meta"]["events"][0]
+        self.assertEqual(e["skip"], "hedge_book_stalled")
+
+    def test_current_mids_are_paired_at_a_common_minute(self):
+        """Comparing the event at 09:27 against a control at 09:26 would
+        read the market's own move over that minute as premarket drift."""
+        t0 = NOW.replace(minute=23, second=0)
+        rows = ([r for r in base_rows() if r["symbol"] not in ("SPY", "US500")]
+                + series("SPY", t0, 5, bid=659.97, ask=660.03)            # ..09:27
+                + series("US500", t0, 4, bid=6599.9, ask=6600.1,          # ..09:26
+                         bid_sz=20, ask_sz=20))
+        e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
+        self.assertEqual(e["premarket_paired_minute"], "2026-09-18T13:26:00Z")
+        self.assertIsNone(e["skip"])
+        ev, ctl, minute = xp.latest_mid_pair(
+            xp.window_rows(rows, "SPY", NOW, xp.lookback_start(D)),
+            xp.window_rows(rows, "US500", NOW, xp.lookback_start(D)))
+        self.assertEqual(minute.strftime("%H:%M"), "13:26")
+        self.assertIsNotNone(ev)
+        self.assertIsNotNone(ctl)
+        # no minute in common at all -> unevaluable -> skip
+        disjoint = ([r for r in base_rows() if r["symbol"] not in ("SPY", "US500")]
+                    + series("SPY", t0, 5, bid=659.97, ask=660.03)
+                    + [row("US500", t0 + timedelta(seconds=30 + 60 * i), 6599.9, 6600.1,
+                           bid_sz=20, ask_sz=20) for i in range(5)])
+        ev, ctl, minute = xp.latest_mid_pair(
+            xp.window_rows(disjoint, "SPY", NOW, xp.lookback_start(D)),
+            xp.window_rows(disjoint, "US500", NOW, xp.lookback_start(D)))
+        self.assertIsNotNone(minute)   # same minutes despite the 30 s offset
+        self.assertEqual(xp.latest_mid_pair([], [])[2], None)
+
     def test_producer_constants_match_the_deployed_config(self):
         """The producer mirrors the runtime caps; drift would produce files
         the runtime rejects."""

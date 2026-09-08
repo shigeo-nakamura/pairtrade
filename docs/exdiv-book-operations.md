@@ -48,7 +48,7 @@ Extending past 2027 means regenerating that calendar first.
 | `configs/book/exdiv-lighter.calendar.json` | runtime calendar, **generated** from the events file (`decision_at 13:29:00Z`, `flatten_at 13:36:00Z`, one entry per date). CI fails if it is stale |
 | `configs/book/exdiv-lighter.yaml` | runtime config (`fp=08a901c93832` at 2026-09-07): universe = event symbols + `US500`/`US100`, gross $8,000 (weights are fractions of it, one leg ≤ 0.25 = $2,000), grace 45 s so the acceptance window closes 15 s before the open, `max_age_secs 300`, `require_dollar_neutral: false` (single stocks are unhedged by design), `max_net_usd 2200` |
 | `scripts/exdiv_signal_producer.py` | `calendar` (events → runtime calendar, `--check` for CI) and `signal` (pre-open cron: gates + sizing → `signal.json`, optional S3 upload). Both derive every instant from `configs/engine-b/trading_calendar.json` (`--trading-calendar` overrides) |
-| `scripts/validate_book_calendar.py` | what `install_book_runtime.sh` runs before installing a calendar, and CI runs on the committed one: `book_runtime --validate` does **not** load the calendar, so shape, RFC 3339 timestamps, unique keys, flatten-outside-the-signal-window and non-overlap are checked here. Both window rules depend on `signal_grace_secs`, which the installer and CI read from the deployed config and pass as `--grace-secs` |
+| `scripts/validate_book_calendar.py` | what `install_book_runtime.sh` runs before installing a calendar, and CI runs on the committed one: `book_runtime --validate` does **not** load the calendar, so shape, `calendar_version` type, RFC 3339 timestamps, unique keys, flatten-outside-the-signal-window and non-overlap are checked here. Both window rules depend on `signal_grace_secs`, which the installer and CI read from the deployed config and pass as `--grace-secs` |
 | `scripts/test_exdiv_signal_producer.py` | unit tests (synthetic logger rows) |
 | `deploy/book-runtime-exdiv-lighter.service` | runtime unit, PROM `127.0.0.1:9475`, status → `s3://debot-dashboard/debot/status/book-exdiv-lighter/` |
 | `deploy/book-signal-fetch-exdiv-lighter.{service,timer}` | S3 → local signal fetch, `Mon..Fri 09:27:00–09:29:40 America/New_York every 20 s` (`AccuracySec=1s`, so it follows US daylight saving); it stops before the open, and nothing polls outside that span |
@@ -71,7 +71,11 @@ the fresh rows (`ob_age_secs ≤ 90`) from seven minutes before the open up
 to the decision instant:
 
 1. **Skip gates** (issue design): median spread > 30 bps; median L1 (min of
-   bid/ask notional) < $200; no fresh book; hedge leg spread > 30 bps; and
+   bid/ask notional) < $200; no fresh book; a **stalled** book — three rows
+   followed by silence still satisfies the row count, and `ob_age_secs`
+   only describes how stale the book was when each row was written, so the
+   newest sample itself must be within 120 s of the decision
+   (`book_stalled` / `hedge_book_stalled`); hedge leg spread > 30 bps; and
    the landed-before-open gate — the event's **mid** move since its T-1
    close mid, minus the hedge's (or `US500`'s) move over the same span,
    ≤ −0.5 × dividend bps. The gate is measured on mids, not on
@@ -79,9 +83,12 @@ to the decision instant:
    internal book price while the futures-derived hedge legs quote
    continuously, so an index-vs-index comparison mixes two price
    definitions and a few bps of thin pre-open noise would false-fire it
-   (QQQ's threshold is only about −6 bps). Both T-1 mids are resolved on
-   the **same** minute, so a logger gap on one leg cannot make the
-   differential include that leg's own drift.
+   (QQQ's threshold is only about −6 bps). Both the T-1 mids **and** the
+   current mids are resolved on a minute the event and control were both
+   sampled (`meta.events[].premarket_paired_minute`), so a logger gap on
+   one leg cannot make the differential include that leg's own drift; if
+   that shared minute is itself more than 120 s old the gate is treated as
+   unevaluable.
 
    If any of the four inputs is missing — including the control — the
    event is **skipped** (`landed_gate_unavailable`) rather than traded

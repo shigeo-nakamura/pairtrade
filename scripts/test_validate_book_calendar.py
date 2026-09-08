@@ -41,6 +41,10 @@ class ValidatorTests(unittest.TestCase):
             "no entries": {"calendar_version": "t", "entries": []},
             "unknown top key": dict(GOOD, schedule="calendar"),
             "entries not a list": {"calendar_version": "t", "entries": {}},
+            # CalendarFile.calendar_version is a String with serde(default):
+            # absent is fine, a number or an explicit null is not.
+            "numeric calendar_version": dict(GOOD, calendar_version=1),
+            "null calendar_version": dict(GOOD, calendar_version=None),
         }
         for name, bad in cases.items():
             with self.assertRaises(SystemExit, msg=name):
@@ -74,6 +78,12 @@ class ValidatorTests(unittest.TestCase):
         for name, fn in entry_cases.items():
             with self.assertRaises(SystemExit, msg=name):
                 vbc.validate(write(mutate(fn)))
+
+    def test_calendar_version_may_be_absent(self):
+        import copy
+        d = copy.deepcopy(GOOD)
+        del d["calendar_version"]
+        self.assertEqual(len(vbc.validate(write(d))["entries"]), 2)   # serde(default)
 
     def test_entry_order_is_not_a_rule(self):
         """Scheduler::build sorts by decision_at before checking, so a
