@@ -2033,6 +2033,30 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
         }
     }
 
+    // A reset is for a change that already invalidated the stored state.
+    // With the config unchanged it discards an accumulated signal window
+    // and re-anchors the risk baselines for nothing -- and re-anchoring is
+    // the part that matters: `initial_equity_usd` and the buy-and-hold
+    // basket are re-marked on the next tick, so cumulative-loss accounting
+    // starts over. Repeated before the limit engages, that is a way to
+    // never reach the cumulative halt at all, available to anyone who can
+    // invoke the executor with the already-approved production config. The
+    // approval gate authorises *this config*, not an unlimited number of
+    // baseline erasures under it (Codex P1 follow-up, bot-strategy#903).
+    if let Some(changed) = store.state_invalidating_drift(&config.runtime)? {
+        if changed.is_empty() {
+            bail!(
+                "Arcus runtime checkpoint {} was written under a config whose state-invalidating \
+                 fields (mode, chain_id, pair, initial_inventory, signal_window_samples) all \
+                 match the one supplied, so there is nothing here for a fresh window to be \
+                 about. Resetting anyway would only discard the accumulated signal window and \
+                 restart the initial-equity and buy-and-hold loss baselines the cumulative halt \
+                 is measured against. Deploy the changed CONFIG_YAML first",
+                config.runtime_state_path.display(),
+            );
+        }
+    }
+
     let tail = publisher.stream().latest_committed()?;
     let tail_sequence = tail.map(|(sequence, _)| sequence).unwrap_or(0);
     if let Some(previous) = &previous {
@@ -9186,6 +9210,32 @@ runtime:
             .expect("the replaced checkpoint is reported");
         assert_eq!(fs::read(copy).unwrap(), replaced);
         assert_ne!(fs::read(&next.runtime_state_path).unwrap(), replaced);
+    }
+
+    #[test]
+    fn reset_window_refuses_an_unchanged_config() {
+        // A reset re-anchors initial_equity_usd and the buy-and-hold
+        // basket, so cumulative-loss accounting starts over. With nothing
+        // state-invalidating actually changed that is not a reset, it is a
+        // repeatable erasure of the accounting the cumulative halt is
+        // measured against, available to anyone who can run the executor
+        // with the approved production config (Codex P1 follow-up).
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 3);
+
+        let error = commit_runtime_window_reset(&config)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("all match the one supplied"), "{error}");
+        // The checkpoint is untouched by a refusal.
+        let summary = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .peek_summary()
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.sequence, 3);
+        assert_eq!(summary.relative_log_price_samples, 3);
     }
 
     #[test]

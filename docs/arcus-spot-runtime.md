@@ -387,6 +387,13 @@ dispatching tick takes -- and refuses unless the bot is genuinely idle:
 - an engaged risk halt -- a fresh state has no halt, so allowing this would
   make `reset-window` a second, undocumented way to disarm the sticky stop
   `clear-risk-halt` exists to gate (#813),
+- a config whose state-invalidating fields all still match the checkpoint's.
+  There is then nothing for a fresh window to be about, and the reset would
+  only discard the accumulated window and restart the loss baselines below
+  -- which, repeated before the limit engages, is a way never to reach the
+  cumulative halt at all. The approval gate authorises *this config*, not an
+  unlimited number of baseline erasures under it. Deploy the changed
+  CONFIG_YAML first,
 - a missing checkpoint on a bot that has already moved funds. With no
   checkpoint the two checks above cannot run at all, and a completed fill
   records its post-fill regime in the checkpoint rather than in the

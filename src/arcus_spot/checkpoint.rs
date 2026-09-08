@@ -327,6 +327,38 @@ impl ArcusSpotRuntimeCheckpointStore {
         }))
     }
 
+    /// Which state-invalidating fields differ between the config the
+    /// checkpoint was written under and `current`. `None` when no
+    /// checkpoint exists.
+    ///
+    /// `reset-window` needs this to hold itself to its own purpose. A reset
+    /// discards the accumulated signal window and re-anchors the risk
+    /// baselines -- `initial_equity_usd` and the buy-and-hold basket are
+    /// re-marked on the next tick, so cumulative-loss accounting starts
+    /// over. That is acceptable precisely *because* it accompanies a change
+    /// that already invalidated the stored state. Run with an unchanged
+    /// config it is not a reset at all, just an erasure of the loss
+    /// accounting the cumulative halt is measured against -- repeatable
+    /// before the limit ever engages (Codex P1 follow-up,
+    /// bot-strategy#903).
+    pub fn state_invalidating_drift(
+        &self,
+        current: &ArcusSpotRuntimeConfig,
+    ) -> Result<Option<Vec<&'static str>>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_private_regular_file(&self.path, "runtime checkpoint")?;
+        let checkpoint: ArcusSpotRuntimeCheckpoint = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid runtime checkpoint {}", self.path.display()))?;
+        if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
+            bail!("unsupported Arcus runtime checkpoint schema");
+        }
+        Ok(Some(
+            classify_config_drift(&checkpoint.config, current).state_invalidating,
+        ))
+    }
+
     /// Load and validate an already-persisted checkpoint without creating
     /// or modifying anything. Operator backup/rollback checks must never
     /// turn a missing checkpoint into a successful first-run state: absence
