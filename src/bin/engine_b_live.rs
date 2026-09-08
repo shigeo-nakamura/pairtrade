@@ -1513,10 +1513,23 @@ impl EngineBLiveEngine {
     /// price -- the price only books PnL. Fail-closed on entry must never
     /// mean fail-closed on getting flat.
     fn usable_prices(&self, now_us: i64) -> HashMap<String, f64> {
-        self.feed
-            .lock()
-            .expect("price feed mutex")
-            .usable(now_us, self.cfg.max_price_staleness_secs)
+        self.usable_prices_with_generation(now_us).0
+    }
+
+    /// `usable_prices` plus the generation those prices were read on,
+    /// under ONE lock acquisition (pairtrade#289 Codex round 6). Taking
+    /// the generation and the prices separately is a race on the
+    /// multi-threaded runtime: the feed task can process a `Lagged` and
+    /// then a fresh US quote in between, so the generation compares equal
+    /// to the t1 capture while the price map already holds a post-lag
+    /// observation. Any decision that compares a generation against the
+    /// prices it is about to act on must use this.
+    fn usable_prices_with_generation(&self, now_us: i64) -> (HashMap<String, f64>, u64) {
+        let feed = self.feed.lock().expect("price feed mutex");
+        (
+            feed.usable(now_us, self.cfg.max_price_staleness_secs),
+            feed.generation,
+        )
     }
 
     /// Symbols whose latest observation is missing or not usable for an
@@ -2258,7 +2271,7 @@ impl EngineBLiveEngine {
         // once the US leg has re-reported, and `t1_prices` is a bare
         // map with no per-symbol metadata left to check (pairtrade#289
         // Codex round 5). Discard the whole capture and take it again.
-        let generation_now = self.feed_generation();
+        let (usable_now, generation_now) = self.usable_prices_with_generation(now_us);
         if self.day.t1_generation.is_some_and(|g| g != generation_now) {
             log::warn!(
                 "[ENTRY] discarding the t1 snapshot captured on feed generation {:?} (now \
@@ -2277,7 +2290,7 @@ impl EngineBLiveEngine {
             // Returning here retries on the next 5 s tick, and the
             // entry-deadline branch above is what eventually turns a
             // feed that never recovers into an explicit skip.
-            let prices = self.usable_prices(now_us);
+            let prices = usable_now;
             if !t0_snapshot_has_required_symbols(
                 &prices,
                 &self.cfg.kr_primary_symbol,
@@ -2539,7 +2552,9 @@ impl EngineBLiveEngine {
         // arriving on the new generation during the awaits above would
         // satisfy `usable_prices` while epsilon still rests on a KR value
         // captured before the drop (pairtrade#289 Codex round 5).
-        let send_generation = self.feed_generation();
+        // One lock for both, so the generation cannot advance between
+        // the check and the price it authorises (Codex round 6).
+        let (usable_at_send, send_generation) = self.usable_prices_with_generation(send_now_us);
         if self.day.t1_generation != Some(send_generation) {
             log::warn!(
                 "[ENTRY] feed generation moved from {:?} to {send_generation} while preparing the \
@@ -2550,11 +2565,7 @@ impl EngineBLiveEngine {
             self.day.t1_generation = None;
             return;
         }
-        let Some(price) = self
-            .usable_prices(send_now_us)
-            .get(&self.cfg.us_primary_symbol)
-            .copied()
-        else {
+        let Some(price) = usable_at_send.get(&self.cfg.us_primary_symbol).copied() else {
             log::error!(
                 "[ENTRY] no fresh price for {} at send time; not sending this tick -- {}",
                 self.cfg.us_primary_symbol,
@@ -4928,6 +4939,29 @@ mod tests {
         assert_eq!(symbol, "SNDK");
         assert_eq!(*side, OrderSide::Short, "reduce-only close of a long");
         assert!(*reduce_only);
+    }
+
+    #[test]
+    fn usable_prices_and_their_generation_come_from_one_lock() {
+        // The pair must always describe the same instant: a generation
+        // that says "current" alongside prices from before the lag is
+        // exactly the race this accessor exists to remove
+        // (pairtrade#289 Codex round 6).
+        let mut h = harness();
+        h.observe_all(T1_US, 190.0, 1700.0);
+        let (prices, generation) = h.engine.usable_prices_with_generation(T1_US);
+        assert_eq!(generation, 0);
+        assert_eq!(prices.len(), 4);
+        h.engine.feed.lock().unwrap().note_lag();
+        let (prices, generation) = h.engine.usable_prices_with_generation(T1_US);
+        assert_eq!(
+            generation, 1,
+            "the reported generation must move with the feed"
+        );
+        assert!(
+            prices.is_empty(),
+            "and the prices reported with it must already exclude the pre-lag ones"
+        );
     }
 
     #[test]
