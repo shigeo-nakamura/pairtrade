@@ -19,6 +19,8 @@ from subsidy_ledger import (  # noqa: E402
     equity_daily_costs,
     load_execution,
     load_pnl,
+    load_points,
+    expand,
     render_table,
     summarize,
 )
@@ -404,6 +406,61 @@ def test_an_arm_with_no_cost_source_at_all_still_says_so():
     rows = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=5_000.0)}, {})
     text = render_for(rows)
     assert "cost unknown (no PnL ledger or equity series covers these days)" in text
+
+
+def test_overlapping_globs_read_each_file_once():
+    """A broad pattern beside a narrow one is a natural way to call this.
+
+    Without deduplication the overlap is read twice and its volume, PnL and
+    funding are counted twice, with nothing in the output to show it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write(
+            root / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+              "fill_value": 10_000.0, "filled_qty": 1.0}],
+        )
+        both = expand([str(root / "execution-*.jsonl"),
+                       str(root / "execution-*_20260908.jsonl")])
+        assert len(both) == 1, both
+        assert load_execution(both)[("2026-09-08", "freq")].volume_usd == 10_000.0
+
+
+def test_a_fill_that_cannot_be_attributed_is_an_error():
+    """Same rule the PnL loader applies to a row with no `ts`.
+
+    Dropping it leaves the day's volume understated while the day still
+    presents as fully covered — the failure this KPI exists to prevent.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 10_000.0},
+                {"event": "leg_fill", "variant": "freq", "fill_value": 5_000.0},
+            ],
+        )
+        try:
+            load_execution([path])
+        except SubsidyLedgerError as error:
+            assert "no ts_ms" in str(error), error
+        else:
+            raise AssertionError("an unattributable fill was silently dropped")
+
+
+def test_a_malformed_points_row_is_an_error():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(Path(tmp) / "points.jsonl",
+                     [{"date": "2026-09-08", "arm": "freq", "points": 1000.0},
+                      {"date": "2026-09-08", "points": 500.0}])
+        try:
+            load_points(path)
+        except SubsidyLedgerError as error:
+            assert "needs date, arm and points" in str(error), error
+        else:
+            raise AssertionError("a points row with no arm was silently dropped")
 
 
 def test_reads_the_real_ledger_shapes():

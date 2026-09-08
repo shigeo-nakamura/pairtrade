@@ -186,8 +186,20 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
             ts_ms = record.get("ts_ms")
             arm = record.get("variant")
             if ts_ms is None or not arm:
-                continue
-            day = days[(utc_date(ts_ms / 1000.0), str(arm))]
+                # Same rule the PnL loader already applies to a row with no
+                # `ts`: a fill that cannot be attributed to a day and an arm
+                # cannot be counted, and cannot be blamed on a day either,
+                # so it would leave an understated denominator presented as
+                # complete. Every archived leg_fill carries both fields, so
+                # this is a broken writer rather than a gap.
+                raise SubsidyLedgerError(
+                    f"{path}: a leg_fill has no {'ts_ms' if ts_ms is None else 'variant'}, "
+                    "so the day and arm it belongs to cannot be determined")
+            try:
+                key = (utc_date(float(ts_ms) / 1000.0), str(arm))
+            except (TypeError, ValueError) as error:
+                raise SubsidyLedgerError(f"{path}: unreadable `ts_ms` {ts_ms!r}") from error
+            day = days[key]
             # `fill_value` is the field the bot actually writes (175/175
             # leg_fill rows in the archived ledgers carry it, and none
             # carry `notional_usd`); the other name is accepted only so a
@@ -396,11 +408,17 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
     for record in read_jsonl(path):
         date, arm, value = record.get("date"), record.get("arm"), record.get("points")
         if not date or not arm or value is None:
-            continue
+            # This file is written by hand for exactly this report. A line
+            # that cannot be attributed is an operator slip worth seeing,
+            # not points to drop quietly -- dropping them moves the price
+            # per point without saying so.
+            raise SubsidyLedgerError(
+                f"{path}: a points row needs date, arm and points; got {record!r}")
         try:
             points[(str(date), str(arm))] = float(value)
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as error:
+            raise SubsidyLedgerError(
+                f"{path}: unreadable points value {value!r} for {date}/{arm}") from error
     return points
 
 
@@ -628,9 +646,24 @@ def render_table(rows: list[Row], summary: dict) -> str:
 
 
 def expand(patterns: list[str]) -> list[Path]:
+    """Every file the patterns name, each exactly once.
+
+    `--exec-glob` and `--pnl-glob` accumulate, so a broad history pattern
+    beside a single-day one is a natural way to call this -- and without
+    deduplication the overlap is read twice, counting its volume, PnL and
+    funding twice with nothing to show that it happened. Resolved paths are
+    compared, so two patterns reaching the same file by different spellings
+    still collapse to one.
+    """
+    seen: set[Path] = set()
     paths: list[Path] = []
     for pattern in patterns:
-        paths.extend(Path(p) for p in sorted(glob.glob(pattern)))
+        for match in sorted(glob.glob(pattern)):
+            resolved = Path(match).resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            paths.append(Path(match))
     return paths
 
 
