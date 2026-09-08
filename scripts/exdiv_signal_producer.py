@@ -696,7 +696,14 @@ def build_signal(events, d: date, rows_t, rows_prev, now: datetime, gross: float
     evals = [evaluate_event(e, rows_t, rows_prev, cutoff, prev_day, start, cal_path)
              for e in todays]
     weights, agg = weights_from_evals(evals, gross, max_net_usd)
-    used = [r["_t"] for e in todays for r in window_rows(rows_t, e["symbol"], cutoff, start)]
+    # Every row an evaluation actually consumed, control/hedge legs
+    # included: their spread feeds the hedge gate and their mid feeds the
+    # landed gate, so a hedge sample newer than the event's would make
+    # `as_of` predate data the decision was really based on.
+    used = [r["_t"]
+            for e in todays
+            for sym in {e["symbol"], e["hedge"] or "US500"}
+            for r in window_rows(rows_t, sym, cutoff, start)]
     as_of = max(used) if used else cutoff
     meta = {"source": "lighter_exdiv_logger rows + configs/book/exdiv-events.json",
             "date": d.isoformat(), "events": evals, "gross_reference_usd": gross,

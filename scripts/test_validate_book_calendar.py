@@ -79,6 +79,21 @@ class ValidatorTests(unittest.TestCase):
             with self.assertRaises(SystemExit, msg=name):
                 vbc.validate(write(mutate(fn)))
 
+    def test_duplicate_json_keys_are_rejected(self):
+        """json.load keeps the last value; serde rejects the file."""
+        for text in (
+            '{"calendar_version": "a", "calendar_version": "b", "entries": []}',
+            '{"calendar_version": "a", "entries": [], "entries": '
+            '[{"decision_key": "x", "decision_at": "2026-09-15T13:29:00Z"}]}',
+            '{"calendar_version": "a", "entries": [{"decision_key": "x", '
+            '"decision_at": "2026-09-15T13:29:00Z", "decision_at": "2026-09-16T13:29:00Z"}]}',
+        ):
+            fd, p = tempfile.mkstemp(suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            with self.assertRaises(SystemExit, msg=text[:60]):
+                vbc.validate(p)
+
     def test_calendar_version_may_be_absent(self):
         import copy
         d = copy.deepcopy(GOOD)

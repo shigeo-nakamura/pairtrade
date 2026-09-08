@@ -523,6 +523,21 @@ class SignalTests(unittest.TestCase):
         e = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)["meta"]["events"][0]
         self.assertEqual(e["skip"], "hedge_no_fresh_book")
 
+    def test_as_of_covers_the_control_rows_too(self):
+        """The hedge's spread and mid are consumed by the gates, so a
+        hedge sample newer than the event's must move `as_of` with it."""
+        t0 = NOW.replace(minute=23, second=0)
+        rows = ([r for r in base_rows() if r["symbol"] != "US500"]
+                + series("US500", t0 + timedelta(seconds=30), 5, bid=6599.9, ask=6600.1,
+                         bid_sz=20, ask_sz=20))
+        sig = xp.build_signal(EVENTS[:1], D, rows, prev_rows(), NOW)
+        newest_ctl = max(r["_t"] for r in rows if r["symbol"] == "US500")
+        newest_ev = max(r["_t"] for r in rows if r["symbol"] == "SPY")
+        self.assertGreater(newest_ctl, newest_ev)          # the control is ahead
+        self.assertEqual(sig["as_of"], newest_ctl.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        # and it still never runs past the decision
+        self.assertLessEqual(sig["as_of"], "2026-09-18T13:29:00Z")
+
     def test_a_stalled_logger_does_not_trade_on_an_old_book(self):
         """Three rows then silence still satisfies MIN_FRESH_ROWS, and the
         row-age bound in `fresh` cannot reject anything inside a 6-minute

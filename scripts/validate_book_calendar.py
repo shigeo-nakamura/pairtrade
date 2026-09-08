@@ -57,11 +57,22 @@ def ceil_secs(t):
     return math.ceil(t.timestamp())
 
 
+def _no_duplicate_keys(pairs):
+    """serde rejects a repeated struct field; json.load would silently keep
+    the last one and promote a calendar the runtime cannot parse."""
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise SystemExit(f"duplicate JSON key {k!r} in the calendar")
+        seen.add(k)
+    return dict(pairs)
+
+
 def validate(path, grace_secs: int = DEFAULT_GRACE_SECS):
     if grace_secs < 0:
         raise SystemExit(f"--grace-secs must not be negative, got {grace_secs}")
     with open(path) as f:
-        d = json.load(f)
+        d = json.load(f, object_pairs_hook=_no_duplicate_keys)
     if not isinstance(d, dict) or not isinstance(d.get("entries"), list):
         raise SystemExit("calendar must be an object with an 'entries' list")
     extra_top = set(d) - {"calendar_version", "entries"}
