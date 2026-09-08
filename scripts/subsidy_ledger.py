@@ -48,6 +48,16 @@ as zero cost would make the arms' worst stretch look like their cheapest.
 `--equity` fills that gap from an equity_history series, marked as such,
 since an equity delta also carries mark-to-market that a realized-cycle
 ledger does not.
+
+The rule behind that is one invariant, applied everywhere rather than
+per known failure: **a day is costed from the PnL ledger only if every
+row it holds is a realized, live-money close.** A single row that is not
+-- an explicit `pnl_available: false`, a DRY_RUN close, a placeholder
+from recovery, or any `source` this script has not been taught to read
+-- makes that day's PnL coverage incomplete, and the day falls through
+to the equity delta or stays uncosted. The allowlist fails safe in the
+direction that matters: an unrecognised source makes a day *uncosted and
+visibly so*, never free.
 """
 
 from __future__ import annotations
@@ -80,6 +90,12 @@ class PnlDay:
     realized_pnl_usd: float = 0.0
     funding_usd: float = 0.0
     funding_seen: bool = False
+    # Set by any row that is not a realized, live-money close. A day with
+    # this set is never costed from the PnL ledger, however many good rows
+    # it also holds: a partial sum presented as the day's cost is a wrong
+    # number, not a smaller one.
+    incomplete: bool = False
+    incomplete_reasons: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -94,6 +110,8 @@ class Row:
     funding_usd: float | None = None
     cost_usd: float | None = None
     cost_source: str | None = None
+    pnl_coverage: str | None = None
+    pnl_incomplete_reasons: list[str] | None = None
     points: float | None = None
     cost_per_point: float | None = None
     cost_per_musd_volume: float | None = None
@@ -102,18 +120,37 @@ class Row:
         return {k: v for k, v in self.__dict__.items()}
 
 
+class SubsidyLedgerError(ValueError):
+    """A ledger this script cannot read honestly."""
+
+
 def read_jsonl(path: Path) -> Iterable[dict]:
-    """Tolerate a partially written trailing line: these files are appended
-    to by a running bot, so the last row can be torn at any moment."""
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    """Tolerate a torn *final* line, and nothing else.
+
+    These files are appended to by a running bot, so the last row can be
+    half-written at any moment -- but only the last, and only when the
+    file does not end in a newline. Interior corruption (a damaged
+    concatenation, an interrupted recovery) is a different thing
+    entirely: skipping it drops real fills or real closes while the
+    report still presents the day as fully covered, which is the one
+    outcome this KPI must never produce. Those are raised.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    tail_may_be_torn = bool(text) and not text.endswith("\n")
+    for number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            yield json.loads(stripped)
+        except json.JSONDecodeError as error:
+            if number == len(lines) and tail_may_be_torn:
+                return
+            raise SubsidyLedgerError(
+                f"{path}:{number}: malformed JSON in the middle of the ledger "
+                f"({error.msg}); this is not a torn trailing write, so records "
+                "after it cannot be assumed present") from error
 
 
 def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
@@ -151,13 +188,45 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
     return dict(days)
 
 
+# Sources this script knows describe a realized close of real money. Seen
+# across every pnl ledger archived locally (645 rows): `exit_fill` is the
+# live close; `exit_dry_run` is a simulated one and is NOT money; and
+# `recovery_no_pnl` is a placeholder that carries `pnl: 0` with
+# `pnl_available: false` because the result only exists in the venue's
+# ledger. An unlisted source is treated like the last two rather than the
+# first, because the cost of being wrong is asymmetric: an unknown source
+# read as a realized close silently changes the KPI, while an unknown
+# source read as incomplete only makes a day visibly uncosted.
+REALIZED_PNL_SOURCES = frozenset({"exit_fill"})
+
+
+def pnl_row_defect(record: dict) -> str | None:
+    """Why this row cannot stand as a realized live close, or None."""
+    if record.get("pnl_available") is False:
+        return "pnl_available_false"
+    source = record.get("source")
+    if source is None:
+        return "missing_source"
+    if str(source) not in REALIZED_PNL_SOURCES:
+        return f"source:{source}"
+    if record.get("pnl") is None:
+        return "missing_pnl"
+    return None
+
+
 def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
-    """Realized PnL and funding per (date, arm).
+    """Realized PnL and funding per (date, arm), with coverage tracked.
 
     The arm comes from the filename (`pnl-<service>-<arm>-<YYYYMMDD>.jsonl`)
     because the rows themselves do not carry it, and the date from each
     row's own timestamp rather than the filename, so a cycle that closes
     after a UTC rollover lands on the day it actually closed.
+
+    Rows that are not realized live closes are not skipped -- skipping is
+    what let a day of placeholders report as free, and what let a day
+    holding one good close beside one placeholder report that close as if
+    it were the whole day. They mark their (date, arm) incomplete, and
+    `build_rows` then refuses to cost that day from this ledger at all.
     """
     days: dict[tuple[str, str], PnlDay] = defaultdict(PnlDay)
     for path in paths:
@@ -165,22 +234,31 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
         if arm is None:
             continue
         for record in read_jsonl(path):
-            if record.get("pnl") is None:
-                continue
-            # A writer that reports a placeholder alongside an explicit
-            # "not available" flag must not be read as a real zero-PnL
-            # cycle, which would report the day as free. No row in the
-            # live ledger carries this today; it is here because the
-            # failure mode is silent (Codex, PR #297).
-            if record.get("pnl_available") is False:
-                continue
             ts = record.get("ts")
             if ts is None:
+                # Not attributable to any day, so it cannot be counted and
+                # cannot be blamed on a day either. A row carrying a PnL
+                # without a timestamp is a broken writer, not a gap.
+                if record.get("pnl") is not None:
+                    raise SubsidyLedgerError(
+                        f"{path}: a PnL row has no `ts`, so the day it belongs to "
+                        "cannot be determined")
                 continue
-            day = days[(utc_date(float(ts)), arm)]
+            try:
+                key = (utc_date(float(ts)), arm)
+            except (TypeError, ValueError) as error:
+                raise SubsidyLedgerError(f"{path}: unreadable `ts` {ts!r}") from error
+            day = days[key]
+            defect = pnl_row_defect(record)
+            if defect is not None:
+                day.incomplete = True
+                day.incomplete_reasons.add(defect)
+                continue
             try:
                 day.realized_pnl_usd += float(record["pnl"])
             except (TypeError, ValueError):
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_pnl")
                 continue
             day.cycles += 1
             funding = record.get("funding_carry_usd")
@@ -189,7 +267,8 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                     day.funding_usd += float(funding)
                     day.funding_seen = True
                 except (TypeError, ValueError):
-                    pass
+                    day.incomplete = True
+                    day.incomplete_reasons.add("unreadable_funding")
     return dict(days)
 
 
@@ -214,6 +293,13 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     has no previous close to measure against and is skipped rather than
     measured from its own first sample, which would understate whatever
     happened before the series started.
+
+    A gap in the series is skipped for the same reason. If the last close
+    before the 7th is the 5th's, the change across those two days is not
+    the 7th's cost, and charging it to the 7th alone -- then dividing by
+    only the 7th's volume -- reports a day that never happened. The 7th
+    is left uncosted, which `summarize` already reports as uncovered
+    volume.
     """
     last_by_day: dict[str, float] = {}
     for row in rows:
@@ -228,12 +314,18 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     costs: dict[str, float] = {}
-    previous: float | None = None
+    previous_day: str | None = None
     for day in sorted(last_by_day):
-        if previous is not None:
-            costs[day] = -(last_by_day[day] - previous)
-        previous = last_by_day[day]
+        if previous_day is not None and is_next_calendar_day(previous_day, day):
+            costs[day] = -(last_by_day[day] - last_by_day[previous_day])
+        previous_day = day
     return costs
+
+
+def is_next_calendar_day(earlier: str, later: str) -> bool:
+    fmt = "%Y-%m-%d"
+    delta = datetime.strptime(later, fmt) - datetime.strptime(earlier, fmt)
+    return delta.days == 1
 
 
 def load_points(path: Path | None) -> dict[tuple[str, str], float]:
@@ -270,11 +362,15 @@ def build_rows(
             row.fills = day.fills
             row.volume_usd = round(day.volume_usd, 6)
             row.slippage_usd = round(day.slippage_usd, 6)
-        if (date, arm) in pnl:
-            day = pnl[(date, arm)]
+        day = pnl.get((date, arm))
+        if day is not None:
             row.cycles = day.cycles
             row.realized_pnl_usd = round(day.realized_pnl_usd, 6)
             row.funding_usd = round(day.funding_usd, 6) if day.funding_seen else None
+            row.pnl_coverage = "incomplete" if day.incomplete else "complete"
+            if day.incomplete:
+                row.pnl_incomplete_reasons = sorted(day.incomplete_reasons)
+        if day is not None and not day.incomplete:
             row.cost_usd = round(-(day.realized_pnl_usd + day.funding_usd), 6)
             row.cost_source = "pnl_ledger"
         elif date in equity_costs.get(arm, {}):

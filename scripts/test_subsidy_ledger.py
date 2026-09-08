@@ -15,6 +15,7 @@ from subsidy_ledger import (  # noqa: E402
     PnlDay,
     arm_from_pnl_filename,
     build_rows,
+    SubsidyLedgerError,
     equity_daily_costs,
     load_execution,
     load_pnl,
@@ -146,21 +147,114 @@ def test_points_from_uncosted_days_do_not_cheapen_the_price():
     assert summary["cost_per_point"] == 0.1, summary["cost_per_point"]
 
 
-def test_an_explicit_no_pnl_flag_is_not_a_zero_cost_cycle():
+def pnl_file(root: Path, records: list[dict], arm: str = "freq", date: str = "20260908") -> Path:
+    return write(root / f"pnl-debot-pair-robinhood-lighter-{arm}-{date}.jsonl", records)
+
+
+def test_a_day_holding_any_non_realized_row_is_not_costed_from_the_pnl_ledger():
+    """One good close beside one placeholder is not a cheap day.
+
+    This is the shape that matters: a day containing *only* placeholders
+    was already caught, but a mixed day quietly reported the good close
+    as if it were the whole day's cost, and that partial sum then
+    suppressed the equity fallback. Coverage is per day, not per row.
+    """
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl"
-        write(
-            path,
+        path = pnl_file(
+            Path(tmp),
             [
-                {"ts": TS, "pnl": -5.0},
-                # A placeholder zero alongside an explicit unavailable flag
-                # would otherwise be counted as a real break-even cycle.
-                {"ts": TS, "pnl": 0.0, "pnl_available": False},
+                {"ts": TS, "source": "exit_fill", "pnl": -5.0},
+                # Real shape, seen in the archived ledgers: a recovery
+                # placeholder carries pnl 0 and an explicit unavailable flag
+                # because the result only exists in the venue's ledger.
+                {"ts": TS, "source": "recovery_no_pnl", "pnl": 0.0, "pnl_available": False},
             ],
         )
         day = load_pnl([path])[("2026-09-08", "freq")]
         assert day.cycles == 1
         assert day.realized_pnl_usd == -5.0
+        assert day.incomplete
+        assert day.incomplete_reasons == {"pnl_available_false"}
+
+        # The day therefore takes the equity delta, not the partial sum.
+        rows = build_rows(
+            {("2026-09-08", "freq"): ExecDay(fills=2, volume_usd=100_000.0)},
+            {("2026-09-08", "freq"): day},
+            equity_costs={"freq": {"2026-09-08": 31.0}},
+        )
+        assert rows[0].cost_usd == 31.0
+        assert rows[0].cost_source == "equity_delta"
+        assert rows[0].pnl_coverage == "incomplete"
+
+        # With no equity series to fall back on it stays uncosted, never
+        # reported as the partial -(-5.0).
+        bare = build_rows(
+            {("2026-09-08", "freq"): ExecDay(fills=2, volume_usd=100_000.0)},
+            {("2026-09-08", "freq"): day},
+        )[0]
+        assert bare.cost_usd is None and bare.cost_source is None
+
+
+def test_a_dry_run_close_is_not_money():
+    """`exit_dry_run` rows are simulated fills and price nothing.
+
+    129 of the 645 rows in the archived ledgers are these. Costing a day
+    from them would report a number that no account ever paid.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(Path(tmp), [{"ts": TS, "source": "exit_dry_run", "pnl": -9.0}])
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.cycles == 0
+        assert day.incomplete and day.incomplete_reasons == {"source:exit_dry_run"}
+        assert build_rows({}, {("2026-09-08", "freq"): day})[0].cost_usd is None
+
+
+def test_an_unrecognised_source_makes_a_day_uncosted_not_free():
+    """The allowlist fails safe: unknown means unknown, not zero."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(Path(tmp), [{"ts": TS, "source": "some_future_close", "pnl": -4.0}])
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.incomplete and day.cycles == 0
+        row = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=50_000.0)},
+                         {("2026-09-08", "freq"): day})[0]
+        assert row.cost_usd is None
+        assert row.pnl_incomplete_reasons == ["source:some_future_close"]
+        # And the volume it traded is reported as uncovered, not dropped.
+        assert summarize([row])["arms"][0]["uncosted_volume_usd"] == 50_000.0
+
+
+def test_interior_corruption_is_raised_while_a_torn_tail_is_tolerated():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        damaged = root / "execution-debot-pair-robinhood-lighter_20260908.jsonl"
+        damaged.write_text(
+            '{"event": "leg_fill", "ts_ms": 1, "variant": "freq", "notional_usd": 1}\n'
+            '{"event": "leg_fill", "ts_ms"\n'
+            '{"event": "leg_fill", "ts_ms": 2, "variant": "freq", "notional_usd": 2}\n',
+            encoding="utf-8",
+        )
+        try:
+            load_execution([damaged])
+        except SubsidyLedgerError as error:
+            assert "malformed JSON in the middle" in str(error)
+        else:
+            raise AssertionError("interior corruption was silently skipped")
+
+
+def test_an_equity_gap_leaves_the_later_day_uncosted():
+    """A two-day change is not one day's cost.
+
+    Charging a 09-05 -> 09-07 delta entirely to 09-07, then dividing it
+    by only 09-07's volume, reports a day that never happened.
+    """
+    series = [
+        {"ts": 1788609600_000, "equity": 1000.0},   # 2026-09-05
+        {"ts": 1788782400_000, "equity": 900.0},    # 2026-09-07
+        {"ts": 1788868800_000, "equity": 880.0},    # 2026-09-08
+    ]
+    costs = equity_daily_costs(series)
+    assert "2026-09-07" not in costs, costs
+    assert costs["2026-09-08"] == 20.0, costs
 
 
 def test_reads_the_real_ledger_shapes():
@@ -190,9 +284,8 @@ def test_reads_the_real_ledger_shapes():
         write(
             root / "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl",
             [
-                {"ts": TS, "pnl": -3.0, "funding_carry_usd": -0.01},
-                {"ts": TS, "pnl": 1.0, "funding_carry_usd": -0.02},
-                {"ts": TS, "source": "no_pnl_row"},
+                {"ts": TS, "source": "exit_fill", "pnl": -3.0, "funding_carry_usd": -0.01},
+                {"ts": TS, "source": "exit_fill", "pnl": 1.0, "funding_carry_usd": -0.02},
             ],
         )
         pnl = load_pnl(sorted(root.glob("pnl-*.jsonl")))
@@ -200,6 +293,7 @@ def test_reads_the_real_ledger_shapes():
         assert day.cycles == 2
         assert round(day.realized_pnl_usd, 6) == -2.0
         assert round(day.funding_usd, 6) == -0.03
+        assert not day.incomplete
 
         # A torn trailing line (the bot appends while this runs) is skipped,
         # not fatal.
