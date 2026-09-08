@@ -149,10 +149,18 @@ mid feed the gates (never after the decision, so never look-ahead);
 ## Workstation cron (operator adds; agents do not edit crontab)
 
 The workstation runs on UTC, so both possible open times get a line and
-whichever one is not the market's 09:27 simply finds no event window:
+whichever one is not the market's 09:27 simply finds no event window.
+Create the log directory once before installing the lines — the shell
+opens the redirect *before* running Python, so on a first-time setup a
+missing directory makes cron fail without the producer ever starting (and
+`write_signal`'s own `mkdir` never gets the chance to run):
 
 ```
-27 13,14 * * 1-5 python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --verify-host-status s3://debot-dashboard/debot/status/book-exdiv-lighter/status.json --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
+mkdir -p $HOME/bot/logs/exdiv_948
+```
+
+```
+27 13,14 * * 1-5 mkdir -p $HOME/bot/logs/exdiv_948 && python3 $HOME/bot/.worktrees/pairtrade-master/scripts/exdiv_signal_producer.py signal --events $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-events.json --config $HOME/bot/.worktrees/pairtrade-master/configs/book/exdiv-lighter.yaml --verify-host-status s3://debot-dashboard/debot/status/book-exdiv-lighter/status.json --out $HOME/bot/logs/exdiv_948/signal.json --s3-uri s3://debot-dashboard/debot/book/exdiv-lighter/signal.json >> $HOME/bot/logs/exdiv_948/producer.log 2>&1
 ```
 
 `--verify-host-status` reads the running instance's published status and
