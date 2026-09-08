@@ -1568,6 +1568,46 @@ impl EngineBLiveEngine {
     /// end of each tick as a backstop. Writes only on an actual change:
     /// the common case is an unchanged `None`.
     fn persist_position(&mut self) {
+        if self.sync_open_position_field() {
+            atomic_write_json(&self.cfg.state_path, &self.state);
+        }
+    }
+
+    /// The in-memory half of `persist_position`: update
+    /// `state.open_position` and report whether it changed, without
+    /// writing. Callers that are about to persist other state in the same
+    /// breath (`on_exit` -> `mark_day_acted`) use this so the close and
+    /// its accounting land in **one** write -- clearing the recovery
+    /// marker first and booking the PnL second leaves a crash window
+    /// where disk says "flat, nothing to reconcile" while the trade was
+    /// never counted (pairtrade#300 Codex review).
+    fn sync_open_position_field(&mut self) -> bool {
+        // Never let a `None` erase the record before startup
+        // reconciliation has run: between process start and the first
+        // successful `get_positions()`, `self.position` is `None` because
+        // nothing has been restored yet, not because the account is flat.
+        // Clearing it there would turn a resumable position into an
+        // unexplained one on the next read -- flattened and halted
+        // instead of exited on schedule (pairtrade#300 Codex review).
+        if self.position.is_none() {
+            if !self.reconciled {
+                return false;
+            }
+            // Nor a record for a symbol this instance no longer trades:
+            // `self.position` is `None` there because reconciliation
+            // refused to manage an exposure it cannot send orders for,
+            // not because anything closed. Discarding it would lose the
+            // only durable trace of that position (pairtrade#300 Codex
+            // review).
+            if self
+                .state
+                .open_position
+                .as_ref()
+                .is_some_and(|p| p.symbol != self.cfg.us_primary_symbol)
+            {
+                return false;
+            }
+        }
         let persisted = self.position.as_ref().map(|p| PersistedPosition {
             symbol: self.cfg.us_primary_symbol.clone(),
             side: p.side.to_string(),
@@ -1583,10 +1623,11 @@ impl EngineBLiveEngine {
                 .window
                 .map(|(_t0, _t1, t2)| t2 + self.cfg.exit_deadline_secs * 1_000_000),
         });
-        if self.state.open_position != persisted {
-            self.state.open_position = persisted;
-            atomic_write_json(&self.cfg.state_path, &self.state);
+        if self.state.open_position == persisted {
+            return false;
         }
+        self.state.open_position = persisted;
+        true
     }
 
     /// Compare the persisted position with the exchange's own once, before
@@ -1657,6 +1698,33 @@ impl EngineBLiveEngine {
         };
         let live = exchange_position_for(&positions, &symbol);
         let persisted = self.state.open_position.clone();
+        // A change to `us_primary` while a position is still open on the
+        // *old* symbol would otherwise look like `Vanished` -- the lookup
+        // above only asks about the configured symbol -- and the record
+        // would be discarded while the exposure stayed on the exchange.
+        // This engine sends every order for `us_primary`, so it cannot
+        // close the old symbol either: halt, keep the record, and say
+        // exactly what a human has to do (pairtrade#300 Codex review).
+        if let Some(stale) = persisted
+            .as_ref()
+            .filter(|p| p.symbol != symbol)
+            .and_then(|p| {
+                exchange_position_for(&positions, &p.symbol).map(|live| (p.symbol.clone(), live))
+            })
+        {
+            let (old_symbol, live) = stale;
+            let reason = format!(
+                "us_primary is now {symbol} but a {} {old_symbol} position size={:.6} is still \
+                 open; this engine only ever sends orders for {symbol}, so it cannot close that \
+                 one -- flatten {old_symbol} by hand (or set us_primary back to {old_symbol}). \
+                 The record is kept, not discarded",
+                live.side, live.size
+            );
+            log::error!("[RECONCILE] {reason}");
+            self.halt_session(reason);
+            self.reconciled = true;
+            return;
+        }
         let action = reconcile_action(persisted.as_ref(), live.as_ref(), &symbol, &today, now_us);
         match action {
             ReconcileAction::Clean => {
@@ -3281,8 +3349,11 @@ impl EngineBLiveEngine {
         // the end of the tick: a crash in between would otherwise leave a
         // record of a position the exchange no longer holds, which the
         // next start would read as `Vanished` and halt on
-        // (bot-strategy#917).
-        self.persist_position();
+        // (bot-strategy#917). Field only -- `mark_day_acted` below writes
+        // it together with the PnL, trade counters and drawdown this
+        // close produced, so the two can never disagree on disk
+        // (pairtrade#300 Codex review).
+        self.sync_open_position_field();
         let sign = match pos.side {
             OrderSide::Long => 1.0,
             OrderSide::Short => -1.0,
@@ -5987,6 +6058,132 @@ mod tests {
         h.engine.on_exit(1769.1, T2_US);
         assert!(h.engine.state.open_position.is_none());
         assert!(load_state(&h.engine.cfg.state_path).open_position.is_none());
+    }
+
+    /// pairtrade#300 Codex review, P1: the end-of-tick backstop must not
+    /// erase the recovery record just because the account could not be
+    /// read yet.
+    #[tokio::test]
+    async fn a_failed_first_read_does_not_erase_the_recovery_record() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.state.last_session_date = Some(TODAY.to_string());
+        h.connector
+            .fail_get_positions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        h.set_now(T1_US + 60_000_000);
+        h.engine.tick().await;
+        assert!(!h.engine.reconciled);
+        assert!(
+            h.engine.state.open_position.is_some(),
+            "the record must survive a failed read"
+        );
+        // And once the account reads, the position is resumed normally --
+        // not adopted as unknown, not halted.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.connector
+            .fail_get_positions
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        h.engine.tick().await;
+        assert!(h.engine.reconciled);
+        let resumed = h.engine.position.clone().expect("resumed");
+        assert!(!resumed.flatten_asap, "resumed on schedule, not flattened");
+        assert!(!h.engine.state.session_halted);
+    }
+
+    /// pairtrade#300 Codex review, P1: a `us_primary` change must not
+    /// orphan a position still open on the old symbol.
+    #[tokio::test]
+    async fn a_position_on_a_previous_us_primary_halts_and_keeps_its_record() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Persisted on SNDK; the instance now trades MU.
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(h.engine.state.session_halted, "halt");
+        let reason = h
+            .engine
+            .state
+            .session_halt_reason
+            .clone()
+            .unwrap_or_default();
+        assert!(reason.contains("SNDK"), "unexpected: {reason}");
+        assert!(
+            h.engine.state.open_position.is_some(),
+            "the record must be kept, not discarded"
+        );
+        assert!(
+            h.engine.position.is_none(),
+            "never adopt a symbol this engine cannot send orders for"
+        );
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "and never close the wrong one"
+        );
+    }
+
+    /// pairtrade#300 Codex review, P2: clearing the record and booking the
+    /// close must reach disk together.
+    #[tokio::test]
+    async fn the_close_and_its_accounting_reach_disk_in_one_write() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+        });
+        h.engine.persist_position();
+        h.engine.on_exit(1769.1, T2_US);
+        // Whatever is on disk must never show "flat" without also showing
+        // the trade that made it flat.
+        let on_disk = load_state(&h.engine.cfg.state_path);
+        assert!(on_disk.open_position.is_none());
+        assert_eq!(on_disk.total_trades, 1);
+        assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// The mechanism behind the test above: the field sync on its own must
+    /// leave the state file untouched, so a crash between clearing the
+    /// record and booking the close cannot land the first without the
+    /// second (pairtrade#300 Codex review, P2).
+    #[tokio::test]
+    async fn syncing_the_field_alone_does_not_touch_the_state_file() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+        });
+        h.engine.persist_position();
+        let before = std::fs::read_to_string(&h.engine.cfg.state_path).unwrap();
+        assert!(before.contains("open_position"));
+        h.engine.position = None;
+        assert!(h.engine.sync_open_position_field(), "the field did change");
+        let after = std::fs::read_to_string(&h.engine.cfg.state_path).unwrap();
+        assert_eq!(before, after, "but nothing was written");
     }
 
     #[tokio::test]
