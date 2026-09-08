@@ -16,6 +16,18 @@ impl Default for EmailClient {
 }
 
 impl EmailClient {
+    /// Whether the three environment variables `new()` needs are all
+    /// present. Callers that treat notifications as a precondition (an
+    /// unattended bot whose only alert path is e-mail) can check this at
+    /// startup instead of discovering it from a `WARN` at the first send
+    /// that mattered -- bot-strategy#968, where `engine-b-live` ran for
+    /// days silently dropping every entry, exit and halt notification.
+    pub fn is_configured() -> bool {
+        env::var("GMAIL_USER").is_ok()
+            && (env::var("GMAIL_TO").is_ok() || env::var("TO_ADDRESS").is_ok())
+            && env::var("GMAIL_APP_PASSWORD").is_ok()
+    }
+
     pub fn new() -> Self {
         let from_address = env::var("GMAIL_USER").ok();
         // Prefer GMAIL_TO (matches stock-signal-bot convention); fall back to
