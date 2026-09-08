@@ -124,6 +124,45 @@ def test_points_are_optional_and_only_divide_when_present():
     assert zero.cost_per_point is None
 
 
+def test_points_from_uncosted_days_do_not_cheapen_the_price():
+    # Points earned on a day whose cost is unknown must not enter the
+    # denominator: the numerator only covers the costed days, so counting
+    # them would understate the price per point.
+    rows = build_rows(
+        {
+            ("2026-08-20", "freq"): ExecDay(fills=5, volume_usd=500_000.0),
+            ("2026-09-08", "freq"): ExecDay(fills=5, volume_usd=500_000.0),
+        },
+        {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-100.0)},
+        None,
+        {("2026-08-20", "freq"): 3000.0, ("2026-09-08", "freq"): 1000.0},
+    )
+    assert rows[0].cost_usd is None and rows[0].points == 3000.0
+    summary = summarize(rows)["arms"][0]
+    assert summary["cost_usd"] == 100.0
+    assert summary["points"] == 1000.0
+    assert summary["uncosted_points"] == 3000.0
+    # $100 / 1000 points, not $100 / 4000.
+    assert summary["cost_per_point"] == 0.1, summary["cost_per_point"]
+
+
+def test_an_explicit_no_pnl_flag_is_not_a_zero_cost_cycle():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl"
+        write(
+            path,
+            [
+                {"ts": TS, "pnl": -5.0},
+                # A placeholder zero alongside an explicit unavailable flag
+                # would otherwise be counted as a real break-even cycle.
+                {"ts": TS, "pnl": 0.0, "pnl_available": False},
+            ],
+        )
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.cycles == 1
+        assert day.realized_pnl_usd == -5.0
+
+
 def test_reads_the_real_ledger_shapes():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

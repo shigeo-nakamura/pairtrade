@@ -12,11 +12,19 @@ What the row means
 `cost_usd` is money given up, so it is **positive when the arm lost** and
 negative when it came out ahead. It is `-(realized_pnl + funding)`.
 
-Fees and slippage are deliberately **not** subtracted on top of that.
-Realized PnL is computed from actual fill prices and is already net of
-both; subtracting them again would double-count the same dollars. The
-slippage column is carried as a diagnostic — it says where the cost came
-from — and is never added into `cost_usd`.
+Slippage is deliberately **not** subtracted on top of that. Realized PnL
+is computed from actual fill prices and already carries it; subtracting
+it again would double-count the same dollars. The slippage column is a
+diagnostic — it says where the cost came from — and is never added into
+`cost_usd`.
+
+Fees are a known gap rather than a decision: **no fee field is recorded
+anywhere** in this bot's ledgers (checked across the execution ledger for
+2026-08-14..09-08). If the venue charges a taker fee that the PnL row's
+price arithmetic does not already capture, every cost below understates
+it by that amount, uniformly. Closing this needs the bot to record
+`filled_fee` from the fill response; it cannot be recovered from what is
+written today, and is not guessed at here.
 
 The denominator
 ---------------
@@ -159,6 +167,13 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
         for record in read_jsonl(path):
             if record.get("pnl") is None:
                 continue
+            # A writer that reports a placeholder alongside an explicit
+            # "not available" flag must not be read as a real zero-PnL
+            # cycle, which would report the day as free. No row in the
+            # live ledger carries this today; it is here because the
+            # failure mode is silent (Codex, PR #297).
+            if record.get("pnl_available") is False:
+                continue
             ts = record.get("ts")
             if ts is None:
                 continue
@@ -294,6 +309,7 @@ def summarize(rows: list[Row]) -> dict:
                 "uncosted_volume_usd": 0.0,
                 "cost_usd": 0.0,
                 "points": 0.0,
+                "uncosted_points": 0.0,
                 "points_seen": False,
                 "cost_days": 0,
             },
@@ -308,8 +324,15 @@ def summarize(rows: list[Row]) -> dict:
             arm["costed_volume_usd"] += row.volume_usd
             arm["cost_days"] += 1
         if row.points is not None:
-            arm["points"] += row.points
             arm["points_seen"] = True
+            if row.cost_usd is None:
+                # Points earned on a day whose cost is unknown. Counting
+                # them would divide a partial numerator by a full
+                # denominator and understate the price per point
+                # (Codex, PR #297).
+                arm["uncosted_points"] += row.points
+            else:
+                arm["points"] += row.points
     for arm in by_arm.values():
         for key in ("volume_usd", "costed_volume_usd", "uncosted_volume_usd", "cost_usd"):
             arm[key] = round(arm[key], 6)
@@ -325,6 +348,9 @@ def summarize(rows: list[Row]) -> dict:
         )
         if not arm["points_seen"]:
             arm["points"] = None
+            arm["uncosted_points"] = None
+        else:
+            arm["uncosted_points"] = round(arm["uncosted_points"], 6)
         del arm["points_seen"]
     return {"arms": [by_arm[a] for a in sorted(by_arm)]}
 
@@ -367,6 +393,11 @@ def render_table(rows: list[Row], summary: dict) -> str:
             out.append(
                 f"         {arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
             )
+            if arm["uncosted_points"]:
+                out.append(
+                    f"         {arm['uncosted_points']:,.1f} points earned on uncosted days "
+                    f"are excluded from that price"
+                )
     return "\n".join(out)
 
 
