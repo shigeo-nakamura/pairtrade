@@ -163,7 +163,7 @@ def test_a_day_holding_any_non_realized_row_is_not_costed_from_the_pnl_ledger():
         path = pnl_file(
             Path(tmp),
             [
-                {"ts": TS, "source": "exit_fill", "pnl": -5.0},
+                {"ts": TS, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600},
                 # Real shape, seen in the archived ledgers: a recovery
                 # placeholder carries pnl 0 and an explicit unavailable flag
                 # because the result only exists in the venue's ledger.
@@ -202,7 +202,7 @@ def test_a_dry_run_close_is_not_money():
     from them would report a number that no account ever paid.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        path = pnl_file(Path(tmp), [{"ts": TS, "source": "exit_dry_run", "pnl": -9.0}])
+        path = pnl_file(Path(tmp), [{"ts": TS, "source": "exit_dry_run", "pnl": -9.0, "hold_secs": 600}])
         day = load_pnl([path])[("2026-09-08", "freq")]
         assert day.cycles == 0
         assert day.incomplete and day.incomplete_reasons == {"source:exit_dry_run"}
@@ -212,7 +212,7 @@ def test_a_dry_run_close_is_not_money():
 def test_an_unrecognised_source_makes_a_day_uncosted_not_free():
     """The allowlist fails safe: unknown means unknown, not zero."""
     with tempfile.TemporaryDirectory() as tmp:
-        path = pnl_file(Path(tmp), [{"ts": TS, "source": "some_future_close", "pnl": -4.0}])
+        path = pnl_file(Path(tmp), [{"ts": TS, "source": "some_future_close", "pnl": -4.0, "hold_secs": 600}])
         day = load_pnl([path])[("2026-09-08", "freq")]
         assert day.incomplete and day.cycles == 0
         row = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=50_000.0)},
@@ -257,6 +257,93 @@ def test_an_equity_gap_leaves_the_later_day_uncosted():
     assert costs["2026-09-08"] == 20.0, costs
 
 
+def test_a_ratio_never_mixes_a_cost_with_another_day_denominator():
+    """Numerator and denominator must come from the same rows.
+
+    The three inputs are selected independently and cover different day
+    ranges, so a cost on a day the other input does not cover has no
+    denominator of its own. Charging it to the days that do have one
+    produces a number about no real period.
+    """
+    rows = build_rows(
+        # 09-07 traded but no points were supplied for it; 09-08 has both.
+        {("2026-09-07", "freq"): ExecDay(fills=1, volume_usd=1_000_000.0),
+         ("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=1_000_000.0)},
+        {("2026-09-07", "freq"): PnlDay(cycles=1, realized_pnl_usd=-100.0, funding_seen=True),
+         ("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-100.0, funding_seen=True)},
+        points={("2026-09-08", "freq"): 1000.0},
+    )
+    arm = summarize(rows)["arms"][0]
+    # $100 over the 1000 points that were actually supplied, not $200.
+    assert arm["cost_per_point"] == 0.1, arm["cost_per_point"]
+    assert arm["cost_usd_without_points"] == 100.0
+    # The volume ratio still spans both days, because both measured volume.
+    assert arm["cost_usd"] == 200.0
+    assert arm["cost_per_musd_volume"] == 100.0, arm["cost_per_musd_volume"]
+
+
+def test_a_cost_with_no_execution_coverage_stays_out_of_the_volume_rate():
+    """A PnL day whose execution file was not passed has no volume of its own."""
+    rows = build_rows(
+        {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=1_000_000.0)},
+        {("2026-09-07", "freq"): PnlDay(cycles=1, realized_pnl_usd=-500.0, funding_seen=True),
+         ("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-100.0, funding_seen=True)},
+    )
+    arm = summarize(rows)["arms"][0]
+    assert arm["cost_usd"] == 600.0
+    assert arm["cost_usd_without_volume"] == 500.0
+    # $100 on the $1M actually measured, not $600.
+    assert arm["cost_per_musd_volume"] == 100.0, arm["cost_per_musd_volume"]
+
+
+def test_a_fill_without_a_value_makes_the_day_volume_a_lower_bound():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 10_000.0, "filled_qty": 1.0},
+                # Filled, but the value is missing: real volume, unmeasured.
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq", "filled_qty": 2.0},
+            ],
+        )
+        day = load_execution([path])[("2026-09-08", "freq")]
+        assert day.volume_usd == 10_000.0
+        assert day.fills_without_value == 1
+
+        # That day's cost is therefore kept out of the per-volume rate,
+        # rather than divided by a denominator known to be short.
+        rows = build_rows({("2026-09-08", "freq"): day},
+                          {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-50.0,
+                                                          funding_seen=True)})
+        arm = summarize(rows)["arms"][0]
+        assert arm["cost_per_musd_volume"] is None
+        assert arm["cost_usd_without_volume"] == 50.0
+        assert arm["fills_without_value"] == 1
+
+
+def test_a_hold_spanning_a_funding_interval_needs_funding_coverage():
+    """Absent funding is a real zero on a short hold and a gap on a long one.
+
+    In the archived ledgers all 101 exit_fill rows without the field were
+    held under an hour, so requiring it on every close would strike out a
+    fifth of real coverage for nothing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root_short = Path(tmp) / "short"
+        root_short.mkdir()
+        root_long = Path(tmp) / "long"
+        root_long.mkdir()
+        brief = pnl_file(root_short, [{"ts": TS, "source": "exit_fill", "pnl": -2.0,
+                                       "hold_secs": 900}])
+        assert not load_pnl([brief])[("2026-09-08", "freq")].incomplete
+
+        held = pnl_file(root_long, [{"ts": TS, "source": "exit_fill", "pnl": -2.0,
+                                     "hold_secs": 7200}])
+        day = load_pnl([held])[("2026-09-08", "freq")]
+        assert day.incomplete and day.incomplete_reasons == {"funding_gap"}
+
+
 def test_reads_the_real_ledger_shapes():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -284,8 +371,10 @@ def test_reads_the_real_ledger_shapes():
         write(
             root / "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl",
             [
-                {"ts": TS, "source": "exit_fill", "pnl": -3.0, "funding_carry_usd": -0.01},
-                {"ts": TS, "source": "exit_fill", "pnl": 1.0, "funding_carry_usd": -0.02},
+                {"ts": TS, "source": "exit_fill", "pnl": -3.0, "funding_carry_usd": -0.01,
+                 "hold_secs": 4000, "funding_ticks_observed": 1},
+                {"ts": TS, "source": "exit_fill", "pnl": 1.0, "funding_carry_usd": -0.02,
+                 "hold_secs": 4000, "funding_ticks_observed": 1},
             ],
         )
         pnl = load_pnl(sorted(root.glob("pnl-*.jsonl")))

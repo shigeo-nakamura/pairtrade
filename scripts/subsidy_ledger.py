@@ -82,6 +82,10 @@ class ExecDay:
     fills: int = 0
     volume_usd: float = 0.0
     slippage_usd: float = 0.0
+    # A fill that moved quantity but reported no value. Its volume is
+    # missing from the denominator, so the day's volume is a lower bound
+    # rather than the number it looks like.
+    fills_without_value: int = 0
 
 
 @dataclass
@@ -104,6 +108,7 @@ class Row:
     arm: str
     fills: int = 0
     volume_usd: float = 0.0
+    fills_without_value: int = 0
     slippage_usd: float | None = None
     cycles: int | None = None
     realized_pnl_usd: float | None = None
@@ -153,6 +158,19 @@ def read_jsonl(path: Path) -> Iterable[dict]:
                 "after it cannot be assumed present") from error
 
 
+def quantity_moved(record: dict) -> bool:
+    """Did this leg_fill actually fill anything?"""
+    for key in ("filled_qty", "fill_qty", "submitted_qty"):
+        value = record.get(key)
+        if value is None:
+            continue
+        try:
+            return abs(float(value)) > 0
+        except (TypeError, ValueError):
+            return True
+    return True
+
+
 def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
     """Volume and execution slippage per (date, arm) from `leg_fill` rows.
 
@@ -170,15 +188,26 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
             if ts_ms is None or not arm:
                 continue
             day = days[(utc_date(ts_ms / 1000.0), str(arm))]
-            notional = record.get("notional_usd")
+            # `fill_value` is the field the bot actually writes (175/175
+            # leg_fill rows in the archived ledgers carry it, and none
+            # carry `notional_usd`); the other name is accepted only so a
+            # differently-shaped export is not silently read as zero.
+            notional = record.get("fill_value")
             if notional is None:
-                notional = record.get("fill_value")
-            if notional is not None:
+                notional = record.get("notional_usd")
+            if notional is None:
+                # Quantity moved with no value attached: the volume is
+                # real but unmeasured. Ignoring it would leave the day
+                # looking fully covered on an understated denominator,
+                # which inflates every per-volume cost.
+                if quantity_moved(record):
+                    day.fills_without_value += 1
+            else:
                 try:
                     day.volume_usd += abs(float(notional))
                     day.fills += 1
                 except (TypeError, ValueError):
-                    pass
+                    day.fills_without_value += 1
             slip = record.get("slippage_usd_vs_decision")
             if slip is not None:
                 try:
@@ -198,6 +227,15 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
 # read as a realized close silently changes the KPI, while an unknown
 # source read as incomplete only makes a day visibly uncosted.
 REALIZED_PNL_SOURCES = frozenset({"exit_fill"})
+
+# Lighter funds hourly. The writer omits `funding_carry_usd` when nothing
+# accrued rather than writing a zero, and the archived ledgers agree
+# exactly: of 514 `exit_fill` rows, all 101 without the field were held
+# under an hour, and none of the 413 with it observed zero ticks. So an
+# absent field on a *short* hold is a real zero, while a hold that spans
+# an interval with no funding coverage is a feed gap -- and a gap read as
+# zero understates the subsidy cost silently.
+FUNDING_INTERVAL_SECS = 3600
 
 
 def pnl_row_defect(record: dict) -> str | None:
@@ -262,14 +300,35 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             day.cycles += 1
             funding = record.get("funding_carry_usd")
-            if funding is not None:
-                try:
-                    day.funding_usd += float(funding)
-                    day.funding_seen = True
-                except (TypeError, ValueError):
+            if funding is None:
+                if spans_a_funding_interval(record):
                     day.incomplete = True
-                    day.incomplete_reasons.add("unreadable_funding")
+                    day.incomplete_reasons.add("funding_gap")
+                continue
+            try:
+                day.funding_usd += float(funding)
+                day.funding_seen = True
+            except (TypeError, ValueError):
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_funding")
+                continue
+            if record.get("funding_ticks_observed") == 0 and spans_a_funding_interval(record):
+                day.incomplete = True
+                day.incomplete_reasons.add("funding_gap")
     return dict(days)
+
+
+def spans_a_funding_interval(record: dict) -> bool:
+    """Was this position held long enough for funding to have accrued?"""
+    hold = record.get("hold_secs")
+    if hold is None:
+        # Unknown hold, so the absence of funding cannot be read as a real
+        # zero either.
+        return True
+    try:
+        return float(hold) >= FUNDING_INTERVAL_SECS
+    except (TypeError, ValueError):
+        return True
 
 
 def arm_from_pnl_filename(name: str) -> str | None:
@@ -361,6 +420,7 @@ def build_rows(
             day = execution[(date, arm)]
             row.fills = day.fills
             row.volume_usd = round(day.volume_usd, 6)
+            row.fills_without_value = day.fills_without_value
             row.slippage_usd = round(day.slippage_usd, 6)
         day = pnl.get((date, arm))
         if day is not None:
@@ -391,6 +451,18 @@ def summarize(rows: list[Row]) -> dict:
     `uncosted_volume_usd` is the honest caveat on every ratio below it: a
     day the cost is unknown for still traded, so the totals describe less
     than the whole program.
+
+    Every ratio here obeys one rule: **it is computed over exactly the
+    rows that carry all of its inputs.** A cost is admitted to a ratio's
+    numerator only if that same row also supplied the denominator. The
+    two inputs are independently selectable (`--exec-glob`, `--pnl-glob`,
+    `--points`) and cover different day ranges on the live host, so
+    without that rule a day costed but not measured -- or measured but
+    with no points supplied -- lands its whole cost on some other day's
+    denominator. That does not make the ratio slightly wrong; it makes it
+    a number about no real period. Costs excluded this way are reported
+    rather than dropped, as `cost_usd_without_volume` and
+    `cost_usd_without_points`.
     """
     by_arm: dict[str, dict] = {}
     for row in rows:
@@ -404,21 +476,41 @@ def summarize(rows: list[Row]) -> dict:
                 "costed_volume_usd": 0.0,
                 "uncosted_volume_usd": 0.0,
                 "cost_usd": 0.0,
+                "cost_usd_on_measured_volume": 0.0,
+                "cost_usd_without_volume": 0.0,
+                "cost_usd_on_pointed_days": 0.0,
+                "cost_usd_without_points": 0.0,
                 "points": 0.0,
                 "uncosted_points": 0.0,
                 "points_seen": False,
                 "cost_days": 0,
+                "fills_without_value": 0,
+                "incomplete_volume_days": 0,
             },
         )
         arm["days"] += 1
         arm["fills"] += row.fills
         arm["volume_usd"] += row.volume_usd
+        arm["fills_without_value"] += row.fills_without_value or 0
+        if row.fills_without_value:
+            arm["incomplete_volume_days"] += 1
         if row.cost_usd is None:
             arm["uncosted_volume_usd"] += row.volume_usd
         else:
             arm["cost_usd"] += row.cost_usd
-            arm["costed_volume_usd"] += row.volume_usd
             arm["cost_days"] += 1
+            # Volume ratio: this cost counts only if this row measured the
+            # volume it was spent on.
+            if row.volume_usd > 0 and not row.fills_without_value:
+                arm["cost_usd_on_measured_volume"] += row.cost_usd
+                arm["costed_volume_usd"] += row.volume_usd
+            else:
+                arm["cost_usd_without_volume"] += row.cost_usd
+            # Points ratio: likewise, only if this row supplied points.
+            if row.points is not None and row.points > 0:
+                arm["cost_usd_on_pointed_days"] += row.cost_usd
+            else:
+                arm["cost_usd_without_points"] += row.cost_usd
         if row.points is not None:
             arm["points_seen"] = True
             if row.cost_usd is None:
@@ -430,21 +522,24 @@ def summarize(rows: list[Row]) -> dict:
             else:
                 arm["points"] += row.points
     for arm in by_arm.values():
-        for key in ("volume_usd", "costed_volume_usd", "uncosted_volume_usd", "cost_usd"):
+        for key in ("volume_usd", "costed_volume_usd", "uncosted_volume_usd", "cost_usd",
+                    "cost_usd_on_measured_volume", "cost_usd_without_volume",
+                    "cost_usd_on_pointed_days", "cost_usd_without_points"):
             arm[key] = round(arm[key], 6)
         arm["cost_per_musd_volume"] = (
-            round(arm["cost_usd"] / (arm["costed_volume_usd"] / 1e6), 4)
+            round(arm["cost_usd_on_measured_volume"] / (arm["costed_volume_usd"] / 1e6), 4)
             if arm["costed_volume_usd"] > 0
             else None
         )
         arm["cost_per_point"] = (
-            round(arm["cost_usd"] / arm["points"], 8)
+            round(arm["cost_usd_on_pointed_days"] / arm["points"], 8)
             if arm["points_seen"] and arm["points"] > 0
             else None
         )
         if not arm["points_seen"]:
             arm["points"] = None
             arm["uncosted_points"] = None
+            arm["cost_usd_without_points"] = None
         else:
             arm["uncosted_points"] = round(arm["uncosted_points"], 6)
         del arm["points_seen"]
@@ -485,6 +580,17 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"         ${arm['uncosted_volume_usd']:,.0f} of that volume has no cost "
                 f"source and is excluded above"
             )
+        if arm["cost_usd_without_volume"]:
+            out.append(
+                f"         ${arm['cost_usd_without_volume']:,.2f} of cost fell on days whose "
+                f"volume is unmeasured and is excluded from that rate"
+            )
+        if arm["fills_without_value"]:
+            out.append(
+                f"         {arm['fills_without_value']} fill(s) across "
+                f"{arm['incomplete_volume_days']} day(s) reported no value, so those days' "
+                f"volume is a lower bound"
+            )
         if arm["cost_per_point"] is not None:
             out.append(
                 f"         {arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
@@ -493,6 +599,11 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 out.append(
                     f"         {arm['uncosted_points']:,.1f} points earned on uncosted days "
                     f"are excluded from that price"
+                )
+            if arm["cost_usd_without_points"]:
+                out.append(
+                    f"         ${arm['cost_usd_without_points']:,.2f} of cost fell on days with "
+                    f"no points supplied and is excluded from that price"
                 )
     return "\n".join(out)
 
