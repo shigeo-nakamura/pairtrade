@@ -8298,51 +8298,47 @@ mod tests {
     #[test]
     fn a_lagging_pre_cutoff_mark_still_halts_after_the_stamp() {
         // The discard stamp is a fact about the calendar, not about a
-        // particular mark. An ordinary overview lag on the tick *after* the
-        // stamp still produces a pre-event mark, and suppressing it would
-        // drop a genuine breach for good -- and disagree with the continuity
-        // verifier, which applies the price clock.
+        // particular mark. Once it exists, an ordinary overview lag still
+        // produces a pre-event mark, and suppressing it would drop a genuine
+        // breach for good -- and disagree with the continuity verifier,
+        // which applies the price clock.
         let anchor = event_time();
         let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
         seed_observed_identities(&mut runtime, anchor);
+        // $4.00 short of the basket at 200, against the $2 daily limit.
         runtime.state.inventory.token_a = Decimal::new(98, 2);
 
-        // effective_at is +4s. This tick is processed past it but priced
-        // before it, so the gate stamps.
-        let priced_at = anchor + Duration::seconds(3);
+        // effective_at is +4s. This tick is priced *after* it, so the units
+        // are stale, no halt is owed -- and the gate writes the stamp.
+        let stamping = anchor + Duration::seconds(5);
         runtime.step_at(
-            &snapshot_with_overview_received_at(priced_at, priced_at),
-            anchor + Duration::seconds(5),
+            &snapshot_with_overview_received_at(stamping, stamping),
+            stamping,
         );
         assert!(runtime
             .state
             .corporate_action
             .as_ref()
             .is_some_and(|p| p.history_invalidated_at.is_some()));
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "post-cutoff prices are stale units"
+        );
 
-        // The next tick lags the same way: still pre-event prices, and the
-        // $4.00 shortfall against the $2 limit is real.
+        // The next collection lags: its overview was received before the
+        // cutoff, so this is a pre-event mark and the shortfall is real.
+        let lagging = anchor + Duration::seconds(6);
         runtime.step_at(
-            &snapshot_with_overview_received_at(priced_at, priced_at),
-            anchor + Duration::seconds(6),
+            &snapshot_with_overview_received_at(lagging, anchor + Duration::seconds(3)),
+            lagging,
         );
         assert!(
             runtime.state.risk_halt.is_some(),
             "a pre-cutoff mark is measured in the units the venue was quoting",
         );
-
-        // A mark priced after the cutoff stays suppressed.
-        let mut post = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
-        seed_entry_signal_history(&mut post);
-        post.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
-        seed_observed_identities(&mut post, anchor);
-        post.state.inventory.token_a = Decimal::new(98, 2);
-        let at = anchor + Duration::seconds(5);
-        post.step_at(&snapshot_with_overview_received_at(at, at), at);
-        assert_eq!(post.state.risk_halt, None);
     }
 
     #[test]
