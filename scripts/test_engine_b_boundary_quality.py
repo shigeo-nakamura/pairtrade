@@ -177,6 +177,28 @@ class QualityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'must be booleans'):
                     self.report()
 
+    def test_boundary_timestamps_must_satisfy_the_producer_rule(self):
+        # The same predicate the collector applies
+        # (TradingCalendar._valid_timestamp_us): not merely "an int in
+        # order". Ordered pre-epoch values would otherwise search 1969
+        # partitions and exit 0 with an ordinary boundary_preflight_fail,
+        # and an out-of-range value is not storable in the collector's own
+        # SQLite column.
+        for times in (
+            [-3_000_000, -2_000_000, -1_000_000],
+            [0, 1, 2**63],
+            [1.0, 2.0, 3.0],
+            [True, 2, 3],
+        ):
+            with self.subTest(times=times):
+                calendar = json.loads(self.calendar.read_text())
+                session = calendar['sessions']['2026-09-08']
+                (session['krx_open_utc_us'], session['krx_close_utc_us'],
+                 session['us_open_utc_us']) = times
+                self.calendar.write_text(json.dumps(calendar))
+                with self.assertRaisesRegex(ValueError, 'invalid boundary timestamps'):
+                    self.report()
+
     def test_conflicting_alias_snapshot_is_ambiguous(self):
         combined = json.loads(json.dumps(self.config))
         old = dict(combined['venues'][0], name='lighter_mainnet_context')

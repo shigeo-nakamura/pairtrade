@@ -16,6 +16,19 @@ ALIASES = ("lighter", "lighter_mainnet_context")
 MAINNET = "mainnet.zklighter.elliot.ai"
 HOUR = 3_600_000_000
 SECOND = 1_000_000
+# The producer's own session-entry rule, copied whole rather than
+# approximated: `TradingCalendar._valid_timestamp_us` in
+# scripts/engine_b_phase0.py. `type(v) is int` because bool subclasses int,
+# a lower bound because a pre-epoch microsecond is never a session
+# boundary, and an upper bound because the collector stores these in a
+# SQLite signed integer column. Reading a calendar the collector itself
+# would refuse must be an input error here too, not a boundary_preflight_fail
+# derived from searching 1969 (Codex, PR #311).
+SQLITE_INT_MAX = 2**63 - 1
+
+
+def valid_timestamp_us(value) -> bool:
+    return type(value) is int and 0 <= value <= SQLITE_INT_MAX
 
 
 def digest(path):
@@ -210,7 +223,7 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
                 row["status"] = "market_closed"
             else:
                 times = [session["krx_open_utc_us"], session["krx_close_utc_us"], session["us_open_utc_us"]]
-                if any(type(t) is not int for t in times) or not times[0] < times[1] < times[2]:
+                if not all(valid_timestamp_us(t) for t in times) or not times[0] < times[1] < times[2]:
                     raise ValueError(f"{day}: invalid boundary timestamps")
                 row["boundaries"] = {label: boundary(dataset, t, symbols, max_age_seconds * SECOND, window_seconds * SECOND)
                                      for label, t in zip(("t0", "t1", "t2"), times)}
