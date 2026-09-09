@@ -342,6 +342,16 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
                 # boundaries must be usable as t0 < t1 < t2.
                 if not times[0] < times[1] < times[2]:
                     raise ValueError(f"{day}: boundary timestamps out of order")
+                # ... and they must belong to this session date. Three
+                # ordered timestamps from another day pass every field
+                # check, and the prices found at them would be recorded
+                # under the requested date and contaminate date-level
+                # analysis. Every boundary in the checked-in calendar falls
+                # on its own UTC date (KRX opens at 00:00 UTC), so this is
+                # an invariant of the data, not a new constraint on it
+                # (Codex, PR #311).
+                if any(datetime.fromtimestamp(t / SECOND, timezone.utc).date() != day for t in times):
+                    raise ValueError(f"{day}: boundary timestamps do not fall on the session date")
                 row["boundaries"] = {label: boundary(dataset, t, symbols, max_age_seconds * SECOND, window_seconds * SECOND)
                                      for label, t in zip(("t0", "t1", "t2"), times)}
                 row["status"] = "boundary_preflight_pass" if all(b["boundary_preflight_pass"] for b in row["boundaries"].values()) else "boundary_preflight_fail"

@@ -233,6 +233,19 @@ class QualityTests(unittest.TestCase):
         self.calendar.write_text(json.dumps(calendar))
         self.assertEqual(self.report()['days'][0]['status'], 'market_closed')
 
+    def test_boundaries_must_fall_on_the_session_date(self):
+        # A stale or alternate calendar whose 2026-09-08 entry carries
+        # September 7's boundaries: ordered, well-formed, and wrong. The
+        # partitions for that day exist in the fixture only by accident of
+        # the window, so this would otherwise be recorded as a 09-08 result.
+        calendar = json.loads(self.calendar.read_text())
+        session = calendar['sessions']['2026-09-08']
+        for key in ('krx_open_utc_us', 'krx_close_utc_us', 'us_open_utc_us'):
+            session[key] -= 24 * HOUR
+        self.calendar.write_text(json.dumps(calendar))
+        with self.assertRaisesRegex(ValueError, 'do not fall on the session date'):
+            self.report()
+
     def test_open_connections_are_bounded(self):
         # A full 2026-2027 range touches ~1,900 hourly partitions; one open
         # connection each exhausts RLIMIT_NOFILE and the analysis fails on
