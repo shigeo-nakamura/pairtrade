@@ -566,6 +566,34 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertTrue(bounded["coverage"]["complete"])
         self.assertFalse(bounded["stop_rule"]["undecidable"])
 
+    def test_an_unpriceable_swap_outside_the_reported_window_is_not_a_hole(self):
+        """With no bounds given, the question is the window actually reported.
+
+        The execution ledger outlives each event export, so an unmatched
+        attempt from an older probe is always sitting in it. Testing those
+        against `(None, None)` admitted every one of them, and the routine
+        no-bounds invocation therefore reported incomplete coverage and an
+        `undecidable` stop verdict over a swap the report does not cover.
+        """
+        events, history = baseline_round_trip()
+        old = attempt(5, ENTRY_AT - timedelta(days=30), sell="NVDA", buy="AMD",
+                      sell_quantity="0.1", buy_quantity="0.2")
+        report = report_for(events, [old] + history)
+
+        # Still named, because it is a swap the ledger holds and cannot price.
+        self.assertEqual(report["ledger_swaps_outside_window"], [5])
+        # But it is outside what this report covers, so it is not a hole in it.
+        self.assertEqual(report["coverage"]["requested_but_unpriceable"], [])
+        self.assertTrue(report["coverage"]["complete"])
+        self.assertFalse(report["stop_rule"]["undecidable"])
+
+        # An explicit bound reaching back over it still makes it part of the
+        # question, exactly as an `--until` past the events does.
+        asked = report_for(events, [old] + history,
+                           since=ENTRY_AT - timedelta(days=60))
+        self.assertEqual(asked["coverage"]["requested_but_unpriceable"], [5])
+        self.assertTrue(asked["stop_rule"]["undecidable"])
+
     def test_the_reported_window_is_never_inverted(self):
         """`--since` after the last observation is now a supported case."""
         just_before_midnight = datetime(2026, 9, 4, 23, 59, 59, tzinfo=timezone.utc)
