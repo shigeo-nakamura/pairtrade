@@ -1,8 +1,8 @@
 use super::{
-    raw_amount_to_quantity, ArcusSpotBalanceSnapshot, ArcusSpotChainClient,
-    ArcusSpotChainPreflightRequest, ArcusSpotDirection, ArcusSpotExecutionAttempt,
-    ArcusSpotExecutionIntent, ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock,
-    ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotRotationPlan,
+    raw_amount_to_quantity, ArcusSpotChainClient, ArcusSpotChainPreflightRequest,
+    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent,
+    ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore,
+    ArcusSpotExecutionPhase, ArcusSpotRotationPlan, ArcusSpotSettlementRead,
     ArcusSpotSettlementReceiptExpectation,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -556,6 +556,7 @@ where
         if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
             bail!("reconciled Arcus sell delta no longer matches the signed intent");
         }
+        require_buy_delta_matches_settled_output(&active, bought_raw)?;
         if plan.sell_quantity <= Decimal::ZERO {
             bail!("approved Arcus plan has an invalid sell quantity");
         }
@@ -732,7 +733,7 @@ where
         // requiring the computed sell delta to equal the dispatched
         // plan's own sell_amount_raw exactly, and refusing (fail-closed)
         // otherwise.
-        let post = self
+        let settlement = self
             .chain
             .balances_requiring_settlement_receipt(
                 &ArcusSpotSettlementReceiptExpectation {
@@ -749,7 +750,7 @@ where
             )
             .await
             .context("Arcus post-submit balance read failed");
-        persist_reconciliation_read(&mut self.ledger, &self.store, post)
+        persist_reconciliation_read(&mut self.ledger, &self.store, settlement)
     }
 
     fn validate_plan_age(&self, plan: &ArcusSpotRotationPlan) -> Result<()> {
@@ -804,10 +805,14 @@ where
 fn persist_reconciliation_read(
     ledger: &mut ArcusSpotExecutionLedger,
     store: &ArcusSpotExecutionLedgerStore,
-    post: Result<ArcusSpotBalanceSnapshot>,
+    settlement: Result<ArcusSpotSettlementRead>,
 ) -> Result<()> {
-    let post = post?;
-    let mutation = ledger.reconcile_balances(post, Utc::now());
+    let settlement = settlement?;
+    let mutation = ledger.reconcile_balances(
+        settlement.balances,
+        &settlement.settled_buy_amount_raw,
+        Utc::now(),
+    );
     store.persist(ledger)?;
     mutation
 }
@@ -953,18 +958,26 @@ fn require_intent_matches_plan_shape(
 /// configured RPC providers turned out not to retain that pinnable
 /// historical state long enough in practice).
 ///
-/// The caller-side check in `reconciled_runtime_fill` below closes the gap
-/// this leaves on the *sell* side (requiring the sell delta to equal the
-/// dispatched plan's own `sell_amount_raw` exactly). There is deliberately
-/// no equivalent exact/floor check of the *buy* delta here against the
-/// on-chain `SwapExecuted` event's own `amount_out` yet -- unlike the
-/// retired pinned-block read, which was structurally isolated to the one
-/// block the swap confirmed in, `post_balances` can now be read an
-/// unbounded amount of time after that (a provider taking several ticks to
-/// catch up, say), widening the window in which unrelated buy-token wallet
-/// activity (a manual operator trade, as has happened historically) could
-/// contaminate `actual_buy_quantity` without being caught. Tracked as a
-/// follow-up in bot-strategy#880 rather than rushed into this pass.
+/// The caller-side checks in `reconciled_runtime_fill` below close the gap
+/// this leaves on both sides: the sell delta must equal the dispatched
+/// plan's own `sell_amount_raw` exactly, and the buy delta must equal the
+/// `amount_out` of this transaction's own `SwapExecuted` event, recorded on
+/// the attempt as `settled_buy_amount_raw` when it reconciled
+/// (bot-strategy#883). The buy-side half matters specifically because of
+/// the retirement above: unlike the pinned-block read, which was
+/// structurally isolated to the one block the swap confirmed in,
+/// `post_balances` can now be read an unbounded amount of time after that
+/// (a provider taking several ticks to catch up, say), so unrelated
+/// buy-token wallet activity in between (a manual operator trade, as in
+/// bot-strategy#869) would otherwise contaminate `actual_buy_quantity`
+/// without anything catching it. An event field cannot be contaminated
+/// that way -- it is part of the swap transaction itself.
+///
+/// This function stays a pure delta computation so the manual-recovery
+/// path can keep using it: `manual_reconciled_runtime_fill_for_attempt`
+/// deliberately checks the buy delta against the *operator's* own attested
+/// amount instead, since the attempts that path exists to recover include
+/// ones reconciled before this field was recorded at all.
 fn reconciled_balance_deltas(active: &ArcusSpotExecutionAttempt) -> Result<(U256, U256)> {
     let post = active
         .post_balances
@@ -981,6 +994,42 @@ fn reconciled_balance_deltas(active: &ArcusSpotExecutionAttempt) -> Result<(U256
         .checked_sub(pre_buy)
         .context("reconciled Arcus buy balance decreased")?;
     Ok((sold_raw, bought_raw))
+}
+
+/// The buy-side half of `reconciled_runtime_fill`'s exact-match pair, kept
+/// out of `reconciled_balance_deltas` so the manual-recovery path (which
+/// attests the buy amount independently) can keep using those deltas
+/// (bot-strategy#883).
+///
+/// `reconcile_balances` already required this equality before it let the
+/// attempt reach `Reconciled` at all. Re-checking it here is the same
+/// defense in depth the sell side gets: this runs against a ledger loaded
+/// from disk -- a `resume` in a later process, or a hand-edited file -- so
+/// it must not depend on the reconciling process's own in-memory result.
+///
+/// A missing `settled_buy_amount_raw` is refused rather than skipped: the
+/// only attempts that can carry none reconciled under a binary from before
+/// this check existed, and treating "no evidence" as "no objection" is
+/// exactly the silent weakening the check exists to prevent. The error
+/// names the manual-reconcile path, which commits such an attempt against
+/// an operator-attested amount instead.
+fn require_buy_delta_matches_settled_output(
+    active: &ArcusSpotExecutionAttempt,
+    bought_raw: U256,
+) -> Result<()> {
+    let settled_buy_amount_raw = active.settled_buy_amount_raw.as_deref().context(
+        "reconciled Arcus attempt records no settled swap output -- it was reconciled before \
+         bot-strategy#883, so commit it through the manual-reconcile-report/-apply path with an \
+         independently verified buy amount instead",
+    )?;
+    let settled_buy = parse_amount("settled buy amount", settled_buy_amount_raw)?;
+    if bought_raw != settled_buy {
+        bail!(
+            "reconciled Arcus buy delta {bought_raw} no longer matches the settled swap output \
+             {settled_buy}"
+        );
+    }
+    Ok(())
 }
 
 /// `bought_raw` scaled to the buy token's real decimals via
@@ -1171,6 +1220,7 @@ fn require_plan_direction_matches_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arcus_spot::ArcusSpotBalanceSnapshot;
     use dex_connector::ArcusSpotSwapStatus;
     use tempfile::tempdir;
 
@@ -1541,9 +1591,58 @@ mod tests {
     fn reconciled_attempt(now: DateTime<Utc>) -> ArcusSpotExecutionAttempt {
         let mut ledger = confirmed_ledger(now);
         ledger
-            .reconcile_balances(execution_balances("4000", "3000", now), now)
+            .reconcile_balances(execution_balances("4000", "3000", now), "1000", now)
             .unwrap();
         ledger.active.unwrap()
+    }
+
+    /// bot-strategy#883: the automated fill re-checks the buy delta against
+    /// the swap's own settled output, the same way it re-checks the sell
+    /// delta against the signed intent. `reconciled_attempt` reconciles a
+    /// 1000-unit buy delta against a 1000-unit settled output.
+    #[test]
+    fn a_runtime_fill_requires_the_buy_delta_to_equal_the_settled_output() {
+        let now = Utc::now();
+        let active = reconciled_attempt(now);
+        require_buy_delta_matches_settled_output(&active, U256::from(1000)).unwrap();
+
+        // The wallet gained more than the swap paid out -- something else
+        // moved buy-token inventory between confirmation and the `latest`
+        // balance read.
+        let error =
+            require_buy_delta_matches_settled_output(&active, U256::from(1015)).unwrap_err();
+        assert!(error.to_string().contains("settled swap output"));
+    }
+
+    /// An attempt reconciled before this field existed carries no evidence
+    /// either way, and the automated path refuses rather than waving it
+    /// through -- pointing at the manual path, which attests the amount
+    /// independently instead.
+    #[test]
+    fn a_runtime_fill_refuses_an_attempt_with_no_settled_output() {
+        let now = Utc::now();
+        let mut active = reconciled_attempt(now);
+        active.settled_buy_amount_raw = None;
+
+        let error =
+            require_buy_delta_matches_settled_output(&active, U256::from(1000)).unwrap_err();
+        assert!(error.to_string().contains("manual-reconcile"));
+    }
+
+    /// The deliberate asymmetry: the manual-recovery path exists for
+    /// exactly the attempts the automated path just refused, so it must
+    /// keep working with no settled output recorded (it checks the buy
+    /// amount against the operator's own attestation instead).
+    #[test]
+    fn the_manual_path_still_commits_an_attempt_with_no_settled_output() {
+        let now = Utc::now();
+        let mut active = reconciled_attempt(now);
+        active.settled_buy_amount_raw = None;
+        let plan = plan_with_buy_amount("1000");
+
+        let fill = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+            .unwrap();
+        assert_eq!(fill.actual_buy_quantity, Decimal::ONE);
     }
 
     #[test]
