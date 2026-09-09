@@ -114,6 +114,21 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
+- **Both legs are bounded taker IOCs** (bot-strategy#918, dex-connector
+  v4.7.22): `submit_order` sends `create_order_taker_ioc` at a marketable
+  limit `ENGINE_B_LIVE_SLIPPAGE_BPS` (default **50**) from the touch,
+  tick-rounded inward, remainder cancelled. This replaces
+  `create_order(price = None)`, whose ±20 % protection price bounded a
+  $100 lot at $20 per leg. The value is validated at startup against the
+  connector's accepted `1..=1000`: the process refuses to start outside
+  it rather than losing a session day to a rejected send (only one entry
+  `sendTx` is allowed per day, G-4). Two consequences at the first live
+  cycle: a book the connector considers stale now **fails the send**
+  instead of pricing off a stale ticker, and a size that truncates to
+  zero at the market's size decimals is rejected instead of being forced
+  up to one size tick. If a live send is ever rejected for crossing the
+  bound, widen `ENGINE_B_LIVE_SLIPPAGE_BPS` deliberately with the
+  observed book in hand — never back to an unbounded market order.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
   `docs/engine-b-order-spec.md` §4 -- introduced by pairtrade#272, so the
   file is absent until that PR merges): a live entry is only recorded once
