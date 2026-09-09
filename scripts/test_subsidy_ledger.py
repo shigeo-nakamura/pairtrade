@@ -1632,6 +1632,82 @@ def test_an_uncosted_arm_still_reports_a_points_file_that_skipped_it():
     assert "points" not in plain.split("money up):")[1], plain
 
 
+def test_out_may_not_name_an_input_ledger():
+    """Every record is read before the write, so this truncates.
+
+    `--out` naming an execution, PnL, equity or points input replaced a
+    live append-only ledger with the report and exited 0 -- irreversible
+    (Codex, PR #297, P1).
+    """
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        execution = write(root / "execution-freq.jsonl",
+                          [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                            "fill_value": 1.0}])
+        pnl_path = pnl_file(root, [{"ts": TS, "source": "exit_fill", "pnl": -1.0,
+                                    "hold_secs": 600}])
+        points_path = write(root / "points.jsonl",
+                            [{"date": "2026-09-08", "arm": "freq", "points": 1}])
+        equity_path = write(root / "equity_history.jsonl",
+                            [{"ts": 1788825600_000, "equity": 1000.0}])
+        original = execution.read_text(encoding="utf-8")
+
+        alias = root / "alias.jsonl"
+        os.symlink(execution, alias)
+        # A hard link resolves to a *different* path, so a name-only
+        # comparison misses it while the write still destroys the same
+        # inode. This is why the check is by st_dev/st_ino when the file
+        # exists (Codex, PR #297).
+        hardlink = root / "hardlink.jsonl"
+        os.link(execution, hardlink)
+        base = ["--exec-glob", str(execution), "--pnl-glob", str(pnl_path),
+                "--equity", f"freq={equity_path}", "--points", str(points_path)]
+        # Every input, and every spelling of one.
+        for target in (execution, alias, hardlink,
+                       root / "." / "execution-freq.jsonl",
+                       pnl_path, points_path, equity_path):
+            try:
+                ledger_main(base + ["--out", str(target)])
+            except SystemExit as exit_code:
+                assert exit_code.code == 2, (target, exit_code.code)
+            else:
+                raise AssertionError(f"--out {target} must be refused")
+        assert execution.read_text(encoding="utf-8") == original, "input was modified"
+
+        # A path that is not an input still writes.
+        out = root / "rows.jsonl"
+        assert ledger_main(base + ["--out", str(out)]) == 0
+        assert out.exists() and out.read_text(encoding="utf-8")
+
+
+def test_a_verified_zero_points_day_is_not_a_missing_points_day():
+    """`points: 0` on a costed day is an award of nothing, not a gap.
+
+    The report said the day's cost had "no points supplied" while its
+    own table row showed 0.0 (Codex, PR #297).
+    """
+    exec_days = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)}
+    pnl_days = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-40.0,
+                                               funding_seen=True)}
+    zero = build_rows(exec_days, pnl_days, None, {("2026-09-08", "freq"): 0.0})
+    arm = summarize(zero, points_input=True)["arms"][0]
+    assert arm["days_zero_points"] == 1, arm
+    assert arm["days_without_points"] == 0, arm
+    assert arm["cost_usd_on_zero_point_days"] == 40.0, arm
+    printed = render_table(zero, summarize(zero, points_input=True))
+    assert "verified zero points" in printed, printed
+    assert "no points supplied" not in printed, printed
+
+    # A day that supplied nothing still reports as missing coverage.
+    absent = build_rows(exec_days, pnl_days)
+    absent_arm = summarize(absent, points_input=True)["arms"][0]
+    assert absent_arm["days_without_points"] == 1, absent_arm
+    assert absent_arm["days_zero_points"] == 0, absent_arm
+    absent_printed = render_table(absent, summarize(absent, points_input=True))
+    assert "no points supplied" in absent_printed, absent_printed
+
+
 def test_an_explicit_zero_points_row_is_not_an_omitted_arm():
     """`points: 0` is a legal award of nothing.
 

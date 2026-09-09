@@ -1219,6 +1219,10 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
                 "cross_day_points_from_yesterday": 0,
                 "cross_day_points_closes_later": 0,
                 "days_without_points": 0,
+                # Days that supplied a real zero. Kept apart from the
+                # ones that supplied nothing (Codex, PR #297).
+                "days_zero_points": 0,
+                "cost_usd_on_zero_point_days": 0.0,
                 "points": 0.0,
                 "uncosted_points": 0.0,
                 "points_seen": False,
@@ -1293,9 +1297,18 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
                 arm["cost_usd_cross_day_points"] = add_or_none(
                     arm["cost_usd_cross_day_points"], row.cost_usd)
             else:
-                arm["days_without_points"] += 1
-                arm["cost_usd_without_points"] = add_or_none(
-                    arm["cost_usd_without_points"], row.cost_usd)
+                # An explicit `points: 0` is a verified award of nothing,
+                # not missing coverage. Grouping the two made the report
+                # say "no points supplied" for a day whose own table row
+                # shows 0.0 (Codex, PR #297).
+                if row.points is None:
+                    arm["days_without_points"] += 1
+                    arm["cost_usd_without_points"] = add_or_none(
+                        arm["cost_usd_without_points"], row.cost_usd)
+                else:
+                    arm["days_zero_points"] += 1
+                    arm["cost_usd_on_zero_point_days"] = add_or_none(
+                        arm["cost_usd_on_zero_point_days"], row.cost_usd)
         if row.points is not None:
             arm["points_seen"] = True
             if row.cost_usd is None or row.cost_spans_two_days():
@@ -1310,7 +1323,8 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
         for key in ("volume_usd", "costed_volume_usd", "uncosted_volume_usd", "cost_usd",
                     "cost_usd_on_measured_volume", "cost_usd_without_volume",
                     "cost_usd_cross_day_volume", "cost_usd_cross_day_points",
-                    "cost_usd_on_pointed_days", "cost_usd_without_points"):
+                    "cost_usd_on_pointed_days", "cost_usd_without_points",
+                    "cost_usd_on_zero_point_days"):
             arm[key] = None if arm[key] is None else round(arm[key], 6)
         # A rate needs both of its terms. `None` on either is the total
         # saying it is not known, and a rate over an unknown total is not
@@ -1402,6 +1416,21 @@ def cross_day_reason(arm: dict, which: str) -> str:
     if arm[f"cross_day_{which}_closes_later"]:
         parts.append(f"{arm[f'cross_day_{which}_closes_later']} close on a later day")
     return " and ".join(parts) if parts else "cost and volume span two days"
+
+
+def _path_key(path: Path) -> tuple:
+    """An identity for a path that survives symlinks and spellings.
+
+    `st_dev`/`st_ino` when the file exists, so a symlink, a hard link and
+    a `./` spelling all compare equal; the resolved path otherwise, so a
+    not-yet-created `--out` still compares against inputs by name
+    (Codex, PR #297).
+    """
+    try:
+        stat = path.stat()
+        return ("inode", stat.st_dev, stat.st_ino)
+    except OSError:
+        return ("path", str(path.resolve()))
 
 
 def money(value: float | None, places: int = 2) -> str:
@@ -1588,6 +1617,12 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"that did supply points, but not the points it was earned against "
                 f"({cross_day_reason(arm, 'points')}), and is excluded from that price"
             )
+        if arm["days_zero_points"]:
+            out.append(
+                f"         {money(arm['cost_usd_on_zero_point_days'])} of cost fell on "
+                f"{arm['days_zero_points']} day(s) that supplied a verified zero points, "
+                f"and is excluded from that price"
+            )
         if arm["days_without_points"]:
             out.append(
                 f"         {money(arm['cost_usd_without_points'])} of cost fell on days with "
@@ -1662,8 +1697,28 @@ def main(argv: list[str] | None = None) -> int:
             + ", ".join(repr(pattern) for pattern in unmatched_pnl)
             + "; omit the option entirely to run without a PnL ledger"
         )
-    execution = load_execution(expand(args.exec_glob))
-    pnl = load_pnl(expand(args.pnl_glob))
+    exec_paths = expand(args.exec_glob)
+    pnl_paths = expand(args.pnl_glob)
+    equity_paths = [Path(spec.partition("=")[2]) for spec in args.equity
+                    if spec.partition("=")[2]]
+    inputs = exec_paths + pnl_paths + equity_paths
+    if args.points is not None:
+        inputs.append(args.points)
+    # Before anything is read, and by resolved path so a symlink or a
+    # `./` spelling cannot slip through. Every record is read before the
+    # write, so `--out` naming an input would truncate a live
+    # append-only ledger and replace it with the report -- irreversible,
+    # and the command would still exit 0 (Codex, PR #297).
+    if args.out is not None:
+        out_key = _path_key(args.out)
+        clash = [path for path in inputs if _path_key(path) == out_key]
+        if clash:
+            parser.error(
+                f"--out {args.out} is also an input ({clash[0]}); writing it would "
+                "destroy that ledger"
+            )
+    execution = load_execution(exec_paths)
+    pnl = load_pnl(pnl_paths)
     equity_costs: dict[str, dict[str, float]] = {}
     for spec in args.equity:
         arm, sep, path = spec.partition("=")
