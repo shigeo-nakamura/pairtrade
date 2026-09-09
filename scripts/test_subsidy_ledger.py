@@ -1120,6 +1120,55 @@ def test_a_complete_day_with_no_funding_ticks_reports_a_known_zero():
         assert gap_row.funding_usd is None
 
 
+def test_a_pnl_file_whose_arm_cannot_be_read_is_refused():
+    """Skipping it dropped every realized cost in it and still exited 0."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(Path(tmp) / "pnl-copy.jsonl",
+                     [{"ts": TS, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}])
+        try:
+            load_pnl([path])
+        except SubsidyLedgerError as error:
+            assert "arm cannot be read" in str(error), error
+        else:
+            raise AssertionError("an unreadable arm must raise, not skip the file")
+
+
+def test_a_marker_only_day_reports_unknown_coverage():
+    """It has no PnL rows, so "complete" would claim coverage it never had."""
+    close = 1788868800 + 3600
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_fill", "pnl": -100.0,
+              "hold_secs": 20 * 3600, "funding_carry_usd": 0.0}],
+        )
+        rows = build_rows(
+            {("2026-09-07", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+            load_pnl([path]),
+        )
+        opening = next(r for r in rows if r.date == "2026-09-07")
+        assert opening.cross_day_entries == 1
+        assert opening.cost_usd is None
+        assert opening.pnl_coverage is None, opening.pnl_coverage
+        closing = next(r for r in rows if r.date == "2026-09-08")
+        assert closing.pnl_coverage == "complete"
+
+
+def test_an_all_uncosted_arm_still_explains_its_points():
+    """"cost unknown" alone said nothing about the points supplied."""
+    rows = build_rows(
+        {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+        {},
+        None,
+        {("2026-09-08", "freq"): 1000.0},
+    )
+    summary = summarize(rows)
+    assert summary["arms"][0]["cost_days"] == 0
+    rendered = render_table(rows, summary)
+    assert "cost unknown" in rendered
+    assert "1,000.0 points were supplied" in rendered, rendered
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

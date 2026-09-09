@@ -378,7 +378,15 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
     for path in paths:
         arm = arm_from_pnl_filename(path.name)
         if arm is None:
-            continue
+            # The arm comes from the basename because the rows do not
+            # carry it. Skipping such a file dropped every realized cost
+            # in it and still exited 0 -- the report then says no PnL
+            # source covers those days, which is a different claim from
+            # "one was supplied and could not be read" (Codex, PR #297).
+            raise SubsidyLedgerError(
+                f"{path}: the arm cannot be read from this filename; a PnL export must be "
+                "named pnl-<service>-<arm>-<YYYYMMDD>.jsonl, since the rows do not carry "
+                "the arm themselves")
         for record in read_jsonl(path):
             ts = record.get("ts")
             if ts is None:
@@ -691,6 +699,19 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
     return points
 
 
+def match_coverage(day: PnlDay) -> str | None:
+    """`"complete"`, `"incomplete"`, or `None` when the day holds no rows.
+
+    The third case exists because a cross-day entry marker can create a
+    `PnlDay` for a date whose own PnL file was never supplied.
+    """
+    if day.incomplete:
+        return "incomplete"
+    if day.cycles > 0:
+        return "complete"
+    return None
+
+
 def build_rows(
     execution: dict[tuple[str, str], ExecDay],
     pnl: dict[tuple[str, str], PnlDay],
@@ -732,7 +753,10 @@ def build_rows(
                 if day.funding_seen or (day.cycles > 0 and not day.incomplete)
                 else None
             )
-            row.pnl_coverage = "incomplete" if day.incomplete else "complete"
+            # A day created only to carry a cross-day entry marker has no
+            # PnL rows at all, so "complete" would claim a coverage it
+            # never had. Its coverage is simply unknown (Codex, PR #297).
+            row.pnl_coverage = match_coverage(day)
             row.cross_day_cycles = day.cross_day_cycles
             row.cross_day_entries = day.cross_day_entries
             if day.incomplete:
@@ -896,6 +920,20 @@ def render_table(rows: list[Row], summary: dict) -> str:
             # read as free rather than as unmeasured.
             out.append(
                 f"{head}, cost unknown (no PnL ledger or equity series covers these days)")
+            # Still say what was supplied and excluded: an all-uncosted
+            # points export otherwise printed "cost unknown" and nothing
+            # about the points it was given (Codex, PR #297).
+            if arm["uncosted_points"]:
+                out.append(
+                    f"         {arm['uncosted_points']:,.1f} points were supplied for days with "
+                    f"no usable cost, so no price per point can be computed"
+                )
+            if arm["fills_without_value"]:
+                out.append(
+                    f"         {arm['fills_without_value']} fill(s) across "
+                    f"{arm['incomplete_volume_days']} day(s) reported no value, so that volume "
+                    f"is a lower bound"
+                )
             continue
         # The cost is known even when no rate can be built from it, so it is
         # stated on its own line rather than folded into an equation. Every
