@@ -710,6 +710,80 @@ def test_negative_points_are_refused_rather_than_mixed_into_the_denominator():
         assert load_points(zero) == {("2026-09-08", "freq"): 0.0}
 
 
+def test_a_cycle_that_crossed_midnight_suppresses_the_day_rate():
+    """The two ledgers file an overnight round trip on different days.
+
+    Its entry notional is yesterday's volume (with no cost, so that day
+    is uncosted) while the whole cost lands on the close day with only
+    the exit side to divide by. With equal legs that doubles the rate.
+    """
+    close = 1788868800 + 3600  # 2026-09-08 13:00 UTC
+    with tempfile.TemporaryDirectory() as tmp:
+        overnight = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_fill", "pnl": -100.0,
+              "hold_secs": 20 * 3600, "funding_carry_usd": 0.0}],
+        )
+        day = load_pnl([overnight])[("2026-09-08", "freq")]
+        assert day.cross_day_cycles == 1
+        assert not day.incomplete, "it is still a good, realized close"
+
+        row = build_rows(
+            {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+            {("2026-09-08", "freq"): day},
+        )[0]
+        assert row.cost_usd == 100.0
+        assert row.cost_per_musd_volume is None, (
+            "the denominator is short by the entry side, so no rate is published")
+        arm = summarize([row])["arms"][0]
+        assert arm["cross_day_cycles"] == 1
+        assert arm["cost_per_musd_volume"] is None
+        assert arm["cost_usd_without_volume"] == 100.0
+
+        # A same-day cycle is unaffected.
+        same_day = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_fill", "pnl": -100.0,
+              "hold_secs": 600, "funding_carry_usd": 0.0}],
+            arm="b",
+        )
+        clean = load_pnl([same_day])[("2026-09-08", "b")]
+        assert clean.cross_day_cycles == 0
+        clean_row = build_rows(
+            {("2026-09-08", "b"): ExecDay(fills=1, volume_usd=1_000_000.0)},
+            {("2026-09-08", "b"): clean},
+        )[0]
+        assert clean_row.cost_per_musd_volume == 100.0
+
+
+def test_non_finite_pnl_funding_and_equity_are_not_costs():
+    """`float()` accepts NaN and Infinity on every cost-bearing field."""
+    with tempfile.TemporaryDirectory() as tmp:
+        bad_pnl = pnl_file(
+            Path(tmp),
+            [{"ts": TS, "source": "exit_fill", "pnl": "NaN", "hold_secs": 600}],
+        )
+        day = load_pnl([bad_pnl])[("2026-09-08", "freq")]
+        assert day.incomplete and "unreadable_pnl" in day.incomplete_reasons
+
+        bad_funding = pnl_file(
+            Path(tmp),
+            [{"ts": TS, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600,
+              "funding_carry_usd": "Infinity"}],
+            arm="b",
+        )
+        funding_day = load_pnl([bad_funding])[("2026-09-08", "b")]
+        assert funding_day.incomplete
+        assert "unreadable_funding" in funding_day.incomplete_reasons
+
+    costs = equity_daily_costs([
+        {"ts": 1788595200000, "equity": 5000.0},   # 2026-09-05
+        {"ts": 1788681600000, "equity": "NaN"},    # 2026-09-06
+        {"ts": 1788768000000, "equity": 4950.0},   # 2026-09-07
+    ])
+    assert costs == {}, costs
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

@@ -33,6 +33,17 @@ here (`api.rh.lighter.xyz` answers 403 on the points routes), so points
 are an operator-supplied input: export them and pass `--points`. Rows
 without them keep `points: null` and no cost-per-point.
 
+A cycle that crosses UTC midnight is the one attribution the two
+ledgers genuinely disagree on: `load_execution` files each fill under
+the day it happened, `load_pnl` files the whole realized cycle under the
+day it closed. The entry notional therefore sits on a day with no cost
+(reported as uncosted volume) while the whole cost lands on the next,
+with only the exit side to divide by. A `leg_fill` carries no cycle id,
+so the fills cannot be tied back and re-attributed from what is written
+today; the close day is marked instead (`cross_day_cycles`) and its
+per-volume rate suppressed, the same treatment an unvalued fill gets.
+Closing it properly needs the bot to stamp a cycle id on both ledgers.
+
 `cost_per_musd_volume` needs no points at all and is the KPI to steer by
 in the meantime: points programs are volume-weighted, so the conversion
 from "cost per $1M traded" to "cost per point" is one multiplier applied
@@ -101,6 +112,11 @@ class PnlDay:
     # number, not a smaller one.
     incomplete: bool = False
     incomplete_reasons: set[str] = field(default_factory=set)
+    # Cycles that opened on an earlier UTC date than the one they closed
+    # on. Their entry fills are counted as *that* day's volume, while all
+    # of their cost lands here, so this day's denominator is short by the
+    # entry side (Codex, PR #297).
+    cross_day_cycles: int = 0
 
 
 @dataclass
@@ -121,6 +137,7 @@ class Row:
     points: float | None = None
     cost_per_point: float | None = None
     cost_per_musd_volume: float | None = None
+    cross_day_cycles: int = 0
 
     def as_json(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -326,12 +343,22 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 day.incomplete_reasons.add(defect)
                 continue
             try:
-                day.realized_pnl_usd += float(record["pnl"])
+                pnl = float(record["pnl"])
             except (TypeError, ValueError):
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_pnl")
                 continue
+            # "NaN" and "Infinity" parse. Neither is a cost: a NaN
+            # spreads through every total and out of `--out` as
+            # non-standard JSON, and an infinity swamps the day.
+            if not math.isfinite(pnl):
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_pnl")
+                continue
+            day.realized_pnl_usd += pnl
             day.cycles += 1
+            if opened_on_an_earlier_day(record, key[0]):
+                day.cross_day_cycles += 1
             funding = record.get("funding_carry_usd")
             if funding is None:
                 # A positive `funding_ticks_observed` is the row's own
@@ -345,16 +372,50 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                     day.incomplete_reasons.add("funding_gap")
                 continue
             try:
-                day.funding_usd += float(funding)
-                day.funding_seen = True
+                carry = float(funding)
             except (TypeError, ValueError):
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_funding")
                 continue
+            if not math.isfinite(carry):
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_funding")
+                continue
+            day.funding_usd += carry
+            day.funding_seen = True
             if record.get("funding_ticks_observed") == 0 and spans_a_funding_interval(record):
                 day.incomplete = True
                 day.incomplete_reasons.add("funding_gap")
     return dict(days)
+
+
+def opened_on_an_earlier_day(record: dict, close_date: str) -> bool:
+    """Did this cycle open on a UTC date before the one it closed on?
+
+    The two ledgers are keyed differently: `load_execution` files a fill
+    under the date it happened, `load_pnl` files a whole realized cycle
+    under the date it *closed*. An overnight round trip therefore leaves
+    its entry notional on one day -- with no cost, so that day is
+    uncosted -- while its entire cost lands on the next, divided by the
+    exit side alone. With equal legs that doubles `cost_per_musd_volume`.
+
+    The fills cannot be tied back to their cycle from what is written
+    (no cycle id on a `leg_fill`), so the day is not re-attributed: it is
+    marked, and its rate suppressed the way an unvalued fill already
+    suppresses it. An unreadable hold is treated as a crossing, since it
+    cannot be shown not to be one.
+    """
+    hold = record.get("hold_secs")
+    ts = record.get("ts")
+    if hold is None or ts is None:
+        return True
+    try:
+        opened = float(ts) - float(hold)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(opened):
+        return True
+    return utc_date(opened) != close_date
 
 
 def funding_ticks_seen(record: dict) -> bool:
@@ -461,9 +522,17 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
             invalid_days.add(day)
             continue
         try:
-            last_by_day[day] = float(equity)
+            value = float(equity)
         except (TypeError, ValueError):
             invalid_days.add(day)
+        else:
+            # "NaN"/"Infinity" parse but are not a close: the next
+            # consecutive-day delta would be non-finite and accepted as a
+            # known `equity_delta` cost.
+            if math.isfinite(value):
+                last_by_day[day] = value
+            else:
+                invalid_days.add(day)
     costs: dict[str, float] = {}
     previous_day: str | None = None
     for day in sorted(last_by_day):
@@ -545,6 +614,7 @@ def build_rows(
             row.realized_pnl_usd = round(day.realized_pnl_usd, 6)
             row.funding_usd = round(day.funding_usd, 6) if day.funding_seen else None
             row.pnl_coverage = "incomplete" if day.incomplete else "complete"
+            row.cross_day_cycles = day.cross_day_cycles
             if day.incomplete:
                 row.pnl_incomplete_reasons = sorted(day.incomplete_reasons)
         if day is not None and not day.incomplete:
@@ -559,8 +629,13 @@ def build_rows(
         # Same rule as the aggregate, and it has to live here too: this row
         # is what `--out` writes and what the daily table prints, so a rate
         # suppressed only in the totals would still be published per day.
+        # A cycle that opened yesterday leaves its entry notional on
+        # yesterday's row while all of its cost lands here, so this
+        # denominator is short by the entry side -- the same kind of
+        # known-short denominator as an unvalued fill, and suppressed the
+        # same way (Codex, PR #297).
         if (row.cost_usd is not None and row.volume_usd > 0
-                and not row.fills_without_value):
+                and not row.fills_without_value and not row.cross_day_cycles):
             row.cost_per_musd_volume = round(row.cost_usd / (row.volume_usd / 1e6), 4)
         rows.append(row)
     return rows
@@ -607,13 +682,15 @@ def summarize(rows: list[Row]) -> dict:
                 "cost_days": 0,
                 "fills_without_value": 0,
                 "incomplete_volume_days": 0,
+                "cross_day_cycles": 0,
             },
         )
         arm["days"] += 1
         arm["fills"] += row.fills
         arm["volume_usd"] += row.volume_usd
         arm["fills_without_value"] += row.fills_without_value or 0
-        if row.fills_without_value:
+        arm["cross_day_cycles"] += row.cross_day_cycles
+        if row.fills_without_value or row.cross_day_cycles:
             arm["incomplete_volume_days"] += 1
         if row.cost_usd is None:
             arm["uncosted_volume_usd"] += row.volume_usd
@@ -622,7 +699,8 @@ def summarize(rows: list[Row]) -> dict:
             arm["cost_days"] += 1
             # Volume ratio: this cost counts only if this row measured the
             # volume it was spent on.
-            if row.volume_usd > 0 and not row.fills_without_value:
+            if (row.volume_usd > 0 and not row.fills_without_value
+                    and not row.cross_day_cycles):
                 arm["cost_usd_on_measured_volume"] += row.cost_usd
                 arm["costed_volume_usd"] += row.volume_usd
             else:
