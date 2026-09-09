@@ -6986,7 +6986,19 @@ mod tests {
         runtime.config.corporate_actions[0].effective_at = anchor + Duration::seconds(30);
         runtime.config.corporate_actions[0].resume_not_before = anchor + Duration::seconds(40);
         let later = anchor + Duration::seconds(3);
-        runtime.step_at(&snapshot_with_valid_row(later), later);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionBlock);
+                assert!(
+                    hold.detail.contains("replaced by a different declaration"),
+                    "the ordinary window hold would mean the new declaration was \
+                     adopted onto the old record: {}",
+                    hold.detail
+                );
+            }
+            other => panic!("expected the replaced window to fail closed, got {other:?}"),
+        }
         assert_eq!(
             runtime.state.corporate_action,
             Some(before),
