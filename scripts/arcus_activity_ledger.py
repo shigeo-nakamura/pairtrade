@@ -17,6 +17,26 @@ used only for what it is authoritative about:
 A swap that cannot be matched to exactly one event is reported and refused
 rather than silently priced at some other tick's marks: a KPI that quietly
 drops or misprices trades is worse than no KPI.
+
+Known limitation -- the buy-side delta
+--------------------------------------
+`buy_quantity` is a wallet delta, and the runtime reads `post_balances`
+once a provider has caught up to the confirmed transaction's block, which
+can be an unbounded time after it (`src/arcus_spot/live_executor.rs`,
+`reconciled_balance_deltas`). Unrelated buy-token activity in that window
+-- a manual operator trade, which has happened -- is therefore counted as
+swap output, inflating the quantity and understating the cost. The sell
+side has an exact check against the dispatched plan; the buy side does
+not.
+
+Nothing here can detect that: the execution ledger records the two
+balance snapshots and no settlement quantity, so the contaminated delta
+is the only number this script is given. Closing it means the runtime
+persisting `amount_out` from the `SwapExecuted` event it already verifies
+(`src/arcus_spot/chain.rs`) and reconciling the delta against it -- the
+follow-up the runtime's own comment tracks under bot-strategy#880. Until
+then every figure below inherits that exposure, in the direction of
+looking cheaper than it was.
 """
 
 from __future__ import annotations
