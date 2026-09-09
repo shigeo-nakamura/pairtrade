@@ -72,6 +72,10 @@ pub struct ArcusSpotCheckpointSummary {
     /// The symbols that window is about (empty when the record predates
     /// the field).
     pub corporate_action_symbols: Vec<String>,
+    /// The observation watermark the stored state reached. `reset-window`
+    /// carries the handled record forward and resolves any legacy entry
+    /// against it (Codex P2, pairtrade#309).
+    pub last_observation_at: Option<DateTime<Utc>>,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -387,6 +391,7 @@ impl ArcusSpotRuntimeCheckpointStore {
                 .corporate_action
                 .as_ref()
                 .map(|progress| progress.event_id.clone()),
+            last_observation_at: checkpoint.state.last_observation_at,
             corporate_action_symbols: checkpoint
                 .state
                 .corporate_action

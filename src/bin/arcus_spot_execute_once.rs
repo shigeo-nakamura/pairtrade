@@ -2246,6 +2246,7 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
             .with_handled_corporate_actions(
                 previous.handled_corporate_action_ids.clone(),
                 previous.handled_corporate_action_fingerprints.clone(),
+                previous.last_observation_at,
             );
 
     // The evidence sidecar describes the state being discarded, so it is
@@ -10160,6 +10161,52 @@ runtime:
         assert_eq!(
             fresh.state().handled_corporate_action_fingerprints,
             vec!["fp-split".to_string()],
+        );
+    }
+
+    #[test]
+    fn reset_window_resolves_a_carried_legacy_handled_record() {
+        // A legacy checkpoint carries ids with no fingerprints. The fresh
+        // state a reset builds is already marked resolved, so without
+        // resolving them here the still-declared completed action would read
+        // as a reused label and block entries forever.
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        state.handled_corporate_action_fingerprints.clear();
+        state.handled_corporate_actions_resolved = false;
+        state.last_observation_at = Some("2026-08-17T00:00:00Z".parse().unwrap());
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+
+        let mut next = reset_window_next_config(dir.path());
+        next.runtime.corporate_actions = vec![ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec![next.runtime.pair.sell_symbol.clone()],
+            entry_block_at: "2026-08-16T00:00:00Z".parse().unwrap(),
+            reduce_exit_at: "2026-08-16T01:00:00Z".parse().unwrap(),
+            effective_at: "2026-08-16T02:00:00Z".parse().unwrap(),
+            resume_not_before: "2026-08-16T03:00:00Z".parse().unwrap(),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        }];
+        commit_runtime_window_reset(&next).unwrap();
+
+        let fresh = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone())
+            .load_existing(&next.runtime)
+            .unwrap();
+        assert_eq!(
+            fresh.state().handled_corporate_action_fingerprints,
+            vec![next.runtime.corporate_actions[0].fingerprint()],
+            "the carried legacy record is resolved, not left ambiguous",
         );
     }
 

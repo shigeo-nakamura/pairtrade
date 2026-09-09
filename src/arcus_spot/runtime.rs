@@ -568,9 +568,16 @@ impl ArcusSpotRuntime {
         mut self,
         ids: Vec<String>,
         fingerprints: Vec<String>,
+        observed_at: Option<DateTime<Utc>>,
     ) -> Self {
         self.state.handled_corporate_action_ids = ids;
         self.state.handled_corporate_action_fingerprints = fingerprints;
+        // A fresh state is already marked resolved, so a carried legacy
+        // record would never get its backfill and a still-declared completed
+        // action would read as a reused label, blocking entries forever.
+        // Resolve it here instead, against the watermark of the checkpoint
+        // it came from (Codex P2, pairtrade#309).
+        resolve_handled_corporate_action_fingerprints(&mut self.state, &self.config, observed_at);
         self
     }
 
@@ -3589,7 +3596,15 @@ impl ArcusSpotRuntime {
     /// dispatch of a still-fresh signed entry must not be the way around it),
     /// and a reused handled id (Codex P1, pairtrade#309).
     fn corporate_action_blocks_entries(&self, at: DateTime<Utc>) -> Option<String> {
-        if let Some(event) = self.active_corporate_action(at) {
+        // A window that opens within the settlement margin blocks entries
+        // already: submission is not execution, and between this guard and
+        // `submit_signed_quote_once` the ledger's dispatch marker still has
+        // to be persisted. Rather than re-check after each intervening step
+        // -- the venue round trip is outside this process and no re-check
+        // reaches it -- entries stop the same margin early that exits do
+        // (Codex P1, pairtrade#309).
+        let margin = Duration::seconds(self.config.corporate_action_settlement_margin_secs);
+        if let Some(event) = self.active_corporate_action(at + margin) {
             return Some(format!(
                 "inside corporate action {}'s window (entries blocked from {})",
                 event.event_id, event.entry_block_at
@@ -8036,6 +8051,37 @@ mod tests {
             .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(17))
             .unwrap_err();
         assert!(error.contains("no longer quotes"), "{error}");
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn an_entry_plan_is_refused_inside_the_settlement_margin() {
+        // Between the submit guard and the client call the ledger's dispatch
+        // marker still has to be persisted, and the venue round trip is
+        // outside this process entirely -- so entries stop a margin before
+        // the window opens rather than being re-checked after each step.
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor + Duration::seconds(10));
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        cfg.corporate_action_settlement_margin_secs = 1;
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(anchor - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                anchor,
+                runtime.state.inventory,
+            )
+            .unwrap();
+        // entry_block_at is +10s: at +8s the 1s margin has not reached it.
+        runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(8))
+            .unwrap();
+        let error = runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(9))
+            .unwrap_err();
+        assert!(error.contains("entries blocked"), "{error}");
     }
 
     #[cfg(feature = "arcus-spot-live")]
