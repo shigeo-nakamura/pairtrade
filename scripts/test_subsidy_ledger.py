@@ -1172,12 +1172,12 @@ def test_an_all_uncosted_arm_still_explains_its_points():
 def test_the_equity_close_is_the_latest_sample_not_the_last_line():
     """A newest-first export must not leave an intraday sample as the close."""
     newest_first = equity_daily_costs([
-        {"ts": 1788681600000, "equity": 4900.0},   # 2026-09-06 00:00, the close
-        {"ts": 1788638400000, "equity": 4990.0},   # 2026-09-05 12:00, intraday
-        {"ts": 1788652800000, "equity": 5000.0},   # 2026-09-05 16:00, the close
+        {"ts": 1788652800000, "equity": 4900.0},   # 2026-09-06 00:00
+        {"ts": 1788638400000, "equity": 5000.0},   # 2026-09-05 20:00, the close
+        {"ts": 1788609600000, "equity": 4990.0},   # 2026-09-05 12:00, intraday
     ])
-    # 09-06 measured against 09-05's real close (5000), not the 4990 line
-    # that happened to be written last.
+    # 09-06 measured against 09-05's real close (5000), not the 4990
+    # sample that happened to be written last.
     assert newest_first["2026-09-06"] == 100.0, newest_first
 
 
