@@ -603,10 +603,13 @@ struct RiskState {
     /// leave a restart with nothing to look for, and a single account
     /// read that comes back flat -- a false negative this file already
     /// documents -- would be taken as a clean start while
-    /// `last_session_date` blocks any further entry
-    /// (pairtrade#300 Codex review).
+    /// `last_session_date` blocks any further entry. It carries the
+    /// **symbol** the order was sent for, not just a flag: a
+    /// `us_primary` change after the crash would otherwise rebind the
+    /// marker to the new symbol and leave the old exposure with no
+    /// record at all (pairtrade#300 Codex review).
     #[serde(default)]
-    entry_in_flight: bool,
+    entry_in_flight: Option<String>,
 }
 
 /// `OpenPosition` reduced to what survives a restart. Deliberately a
@@ -650,6 +653,37 @@ struct PersistedPosition {
 /// still describes the same position (same side), because a flip makes
 /// the basis meaningless for what is there now (pairtrade#300 Codex
 /// review).
+/// A parked record for an exposure this engine has no record of -- an
+/// order sent for a symbol `us_primary` no longer names, whose fill
+/// this process never saw. It is unmanaged by construction: nothing here
+/// can close that symbol (pairtrade#300 Codex review).
+fn unmanaged_from_live(
+    symbol: &str,
+    live: &ExchangePosition,
+    ws_price: Option<f64>,
+    session_date: &str,
+) -> PersistedPosition {
+    let (entry_price, estimated, unknown) = match (live.entry_price, ws_price) {
+        (Some(e), _) => (e, false, false),
+        (None, Some(mid)) if mid > 0.0 => (mid, true, false),
+        _ => (0.0, true, true),
+    };
+    PersistedPosition {
+        symbol: symbol.to_string(),
+        side: live.side.to_string(),
+        entry_price,
+        entry_price_estimated: estimated,
+        entry_price_unknown: unknown,
+        size: live.size,
+        open_size: live.size,
+        realized_partial_pnl: 0.0,
+        entered_at_us: 0,
+        flatten_asap: true,
+        session_date: session_date.to_string(),
+        exit_deadline_us: None,
+    }
+}
+
 fn refreshed_unmanaged(
     record: PersistedPosition,
     live: &ExchangePosition,
@@ -1914,18 +1948,49 @@ impl EngineBLiveEngine {
         // re-checks the exchange every tick and adopts the position if it
         // appears, and only RISK_ACK clears it
         // (pairtrade#300 Codex review).
-        if self.state.entry_in_flight {
-            let reason = format!(
-                "entry_in_flight_across_restart: an entry order for {} was sent and this \
-                 process died before its fill was confirmed -- the account may hold a \
-                 position no record describes; reconcile against the exchange, then RISK_ACK",
-                symbol
-            );
-            log::error!("[RECONCILE] {reason}");
-            self.state.entry_in_flight = false;
-            self.state.position_unconfirmed = true;
+        if let Some(sent_for) = self.state.entry_in_flight.take() {
             self.state_write_pending = true;
-            self.halt_session(reason);
+            if sent_for == symbol {
+                let reason = format!(
+                    "entry_in_flight_across_restart: an entry order for {symbol} was sent and \
+                     this process died before its fill was confirmed -- the account may hold a \
+                     position no record describes; reconcile against the exchange, then RISK_ACK"
+                );
+                log::error!("[RECONCILE] {reason}");
+                self.state.position_unconfirmed = true;
+                self.halt_session(reason);
+            } else {
+                // The order went out for a symbol this instance no longer
+                // trades, so `position_unconfirmed` -- which drives an
+                // adoption poll against `us_primary` -- would watch the
+                // wrong instrument. Whatever it created has to be handled
+                // as an unmanaged exposure (pairtrade#300 Codex review).
+                let live = exchange_position_for(&positions, &sent_for);
+                let reason = format!(
+                    "entry_in_flight_on_a_former_symbol: an entry order for {sent_for} was sent \
+                     and never confirmed, and us_primary is now {symbol}. This engine cannot \
+                     close {sent_for}{} -- flatten it by hand",
+                    match live.as_ref() {
+                        Some(live) => format!(
+                            "; the venue reports {} size={:.6} there",
+                            live.side, live.size
+                        ),
+                        None => ", and the venue reports nothing there right now (a single read \
+                             proves nothing this soon after a send)"
+                            .to_string(),
+                    }
+                );
+                log::error!("[RECONCILE] {reason}");
+                if let Some(live) = live {
+                    let mid = self.exit_accounting_price(&sent_for).map(|(mid, _)| mid);
+                    let record = unmanaged_from_live(&sent_for, &live, mid, &today);
+                    self.state
+                        .unmanaged_positions
+                        .retain(|q| q.symbol != record.symbol);
+                    self.state.unmanaged_positions.push(record);
+                }
+                self.halt_session(reason);
+            }
         }
         let persisted = self.state.open_position.clone();
         // A change to `us_primary` while a position is still open on the
@@ -2160,6 +2225,18 @@ impl EngineBLiveEngine {
                                      being parked",
                                 );
                             }
+                            // A live exposure this engine can no longer
+                            // close is a halt in its own right. Without
+                            // it, an earlier halt already cleared by
+                            // RISK_ACK would let the promoted symbol
+                            // trade on while this one stayed open and
+                            // unmanaged (pairtrade#300 Codex review).
+                            halt_reason.get_or_insert(format!(
+                                "unmanaged_position_still_open: {} {} size={:.6} was displaced \
+                                 when us_primary returned to {}, and this engine cannot close \
+                                 it -- flatten it by hand",
+                                live.side, displaced.symbol, live.size, p.symbol
+                            ));
                             let mid = self
                                 .exit_accounting_price(&displaced.symbol)
                                 .map(|(mid, _)| mid);
@@ -3912,7 +3989,7 @@ impl EngineBLiveEngine {
         // Same write, same reason: from here on, a restart has to know an
         // order may exist even though nothing is persisted about a
         // position yet (pairtrade#300 Codex review).
-        self.state.entry_in_flight = true;
+        self.state.entry_in_flight = Some(self.cfg.us_primary_symbol.clone());
         if let Err(e) = atomic_write_json_checked(&self.cfg.state_path, &self.state) {
             // No durable marker, no order: sending now would make the
             // at-most-one guarantee depend on this process surviving.
@@ -3921,7 +3998,7 @@ impl EngineBLiveEngine {
                 "[ENTRY] cannot persist the entry-attempt marker to {} ({e}); NOT sending this tick",
                 self.cfg.state_path.display()
             );
-            self.state.entry_in_flight = false;
+            self.state.entry_in_flight = None;
             return;
         }
         let submit = self.submit_order(side, size, false).await;
@@ -4283,8 +4360,8 @@ impl EngineBLiveEngine {
         }
         // The confirmation has resolved (or was never installed), so the
         // durable in-flight marker is no longer owed to a restart.
-        if self.pending.is_none() && self.state.entry_in_flight {
-            self.state.entry_in_flight = false;
+        if self.pending.is_none() && self.state.entry_in_flight.is_some() {
+            self.state.entry_in_flight = None;
             self.state_write_pending = true;
         }
         // Backstop for any path above that changed the position without
@@ -6541,8 +6618,11 @@ mod tests {
         // say so: a crash here must not restart as a clean start
         // (pairtrade#300 Codex review).
         assert!(
-            load_state(&h.engine.cfg.state_path).entry_in_flight,
-            "the in-flight marker must be durable before the send"
+            load_state(&h.engine.cfg.state_path)
+                .entry_in_flight
+                .as_deref()
+                == Some("SNDK"),
+            "the in-flight marker, with its symbol, must be durable before the send"
         );
     }
 
@@ -7130,7 +7210,7 @@ mod tests {
         h.engine.reconciled = false;
         // What the pre-send marker leaves on disk, with the process
         // having died before the fill was confirmed.
-        h.engine.state.entry_in_flight = true;
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
         h.engine.state.last_session_date = Some(TODAY.to_string());
         // The account read comes back flat -- which proves nothing.
         h.set_now(T1_US);
@@ -7141,7 +7221,7 @@ mod tests {
         );
         assert!(h.engine.state.session_halted);
         assert!(
-            !h.engine.state.entry_in_flight,
+            h.engine.state.entry_in_flight.is_none(),
             "the marker is consumed, not left to repeat"
         );
         assert!(
@@ -7157,6 +7237,84 @@ mod tests {
             .push(snap("SNDK", "0.057", 1, Some("1756.92")));
         h.engine.tick().await;
         assert!(h.engine.position.is_some(), "the delayed fill is picked up");
+    }
+
+    /// pairtrade#300 Codex review round 13, P1: the in-flight marker
+    /// names the symbol it was sent for.
+    #[tokio::test]
+    async fn an_in_flight_entry_on_a_former_symbol_is_parked_not_rebound() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // The order went out for SNDK; us_primary is MU by the time this
+        // process starts again.
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            !h.engine.state.position_unconfirmed,
+            "watching MU for an order sent on SNDK would be the wrong instrument"
+        );
+        assert_eq!(
+            unmanaged_symbols(&h.engine.state),
+            vec!["SNDK".to_string()],
+            "the exposure it may have created must have a record"
+        );
+        assert!(h.engine.state.session_halted);
+        let reason = h
+            .engine
+            .state
+            .session_halt_reason
+            .clone()
+            .unwrap_or_default();
+        assert!(reason.contains("SNDK"), "unexpected: {reason}");
+        // And it is visible where an operator looks.
+        h.engine.last_status_write_us = 0;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(status["positions"][0]["symbol"], serde_json::json!("SNDK"));
+    }
+
+    /// pairtrade#300 Codex review round 13, P1: parking a live displaced
+    /// position halts, even if the earlier halt was already acknowledged.
+    #[tokio::test]
+    async fn parking_a_displaced_live_position_engages_its_own_halt() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let parked = persisted_long(0.057, TODAY); // SNDK
+        h.engine.state.unmanaged_positions = vec![parked];
+        let mut managed = persisted_long(0.020, TODAY);
+        managed.symbol = "BBB".to_string();
+        h.engine.state.open_position = Some(managed);
+        // An operator already cleared the previous halt.
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        {
+            let mut positions = h.connector.positions.lock().unwrap();
+            positions.push(snap("SNDK", "0.057", 1, Some("1756.92")));
+            positions.push(snap("BBB", "0.020", 1, Some("20.0")));
+        }
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            h.engine.state.session_halted,
+            "BBB is now unmanaged and still open, which is a halt of its own"
+        );
+        let reason = h
+            .engine
+            .state
+            .session_halt_reason
+            .clone()
+            .unwrap_or_default();
+        assert!(reason.contains("BBB"), "unexpected: {reason}");
+        assert_eq!(unmanaged_symbols(&h.engine.state), vec!["BBB".to_string()]);
     }
 
     /// pairtrade#300 Codex review round 12, P2: a flipped parked record
