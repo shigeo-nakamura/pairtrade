@@ -362,6 +362,15 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                 continue
             ts_ms = record.get("ts_ms")
             arm = record.get("variant")
+            # The last unvalidated arm source. Round 33 called this "the
+            # only genuinely machine-written arm" and left it alone; it
+            # is still a field read out of a file, and `"freq "` here
+            # creates an execution-only arm whose volume reports as
+            # uncosted while the real cost reports as having no volume
+            # (Codex, PR #297).
+            if arm is not None and not is_bare_arm(arm):
+                raise SubsidyLedgerError(
+                    f"{path}: a leg_fill needs a bare `variant` arm name; got {arm!r}")
             if ts_ms is None or not arm:
                 # Same rule the PnL loader already applies to a row with no
                 # `ts`: a fill that cannot be attributed to a day and an arm
@@ -1291,6 +1300,13 @@ def summarize(rows: list[Row]) -> dict:
             or arm["uncosted_points"] is None
             or arm["cost_usd_on_pointed_days"] is None
         )
+        # Whether a points input existed at all, which is different from
+        # every points total being unknown. Without it the renderer keyed
+        # the point-coverage lines off a day count that is non-zero on
+        # the ordinary `--points`-less run, and printed "unknown of cost
+        # fell on days with no points supplied" under a known total cost
+        # (Codex, PR #297).
+        arm["points_supplied"] = bool(arm["points_seen"])
         if not arm["points_seen"]:
             arm["points"] = None
             arm["uncosted_points"] = None
@@ -1442,6 +1458,10 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"{arm['incomplete_volume_days']} day(s) reported no value, so those days' "
                 f"volume is a lower bound"
             )
+        if not arm["points_supplied"]:
+            # No points input at all: the whole point-coverage section is
+            # about a KPI the caller did not ask for (Codex, PR #297).
+            continue
         if arm["cost_per_point"] is not None:
             out.append(
                 f"         {money(arm['cost_usd_on_pointed_days'])} of it over "

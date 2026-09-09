@@ -1500,6 +1500,58 @@ def test_two_equity_closes_at_the_same_instant_settle_nothing():
     assert repeated.get("2026-09-09") == 100.0, repeated
 
 
+def test_a_padded_execution_variant_is_refused():
+    """The last unvalidated arm source, and it is still a file field.
+
+    `"freq "` created an execution-only arm: the real volume reported as
+    uncosted while the real cost reported as having no volume, exit 0
+    (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for bad in ("freq ", " freq", "", 1):
+            path = write(Path(tmp) / "execution-freq.jsonl",
+                         [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": bad,
+                           "fill_value": 10_000.0}])
+            try:
+                load_execution([path])
+            except SubsidyLedgerError as error:
+                assert "bare `variant`" in str(error) or "has no" in str(error), error
+            else:
+                raise AssertionError(f"variant {bad!r} must be refused")
+        good = write(Path(tmp) / "execution-freq.jsonl",
+                     [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                       "fill_value": 10_000.0}])
+        assert ("2026-09-08", "freq") in load_execution([good])
+
+
+def test_a_run_without_points_says_nothing_about_points():
+    """The ordinary invocation must not discuss a KPI it was not given.
+
+    Keying the point-coverage lines off a day count printed "unknown of
+    cost fell on days with no points supplied" under a known total cost
+    on every `--points`-less run (Codex, PR #297).
+    """
+    rows = build_rows(
+        {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+        {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-40.0,
+                                        funding_seen=True)},
+    )
+    printed = render_table(rows, summarize(rows))
+    assert "point" not in printed.split("money up):")[1], printed
+    assert "unknown" not in printed, printed
+
+    # With points supplied the section comes back.
+    pointed = build_rows(
+        {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+        {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-40.0,
+                                        funding_seen=True)},
+        None,
+        {("2026-09-08", "freq"): 1000.0},
+    )
+    pointed_printed = render_table(pointed, summarize(pointed))
+    assert "per point" in pointed_printed, pointed_printed
+
+
 def test_a_padded_arm_in_a_pnl_filename_is_not_an_arm():
     """A filename is operator-supplied, not a machine source.
 
