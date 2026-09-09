@@ -1253,6 +1253,52 @@ def test_a_boolean_is_never_a_number_anywhere_in_the_ledger():
         assert round(carry_day.funding_usd, 6) == 0.0, "nothing was booked from it"
 
 
+def test_a_boolean_timestamp_or_hold_never_reads_as_a_real_value():
+    """The remaining `float()` sites: timestamps and hold durations.
+
+    `float(False)` is `0.0`, so a boolean `ts` attributed a row to
+    1970-01-01 and published a complete realized cost there, and a
+    boolean `hold_secs` read as a 0s/1s hold -- same-day, inside one
+    funding interval -- turning a missing carry into a verified zero
+    (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # A boolean PnL timestamp is fatal, like any unreadable `ts`.
+        bad_ts = pnl_file(
+            Path(tmp),
+            [{"ts": False, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}],
+        )
+        try:
+            load_pnl([bad_ts])
+        except SubsidyLedgerError as error:
+            assert "unreadable `ts`" in str(error), error
+        else:
+            raise AssertionError("a boolean ts must not attribute the row to 1970-01-01")
+
+        # And so is a boolean execution timestamp.
+        bad_ts_ms = write(
+            Path(tmp) / "execution-freq.jsonl",
+            [{"event": "leg_fill", "ts_ms": True, "variant": "freq", "fill_value": 10_000.0}],
+        )
+        try:
+            load_execution([bad_ts_ms])
+        except SubsidyLedgerError as error:
+            assert "unreadable `ts_ms`" in str(error), error
+        else:
+            raise AssertionError("a boolean ts_ms must not publish volume under 1970-01-01")
+
+    # A boolean hold takes the fail-safe in both hold-reading helpers.
+    boolean_hold = {"ts": 1788868800 + 1800, "hold_secs": False}
+    assert opening_date(boolean_hold) is None, "the opening date is unknowable, not same-day"
+    assert spans_a_funding_interval(boolean_hold), "and it is not a proven no-tick hold"
+    assert opening_date({"ts": True, "hold_secs": 600}) is None
+    # A real short hold still reads as one, so the fail-safe has not
+    # swallowed the normal case.
+    real = {"ts": 1788868800 + 1800, "hold_secs": 600}
+    assert opening_date(real) == "2026-09-08"
+    assert not spans_a_funding_interval(real)
+
+
 def test_a_supplied_pnl_glob_that_matches_nothing_is_refused():
     """Omitting `--pnl-glob` is supported; mistyping it is not.
 
