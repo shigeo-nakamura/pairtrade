@@ -1909,11 +1909,34 @@ def test_a_padded_arm_in_a_pnl_filename_is_not_an_arm():
     hyphenated = "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl"
     assert arm_from_pnl_filename(hyphenated) == "new", "unaided, the last token"
     assert arm_from_pnl_filename(hyphenated, {"brand-new"}) == "brand-new"
-    # Longest wins, so a known `new` does not shadow a known `brand-new`.
-    assert arm_from_pnl_filename(hyphenated, {"new", "brand-new"}) == "brand-new"
     # An unrelated hint changes nothing.
     assert arm_from_pnl_filename(hyphenated, {"freq"}) == "new"
     assert arm_from_pnl_filename("pnl-svc-freq-20260908.jsonl", {"freq"}) == "freq"
+
+    # When two known arms both fit, the filename does not say which, and
+    # "longest wins" only looked right: with arms `freq` and
+    # `lighter-freq` the longer match is longer because it ate the
+    # service's trailing `lighter`, so it attributed freq's PnL to the
+    # wrong arm. Refused, like every other ambiguity here
+    # (Codex, PR #297).
+    production = "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl"
+    assert arm_from_pnl_filename(production) == "freq"
+    assert arm_from_pnl_filename(production, {"freq"}) == "freq"
+    assert arm_from_pnl_filename(production, {"freq", "lighter-freq"}) is None
+    assert arm_from_pnl_filename(hyphenated, {"new", "brand-new"}) is None
+
+    # And the refusal names the candidates rather than only saying the
+    # arm is unreadable.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(Path(tmp) / production,
+                     [{"ts": TS, "source": "exit_fill", "pnl": -1.0, "hold_secs": 600}])
+        try:
+            load_pnl([path], {"freq", "lighter-freq"})
+        except SubsidyLedgerError as error:
+            assert "not decidable" in str(error), error
+            assert "'lighter-freq'" in str(error), error
+        else:
+            raise AssertionError("an ambiguous arm must be refused")
 
 
 def test_a_total_that_overflows_is_a_gap_not_an_infinity():

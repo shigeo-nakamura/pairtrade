@@ -566,10 +566,19 @@ def load_pnl(paths: Iterable[Path],
             # in it and still exited 0 -- the report then says no PnL
             # source covers those days, which is a different claim from
             # "one was supplied and could not be read" (Codex, PR #297).
+            ambiguous = sorted(candidate for candidate in known_arms
+                               if f"-{candidate}-" in f"-{path.name}")
+            detail = ""
+            if len(ambiguous) > 1:
+                detail = (
+                    "; more than one known arm fits the name ("
+                    + ", ".join(repr(candidate) for candidate in ambiguous)
+                    + "), and which one the file holds is not decidable from it"
+                )
             raise SubsidyLedgerError(
                 f"{path}: the arm cannot be read from this filename; a PnL export must be "
                 "named pnl-<service>-<arm>-<YYYYMMDD>.jsonl, since the rows do not carry "
-                "the arm themselves")
+                f"the arm themselves{detail}")
         for record in read_jsonl(path):
             ts = record.get("ts")
             if ts is None:
@@ -882,10 +891,20 @@ def arm_from_pnl_filename(name: str, known_arms: Iterable[str] = ()) -> str | No
     uncosted (Codex, PR #297).
 
     So the other inputs settle it: any arm already seen in the execution
-    ledger, the points file or `--equity` is matched as a whole suffix
-    first, longest wins. That is exactly the case where the bug bites --
-    the arm exists elsewhere and only its PnL was misfiled. With nothing
-    to match against, the last token remains the answer.
+    ledger, the points file or `--equity` is matched as a whole suffix.
+    That is exactly the case where the bug bites -- the arm exists
+    elsewhere and only its PnL was misfiled. With nothing to match
+    against, the last token remains the answer, which is right for every
+    production filename.
+
+    When *two* known arms both match, the filename genuinely does not
+    say which: with arms `freq` and `lighter-freq`,
+    `pnl-debot-pair-robinhood-lighter-freq-...` fits both, and the
+    longer one is only longer because it ate the service's trailing
+    `lighter`. "Longest wins" traded one silent mis-attribution for
+    another, so this returns `None` and the caller refuses the file --
+    the same thing this module does with every other ambiguity rather
+    than guessing (Codex, PR #297).
     """
     if not name.startswith("pnl-") or not name.endswith(".jsonl"):
         return None
@@ -894,10 +913,12 @@ def arm_from_pnl_filename(name: str, known_arms: Iterable[str] = ()) -> str | No
     if len(parts) != 2 or not parts[1].isdigit():
         return None
     service_and_arm = parts[0]
-    matches = [candidate for candidate in known_arms
-               if service_and_arm.endswith(f"-{candidate}")]
+    matches = sorted({candidate for candidate in known_arms
+                      if service_and_arm.endswith(f"-{candidate}")})
+    if len(matches) > 1:
+        return None
     if matches:
-        return max(matches, key=len)
+        return matches[0]
     arm = service_and_arm.rsplit("-", 1)[-1]
     # A filename is operator-supplied, so this is not the machine source
     # the round-33 comment took it for: `pnl-service-freq -20260908.jsonl`
