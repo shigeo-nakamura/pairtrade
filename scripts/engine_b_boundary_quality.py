@@ -106,6 +106,12 @@ def reject_unless_closed_copy(name, path):
         raise ValueError(f"{name}: must be a regular file, not a symlink")
     if path.exists() and not path.is_file():
         raise ValueError(f"{name}: must be a regular file")
+    # A hard link is the same inode under another name: the writer's
+    # -wal/-shm sit beside *its* name, so a companion check beside this one
+    # finds nothing, and the same stale-but-passing report follows
+    # (Codex, PR #311). A closed offline copy has one name.
+    if path.exists() and path.stat().st_nlink > 1:
+        raise ValueError(f"{name}: must not be hard-linked ({path.stat().st_nlink} links)")
     if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")):
         raise ValueError(f"{name}: use a closed offline copy without WAL/SHM")
 
@@ -129,6 +135,13 @@ class Dataset:
         # name -> connection, least-recently-used first.
         self.opened = OrderedDict()
         self.mappings = {}
+        # One market ID per symbol for the whole dataset, across both aliases
+        # and every manifest read. `provenance()` only rejects a conflict
+        # inside one manifest under one alias; the boundary logic then merges
+        # every alias's events into a single symbol series, so an ID that
+        # differs between aliases -- or between hourly files -- would mix two
+        # instruments into one passing report (Codex, PR #311).
+        self.market_ids = {}
         self.inventory = {}
         self.absent = set()
 
@@ -185,6 +198,14 @@ class Dataset:
         except Exception:
             db.close()
             raise
+        for (alias, symbol), market_id in mapping.items():
+            known = self.market_ids.setdefault(symbol, market_id)
+            if known != market_id:
+                db.close()
+                raise ValueError(
+                    f"{name}: {alias}/{symbol} has market ID {market_id} but the dataset "
+                    f"already maps {symbol} to {known}; one market ID per symbol across all "
+                    "aliases and partitions")
         self.inventory[name] = {"sha256": sha, "bytes": path.stat().st_size}
         self.mappings[name] = mapping
         self.opened[name] = db

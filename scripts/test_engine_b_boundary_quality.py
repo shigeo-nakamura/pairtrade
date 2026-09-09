@@ -2,6 +2,7 @@
 import ast
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -325,6 +326,28 @@ class QualityTests(unittest.TestCase):
                 self.report()
         self.assertEqual(len(seen), 2)
 
+    def test_market_id_must_agree_across_aliases_and_partitions(self):
+        # Across aliases inside one manifest: provenance() keys on
+        # (alias, symbol), so both survive it, and the boundary logic would
+        # merge their events into one SNDK series.
+        combined = json.loads(json.dumps(self.config))
+        other = json.loads(json.dumps(self.config['venues'][0]))
+        other['name'] = 'lighter_mainnet_context'
+        other['markets'][0]['market_id'] = 140
+        combined['venues'].append(other)
+        self.sql(T0-SECOND, 'UPDATE collector_manifest SET config_json=?', (json.dumps(combined),))
+        with self.assertRaisesRegex(ValueError, 'one market ID per symbol'):
+            self.report()
+
+        # Across partitions: each file's manifest is internally consistent
+        # and the ID changes between hourly files.
+        self.sql(T0-SECOND, 'UPDATE collector_manifest SET config_json=?', (json.dumps(self.config),))
+        moved = json.loads(json.dumps(self.config))
+        moved['venues'][0]['markets'][0]['market_id'] = 140
+        self.sql(TIMES[1]-SECOND, 'UPDATE collector_manifest SET config_json=?', (json.dumps(moved),))
+        with self.assertRaisesRegex(ValueError, 'one market ID per symbol'):
+            self.report()
+
     def test_conflicting_alias_snapshot_is_ambiguous(self):
         combined = json.loads(json.dumps(self.config))
         old = dict(combined['venues'][0], name='lighter_mainnet_context')
@@ -365,6 +388,19 @@ class QualityTests(unittest.TestCase):
         partition.symlink_to(moved)
         with self.assertRaisesRegex(ValueError, 'not a symlink'):
             dataset.verify_and_close()
+
+    def test_rejects_hard_linked_partitions(self):
+        # Same inode as a live database whose WAL sits beside the *other*
+        # name: a regular file by every test the symlink guard makes.
+        live_dir = self.root / 'live'
+        live_dir.mkdir()
+        partition = self.path(T0)
+        live = live_dir / partition.name
+        partition.rename(live)
+        (live_dir / (partition.name + '-wal')).touch()
+        os.link(live, partition)
+        with self.assertRaisesRegex(ValueError, 'hard-linked'):
+            self.report()
 
     def test_rejects_wal_input(self):
         Path(str(self.path(T0)) + '-wal').touch()
