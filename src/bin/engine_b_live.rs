@@ -1811,6 +1811,15 @@ impl EngineBLiveEngine {
             }
         };
         let live = exchange_position_for(&positions, &symbol);
+        // Before `persisted` is read: a record parked in
+        // `unmanaged_positions` is still an exposure claim, nothing else
+        // looks at it (`reconcile_action`, `write_status_if_due` and the
+        // shutdown report all read `open_position` / `self.position`),
+        // and a symbol that has come back under management has to be in
+        // the managed slot by the time the decision table runs -- else it
+        // is adopted from the exchange as an unknown position and its
+        // basis and partial PnL are lost (pairtrade#300 Codex review).
+        self.reconcile_unmanaged(&positions);
         let persisted = self.state.open_position.clone();
         // A change to `us_primary` while a position is still open on the
         // *old* symbol would otherwise look like `Vanished` -- the lookup
@@ -1868,13 +1877,6 @@ impl EngineBLiveEngine {
             self.reconciled = true;
             return;
         }
-        // A record parked in `unmanaged_position` is still an exposure
-        // claim, and nothing else looks at it: `reconcile_action`,
-        // `write_status_if_due` and the shutdown report all read
-        // `open_position` / `self.position`. Left unchecked it would go
-        // quiet after one restart while the position stayed on the
-        // exchange (pairtrade#300 Codex review).
-        self.reconcile_unmanaged(&positions);
         let action = reconcile_action(persisted.as_ref(), live.as_ref(), &symbol, &today, now_us);
         match action {
             ReconcileAction::Clean => {
@@ -1961,6 +1963,33 @@ impl EngineBLiveEngine {
         self.reconciled = true;
     }
 
+    /// Book the reductions a record already realized, at the moment that
+    /// record stops being the thing that carries them.
+    ///
+    /// Every path that discards or replaces a `PersistedPosition` needs
+    /// this, and they kept being found one at a time: the remainder's
+    /// result may be unknown (closed while we were down, flattened by
+    /// hand, flipped away), but reductions that completed *before* that
+    /// were realized at their own prices and this record is the only
+    /// copy. No trade counter moves -- nothing closed here -- only the
+    /// session and day PnL the drawdown halt is measured against
+    /// (pairtrade#300 Codex review).
+    fn book_orphaned_partial_pnl(&mut self, record: &PersistedPosition, why: &str) {
+        if record.realized_partial_pnl == 0.0 {
+            return;
+        }
+        log::error!(
+            "[RECONCILE] booking ${:.2} of partial PnL already realized on the {} {} record \
+             ({why}); only its final remainder is unbooked",
+            record.realized_partial_pnl,
+            record.side,
+            record.symbol
+        );
+        self.state.realized_pnl_session += record.realized_partial_pnl;
+        self.state.pnl_today += record.realized_partial_pnl;
+        self.state_write_pending = true;
+    }
+
     /// Check the exposure this engine cannot manage against the exchange
     /// on every start: cleared when the venue says it is gone, and kept
     /// with the session halted while it is still there. Without this the
@@ -1973,6 +2002,34 @@ impl EngineBLiveEngine {
         let mut kept: Vec<PersistedPosition> = Vec::new();
         let mut halt_reason: Option<String> = None;
         for p in std::mem::take(&mut self.state.unmanaged_positions) {
+            // `us_primary` came back to this symbol: the engine can send
+            // orders for it again, so the record belongs in the managed
+            // slot. Left here it would be adopted from the exchange as
+            // an unknown position -- losing its basis and its partial
+            // PnL -- and then linger as a duplicate claim after that
+            // adopted position closed (pairtrade#300 Codex review).
+            if p.symbol == self.cfg.us_primary_symbol {
+                if self.state.open_position.is_none() {
+                    log::warn!(
+                        "[RECONCILE] us_primary is {} again -- taking the parked {} record \
+                         (size={:.6}) back under management",
+                        p.symbol,
+                        p.side,
+                        p.open_size
+                    );
+                    self.state.open_position = Some(p);
+                    self.state_write_pending = true;
+                } else {
+                    // A managed record already exists for this symbol;
+                    // two claims on one symbol cannot both be resumed.
+                    self.book_orphaned_partial_pnl(
+                        &p,
+                        "a managed record already exists for the same symbol",
+                    );
+                    self.state_write_pending = true;
+                }
+                continue;
+            }
             match exchange_position_for(positions, &p.symbol) {
                 Some(live) => {
                     let reason = format!(
@@ -1988,12 +2045,13 @@ impl EngineBLiveEngine {
                 None => {
                     log::warn!(
                         "[RECONCILE] the unmanaged {} record ({} size={:.6}) is gone from the \
-                         exchange -- clearing it; whatever closed it did so at a price this \
-                         process never saw, so its PnL is unbooked",
+                         exchange -- clearing it; whatever closed its remainder did so at a \
+                         price this process never saw",
                         p.symbol,
                         p.side,
                         p.open_size
                     );
+                    self.book_orphaned_partial_pnl(&p, "its unmanaged record was flattened");
                     self.state_write_pending = true;
                 }
             }
@@ -2069,25 +2127,28 @@ impl EngineBLiveEngine {
         // loses money from the session's books, so they are booked here
         // instead of carried onto a position they did not come from
         // (pairtrade#300 Codex review).
-        let orphaned_partial_pnl = self
+        //
+        // Any record about to be replaced that this adoption cannot carry
+        // forward -- a different side, or a different symbol entirely
+        // (reachable when the old symbol is already flat, so the
+        // stale-symbol branch above did not fire). Both lose the record
+        // to the `sync_open_position_field` below, so what it already
+        // realized is booked first (pairtrade#300 Codex review).
+        let replaced = self
             .state
             .open_position
             .as_ref()
             .filter(|p| {
-                p.symbol == self.cfg.us_primary_symbol
-                    && side_from_str(&p.side) != Some(live.side)
-                    && p.realized_partial_pnl != 0.0
+                p.symbol != self.cfg.us_primary_symbol || side_from_str(&p.side) != Some(live.side)
             })
-            .map(|p| (p.realized_partial_pnl, p.side.clone()));
-        if let Some((pnl, old_side)) = orphaned_partial_pnl {
-            log::error!(
-                "[RECONCILE] the saved {old_side} position's ${pnl:.2} of already-realized \
-                 partial PnL is booked now: the exchange reports {} instead, so the record it \
-                 belonged to cannot be resumed",
-                live.side
-            );
-            self.state.realized_pnl_session += pnl;
-            self.state.pnl_today += pnl;
+            .cloned();
+        if let Some(record) = replaced {
+            let why = if record.symbol != self.cfg.us_primary_symbol {
+                "its symbol is no longer the configured one and the record is being replaced"
+            } else {
+                "the exchange reports the opposite side, so the record cannot be resumed"
+            };
+            self.book_orphaned_partial_pnl(&record, why);
         }
         let ws_price = self
             .exit_accounting_price(&self.cfg.us_primary_symbol)
@@ -2181,6 +2242,35 @@ impl EngineBLiveEngine {
     /// never a close this process did not actually see.
     fn note_shutdown_signal(&mut self, signal: &str) -> ShutdownReport {
         self.persist_position();
+        // Every parked exposure, not the first one: an operator who
+        // flattens the single position an alert names would leave the
+        // others live and undisclosed (pairtrade#300 Codex review). This
+        // is reported alongside whatever the match below decides, since
+        // a tracked position does not make these go away.
+        if !self.state.unmanaged_positions.is_empty() {
+            let listed = self
+                .state
+                .unmanaged_positions
+                .iter()
+                .map(|p| format!("{} {} size={:.6}", p.side, p.symbol, p.open_size))
+                .collect::<Vec<_>>()
+                .join("; ");
+            log::error!(
+                "[SHUTDOWN] {signal}: {} exposure(s) this engine cannot close are still claimed: \
+                 {listed}",
+                self.state.unmanaged_positions.len()
+            );
+            send_notification(
+                format!(
+                    "Han Bridge SHUTDOWN with {} unmanaged exposure(s) ({signal})",
+                    self.state.unmanaged_positions.len()
+                ),
+                format!(
+                    "{listed} -- on symbols this engine no longer trades, so it never sent a \
+                     close for them. Flatten each by hand."
+                ),
+            );
+        }
         match self.position.as_ref() {
             Some(p) => {
                 log::error!(
@@ -3083,7 +3173,20 @@ impl EngineBLiveEngine {
             // is still no price to install.
             p.entry_price_unknown = live.entry_price.is_none() && !(ws_price > 0.0);
         }
+        // Durable before the caller does anything else. The old leg's
+        // PnL and the replacement leg exist only in `self.position` at
+        // this point; `halt_session` would otherwise write the *stale*
+        // record, and `maybe_exit` goes straight on to submit the
+        // replacement leg's close. A crash -- or an accepted order whose
+        // outcome is ambiguous -- in that window restores the pre-flip
+        // record and the booked leg is gone for good
+        // (pairtrade#300 Codex review).
+        self.sync_open_position_field();
+        self.state_write_pending = true;
         self.halt_session(reason);
+        if self.state_write_pending {
+            self.persist_state();
+        }
     }
 
     /// Sticky session halt (same on-disk RISK_ACK contract as the drawdown
@@ -6679,6 +6782,148 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 7: every path that discards a
+    /// record books what it already realized, and a symbol coming back
+    /// under management is resumed rather than re-adopted blind.
+    #[tokio::test]
+    async fn a_parked_symbol_that_becomes_primary_again_is_resumed() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let mut parked = persisted_long(0.057, TODAY);
+        parked.realized_partial_pnl = 0.42;
+        h.engine.state.unmanaged_positions = vec![parked];
+        // us_primary is SNDK again, and the position is still there.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            h.engine.state.unmanaged_positions.is_empty(),
+            "the record belongs in the managed slot once the engine can trade it again"
+        );
+        let resumed = h
+            .engine
+            .position
+            .clone()
+            .expect("resumed, not adopted blind");
+        assert!(
+            (resumed.entry_price - 1756.92).abs() < 1e-9,
+            "its saved basis survives"
+        );
+        assert!(
+            (resumed.realized_partial_pnl - 0.42).abs() < 1e-12,
+            "and so does its partial PnL, rather than being booked and lost"
+        );
+        assert!(
+            !h.engine.state.session_halted,
+            "this is a resume, not an anomaly"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manually_flattened_unmanaged_record_books_what_it_realized() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let mut parked = persisted_long(0.057, TODAY);
+        parked.symbol = "AAA".to_string();
+        parked.realized_partial_pnl = 0.42;
+        h.engine.state.unmanaged_positions = vec![parked];
+        // The operator flattened it: the venue reports nothing.
+        h.set_now(T1_US);
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.tick().await;
+        assert!(h.engine.state.unmanaged_positions.is_empty());
+        assert!(
+            ((h.engine.state.realized_pnl_session - before) - 0.42).abs() < 1e-12,
+            "reductions realized before the symbol change are still money"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopting_over_a_foreign_symbol_record_books_its_partial_pnl() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Saved on AAA (now flat, so the stale-symbol branch does not
+        // fire); the configured symbol has an unexplained position.
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.symbol = "AAA".to_string();
+        saved.realized_partial_pnl = 0.42;
+        h.engine.state.open_position = Some(saved);
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.030", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.tick().await;
+        assert!(h.engine.position.is_some(), "the live position is adopted");
+        assert!(
+            ((h.engine.state.realized_pnl_session - before) - 0.42).abs() < 1e-12,
+            "the replaced record's realized PnL must not vanish with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_side_flip_is_durable_before_the_replacement_close_is_sent() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        });
+        h.engine.persist_position();
+        h.engine.reconcile_side_flip_if_any(
+            &ExchangePosition {
+                side: OrderSide::Short,
+                size: 0.030,
+                entry_price: Some(1750.0),
+            },
+            1760.0,
+            "test",
+        );
+        // Disk must already carry the flipped record, not the pre-flip one.
+        let on_disk = load_state(&h.engine.cfg.state_path)
+            .open_position
+            .expect("still claimed");
+        assert_eq!(on_disk.side, "short");
+        assert!(
+            (on_disk.realized_partial_pnl - (1760.0 - 1700.0) * 0.057).abs() < 1e-9,
+            "the booked old leg must survive a crash before the close is sent, got {}",
+            on_disk.realized_partial_pnl
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_names_every_unmanaged_exposure() {
+        let mut h = harness();
+        let mut a = persisted_long(0.010, TODAY);
+        a.symbol = "AAA".to_string();
+        let mut b = persisted_long(0.020, TODAY);
+        b.symbol = "BBB".to_string();
+        h.engine.state.unmanaged_positions = vec![a, b];
+        h.engine.position = None;
+        h.engine.state.open_position = None;
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnreconciledClaim,
+            "parked exposures are still claims"
+        );
+        // Both are named; the assertion that matters is that the count is
+        // not 1 (the previous `.first()` behaviour).
+        assert_eq!(h.engine.state.unmanaged_positions.len(), 2);
     }
 
     /// pairtrade#300 Codex review round 6, P1: a second `us_primary`
