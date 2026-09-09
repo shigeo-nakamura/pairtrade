@@ -232,9 +232,10 @@ fn require_config_within_auto_execute_policy(
 /// `live-tick` does not go through this path: it builds its own plan from
 /// `step_at` under the checkpoint lock immediately before dispatch, so that
 /// provenance is inherent rather than merely asserted. A `MeanReversionExit`/
-/// `MaxHoldExit` plan supplied here is still risk-reducing and already
-/// bounded by `validate_plan_consistent_with_state` (cannot exceed the
-/// genuinely open rotated quantity), so only entries are refused.
+/// `MaxHoldExit`/`CorporateActionExit` plan supplied here is still
+/// risk-reducing and already bounded by `validate_plan_consistent_with_state`
+/// (cannot exceed the genuinely open rotated quantity), so only entries are
+/// refused.
 fn require_auto_execute_plan_is_not_a_fresh_entry(plan: &ArcusSpotRotationPlan) -> Result<()> {
     if plan.trigger == ArcusSpotRotationTrigger::EntrySignal {
         bail!(
@@ -4396,6 +4397,41 @@ async fn main() -> Result<()> {
                     .context("cost buffers exceed Decimal range")?
                     .normalize(),
             );
+            // The same reasoning for the corporate-action calendar
+            // (bot-strategy#853): a window that was meant to be declared and
+            // silently is not looks exactly like no window at all, and the
+            // one moment an operator can still catch that is while
+            // installing the config they just edited. `deny_unknown_fields`
+            // catches a mistyped key; this catches an event that landed
+            // somewhere other than where it was meant to.
+            if config.runtime.corporate_actions.is_empty() {
+                eprintln!("[arcus-config] corporate actions: none declared");
+            } else {
+                eprintln!(
+                    "[arcus-config] corporate actions: {} declared",
+                    config.runtime.corporate_actions.len()
+                );
+                for event in &config.runtime.corporate_actions {
+                    eprintln!(
+                        "[arcus-config]   {} ({}) block {} -> exit {} -> effective {} -> resume {}                          [{}] source: {}",
+                        event.event_id,
+                        event.symbols.join("+"),
+                        event.entry_block_at,
+                        event.reduce_exit_at,
+                        event.effective_at,
+                        event.resume_not_before,
+                        match event.post_event_inventory {
+                            Some(inventory) => format!(
+                                "reconciled token_a={} token_b={}",
+                                inventory.token_a.normalize(),
+                                inventory.token_b.normalize()
+                            ),
+                            None => "NOT RECONCILED -- the resume will hold".to_string(),
+                        },
+                        event.source,
+                    );
+                }
+            }
             println!("{}", auto_execute_config_digest(&config)?);
             Ok(())
         }

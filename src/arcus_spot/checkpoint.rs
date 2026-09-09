@@ -119,6 +119,7 @@ fn classify_config_drift(
         max_inventory_imbalance_fraction: stored_max_inventory_imbalance_fraction,
         daily_loss_limit_usd: stored_daily_loss_limit_usd,
         cumulative_loss_limit_usd: stored_cumulative_loss_limit_usd,
+        corporate_actions: stored_corporate_actions,
     } = stored;
     let ArcusSpotRuntimeConfig {
         mode: current_mode,
@@ -140,6 +141,7 @@ fn classify_config_drift(
         max_inventory_imbalance_fraction: current_max_inventory_imbalance_fraction,
         daily_loss_limit_usd: current_daily_loss_limit_usd,
         cumulative_loss_limit_usd: current_cumulative_loss_limit_usd,
+        corporate_actions: current_corporate_actions,
     } = current;
 
     let mut drift = ArcusSpotCheckpointConfigDrift::default();
@@ -241,6 +243,19 @@ fn classify_config_drift(
     }
     if stored_cumulative_loss_limit_usd != current_cumulative_loss_limit_usd {
         drift.state_preserving.push("cumulative_loss_limit_usd");
+    }
+    // Declaring, amending or reconciling a corporate-action window must not
+    // require a window reset: the whole point of the calendar is that an
+    // operator can add the event they just learned about while the runtime
+    // keeps marking, keeps risk-accounting, and keeps the ability to exit.
+    // The one state change a window does make -- discarding the pre-event
+    // signal history -- is performed by the guard itself, once, at the
+    // declared effective time, and recorded in the checkpoint; a blanket
+    // reset here would instead discard it at config-install time, which is
+    // the wrong moment and would also drop the regime and risk baselines
+    // that the forced exit still needs.
+    if stored_corporate_actions != current_corporate_actions {
+        drift.state_preserving.push("corporate_actions");
     }
 
     drift
@@ -517,6 +532,16 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::new(76, 2),
             daily_loss_limit_usd: Decimal::from(3),
             cumulative_loss_limit_usd: Decimal::from(11),
+            corporate_actions: vec![super::super::ArcusSpotCorporateActionEvent {
+                event_id: "SPY-2026-SPLIT".to_string(),
+                symbols: vec!["SPY".to_string()],
+                entry_block_at: "2026-10-01T00:00:00Z".parse().unwrap(),
+                reduce_exit_at: "2026-10-01T12:00:00Z".parse().unwrap(),
+                effective_at: "2026-10-02T00:00:00Z".parse().unwrap(),
+                resume_not_before: "2026-10-03T00:00:00Z".parse().unwrap(),
+                source: "issuer notice".to_string(),
+                post_event_inventory: None,
+            }],
         }
     }
 
@@ -550,6 +575,7 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::new(75, 2),
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
+            corporate_actions: Vec::new(),
         }
     }
 
@@ -679,6 +705,7 @@ mod tests {
                 "signal_window_samples",
             ],
         );
+        assert!(drift.state_preserving.contains(&"corporate_actions"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use dex_connector::ArcusSpotPair;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,76 @@ impl ArcusSpotInventory {
     }
 }
 
+/// One operator-supplied corporate-action or token-lifecycle window.
+///
+/// The recorder payload carries token identity, `addedTimestamp`, prices and
+/// financial fields, but no corporate-action calendar, effective time, halt
+/// flag or settlement status, so the runtime cannot infer a split, merger,
+/// symbol change or redemption on its own (bot-strategy#853). A price-jump
+/// threshold cannot substitute: it cannot separate a split from a legitimate
+/// gap, and it sees nothing at all for the lifecycle events that leave price
+/// untouched. So each window is declared by an operator, from a named
+/// authoritative source, and the runtime only ever *applies* it.
+///
+/// The four timestamps are non-decreasing and mark the phases:
+///
+/// - `entry_block_at` -- stop opening new rotations. Exits stay available.
+/// - `reduce_exit_at` -- if a rotation is still open, exit it (the exit is
+///   still subject to every quote, venue, cost, floor, gas, signing and
+///   reconciliation gate; a failure holds, it never bypasses one).
+/// - `effective_at` -- the pre-event relative-price history stops describing
+///   the same instrument, so it is discarded exactly once and no further
+///   samples are accumulated until `resume_not_before`.
+/// - `resume_not_before` -- the earliest the operator asserts post-event data
+///   is trustworthy. Resuming additionally requires unchanged token
+///   identity, a flat regime, and `post_event_inventory`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ArcusSpotCorporateActionEvent {
+    /// Stable identifier. The runtime records it once handled, so an event
+    /// is applied exactly once across restart and replay even if it stays
+    /// in the config forever.
+    pub event_id: String,
+    /// Affected pair symbol(s). Either leg invalidates the *relative* price,
+    /// so the window blocks the pair regardless of which side is named; the
+    /// list is what the post-event token-identity comparison checks.
+    pub symbols: Vec<String>,
+    pub entry_block_at: DateTime<Utc>,
+    pub reduce_exit_at: DateTime<Utc>,
+    pub effective_at: DateTime<Utc>,
+    pub resume_not_before: DateTime<Utc>,
+    /// Where the operator read this event. Required, and never inferred --
+    /// an event with no citable source is a guess, and a guess that blocks
+    /// trading or rebases inventory is worse than no guard at all.
+    pub source: String,
+    /// Wallet holdings the operator verified on-chain at or after
+    /// `effective_at`.
+    ///
+    /// This is the reconciliation step, and it is deliberately a config
+    /// field rather than a chain read inside the runtime. A split rewrites
+    /// balances with no swap, so the tracked inventory -- which only ever
+    /// moves through `apply_confirmed_live_fill` -- is wrong afterwards and
+    /// nothing in the recorder snapshot can correct it. Putting the observed
+    /// numbers in the config keeps the decision identical between replay and
+    /// live-tick (the acceptance criterion this whole guard is measured on),
+    /// keeps it under the same administrator-approved policy digest as every
+    /// other config change, and leaves the runtime with no privileged input
+    /// a replay cannot reproduce. Absent, the runtime holds at
+    /// `resume_not_before` rather than resuming on stale quantities.
+    #[serde(default)]
+    pub post_event_inventory: Option<ArcusSpotInventory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// A key serde does not recognise here is a key that silently does nothing.
+// That is tolerable for a retune and not tolerable for `corporate_actions`,
+// where a mistyped list is indistinguishable from a declared window that
+// simply never engages -- the guard would report nothing and trade straight
+// through the event it was installed for. Refusing the config outright at
+// install time is the only failure mode that cannot be missed. Verified
+// against the live 2026-09-09 `/etc/arcus-spot/config.yaml`, whose
+// `runtime:` section carries exactly these keys.
+#[serde(deny_unknown_fields)]
 pub struct ArcusSpotRuntimeConfig {
     #[serde(default)]
     pub mode: ArcusSpotRuntimeMode,
@@ -60,12 +130,24 @@ pub struct ArcusSpotRuntimeConfig {
     pub max_inventory_imbalance_fraction: Decimal,
     pub daily_loss_limit_usd: Decimal,
     pub cumulative_loss_limit_usd: Decimal,
+    /// Operator-declared corporate-action windows, ordered and
+    /// non-overlapping. Empty -- the default, and what every existing
+    /// deployment deserializes to -- leaves behaviour exactly as it was.
+    #[serde(default)]
+    pub corporate_actions: Vec<ArcusSpotCorporateActionEvent>,
 }
 
 impl ArcusSpotRuntimeConfig {
     pub fn normalize(&mut self) {
         self.pair.sell_symbol = self.pair.sell_symbol.trim().to_ascii_uppercase();
         self.pair.buy_symbol = self.pair.buy_symbol.trim().to_ascii_uppercase();
+        for event in &mut self.corporate_actions {
+            event.event_id = event.event_id.trim().to_string();
+            event.source = event.source.trim().to_string();
+            for symbol in &mut event.symbols {
+                *symbol = symbol.trim().to_ascii_uppercase();
+            }
+        }
     }
 
     /// Recorder pairs required to independently cost-gate entries in both
@@ -165,6 +247,101 @@ impl ArcusSpotRuntimeConfig {
         {
             return Err("daily and cumulative loss limits must be positive".to_string());
         }
+        self.validate_corporate_actions()?;
+        Ok(())
+    }
+
+    /// Ordering, uniqueness, pair membership and monotonic timestamps for
+    /// `corporate_actions`.
+    ///
+    /// Windows are required to be strictly ordered *and* disjoint so that at
+    /// most one event is ever active. Two genuinely simultaneous events --
+    /// say a split in one leg and a symbol change in the other -- are
+    /// declared as one window naming both symbols; that is the same guard,
+    /// and it keeps "which event is this tick in" from being a question with
+    /// two answers.
+    fn validate_corporate_actions(&self) -> Result<(), String> {
+        let mut previous: Option<&ArcusSpotCorporateActionEvent> = None;
+        for event in &self.corporate_actions {
+            if event.event_id.trim().is_empty() {
+                return Err("corporate_actions entries need a non-empty event_id".to_string());
+            }
+            if event.source.trim().is_empty() {
+                return Err(format!(
+                    "corporate action {} needs a source; the runtime never infers an event",
+                    event.event_id
+                ));
+            }
+            if self
+                .corporate_actions
+                .iter()
+                .filter(|other| other.event_id.eq_ignore_ascii_case(&event.event_id))
+                .count()
+                > 1
+            {
+                return Err(format!(
+                    "corporate action event_id {} is not unique",
+                    event.event_id
+                ));
+            }
+            if event.symbols.is_empty() {
+                return Err(format!(
+                    "corporate action {} names no symbol",
+                    event.event_id
+                ));
+            }
+            for (index, symbol) in event.symbols.iter().enumerate() {
+                if !symbol.eq_ignore_ascii_case(&self.pair.sell_symbol)
+                    && !symbol.eq_ignore_ascii_case(&self.pair.buy_symbol)
+                {
+                    return Err(format!(
+                        "corporate action {} names {symbol}, which is not in the configured pair",
+                        event.event_id
+                    ));
+                }
+                if event.symbols[..index]
+                    .iter()
+                    .any(|earlier| earlier.eq_ignore_ascii_case(symbol))
+                {
+                    return Err(format!(
+                        "corporate action {} names {symbol} twice",
+                        event.event_id
+                    ));
+                }
+            }
+            if !(event.entry_block_at <= event.reduce_exit_at
+                && event.reduce_exit_at <= event.effective_at
+                && event.effective_at <= event.resume_not_before)
+            {
+                return Err(format!(
+                    "corporate action {} timestamps must be non-decreasing: entry_block_at <= \
+                     reduce_exit_at <= effective_at <= resume_not_before",
+                    event.event_id
+                ));
+            }
+            if let Some(previous) = previous {
+                if event.entry_block_at <= previous.entry_block_at {
+                    return Err(format!(
+                        "corporate actions must be ordered by entry_block_at; {} does not follow {}",
+                        event.event_id, previous.event_id
+                    ));
+                }
+                if event.entry_block_at <= previous.resume_not_before {
+                    return Err(format!(
+                        "corporate action {} overlaps {}; declare simultaneous events as one \
+                         window naming both symbols",
+                        event.event_id, previous.event_id
+                    ));
+                }
+            }
+            if let Some(inventory) = event.post_event_inventory {
+                validate_inventory(
+                    &format!("corporate action {} post_event_inventory", event.event_id),
+                    inventory,
+                )?;
+            }
+            previous = Some(event);
+        }
         Ok(())
     }
 }
@@ -211,6 +388,7 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::new(8, 1),
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
+            corporate_actions: Vec::new(),
         }
     }
 
@@ -254,5 +432,159 @@ mod tests {
         assert_eq!(recorder.pairs[0], config.pair);
         assert_eq!(recorder.pairs[1].sell_symbol, config.pair.buy_symbol);
         assert_eq!(recorder.pairs[1].buy_symbol, config.pair.sell_symbol);
+    }
+
+    fn config_with_events(events: Vec<ArcusSpotCorporateActionEvent>) -> ArcusSpotRuntimeConfig {
+        let mut config = valid_config();
+        config.corporate_actions = events;
+        config.normalize();
+        config
+    }
+
+    fn split_event(event_id: &str, anchor: DateTime<Utc>) -> ArcusSpotCorporateActionEvent {
+        ArcusSpotCorporateActionEvent {
+            event_id: event_id.to_string(),
+            symbols: vec!["NVDA".to_string()],
+            entry_block_at: anchor,
+            reduce_exit_at: anchor + chrono::Duration::hours(1),
+            effective_at: anchor + chrono::Duration::hours(2),
+            resume_not_before: anchor + chrono::Duration::hours(3),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        }
+    }
+
+    fn anchor() -> DateTime<Utc> {
+        "2026-10-01T00:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn a_mistyped_corporate_action_key_is_refused_rather_than_ignored() {
+        let error = serde_yaml::from_str::<ArcusSpotRuntimeConfig>(
+            r#"mode: read_only
+chain_id: 4663
+pair:
+  sell_symbol: NVDA
+  buy_symbol: AMD
+notional_usd: "5"
+initial_inventory: {token_a: "1", token_b: "1"}
+inventory_floors: {token_a: "0.1", token_b: "0.1"}
+max_rotation_fraction: "1"
+signal_window_samples: 20
+min_signal_samples: 10
+entry_z_score: 2.0
+exit_z_score: 0.25
+max_quote_age_secs: 30
+max_hold_secs: 86400
+max_all_in_round_trip_cost_bps: "100"
+gas_buffer_bps: "5"
+settlement_buffer_bps: "5"
+max_inventory_imbalance_fraction: "0.8"
+daily_loss_limit_usd: "2"
+cumulative_loss_limit_usd: "10"
+corporate_action:
+  - event_id: a
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("corporate_action"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_calendar_is_valid_and_is_the_default() {
+        let config = valid_config();
+        assert!(config.corporate_actions.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_ordered_disjoint_windows() {
+        let config = config_with_events(vec![
+            split_event("a", anchor()),
+            split_event("b", anchor() + chrono::Duration::days(1)),
+        ]);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn normalize_upper_cases_event_symbols_so_pair_membership_is_comparable() {
+        let mut event = split_event("a", anchor());
+        event.symbols = vec![" nvda ".to_string()];
+        let config = config_with_events(vec![event]);
+        assert_eq!(
+            config.corporate_actions[0].symbols,
+            vec!["NVDA".to_string()]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_a_symbol_outside_the_configured_pair() {
+        let mut event = split_event("a", anchor());
+        event.symbols = vec!["TSLA".to_string()];
+        let error = config_with_events(vec![event]).validate().unwrap_err();
+        assert!(error.contains("not in the configured pair"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_event_id() {
+        let error = config_with_events(vec![
+            split_event("a", anchor()),
+            split_event("A", anchor() + chrono::Duration::days(1)),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("not unique"), "{error}");
+    }
+
+    #[test]
+    fn rejects_out_of_order_timestamps_inside_one_event() {
+        let mut event = split_event("a", anchor());
+        event.effective_at = event.reduce_exit_at - chrono::Duration::minutes(1);
+        let error = config_with_events(vec![event]).validate().unwrap_err();
+        assert!(error.contains("non-decreasing"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unordered_events() {
+        let error = config_with_events(vec![
+            split_event("a", anchor() + chrono::Duration::days(1)),
+            split_event("b", anchor()),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("ordered by entry_block_at"), "{error}");
+    }
+
+    #[test]
+    fn rejects_overlapping_windows() {
+        let error = config_with_events(vec![
+            split_event("a", anchor()),
+            // Opens one hour before "a" resumes.
+            split_event("b", anchor() + chrono::Duration::hours(2)),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("overlaps"), "{error}");
+    }
+
+    #[test]
+    fn rejects_an_event_with_no_source() {
+        let mut event = split_event("a", anchor());
+        event.source = "   ".to_string();
+        let error = config_with_events(vec![event]).validate().unwrap_err();
+        assert!(error.contains("needs a source"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_negative_reconciled_inventory() {
+        let mut event = split_event("a", anchor());
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(-1),
+            token_b: Decimal::ONE,
+        });
+        let error = config_with_events(vec![event]).validate().unwrap_err();
+        assert!(error.contains("cannot be negative"), "{error}");
     }
 }

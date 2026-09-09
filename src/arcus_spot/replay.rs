@@ -104,6 +104,7 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::ONE,
             daily_loss_limit_usd: Decimal::from(100),
             cumulative_loss_limit_usd: Decimal::from(100),
+            corporate_actions: Vec::new(),
         }
     }
 
