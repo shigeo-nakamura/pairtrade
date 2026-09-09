@@ -3242,8 +3242,24 @@ impl ArcusSpotRuntime {
         // ... and the calendar covers the tick that first crosses
         // `effective_at`, where the halt is evaluated before the gate has
         // had a chance to write the stamp.
-        self.active_corporate_action(evaluation_time)
+        if self
+            .active_corporate_action(evaluation_time)
             .is_some_and(|event| evaluation_time >= event.effective_at)
+        {
+            return true;
+        }
+        // A refused declaration (a handled id reused for a different action)
+        // never becomes active and never gets a progress record, yet its
+        // cutoff is as real as any other: past it the venue may quote new
+        // units. The gate's overlay already suppresses its exits; this is the
+        // same fact for everything that asks the predicate directly -- the
+        // dispatch validator above all, which otherwise accepts an exit
+        // planned before the cutoff and dispatched after it (Codex P1,
+        // pairtrade#309).
+        self.config.corporate_actions.iter().any(|event| {
+            self.handled_record_for(event) == Some(HandledMatch::ReusedId)
+                && evaluation_time >= event.effective_at
+        })
     }
 
     /// The one declared window this tick falls in, if any: unhandled, and
@@ -7425,6 +7441,47 @@ mod tests {
         }
         assert_eq!(runtime.state.inventory, before);
         assert!(runtime.state.handled_corporate_action_ids.is_empty());
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn an_exit_plan_is_refused_at_dispatch_past_a_reused_ids_cutoff() {
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor);
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        // The first action is handled; a distinct later one reuses its id,
+        // with effective_at at +17s.
+        runtime.state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
+        runtime.state.handled_corporate_action_fingerprints =
+            vec![runtime.config.corporate_actions[0].fingerprint()];
+        let mut reused = corporate_action_event(anchor + Duration::seconds(13));
+        reused.post_event_inventory = None;
+        runtime.config.corporate_actions = vec![reused];
+        assert_eq!(
+            runtime.handled_record_for(&runtime.config.corporate_actions[0]),
+            Some(HandledMatch::ReusedId)
+        );
+        seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
+        // A legitimate max-hold exit planned before the cutoff...
+        let planned_at = anchor + Duration::seconds(10);
+        let plan = runtime
+            .build_plan(
+                &context(planned_at - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::MaxHoldExit,
+                planned_at,
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime
+            .validate_plan_consistent_with_state(&plan, planned_at)
+            .unwrap();
+        // ...dispatched after it.
+        let error = runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(17))
+            .unwrap_err();
+        assert!(error.contains("no longer quotes"), "{error}");
     }
 
     #[cfg(feature = "arcus-spot-live")]
