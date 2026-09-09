@@ -1511,14 +1511,47 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
         assert math.isfinite(pday.realized_pnl_usd), pday.realized_pnl_usd
         assert pday.incomplete and "unreadable_pnl" in pday.incomplete_reasons
 
-    # Nothing non-finite can reach `--out`, which is the property all of
-    # this exists for.
-    rows = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=1e308)},
-                      {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-5.0)})
-    for row in rows:
-        for value in (row.volume_usd, row.realized_pnl_usd, row.funding_usd,
-                      row.cost_usd, row.slippage_usd):
-            assert value is None or math.isfinite(value), (row, value)
+    # Nothing non-finite can reach `--out` -- the property all of this
+    # exists for, asserted over the *derived* values too. A value derived
+    # from two guarded inputs can still overflow (cost = -(pnl+funding),
+    # an equity delta between closes of opposite sign, a rate divided by
+    # a denormal), so this sweeps combinations rather than one fixture:
+    # a new derived field is caught here instead of in the next review
+    # round (Codex, PR #297).
+    extremes = (0.0, 1.0, -1.0, 1e308, -1e308, 5e-324, 1e-300)
+    serialized = ("volume_usd", "realized_pnl_usd", "funding_usd", "cost_usd",
+                  "slippage_usd", "cost_per_point", "cost_per_musd_volume")
+    for pnl in extremes:
+        for funding in extremes:
+            for volume in extremes:
+                for pts in extremes:
+                    rows = build_rows(
+                        {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=volume)},
+                        {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=pnl,
+                                                        funding_usd=funding,
+                                                        funding_seen=True)},
+                        points={("2026-09-08", "freq"): pts},
+                    )
+                    for row in rows:
+                        for name in serialized:
+                            value = getattr(row, name)
+                            assert value is None or math.isfinite(value), \
+                                (name, value, pnl, funding, volume, pts)
+                        # And it must survive json.dumps without the
+                        # non-standard tokens, which is the actual
+                        # contract `--out` has with its consumers.
+                        blob = json.dumps({n: getattr(row, n) for n in serialized})
+                        assert "Infinity" not in blob and "NaN" not in blob, blob
+
+    # The equity path has its own derived value: two finite closes of
+    # opposite sign whose difference is not finite.
+    day_one = 1788825600_000
+    spread = equity_daily_costs([
+        {"ts": day_one + 100, "equity": -1e308},
+        {"ts": day_one + 86_400_000 + 100, "equity": 1e308},
+    ])
+    for value in spread.values():
+        assert math.isfinite(value), spread
 
 
 def test_an_epoch_too_large_to_render_is_a_gap_not_a_traceback():

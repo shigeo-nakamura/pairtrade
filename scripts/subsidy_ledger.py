@@ -104,6 +104,18 @@ from pathlib import Path
 from typing import Iterable
 
 
+def finite_or_none(value: float, places: int) -> float | None:
+    """A derived number, or `None` when the arithmetic left the reals.
+
+    Every *input* is guarded, but a value derived from two guarded inputs
+    can still overflow -- `1e308 + 1e308`, or the difference between two
+    equity closes of opposite sign. `None` is the module's existing word
+    for "not known", so an unrepresentable result reports as unknown
+    rather than as `Infinity` in `--out` (Codex, PR #297).
+    """
+    return round(value, places) if math.isfinite(value) else None
+
+
 def overflows(total: float, addend: float) -> bool:
     """Would adding this to a finite running total make it non-finite?
 
@@ -871,7 +883,13 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     for day in sorted(last_by_day):
         if (previous_day is not None and is_next_calendar_day(previous_day, day)
                 and day not in invalid_days and previous_day not in invalid_days):
-            costs[day] = -(last_by_day[day][1] - last_by_day[previous_day][1])
+            delta = -(last_by_day[day][1] - last_by_day[previous_day][1])
+            # Two finite closes of opposite sign can differ by more than a
+            # float holds. An unrepresentable delta is not a known cost,
+            # so the day stays uncosted rather than becoming `Infinity`
+            # in `--out` (Codex, PR #297).
+            if math.isfinite(delta):
+                costs[day] = delta
         previous_day = day
     return costs
 
@@ -1029,8 +1047,10 @@ def build_rows(
             if day.incomplete:
                 row.pnl_incomplete_reasons = sorted(day.incomplete_reasons)
         if day is not None and not day.incomplete and day.cycles > 0:
-            row.cost_usd = round(-(day.realized_pnl_usd + day.funding_usd), 6)
-            row.cost_source = "pnl_ledger"
+            # Each accumulator is guarded on its own, but their sum is a
+            # third value and can overflow where neither did.
+            row.cost_usd = finite_or_none(-(day.realized_pnl_usd + day.funding_usd), 6)
+            row.cost_source = "pnl_ledger" if row.cost_usd is not None else None
         elif date in equity_costs.get(arm, {}):
             row.cost_usd = round(equity_costs[arm][date], 6)
             row.cost_source = "equity_delta"
@@ -1043,7 +1063,7 @@ def build_rows(
         # operator, with no cycle to key them to (Codex, PR #297).
         if (row.points is not None and row.points > 0 and row.cost_usd is not None
                 and not row.cost_spans_two_days()):
-            row.cost_per_point = round(row.cost_usd / row.points, 8)
+            row.cost_per_point = finite_or_none(row.cost_usd / row.points, 8)
         # Same rule as the aggregate, and it has to live here too: this row
         # is what `--out` writes and what the daily table prints, so a rate
         # suppressed only in the totals would still be published per day.
@@ -1054,7 +1074,8 @@ def build_rows(
         # same way (Codex, PR #297).
         if (row.cost_usd is not None and row.volume_usd > 0
                 and not row.fills_without_value and not row.cost_spans_two_days()):
-            row.cost_per_musd_volume = round(row.cost_usd / (row.volume_usd / 1e6), 4)
+            row.cost_per_musd_volume = finite_or_none(
+                row.cost_usd / (row.volume_usd / 1e6), 4)
         rows.append(row)
     return rows
 
