@@ -1222,12 +1222,20 @@ def summarize(rows: list[Row]) -> dict:
             and arm["points"] > 0
             else None
         )
-        # `None` on a points total means two different things and the
-        # table has to tell them apart: no points were supplied at all,
-        # or they were and the roll-up could not be represented. Only the
-        # second is worth explaining to the reader (Codex, PR #297).
-        arm["points_unrepresentable"] = bool(arm["points_seen"]) and (
-            arm["points"] is None or arm["uncosted_points"] is None
+        # A missing rate means two different things and the table has to
+        # tell them apart: the coverage genuinely was not there, or it
+        # was and a total could not be represented. Derived per rate from
+        # the inputs that rate actually needs -- round 37 flagged only
+        # the points totals, so an overflow in `costed_volume_usd` or in
+        # `cost_usd_on_pointed_days` was still reported as absent
+        # coverage (Codex, PR #297).
+        arm["volume_rate_unrepresentable"] = (
+            arm["cost_usd_on_measured_volume"] is None or arm["costed_volume_usd"] is None
+        )
+        arm["points_rate_unrepresentable"] = bool(arm["points_seen"]) and (
+            arm["points"] is None
+            or arm["uncosted_points"] is None
+            or arm["cost_usd_on_pointed_days"] is None
         )
         if not arm["points_seen"]:
             arm["points"] = None
@@ -1277,7 +1285,7 @@ def render_table(rows: list[Row], summary: dict) -> str:
             # Still say what was supplied and excluded: an all-uncosted
             # points export otherwise printed "cost unknown" and nothing
             # about the points it was given (Codex, PR #297).
-            if arm["points_unrepresentable"]:
+            if arm["points_rate_unrepresentable"]:
                 out.append(
                     "         the points total could not be represented, so no price per "
                     "point can be computed"
@@ -1303,7 +1311,12 @@ def render_table(rows: list[Row], summary: dict) -> str:
         out.append(
             f"{head}, cost {money(arm['cost_usd'])} across "
             f"{arm['cost_days']} costed day(s)")
-        if arm["cost_per_musd_volume"] is None:
+        if arm["volume_rate_unrepresentable"]:
+            out.append(
+                "         the measured-volume totals could not be represented, so the "
+                "per-$1M rate is unavailable"
+            )
+        elif arm["cost_per_musd_volume"] is None:
             out.append(
                 "         no costed day has fully measured volume, so the per-$1M rate "
                 "is unavailable"
@@ -1335,6 +1348,11 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"         {money(arm['cost_usd_on_pointed_days'])} of it over "
                 f"{arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
             )
+        elif arm["points_rate_unrepresentable"]:
+            out.append(
+                "         the points-day totals could not be represented, so no price "
+                "per point can be computed"
+            )
         elif arm["points"] is not None:
             # No rate is exactly when the reader most needs to be told
             # why: points and cost landing on different days is the
@@ -1346,7 +1364,7 @@ def render_table(rows: list[Row], summary: dict) -> str:
             )
         # These say which side was missing, and are worth printing
         # whether or not a rate came out of what remained.
-        if arm["points_unrepresentable"]:
+        if arm["points_rate_unrepresentable"]:
             out.append(
                 "         the points total could not be represented, so it is excluded "
                 "from that price"

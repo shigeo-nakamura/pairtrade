@@ -1592,11 +1592,55 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
                  for i in range(4)}
     pt_rows = build_rows(small, small_pnl, points=pts)
     pt_printed = render_table(pt_rows, summarize(pt_rows))
-    assert "points total could not be represented" in pt_printed, pt_printed
+    assert "could not be represented" in pt_printed, pt_printed
+    # ... and it must not be reported as absent coverage, which is a
+    # different fact about the data (Codex, PR #297).
+    assert "no day supplied both a cost and points" not in pt_printed, pt_printed
 
     plain_rows = build_rows(small, small_pnl)
     plain = render_table(plain_rows, summarize(plain_rows))
-    assert "points total could not be represented" not in plain, plain
+    assert "could not be represented" not in plain, plain
+
+    # The volume rate has the same two cases and the same requirement.
+    # Fully measured volume that only overflows in the per-arm roll-up
+    # must not read as "no costed day has fully measured volume".
+    vol = {(f"2026-09-0{i + 1}", "freq"): ExecDay(fills=1, volume_usd=1e308)
+           for i in range(4)}
+    vol_pnl = {(f"2026-09-0{i + 1}", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                                     funding_seen=True)
+               for i in range(4)}
+    vol_printed = render_table(build_rows(vol, vol_pnl),
+                               summarize(build_rows(vol, vol_pnl)))
+    assert "measured-volume totals could not be represented" in vol_printed, vol_printed
+    assert "no costed day has fully measured volume" not in vol_printed, vol_printed
+
+    # The points rate needs BOTH its inputs flagged. Here the points
+    # totals stay small and finite while the cost on pointed days
+    # overflows -- the case the round-37 flag missed because it looked
+    # only at the points side (Codex, PR #297).
+    big_cost = {(f"2026-09-0{i + 1}", "freq"): ExecDay(fills=1, volume_usd=100.0)
+                for i in range(4)}
+    big_cost_pnl = {(f"2026-09-0{i + 1}", "freq"): PnlDay(cycles=1,
+                                                          realized_pnl_usd=-1e308,
+                                                          funding_seen=True)
+                    for i in range(4)}
+    one_point = {(f"2026-09-0{i + 1}", "freq"): 1.0 for i in range(4)}
+    cost_rows = build_rows(big_cost, big_cost_pnl, points=one_point)
+    cost_summary = summarize(cost_rows)
+    assert cost_summary["arms"][0]["points"] == 4.0, cost_summary["arms"][0]["points"]
+    assert cost_summary["arms"][0]["cost_usd_on_pointed_days"] is None
+    cost_printed = render_table(cost_rows, cost_summary)
+    assert "points-day totals could not be represented" in cost_printed, cost_printed
+    assert "no day supplied both a cost and points" not in cost_printed, cost_printed
+
+    # And an arm that genuinely has no measured volume still says so.
+    unmeasured = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0,
+                                                  fills_without_value=1)}
+    unmeasured_pnl = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                                     funding_seen=True)}
+    absent = render_table(build_rows(unmeasured, unmeasured_pnl),
+                          summarize(build_rows(unmeasured, unmeasured_pnl)))
+    assert "no costed day has fully measured volume" in absent, absent
 
     # The equity path has its own derived value: two finite closes of
     # opposite sign whose difference is not finite.
