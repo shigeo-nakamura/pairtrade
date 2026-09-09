@@ -1756,10 +1756,20 @@ impl EngineBLiveEngine {
         // marker is written immediately before `sendTx`, and `pending`
         // already suppresses `maybe_enter` until the confirmation resolves
         // and clears it (pairtrade#300 Codex review).
+        //
+        // A parked exposure is a gate of its own for the same reason, and
+        // `session_halted` cannot stand in for it: `halt_session` returns
+        // early when a halt is already engaged, so in the A -> B -> C
+        // flow the reason and the alert keep naming A while B is parked
+        // behind them. One `RISK_ACK` for A then cleared the only gate B
+        // had. The record itself is the durable claim, and only
+        // `reconcile_unmanaged` retires it -- when the venue says that
+        // exposure is gone (pairtrade#300 Codex review).
         !self.kill_switch_engaged()
             && !self.state.session_halted
             && self.reconciled
             && self.state.entry_in_flight.is_none()
+            && self.state.unmanaged_positions.is_empty()
     }
 
     /// `t2 + exit_deadline_secs` for the session currently in `window` --
@@ -4003,11 +4013,16 @@ impl EngineBLiveEngine {
         if !self.entries_allowed() {
             log::warn!(
                 "[ENTRY] signal fired but entries blocked (kill_switch={}, session_halted={}, \
-                 reconciled={}, entry_in_flight={:?})",
+                 reconciled={}, entry_in_flight={:?}, unmanaged={:?})",
                 self.kill_switch_engaged(),
                 self.state.session_halted,
                 self.reconciled,
-                self.state.entry_in_flight
+                self.state.entry_in_flight,
+                self.state
+                    .unmanaged_positions
+                    .iter()
+                    .map(|p| p.symbol.as_str())
+                    .collect::<Vec<_>>()
             );
             return;
         }
@@ -8908,6 +8923,44 @@ mod tests {
         );
         // The claim resolving is what re-opens them.
         h.engine.state.entry_in_flight = None;
+        assert!(h.engine.entries_allowed());
+    }
+
+    /// pairtrade#300 Codex review round 18, P1: `halt_session` returns
+    /// early when a halt already exists, so in the A -> B -> C flow the
+    /// halt naming A was the only gate parked B ever got, and one
+    /// RISK_ACK for A released it.
+    #[tokio::test]
+    async fn a_parked_exposure_blocks_entries_on_its_own() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.state.entry_in_flight = None;
+        // What the operator's RISK_ACK for A leaves behind: no halt, and
+        // B still parked because the venue still reports it.
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        h.engine.state.position_unconfirmed = false;
+        h.engine.state.unmanaged_positions = vec![PersistedPosition {
+            symbol: "SNDK".to_string(),
+            side: OrderSide::Long.to_string(),
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: 0,
+            flatten_asap: true,
+            session_date: "2026-09-08".to_string(),
+            exit_deadline_us: None,
+        }];
+        assert!(
+            !h.engine.entries_allowed(),
+            "an exposure this engine cannot close must gate entries by itself"
+        );
+        // Only the venue reporting it gone retires the claim.
+        h.engine.state.unmanaged_positions.clear();
         assert!(h.engine.entries_allowed());
     }
 
