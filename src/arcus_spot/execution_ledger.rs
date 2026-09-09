@@ -145,6 +145,14 @@ pub struct ArcusSpotExecutionAttempt {
     /// missing key as `None`, so no `#[serde(default)]` is needed and the
     /// test below pins the behaviour rather than the attribute.)
     pub settled_buy_amount_raw: Option<String>,
+    /// Sell tokens this swap actually took from the taker, derived from the
+    /// transaction's own ERC-20 `Transfer` logs: everything that left the
+    /// taker minus anything the same transaction refunded back
+    /// (bot-strategy#979). `None` on every attempt written before that
+    /// check existed, and on any attempt that has not reached `Reconciled`
+    /// yet -- `Option` carries schema compatibility with ledgers already on
+    /// disk, exactly like `settled_buy_amount_raw` above.
+    pub settled_sell_amount_raw: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,6 +227,13 @@ impl ArcusSpotExecutionLedger {
                     bail!("Arcus execution attempt settled buy amount must be positive");
                 }
             }
+            if let Some(settled) = &attempt.settled_sell_amount_raw {
+                let settled = U256::from_dec_str(settled)
+                    .context("invalid Arcus execution attempt settled_sell_amount_raw")?;
+                if settled.is_zero() {
+                    bail!("Arcus execution attempt settled sell amount must be positive");
+                }
+            }
             validate_payload_hash(&attempt.payload_hash)?;
             let hash_suffix = &attempt.payload_hash["sha256:".len()..][..16];
             let expected_key = format!("arcus-spot-{:020}-{hash_suffix}", attempt.sequence);
@@ -288,6 +303,7 @@ impl ArcusSpotExecutionLedger {
             router_status: None,
             detail: None,
             settled_buy_amount_raw: None,
+            settled_sell_amount_raw: None,
         });
         Ok(self.active.as_ref().expect("active set above"))
     }
@@ -396,20 +412,30 @@ impl ArcusSpotExecutionLedger {
     /// returning.
     ///
     /// `settled_buy_amount_raw` is the `amount_out` of this transaction's own
-    /// `SwapExecuted` event, which the reconciliation read already had to
-    /// find and validate before any balance was trusted. The buy delta must
-    /// equal it exactly (bot-strategy#883): `post` is a `latest` snapshot
+    /// `SwapExecuted` event, and `settled_sell_amount_raw` is the net
+    /// sell-token outflow its own `Transfer` logs report. Both come from the
+    /// reconciliation read, which had to find and validate them before any
+    /// balance was trusted. Each delta must equal its settled amount exactly
+    /// (bot-strategy#883, bot-strategy#979): `post` is a `latest` snapshot
     /// read an unbounded time after confirmation, so on its own it cannot
-    /// distinguish this swap's output from any other buy-token wallet
-    /// activity that landed in between (a manual operator trade, as in
-    /// bot-strategy#869) -- the event amount can, because it is part of the
-    /// swap transaction itself. The sell side has always been exact
-    /// (`expected_sell` from the signed intent); this makes the buy side
-    /// symmetric instead of a `>= minimum_buy` floor.
+    /// distinguish this swap's movements from any other wallet activity that
+    /// landed in between (a manual operator trade, as in bot-strategy#869)
+    /// -- the transaction's own logs can, because they are part of the swap
+    /// transaction itself.
+    ///
+    /// The sell side used to be compared against `expected_sell` (the signed
+    /// intent) instead. That held until an arcus-venue route pulled the full
+    /// signed amount and refunded 16 unused wei in the same transaction: the
+    /// balance delta nets the refund out, so an economically clean swap went
+    /// sticky UNKNOWN and halted the bot (bot-strategy#979). The signed
+    /// amount remains an upper bound -- Permit2 authorises at most it, never
+    /// more -- but only the transaction's own transfers say how much of it
+    /// was actually taken.
     pub fn reconcile_balances(
         &mut self,
         post: ArcusSpotBalanceSnapshot,
         settled_buy_amount_raw: &str,
+        settled_sell_amount_raw: &str,
         now: DateTime<Utc>,
     ) -> Result<()> {
         let active = self.active_mut()?;
@@ -424,12 +450,18 @@ impl ArcusSpotExecutionLedger {
         if settled_buy.is_zero() {
             bail!("settled buy amount from settlement receipt must be positive");
         }
+        let settled_sell = U256::from_dec_str(settled_sell_amount_raw)
+            .context("invalid settled sell amount from settlement receipt")?;
+        if settled_sell.is_zero() {
+            bail!("settled sell amount from settlement receipt must be positive");
+        }
         active.post_balances = Some(post);
         // Recorded before the checks below, exactly like `post_balances`: an
         // attempt that goes sticky UNKNOWN here is the one an operator has
-        // to reconstruct by hand, and the settled amount is the evidence
-        // that says by how much the wallet delta and the swap disagreed.
+        // to reconstruct by hand, and the settled amounts are the evidence
+        // that says by how much the wallet deltas and the swap disagreed.
         active.settled_buy_amount_raw = Some(settled_buy.to_string());
+        active.settled_sell_amount_raw = Some(settled_sell.to_string());
         active.updated_at = now;
 
         let result = (|| -> Result<()> {
@@ -439,8 +471,17 @@ impl ArcusSpotExecutionLedger {
             let bought = post_buy
                 .checked_sub(pre_buy)
                 .context("buy balance decreased or underflowed")?;
-            if sold != expected_sell {
-                bail!("sell balance delta {sold} does not equal signed amount {expected_sell}");
+            // The signed intent stays the ceiling -- Permit2 can never
+            // authorise more than it -- but the transaction's own transfers
+            // decide the exact figure below it (bot-strategy#979).
+            if settled_sell > expected_sell {
+                bail!("settled sell amount {settled_sell} exceeds signed amount {expected_sell}");
+            }
+            if sold != settled_sell {
+                bail!(
+                    "sell balance delta {sold} does not equal the settled swap input \
+                     {settled_sell} (signed amount {expected_sell})"
+                );
             }
             if bought < minimum_buy {
                 bail!("buy balance delta {bought} is below signed minimum {minimum_buy}");
@@ -1064,7 +1105,7 @@ mod tests {
             .record_submit_status(&status("confirmed"), now)
             .unwrap();
         ledger
-            .reconcile_balances(balances("4000", "2985", now), "985", now)
+            .reconcile_balances(balances("4000", "2985", now), "985", "1000", now)
             .unwrap();
         assert_eq!(
             ledger.active.as_ref().unwrap().phase,
@@ -1101,7 +1142,7 @@ mod tests {
         // Wallet gained 1000 (>= the 980 minimum, so the floor is happy);
         // the swap itself only paid out 985.
         let error = ledger
-            .reconcile_balances(balances("4000", "3000", now), "985", now)
+            .reconcile_balances(balances("4000", "3000", now), "985", "1000", now)
             .unwrap_err();
         assert!(error.to_string().contains("settled swap output"));
         let active = ledger.active.as_ref().unwrap();
@@ -1130,7 +1171,7 @@ mod tests {
             .record_submit_status(&status("confirmed"), now)
             .unwrap();
         ledger
-            .reconcile_balances(balances("4000", "2985", now), "985", now)
+            .reconcile_balances(balances("4000", "2985", now), "985", "1000", now)
             .unwrap();
 
         let active = ledger.active.as_ref().unwrap();
@@ -1160,7 +1201,7 @@ mod tests {
             .record_submit_status(&status("confirmed"), now)
             .unwrap();
         ledger
-            .reconcile_balances(balances("4000", "2985", now), "985", now)
+            .reconcile_balances(balances("4000", "2985", now), "985", "1000", now)
             .unwrap();
 
         let mut value = serde_json::to_value(&ledger).unwrap();
@@ -1178,6 +1219,85 @@ mod tests {
             .settled_buy_amount_raw
             .is_none());
         loaded.validate().unwrap();
+    }
+
+    /// bot-strategy#979, the live failure: the route pulled the full signed
+    /// 1000 and refunded 16 in the same transaction, so the wallet parted
+    /// with 984. That is what the settlement read reports, and what the
+    /// balance delta shows -- reconciliation must accept it. Comparing the
+    /// delta against the signed amount (as it did before) turned this into
+    /// sticky UNKNOWN and halted the bot.
+    #[test]
+    fn a_same_transaction_sell_refund_reconciles() {
+        let now = Utc::now();
+        let mut ledger = reconcilable_ledger(now);
+        ledger
+            .reconcile_balances(balances("4016", "2985", now), "985", "984", now)
+            .unwrap();
+
+        let active = ledger.active.as_ref().unwrap();
+        assert_eq!(active.phase, ArcusSpotExecutionPhase::Reconciled);
+        assert_eq!(active.settled_sell_amount_raw.as_deref(), Some("984"));
+    }
+
+    /// The signed intent stays the ceiling: Permit2 cannot authorise more
+    /// than it, so a settlement claiming more than the signed amount left
+    /// the wallet is evidence of something this bot did not sign for
+    /// (bot-strategy#979).
+    #[test]
+    fn a_settled_sell_above_the_signed_amount_becomes_unknown() {
+        let now = Utc::now();
+        let mut ledger = reconcilable_ledger(now);
+        let error = ledger
+            .reconcile_balances(balances("3999", "2985", now), "985", "1001", now)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("exceeds signed amount"));
+        assert_eq!(
+            ledger.active.as_ref().unwrap().phase,
+            ArcusSpotExecutionPhase::Unknown
+        );
+    }
+
+    /// The exactness bot-strategy#869 needs is preserved, just anchored to
+    /// the transaction's own transfers instead of the signed amount: a
+    /// wallet delta that disagrees with them still means something else
+    /// moved sell-token inventory between confirmation and the `latest`
+    /// read.
+    #[test]
+    fn a_sell_delta_that_disagrees_with_the_settled_input_becomes_unknown() {
+        let now = Utc::now();
+        let mut ledger = reconcilable_ledger(now);
+        let error = ledger
+            .reconcile_balances(balances("4000", "2985", now), "985", "984", now)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("settled swap input"));
+        assert_eq!(
+            ledger.active.as_ref().unwrap().phase,
+            ArcusSpotExecutionPhase::Unknown
+        );
+    }
+
+    /// A ledger with one confirmed attempt (sell 1000 signed, pre-balances
+    /// 5000/2000), ready for `reconcile_balances`.
+    fn reconcilable_ledger(now: DateTime<Utc>) -> ArcusSpotExecutionLedger {
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        ledger
+            .record_submit_status(&status("confirmed"), now)
+            .unwrap();
+        ledger
     }
 
     #[test]
@@ -1199,7 +1319,7 @@ mod tests {
             .record_submit_status(&status("confirmed"), now)
             .unwrap();
         assert!(ledger
-            .reconcile_balances(balances("4500", "2985", now), "985", now)
+            .reconcile_balances(balances("4500", "2985", now), "985", "1000", now)
             .is_err());
         assert_eq!(
             ledger.active.as_ref().unwrap().phase,

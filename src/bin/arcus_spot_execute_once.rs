@@ -2850,7 +2850,7 @@ fn reconciled_fill_for_continuity(
     plan: &ArcusSpotRotationPlan,
     attempt: &ArcusSpotExecutionAttempt,
     evaluation_time: DateTime<Utc>,
-) -> Result<(Decimal, DateTime<Utc>)> {
+) -> Result<(Decimal, Decimal, DateTime<Utc>)> {
     require_acceptance_plan_matches_config(config, plan)?;
     if attempt.phase != ArcusSpotExecutionPhase::Reconciled {
         bail!("Arcus acceptance attempt did not finish reconciled");
@@ -2959,8 +2959,14 @@ fn reconciled_fill_for_continuity(
     let bought_raw = post_buy
         .checked_sub(pre_buy)
         .context("reconciled Arcus acceptance buy balance decreased")?;
-    if sold_raw != parse_raw_amount("intent sell amount", &attempt.intent.sell_amount_raw)? {
-        bail!("Arcus acceptance sell delta does not match its intent");
+    // Upper bound, not equality: a settlement transaction can refund part
+    // of the signed sell amount inside the same transaction, so the wallet
+    // may part with less than was signed for (bot-strategy#979). More than
+    // the signed amount remains impossible under Permit2 and stays fatal,
+    // and the quantity committed below is derived from what actually moved.
+    let signed_sell_raw = parse_raw_amount("intent sell amount", &attempt.intent.sell_amount_raw)?;
+    if sold_raw > signed_sell_raw {
+        bail!("Arcus acceptance sell delta exceeds its intent");
     }
     let planned_buy_raw = parse_raw_amount("plan buy amount", &plan.buy_amount_raw)?;
     if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
@@ -2994,7 +3000,24 @@ fn reconciled_fill_for_continuity(
         .checked_mul(bought_decimal)
         .and_then(|value| value.checked_div(planned_buy_decimal))
         .context("Arcus acceptance buy quantity exceeds Decimal range")?;
-    if plan.sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
+    // Scaled from what actually left the wallet, the same way the buy side
+    // is scaled from what actually arrived: committing the plan's own
+    // sell_quantity would book inventory the wallet still holds whenever the
+    // settlement refunded part of the signed amount (bot-strategy#979).
+    let planned_sell_raw = parse_raw_amount("plan sell amount", &plan.sell_amount_raw)?;
+    if planned_sell_raw.is_zero() || plan.sell_quantity <= Decimal::ZERO {
+        bail!("Arcus acceptance pending plan has an invalid sell quantity");
+    }
+    let sold_decimal = Decimal::from_str(&sold_raw.to_string())
+        .context("Arcus acceptance sell amount exceeds Decimal range")?;
+    let planned_sell_decimal = Decimal::from_str(&planned_sell_raw.to_string())
+        .context("Arcus acceptance planned sell amount exceeds Decimal range")?;
+    let actual_sell_quantity = plan
+        .sell_quantity
+        .checked_mul(sold_decimal)
+        .and_then(|value| value.checked_div(planned_sell_decimal))
+        .context("Arcus acceptance sell quantity exceeds Decimal range")?;
+    if actual_sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
         bail!("Arcus acceptance runtime quantities must be positive");
     }
     let filled_at = attempt
@@ -3015,7 +3038,7 @@ fn reconciled_fill_for_continuity(
     if plan_age_ms < 0 || plan_age_ms > max_plan_age_ms {
         bail!("Arcus acceptance plan was stale or future-dated at dispatch");
     }
-    Ok((actual_buy_quantity, filled_at))
+    Ok((actual_sell_quantity, actual_buy_quantity, filled_at))
 }
 
 fn position_state_matches(left: &ArcusSpotRuntimeState, right: &ArcusSpotRuntimeState) -> bool {
@@ -3472,7 +3495,7 @@ fn require_acceptance_ledger_and_position_continuity(
                 token_a_reference_price_usd,
                 token_b_reference_price_usd,
             )?;
-            let (actual_buy_quantity, filled_at) =
+            let (actual_sell_quantity, actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt, evidence.evaluation_time)?;
             replayed_runtime
                 .validate_plan_consistent_with_state(&plan)
@@ -3481,7 +3504,7 @@ fn require_acceptance_ledger_and_position_continuity(
             let applied = replayed_runtime
                 .apply_confirmed_live_fill_once(
                     &plan,
-                    plan.sell_quantity,
+                    actual_sell_quantity,
                     actual_buy_quantity,
                     filled_at,
                     &attempt.idempotency_key,
@@ -5623,6 +5646,10 @@ runtime:
             // `SwapExecuted.amount_out` would have reported it
             // (bot-strategy#883).
             settled_buy_amount_raw: Some("50000000000000000".to_string()),
+            // The sell-balance delta above, as the settlement
+            // transaction's own transfers would have reported it, with no
+            // refund leg (bot-strategy#979).
+            settled_sell_amount_raw: Some("50000000000000000".to_string()),
         }
     }
 
@@ -6882,6 +6909,66 @@ runtime:
         assert!(error
             .to_string()
             .contains("does not match its independently replayed recorder evidence"));
+    }
+
+    /// An entry plan quoted one second before `reconciled_entry_attempt`'s
+    /// fixed dispatch time, so the continuity path's plan/quote freshness
+    /// checks pass.
+    fn continuity_plan() -> ArcusSpotRotationPlan {
+        let mut plan = rotation_plan("entry_signal");
+        plan.quote_received_at = DateTime::parse_from_rfc3339("2026-08-16T12:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        plan
+    }
+
+    /// bot-strategy#979: the continuity path carries the same invariant as
+    /// the live one. A settlement that refunded 16 wei of the signed sell
+    /// amount must reconcile, and the quantity it hands the runtime must be
+    /// the 16-wei-smaller amount the wallet actually parted with -- not the
+    /// plan's own sell_quantity.
+    #[test]
+    fn continuity_fill_scales_the_sell_quantity_when_the_settlement_refunded() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = continuity_plan();
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        // pre 1000000000000000000 - post 950000000000000016 = 49999999999999984,
+        // i.e. the signed 50000000000000000 less a 16-wei refund.
+        attempt.post_balances.as_mut().unwrap().sell_balance_raw = "950000000000000016".to_string();
+
+        let (actual_sell_quantity, _actual_buy_quantity, _filled_at) =
+            reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at).unwrap();
+
+        assert_eq!(
+            actual_sell_quantity,
+            Decimal::from_str_exact("0.049999999999999984").unwrap()
+        );
+        assert!(actual_sell_quantity < plan.sell_quantity);
+    }
+
+    /// More than the signed amount can never have left the wallet under
+    /// Permit2, so that stays fatal on this path too (bot-strategy#979).
+    #[test]
+    fn continuity_fill_refuses_a_sell_delta_above_the_signed_amount() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = continuity_plan();
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.post_balances.as_mut().unwrap().sell_balance_raw = "949999999999999999".to_string();
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("sell delta exceeds its intent"));
     }
 
     #[test]
@@ -8262,6 +8349,7 @@ runtime:
             router_status: Some("submitted".to_string()),
             detail: None,
             settled_buy_amount_raw: None,
+            settled_sell_amount_raw: None,
         }
     }
 
