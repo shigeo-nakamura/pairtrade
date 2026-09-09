@@ -1216,8 +1216,12 @@ def main(argv: list[str] | None = None) -> int:
     pnl = load_pnl(expand(args.pnl_glob))
     equity_costs: dict[str, dict[str, float]] = {}
     for spec in args.equity:
-        arm, _, path = spec.partition("=")
-        if not path:
+        arm, sep, path = spec.partition("=")
+        # Both sides, not just the path: `--equity =PATH` used to load the
+        # costs under the arm `""` and emit them as a separate blank-arm
+        # series, leaving the arm the operator meant to cost uncosted --
+        # and exiting 0 (Codex, PR #297).
+        if not sep or not arm or not path:
             parser.error(f"--equity expects ARM=PATH, got {spec!r}")
         # `--equity` repeats, and a second file for the same arm replaced
         # the first silently: costs the operator did supply would vanish,

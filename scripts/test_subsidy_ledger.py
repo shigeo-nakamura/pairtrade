@@ -1419,6 +1419,29 @@ def test_a_boolean_timestamp_or_hold_never_reads_as_a_real_value():
     assert not spans_a_funding_interval(real)
 
 
+def test_an_equity_spec_needs_both_an_arm_and_a_path():
+    """`--equity =PATH` used to cost a blank arm and exit 0.
+
+    The arm the operator meant to cost stayed uncosted while its equity
+    series was emitted under `""` (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        execution = Path(tmp) / "execution-freq.jsonl"
+        execution.write_text("")
+        equity = write(Path(tmp) / "equity_history.jsonl",
+                       [{"ts": 1788868800_000, "equity": 1000.0}])
+        for bad in (f"={equity}", "freq=", "freq", "", "="):
+            try:
+                ledger_main(["--exec-glob", str(execution), "--equity", bad])
+            except SystemExit as exit_code:
+                assert exit_code.code == 2, (bad, exit_code.code)
+            else:
+                raise AssertionError(f"--equity {bad!r} must be refused")
+        # The documented form still works.
+        assert ledger_main(["--exec-glob", str(execution),
+                            "--equity", f"freq={equity}"]) == 0
+
+
 def test_a_supplied_pnl_glob_that_matches_nothing_is_refused():
     """Omitting `--pnl-glob` is supported; mistyping it is not.
 
