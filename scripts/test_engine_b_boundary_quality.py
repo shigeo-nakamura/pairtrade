@@ -310,6 +310,39 @@ class QualityTests(unittest.TestCase):
         self.event(T0-SECOND, venue='lighter_mainnet_context', bid='199', ask='201')
         self.assertIn('ambiguous_latest_snapshot', self.cell(self.report())['reasons'])
 
+    def test_rejects_symlinked_partitions(self):
+        # A link to a live collector database: the WAL sits beside the
+        # target, so a check beside the link misses it, SQLite opens the
+        # target immutable and ignores the WAL, and the hash is stable
+        # because writes are confined to it. The report would pass.
+        live_dir = self.root / 'live'
+        live_dir.mkdir()
+        partition = self.path(T0)
+        live = live_dir / partition.name
+        partition.rename(live)
+        (live_dir / (partition.name + '-wal')).touch()
+        partition.symlink_to(live)
+        with self.assertRaisesRegex(ValueError, 'not a symlink'):
+            self.report()
+        # Whatever it points at: a link to a genuinely closed copy is
+        # refused too, because "closed offline copy" is the contract and a
+        # link is not one.
+        (live_dir / (partition.name + '-wal')).unlink()
+        with self.assertRaisesRegex(ValueError, 'not a symlink'):
+            self.report()
+
+    def test_a_partition_swapped_for_a_symlink_mid_run_is_caught(self):
+        dataset = Dataset(self.root, max_open=1)
+        first_hour = T0 // HOUR * HOUR
+        dataset.open_window([first_hour])
+        dataset.open_window([TIMES[1] // HOUR * HOUR])  # evicts the first
+        partition = self.path(first_hour)
+        moved = self.root / ('moved-' + partition.name)
+        partition.rename(moved)
+        partition.symlink_to(moved)
+        with self.assertRaisesRegex(ValueError, 'not a symlink'):
+            dataset.verify_and_close()
+
     def test_rejects_wal_input(self):
         Path(str(self.path(T0)) + '-wal').touch()
         with self.assertRaisesRegex(ValueError, 'offline copy'):

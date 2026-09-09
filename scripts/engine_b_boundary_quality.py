@@ -89,6 +89,27 @@ def provenance(db):
     return mappings
 
 
+def reject_unless_closed_copy(name, path):
+    """A partition must be a regular file with no WAL/SHM beside it.
+
+    Symlinks are refused outright rather than resolved. `digest()` and SQLite
+    both follow a link, but a `-wal`/`-shm` check beside the *link* looks in
+    the wrong directory: a link to a live collector database then opens the
+    target with `immutable=1`, ignores its real WAL, hashes identically
+    before and after (writes are confined to that WAL), and yields a
+    plausible passing report missing recent events or gaps. "Closed offline
+    copy" is the contract; a link is not one, whatever it points at
+    (Codex, PR #311). Applied on every open and again at the end, so a file
+    swapped for a link mid-run is caught too.
+    """
+    if path.is_symlink():
+        raise ValueError(f"{name}: must be a regular file, not a symlink")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"{name}: must be a regular file")
+    if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")):
+        raise ValueError(f"{name}: use a closed offline copy without WAL/SHM")
+
+
 class Dataset:
     """Only closed copies: hashes cover the DBs actually read, never a live WAL."""
 
@@ -144,12 +165,11 @@ class Dataset:
             self.opened.move_to_end(name)
             return (name, self.opened[name], self.mappings[name])
         path = self.root / name
+        reject_unless_closed_copy(name, path)
         if not path.exists():
             self.inventory[name] = {"missing": True}
             self.absent.add(name)
             return None
-        if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")):
-            raise ValueError(f"{name}: use a closed offline copy without WAL/SHM")
         sha = digest(path)
         known = self.inventory.get(name, {}).get("sha256")
         if known is not None and known != sha:
@@ -184,8 +204,8 @@ class Dataset:
                 if entry.get("missing"):
                     continue
                 path = self.root / name
-                if (digest(path) != entry["sha256"]
-                        or any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm"))):
+                reject_unless_closed_copy(name, path)
+                if digest(path) != entry["sha256"]:
                     raise ValueError(f"{name}: input changed during analysis")
         finally:
             for db in self.opened.values():
