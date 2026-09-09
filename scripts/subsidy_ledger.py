@@ -1141,8 +1141,17 @@ def summarize(rows: list[Row]) -> dict:
                 "cost_usd": 0.0,
                 "cost_usd_on_measured_volume": 0.0,
                 "cost_usd_without_volume": 0.0,
+                # Cost excluded from the volume rate because its day's
+                # volume and its own cost belong to different days --
+                # kept apart from the unmeasured-volume bucket, or the
+                # table reports the same rows as both measured and
+                # unmeasured (Codex, PR #297).
+                "cost_usd_cross_day_volume": 0.0,
                 "cost_usd_on_pointed_days": 0.0,
                 "cost_usd_without_points": 0.0,
+                # The points mirror: this day *did* supply points, they
+                # are simply not the points its cost was earned against.
+                "cost_usd_cross_day_points": 0.0,
                 "points": 0.0,
                 "uncosted_points": 0.0,
                 "points_seen": False,
@@ -1152,6 +1161,11 @@ def summarize(rows: list[Row]) -> dict:
                 # Excluded from the rate for a third reason, and the
                 # reader has to be told which one (Codex, PR #297).
                 "measured_but_cross_day": 0,
+                # Which direction the misalignment ran, so the diagnostic
+                # describes what actually happened rather than assuming
+                # the close-day case (Codex, PR #297).
+                "cross_day_cost_from_yesterday": 0,
+                "cross_day_entry_closes_later": 0,
                 "fills_without_value": 0,
                 "incomplete_volume_days": 0,
                 "cross_day_cycles": 0,
@@ -1181,9 +1195,17 @@ def summarize(rows: list[Row]) -> dict:
                     arm["cost_usd_on_measured_volume"], row.cost_usd)
                 arm["costed_volume_usd"] = add_or_none(
                     arm["costed_volume_usd"], row.volume_usd)
+            elif row.volume_usd > 0 and not row.fills_without_value:
+                # Measured, but misaligned: a separate reason and a
+                # separate bucket, so no row is described as both.
+                arm["measured_but_cross_day"] += 1
+                if row.cross_day_cycles:
+                    arm["cross_day_cost_from_yesterday"] += 1
+                if row.cross_day_entries:
+                    arm["cross_day_entry_closes_later"] += 1
+                arm["cost_usd_cross_day_volume"] = add_or_none(
+                    arm["cost_usd_cross_day_volume"], row.cost_usd)
             else:
-                if row.volume_usd > 0 and not row.fills_without_value:
-                    arm["measured_but_cross_day"] += 1
                 arm["cost_usd_without_volume"] = add_or_none(
                     arm["cost_usd_without_volume"], row.cost_usd)
             # Points ratio: likewise, only if this row supplied points
@@ -1192,6 +1214,11 @@ def summarize(rows: list[Row]) -> dict:
                     and not row.cost_spans_two_days()):
                 arm["cost_usd_on_pointed_days"] = add_or_none(
                     arm["cost_usd_on_pointed_days"], row.cost_usd)
+            elif row.points is not None and row.points > 0:
+                # Points were supplied; they are just not the points this
+                # cost was earned against (Codex, PR #297).
+                arm["cost_usd_cross_day_points"] = add_or_none(
+                    arm["cost_usd_cross_day_points"], row.cost_usd)
             else:
                 arm["cost_usd_without_points"] = add_or_none(
                     arm["cost_usd_without_points"], row.cost_usd)
@@ -1208,6 +1235,7 @@ def summarize(rows: list[Row]) -> dict:
     for arm in by_arm.values():
         for key in ("volume_usd", "costed_volume_usd", "uncosted_volume_usd", "cost_usd",
                     "cost_usd_on_measured_volume", "cost_usd_without_volume",
+                    "cost_usd_cross_day_volume", "cost_usd_cross_day_points",
                     "cost_usd_on_pointed_days", "cost_usd_without_points"):
             arm[key] = None if arm[key] is None else round(arm[key], 6)
         # A rate needs both of its terms. `None` on either is the total
@@ -1248,10 +1276,26 @@ def summarize(rows: list[Row]) -> dict:
             arm["points"] = None
             arm["uncosted_points"] = None
             arm["cost_usd_without_points"] = None
+            arm["cost_usd_cross_day_points"] = None
         elif arm["uncosted_points"] is not None:
             arm["uncosted_points"] = round(arm["uncosted_points"], 6)
         del arm["points_seen"]
     return {"arms": [by_arm[a] for a in sorted(by_arm)]}
+
+
+def cross_day_reason(arm: dict) -> str:
+    """Which direction(s) the cost/volume misalignment ran, in words.
+
+    Two different things suppress a rate and the old wording described
+    only the first: a cost that opened the day before, and an entry made
+    today that closes tomorrow. A day can carry both (Codex, PR #297).
+    """
+    parts = []
+    if arm["cross_day_cost_from_yesterday"]:
+        parts.append(f"{arm['cross_day_cost_from_yesterday']} opened the day before")
+    if arm["cross_day_entry_closes_later"]:
+        parts.append(f"{arm['cross_day_entry_closes_later']} close on a later day")
+    return " and ".join(parts) if parts else "cost and volume span two days"
 
 
 def money(value: float | None, places: int = 2) -> str:
@@ -1327,11 +1371,14 @@ def render_table(rows: list[Row], summary: dict) -> str:
             # The volume is measured; it is misaligned with the cost.
             # Saying "no costed day has fully measured volume" here sent
             # the reader looking for missing fill values that are not
-            # missing (Codex, PR #297).
+            # missing. And the misalignment runs in two directions -- a
+            # cost that opened yesterday, or an entry today that closes
+            # tomorrow -- so the line names the one(s) that occurred
+            # instead of assuming the close-day case (Codex, PR #297).
             out.append(
                 f"         {arm['measured_but_cross_day']} costed day(s) measured their "
-                f"volume but carry a cost that opened the day before, so the per-$1M rate "
-                f"is unavailable"
+                f"volume but it is not aligned with the cost "
+                f"({cross_day_reason(arm)}), so the per-$1M rate is unavailable"
             )
         elif arm["cost_per_musd_volume"] is None:
             out.append(
@@ -1354,6 +1401,16 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"         {money(arm['cost_usd_without_volume'])} of cost fell on days whose "
                 f"volume is unmeasured and is excluded from that rate"
             )
+        if arm["cost_usd_cross_day_volume"]:
+            # A separate line from the one above, because these days'
+            # volume *is* measured. Printing them under the same heading
+            # made the table say measured and unmeasured of the same
+            # rows (Codex, PR #297).
+            out.append(
+                f"         {money(arm['cost_usd_cross_day_volume'])} of cost fell on days "
+                f"whose volume is measured but not aligned with it "
+                f"({cross_day_reason(arm)}), and is excluded from that rate"
+            )
         if arm["fills_without_value"]:
             out.append(
                 f"         {arm['fills_without_value']} fill(s) across "
@@ -1369,6 +1426,14 @@ def render_table(rows: list[Row], summary: dict) -> str:
             out.append(
                 "         the points-day totals could not be represented, so no price "
                 "per point can be computed"
+            )
+        elif arm["cost_usd_cross_day_points"]:
+            # Both were supplied on the same row; they are misaligned.
+            # "No day supplied both" is a different fact and was the
+            # wrong one to print here (Codex, PR #297).
+            out.append(
+                f"         no price per point: the day(s) that supplied points carry a "
+                f"cost earned against another day ({cross_day_reason(arm)})"
             )
         elif arm["points"] is not None:
             # No rate is exactly when the reader most needs to be told
@@ -1390,6 +1455,12 @@ def render_table(rows: list[Row], summary: dict) -> str:
             out.append(
                 f"         {arm['uncosted_points']:,.1f} points earned on days with no usable "
                 f"cost are excluded from that price"
+            )
+        if arm["cost_usd_cross_day_points"]:
+            out.append(
+                f"         {money(arm['cost_usd_cross_day_points'])} of cost fell on days "
+                f"that did supply points, but not the points it was earned against "
+                f"({cross_day_reason(arm)}), and is excluded from that price"
             )
         if arm["cost_usd_without_points"]:
             out.append(

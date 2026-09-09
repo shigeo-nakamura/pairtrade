@@ -751,7 +751,13 @@ def test_a_cycle_that_crossed_midnight_suppresses_the_day_rate():
         arm = summarize([row])["arms"][0]
         assert arm["cross_day_cycles"] == 1
         assert arm["cost_per_musd_volume"] is None
-        assert arm["cost_usd_without_volume"] == 100.0
+        # The cross-day bucket, not the unmeasured one: this row's
+        # volume *is* measured, it is misaligned with the cost
+        # (Codex, PR #297).
+        assert arm["cost_usd_cross_day_volume"] == 100.0
+        assert arm["cost_usd_without_volume"] == 0.0
+        assert arm["cross_day_cost_from_yesterday"] == 1
+        assert arm["cross_day_entry_closes_later"] == 0
 
         # Points are short by the same entry side, and cannot be
         # re-attributed either -- they are supplied per day.
@@ -765,7 +771,10 @@ def test_a_cycle_that_crossed_midnight_suppresses_the_day_rate():
         pointed_arm = summarize([pointed])["arms"][0]
         assert pointed_arm["cost_per_point"] is None
         assert pointed_arm["uncosted_points"] == 1000.0
-        assert pointed_arm["cost_usd_without_points"] == 100.0
+        # Likewise: points *were* supplied, they are simply not the
+        # points this cost was earned against.
+        assert pointed_arm["cost_usd_cross_day_points"] == 100.0
+        assert pointed_arm["cost_usd_without_points"] == 0.0
 
         # A same-day cycle is unaffected.
         same_day = pnl_file(
@@ -1634,7 +1643,7 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
     assert "no day supplied both a cost and points" not in cost_printed, cost_printed
 
     # A third reason the rate can be missing: the volume IS measured but
-    # the cost opened the day before. Saying "no costed day has fully
+    # it is not aligned with the cost. Saying "no costed day has fully
     # measured volume" sent the reader looking for absent fill values
     # (Codex, PR #297).
     cross = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0)}
@@ -1642,8 +1651,28 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
                                                 funding_seen=True, cross_day_cycles=1)}
     cross_rows = build_rows(cross, cross_pnl)
     cross_printed = render_table(cross_rows, summarize(cross_rows))
+    assert "not aligned with the cost" in cross_printed, cross_printed
     assert "opened the day before" in cross_printed, cross_printed
     assert "no costed day has fully measured volume" not in cross_printed, cross_printed
+    # The table must not call the same rows measured and unmeasured.
+    assert "volume is unmeasured" not in cross_printed, cross_printed
+
+    # The misalignment runs in two directions and the diagnostic has to
+    # say which one happened: an entry made today that closes tomorrow is
+    # not "a cost that opened the day before" (Codex, PR #297).
+    later_pnl = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                                funding_seen=True, cross_day_entries=1)}
+    later_rows = build_rows(cross, later_pnl)
+    later_printed = render_table(later_rows, summarize(later_rows))
+    assert "close on a later day" in later_printed, later_printed
+    assert "opened the day before" not in later_printed, later_printed
+
+    # Points supplied on a misaligned day are not "no points supplied".
+    pt_cross = build_rows(cross, cross_pnl, None, {("2026-09-08", "freq"): 50.0})
+    pt_cross_printed = render_table(pt_cross, summarize(pt_cross))
+    assert "not the points it was earned against" in pt_cross_printed, pt_cross_printed
+    assert "no day supplied both a cost and points" not in pt_cross_printed, pt_cross_printed
+    assert "no points supplied" not in pt_cross_printed, pt_cross_printed
 
     # And an arm that genuinely has no measured volume still says so.
     unmeasured = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0,
