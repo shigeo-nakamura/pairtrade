@@ -1922,6 +1922,49 @@ def test_an_explicit_zero_points_row_is_not_an_omitted_arm():
     assert "supplied none for this arm" in omitted_printed, omitted_printed
 
 
+def test_a_rejected_pnl_ledger_is_not_an_absent_one():
+    """"No PnL ledger covers these days" is a different instruction.
+
+    The reasons live on the row, which the table does not print, so an
+    operator was told the input was missing when it was supplied and
+    refused -- and had nothing to go and fix (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        execution = load_execution([write(
+            root / "execution-freq.jsonl",
+            [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+              "fill_value": 500_000.0}])])
+        rejected = load_pnl([write(
+            root / "pnl-svc-freq-20260908.jsonl",
+            [{"ts": TS, "source": "recovery_no_pnl", "pnl": 0.0,
+              "pnl_available": False}])])
+        rows = build_rows(execution, rejected)
+        arm = summarize(rows)["arms"][0]
+        assert arm["pnl_rejected_days"] == 1, arm
+        assert arm["pnl_incomplete_reasons"] == ["pnl_available_not_true"], arm
+        printed = render_table(rows, summarize(rows))
+        assert "every row in them was rejected" in printed, printed
+        assert "pnl_available_not_true" in printed, printed
+        assert "no PnL ledger or equity series covers" not in printed, printed
+
+        # An arm with genuinely no PnL input still says exactly that.
+        bare_rows = build_rows(execution, {})
+        bare = render_table(bare_rows, summarize(bare_rows))
+        assert "no PnL ledger or equity series covers" in bare, bare
+        assert "rejected" not in bare, bare
+
+        # And a partly costed arm reports the rejected days beside its cost.
+        mixed_pnl = dict(rejected)
+        mixed_exec = dict(execution)
+        mixed_exec[("2026-09-09", "freq")] = ExecDay(fills=1, volume_usd=100.0)
+        mixed_pnl[("2026-09-09", "freq")] = PnlDay(cycles=1, realized_pnl_usd=-5.0,
+                                                   funding_seen=True)
+        mixed_rows = build_rows(mixed_exec, mixed_pnl)
+        mixed = render_table(mixed_rows, summarize(mixed_rows))
+        assert "1 further day(s) had a PnL ledger whose rows were all rejected" in mixed, mixed
+
+
 def test_a_run_without_points_says_nothing_about_points():
     """The ordinary invocation must not discuss a KPI it was not given.
 

@@ -1289,6 +1289,12 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
                 "cross_day_points_from_yesterday": 0,
                 "cross_day_points_closes_later": 0,
                 "days_without_points": 0,
+                # A PnL ledger that was supplied and *rejected* is not an
+                # absent one, and the reasons live only on the row, which
+                # the table does not print. Aggregated here so the report
+                # can name what to go and fix (Codex, PR #297).
+                "pnl_rejected_days": 0,
+                "pnl_incomplete_reasons": [],
                 # Days that supplied a real zero. Kept apart from the
                 # ones that supplied nothing (Codex, PR #297).
                 "days_zero_points": 0,
@@ -1309,6 +1315,11 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
         )
         arm["days"] += 1
         arm["fills"] += row.fills
+        if row.pnl_coverage == "incomplete":
+            arm["pnl_rejected_days"] += 1
+            arm["pnl_incomplete_reasons"] = sorted(
+                set(arm["pnl_incomplete_reasons"]) | set(row.pnl_incomplete_reasons or ())
+            )
         # The per-day loaders guard this exact failure; the per-arm roll-up
         # is a second level of accumulation and needs the same guard, or
         # two finite days total to `Infinity` and the printed rates become
@@ -1557,8 +1568,19 @@ def render_table(rows: list[Row], summary: dict) -> str:
         if arm["cost_days"] == 0:
             # Nothing priced this arm at all. Saying "cost $0.00" here would
             # read as free rather than as unmeasured.
-            out.append(
-                f"{head}, cost unknown (no PnL ledger or equity series covers these days)")
+            if arm["pnl_rejected_days"]:
+                # Supplied and refused, which is a different instruction
+                # to the reader than "nothing covers these days".
+                out.append(
+                    f"{head}, cost unknown: a PnL ledger covers "
+                    f"{arm['pnl_rejected_days']} of these day(s) but every row in them "
+                    f"was rejected ({', '.join(arm['pnl_incomplete_reasons'])}), and no "
+                    "equity series covers them either"
+                )
+            else:
+                out.append(
+                    f"{head}, cost unknown (no PnL ledger or equity series covers "
+                    "these days)")
             # Still say what was supplied and excluded: an all-uncosted
             # points export otherwise printed "cost unknown" and nothing
             # about the points it was given (Codex, PR #297).
@@ -1597,6 +1619,15 @@ def render_table(rows: list[Row], summary: dict) -> str:
         out.append(
             f"{head}, cost {money(arm['cost_usd'])} across "
             f"{arm['cost_days']} costed day(s)")
+        if arm["pnl_rejected_days"]:
+            # Some days were costed and others' PnL rows were refused.
+            # The reasons are on the rows, which this table does not
+            # print, so an operator had no way to see what to fix
+            # (Codex, PR #297).
+            out.append(
+                f"         {arm['pnl_rejected_days']} further day(s) had a PnL ledger "
+                f"whose rows were all rejected ({', '.join(arm['pnl_incomplete_reasons'])})"
+            )
         if arm["volume_rate_unrepresentable"]:
             out.append(
                 "         the measured-volume totals could not be represented, so the "
