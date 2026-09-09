@@ -756,8 +756,9 @@ def test_a_cycle_that_crossed_midnight_suppresses_the_day_rate():
         # (Codex, PR #297).
         assert arm["cost_usd_cross_day_volume"] == 100.0
         assert arm["cost_usd_without_volume"] == 0.0
-        assert arm["cross_day_cost_from_yesterday"] == 1
-        assert arm["cross_day_entry_closes_later"] == 0
+        assert arm["cross_day_volume_from_yesterday"] == 1
+        assert arm["cross_day_volume_closes_later"] == 0
+        assert arm["days_cross_day_volume"] == 1
 
         # Points are short by the same entry side, and cannot be
         # re-attributed either -- they are supplied per day.
@@ -775,6 +776,12 @@ def test_a_cycle_that_crossed_midnight_suppresses_the_day_rate():
         # points this cost was earned against.
         assert pointed_arm["cost_usd_cross_day_points"] == 100.0
         assert pointed_arm["cost_usd_without_points"] == 0.0
+        # The points classification counts its own directions: this row
+        # is excluded from both rates, so both see it -- but a row
+        # excluded from only one must appear in only that one, which the
+        # dedicated test below pins (Codex, PR #297).
+        assert pointed_arm["days_cross_day_points"] == 1
+        assert pointed_arm["cross_day_points_from_yesterday"] == 1
 
         # A same-day cycle is unaffected.
         same_day = pnl_file(
@@ -1666,6 +1673,53 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
     later_printed = render_table(later_rows, summarize(later_rows))
     assert "close on a later day" in later_printed, later_printed
     assert "opened the day before" not in later_printed, later_printed
+
+    # The two classifications exclude different rows, so they must count
+    # their own directions. Here one row is misaligned the "opened
+    # yesterday" way and supplies NO points, while another is misaligned
+    # the "closes later" way and does. The points diagnostic must claim
+    # only the second direction (Codex, PR #297).
+    mixed_exec = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0),
+                  ("2026-09-09", "freq"): ExecDay(fills=1, volume_usd=100.0)}
+    mixed_pnl = {
+        ("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                       funding_seen=True, cross_day_cycles=1),
+        ("2026-09-09", "freq"): PnlDay(cycles=1, realized_pnl_usd=-2.0,
+                                       funding_seen=True, cross_day_entries=1),
+    }
+    mixed_rows = build_rows(mixed_exec, mixed_pnl, None,
+                            {("2026-09-09", "freq"): 10.0})
+    mixed_arm = summarize(mixed_rows)["arms"][0]
+    assert mixed_arm["days_cross_day_volume"] == 2, mixed_arm
+    assert mixed_arm["cross_day_volume_from_yesterday"] == 1
+    assert mixed_arm["cross_day_volume_closes_later"] == 1
+    # Only the pointed row reaches the points bucket, so only its
+    # direction may be named there.
+    assert mixed_arm["days_cross_day_points"] == 1, mixed_arm
+    assert mixed_arm["cross_day_points_from_yesterday"] == 0
+    assert mixed_arm["cross_day_points_closes_later"] == 1
+    mixed_printed = render_table(mixed_rows, summarize(mixed_rows))
+    points_line = [ln for ln in mixed_printed.splitlines()
+                   if "not the points it was earned against" in ln]
+    assert points_line and "opened the day before" not in points_line[0], points_line
+
+    # Excluded rows whose signed costs cancel to exactly zero are still
+    # excluded, and the table has to say so. A net of $0.00 is not
+    # "nothing was excluded" (Codex, PR #297).
+    cancel_exec = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0),
+                   ("2026-09-09", "freq"): ExecDay(fills=1, volume_usd=100.0)}
+    cancel_pnl = {
+        ("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-50.0,
+                                       funding_seen=True, cross_day_cycles=1),
+        ("2026-09-09", "freq"): PnlDay(cycles=1, realized_pnl_usd=50.0,
+                                       funding_seen=True, cross_day_cycles=1),
+    }
+    cancel_rows = build_rows(cancel_exec, cancel_pnl)
+    cancel_arm = summarize(cancel_rows)["arms"][0]
+    assert cancel_arm["cost_usd_cross_day_volume"] == 0.0, cancel_arm
+    assert cancel_arm["days_cross_day_volume"] == 2, cancel_arm
+    cancel_printed = render_table(cancel_rows, summarize(cancel_rows))
+    assert "not aligned with it" in cancel_printed, cancel_printed
 
     # Points supplied on a misaligned day are not "no points supplied".
     pt_cross = build_rows(cross, cross_pnl, None, {("2026-09-08", "freq"): 50.0})
