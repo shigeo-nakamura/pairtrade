@@ -1501,6 +1501,55 @@ def test_two_equity_closes_at_the_same_instant_settle_nothing():
     assert repeated.get("2026-09-09") == 100.0, repeated
 
 
+def test_a_hyphenated_arm_keeps_its_pnl(monkeypatch=None):
+    """End to end: execution names the arm, so the PnL joins it.
+
+    Otherwise the cost lands on a separate zero-volume `new` while
+    `brand-new` reports uncosted (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write(root / "execution-brand-new.jsonl",
+              [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "brand-new",
+                "fill_value": 500_000.0, "filled_qty": 1.0}])
+        write(root / "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl",
+              [{"ts": TS, "source": "exit_fill", "pnl": -40.0, "hold_secs": 600}])
+        execution = load_execution([root / "execution-brand-new.jsonl"])
+        known = {arm for _, arm in execution}
+        pnl = load_pnl([root / "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl"],
+                       known)
+        assert list(pnl) == [("2026-09-08", "brand-new")], list(pnl)
+        rows = build_rows(execution, pnl)
+        assert len(rows) == 1, [(r.date, r.arm) for r in rows]
+        assert rows[0].arm == "brand-new"
+        assert rows[0].cost_usd == 40.0 and rows[0].volume_usd == 500_000.0
+
+
+def test_an_explicit_null_slippage_is_unreadable_not_absent():
+    """The writer omits the diagnostic when it has none.
+
+    So a present `null` is a value that could not be read, and treating
+    the two alike published `slippage_usd: 0` with no coverage warning
+    (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        null_slip = write(root / "execution-freq.jsonl",
+                          [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                            "fill_value": 100.0, "filled_qty": 1.0,
+                            "slippage_usd_vs_decision": None}])
+        day = load_execution([null_slip])[("2026-09-08", "freq")]
+        assert day.slippage_unreadable == 1, day
+        assert day.slippage_usd == 0.0
+
+        # Omitting it entirely is the documented "no diagnostic" case.
+        omitted = write(root / "execution-freq.jsonl",
+                        [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                          "fill_value": 100.0, "filled_qty": 1.0}])
+        clean = load_execution([omitted])[("2026-09-08", "freq")]
+        assert clean.slippage_unreadable == 0, clean
+
+
 def test_a_padded_execution_variant_is_refused():
     """The last unvalidated arm source, and it is still a file field.
 
@@ -1851,6 +1900,20 @@ def test_a_padded_arm_in_a_pnl_filename_is_not_an_arm():
         "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl") == "freq"
     assert arm_from_pnl_filename("pnl-service-freq -20260908.jsonl") is None
     assert arm_from_pnl_filename("pnl-service- freq-20260908.jsonl") is None
+
+    # `pnl-<service>-<arm>-<date>` cannot express a hyphenated arm on its
+    # own -- nothing in `pnl-a-b-c-20260908.jsonl` says whether the arm
+    # is `c` or `b-c` -- so a hyphenated arm was silently truncated and
+    # its PnL landed on a separate zero-volume arm. The arms the other
+    # inputs name settle it (Codex, PR #297).
+    hyphenated = "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl"
+    assert arm_from_pnl_filename(hyphenated) == "new", "unaided, the last token"
+    assert arm_from_pnl_filename(hyphenated, {"brand-new"}) == "brand-new"
+    # Longest wins, so a known `new` does not shadow a known `brand-new`.
+    assert arm_from_pnl_filename(hyphenated, {"new", "brand-new"}) == "brand-new"
+    # An unrelated hint changes nothing.
+    assert arm_from_pnl_filename(hyphenated, {"freq"}) == "new"
+    assert arm_from_pnl_filename("pnl-svc-freq-20260908.jsonl", {"freq"}) == "freq"
 
 
 def test_a_total_that_overflows_is_a_gap_not_an_infinity():

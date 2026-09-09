@@ -477,19 +477,26 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                     else:
                         day.volume_usd += value
                         day.fills += 1
-            slip = record.get("slippage_usd_vs_decision")
-            if slip is not None:
+            # `in`, not a `None` test: the writer omits this diagnostic
+            # when it has none, so a present `null` is a value that could
+            # not be read. Treating the two alike published
+            # `slippage_usd: 0` with no coverage warning
+            # (Codex, PR #297).
+            if "slippage_usd_vs_decision" in record:
+                slip = record["slippage_usd_vs_decision"]
                 slip_value = None if is_not_a_number(slip) else float(slip)
                 # Same finite test as the notional: a NaN here is only a
                 # diagnostic, but it still leaves `--out` holding a token
                 # no strict JSON reader will accept.
-                if slip_value is not None and math.isfinite(slip_value):
-                    if overflows(day.slippage_usd, slip_value):
-                        day.slippage_unreadable += 1
-                    else:
-                        day.slippage_usd += slip_value
-                else:
+                if slip_value is None or not math.isfinite(slip_value):
+                    # Present but unusable -- including an explicit
+                    # `null`. The column is a diagnostic, so this
+                    # qualifies the column rather than the day.
                     day.slippage_unreadable += 1
+                elif overflows(day.slippage_usd, slip_value):
+                    day.slippage_unreadable += 1
+                else:
+                    day.slippage_usd += slip_value
     return dict(days)
 
 
@@ -535,7 +542,8 @@ def pnl_row_defect(record: dict) -> str | None:
     return None
 
 
-def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
+def load_pnl(paths: Iterable[Path],
+             known_arms: Iterable[str] = ()) -> dict[tuple[str, str], PnlDay]:
     """Realized PnL and funding per (date, arm), with coverage tracked.
 
     The arm comes from the filename (`pnl-<service>-<arm>-<YYYYMMDD>.jsonl`)
@@ -551,7 +559,7 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
     """
     days: dict[tuple[str, str], PnlDay] = defaultdict(PnlDay)
     for path in paths:
-        arm = arm_from_pnl_filename(path.name)
+        arm = arm_from_pnl_filename(path.name, known_arms)
         if arm is None:
             # The arm comes from the basename because the rows do not
             # carry it. Skipping such a file dropped every realized cost
@@ -862,8 +870,23 @@ def spans_a_funding_interval(record: dict) -> bool:
     return (close_secs // FUNDING_INTERVAL_SECS) != (opened // FUNDING_INTERVAL_SECS)
 
 
-def arm_from_pnl_filename(name: str) -> str | None:
-    """`pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl` -> `freq`."""
+def arm_from_pnl_filename(name: str, known_arms: Iterable[str] = ()) -> str | None:
+    """`pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl` -> `freq`.
+
+    `pnl-<service>-<arm>-<date>` is genuinely ambiguous when both the
+    service and the arm may contain hyphens: nothing in
+    `pnl-a-b-c-20260908.jsonl` says whether the arm is `c` or `b-c`. The
+    last token is right for every production filename, but it silently
+    truncated a hyphenated arm -- `brand-new` became `new`, so its cost
+    landed on a separate zero-volume arm while the real one reported
+    uncosted (Codex, PR #297).
+
+    So the other inputs settle it: any arm already seen in the execution
+    ledger, the points file or `--equity` is matched as a whole suffix
+    first, longest wins. That is exactly the case where the bug bites --
+    the arm exists elsewhere and only its PnL was misfiled. With nothing
+    to match against, the last token remains the answer.
+    """
     if not name.startswith("pnl-") or not name.endswith(".jsonl"):
         return None
     stem = name[len("pnl-") : -len(".jsonl")]
@@ -871,6 +894,10 @@ def arm_from_pnl_filename(name: str) -> str | None:
     if len(parts) != 2 or not parts[1].isdigit():
         return None
     service_and_arm = parts[0]
+    matches = [candidate for candidate in known_arms
+               if service_and_arm.endswith(f"-{candidate}")]
+    if matches:
+        return max(matches, key=len)
     arm = service_and_arm.rsplit("-", 1)[-1]
     # A filename is operator-supplied, so this is not the machine source
     # the round-33 comment took it for: `pnl-service-freq -20260908.jsonl`
@@ -1755,7 +1782,13 @@ def main(argv: list[str] | None = None) -> int:
                 "destroy that ledger"
             )
     execution = load_execution(exec_paths)
-    pnl = load_pnl(pnl_paths)
+    points = load_points(args.points)
+    # The PnL filename format cannot express a hyphenated arm on its own,
+    # so the arms the other inputs already name are what disambiguate it
+    # (Codex, PR #297).
+    known_arms = {arm for _, arm in execution} | {arm for _, arm in points}
+    known_arms |= {spec.partition("=")[0] for spec in args.equity}
+    pnl = load_pnl(pnl_paths, known_arms)
     equity_costs: dict[str, dict[str, float]] = {}
     for spec in args.equity:
         arm, sep, path = spec.partition("=")
@@ -1782,7 +1815,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         equity_costs[arm] = equity_daily_costs(read_jsonl(Path(path)))
 
-    rows = build_rows(execution, pnl, equity_costs, load_points(args.points))
+    rows = build_rows(execution, pnl, equity_costs, points)
     summary = summarize(rows, points_input=args.points is not None)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
