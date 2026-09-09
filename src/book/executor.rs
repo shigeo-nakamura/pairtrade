@@ -441,24 +441,16 @@ impl LiveExecutor {
         );
     }
 
-    /// The fresh WS touch for `symbol`, if the feed carried one. The
-    /// ticker fallback has no touch, so an adopted out-of-universe leg can
-    /// be sized and closed but never opened -- which is the rule anyway.
-    async fn touch_for(&self, symbol: &str) -> Option<(f64, f64)> {
-        let q = self.prices.read().await.get(symbol).copied()?;
-        (q.at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS)
-            .then_some(q.touch)
-            .flatten()
-    }
-
-    /// Current price for `symbol`: the WS mid when the feed carries it,
-    /// otherwise the ticker fallback (cached `FALLBACK_PRICE_TTL_SECS`).
-    /// Used both by the planner (`prices`) and at send time (`execute`) so
-    /// an adopted out-of-universe leg can be planned *and* sent.
-    async fn price_for(&self, symbol: &str) -> Option<f64> {
+    /// One send-time snapshot of `symbol`: the fresh WS quote (mid and
+    /// touch, read together so the drift guard and the bound conversion
+    /// see the same book), otherwise the ticker fallback (cached
+    /// `FALLBACK_PRICE_TTL_SECS`) as a mid with no touch -- so an adopted
+    /// out-of-universe leg can be sized and closed but never opened, which
+    /// is the rule anyway.
+    async fn quote_for(&self, symbol: &str) -> Option<(f64, Option<(f64, f64)>)> {
         if let Some(q) = self.prices.read().await.get(symbol).copied() {
             if q.at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
-                return Some(q.mid);
+                return Some((q.mid, q.touch));
             }
             log::warn!(
                 "[PRICE] WS mid for {symbol} is {}s old; falling back to the ticker",
@@ -468,7 +460,7 @@ impl LiveExecutor {
         let cached = self.fallback_prices.read().await.get(symbol).copied();
         if let Some((px, at)) = cached {
             if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS {
-                return Some(px);
+                return Some((px, None));
             }
         }
         match self.connector.get_ticker(symbol, None).await {
@@ -478,7 +470,7 @@ impl LiveExecutor {
                     .write()
                     .await
                     .insert(symbol.to_string(), (px, Instant::now()));
-                Some(px)
+                Some((px, None))
             }
             Err(e) => {
                 log::warn!("[PRICE] no WS mid for {symbol} and ticker fallback failed: {e:?}");
@@ -636,44 +628,43 @@ impl Executor for LiveExecutor {
 
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
         let started = Instant::now();
-        // Drift guard: the plan was sized at `reference_price`; if the book
-        // has already moved past the slippage budget the order is not sent
-        // (the engine re-plans on the next tick with fresh prices).
-        let mid = self.price_for(&intent.symbol).await.ok_or_else(|| {
-            anyhow!(PreSendAbort(format!(
-                "live: no price for {}",
-                intent.symbol
-            )))
-        })?;
-        if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
-            return Err(anyhow!(PreSendAbort(format!(
-                "price moved beyond slippage_bps={} before send (reference={} mid={})",
-                self.slippage_bps, intent.reference_price, mid
-            ))));
-        }
         // The preflight read happens before any submission, so a
         // transient account-read outage here must not spend an attempt.
+        // It also happens before the quote is read: the feed task keeps
+        // replacing the quote while this awaits, and the drift guard and
+        // the bound conversion below must judge the *same* book, taken as
+        // late as possible before the send.
         let before = self
             .venue_position(&intent.symbol)
             .await
             .map_err(|e| anyhow!(PreSendAbort(format!("preflight position read: {e}"))))?
             .map(|p| p.qty)
             .unwrap_or(0.0);
+        let (mid, touch) = self.quote_for(&intent.symbol).await.ok_or_else(|| {
+            anyhow!(PreSendAbort(format!(
+                "live: no price for {}",
+                intent.symbol
+            )))
+        })?;
+        // Drift guard: the plan was sized at `reference_price`; if the book
+        // has already moved past the slippage budget the order is not sent
+        // (the engine re-plans on the next tick with fresh prices).
+        if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
+            return Err(anyhow!(PreSendAbort(format!(
+                "price moved beyond slippage_bps={} before send (reference={} mid={})",
+                self.slippage_bps, intent.reference_price, mid
+            ))));
+        }
         let side = match intent.side {
             Side::Buy => OrderSide::Long,
             Side::Sell => OrderSide::Short,
         };
         // `slippage_bps` is a bound against the mid (the paper fill and the
         // drift guard above already read it that way); the venue crosses
-        // the touch by what it is handed, so convert with the observed
-        // half-spread (bot-strategy#971). An entry that cannot be bounded
-        // is not sent and costs no attempt; an exit always goes out.
-        let bound_bps = match send_bound_bps(
-            self.slippage_bps,
-            self.touch_for(&intent.symbol).await,
-            side,
-            intent.reduce_only,
-        ) {
+        // the touch by what it is handed, so convert with the half-spread
+        // of the same snapshot (bot-strategy#971). An entry that cannot be
+        // bounded is not sent and costs no attempt; an exit always goes out.
+        let bound_bps = match send_bound_bps(self.slippage_bps, touch, side, intent.reduce_only) {
             Ok(SendBound::Inside(b)) => b,
             Ok(SendBound::AtTouch) => {
                 log::warn!(
