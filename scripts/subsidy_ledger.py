@@ -549,7 +549,7 @@ def pnl_row_defect(record: dict) -> str | None:
 
 
 def load_pnl(paths: Iterable[Path],
-             known_arms: Iterable[str] = ()) -> dict[tuple[str, str], PnlDay]:
+             service: str | None = None) -> dict[tuple[str, str], PnlDay]:
     """Realized PnL and funding per (date, arm), with coverage tracked.
 
     The arm comes from the filename (`pnl-<service>-<arm>-<YYYYMMDD>.jsonl`)
@@ -565,20 +565,20 @@ def load_pnl(paths: Iterable[Path],
     """
     days: dict[tuple[str, str], PnlDay] = defaultdict(PnlDay)
     for path in paths:
-        arm = arm_from_pnl_filename(path.name, known_arms)
+        arm = arm_from_pnl_filename(path.name, service)
         if arm is None:
             # The arm comes from the basename because the rows do not
             # carry it. Skipping such a file dropped every realized cost
             # in it and still exited 0 -- the report then says no PnL
             # source covers those days, which is a different claim from
             # "one was supplied and could not be read" (Codex, PR #297).
-            ambiguous = matching_pnl_arms(path.name, known_arms)
             detail = ""
-            if len(ambiguous) > 1:
+            if service is not None:
+                detail = f"; --pnl-service {service!r} does not prefix this name"
+            elif "-" in (_pnl_service_and_arm(path.name) or ""):
                 detail = (
-                    "; more than one known arm fits the name ("
-                    + ", ".join(repr(candidate) for candidate in ambiguous)
-                    + "), and which one the file holds is not decidable from it"
+                    "; if this arm's name contains a hyphen, pass --pnl-service to say "
+                    "where the service name ends -- the filename alone cannot"
                 )
             raise SubsidyLedgerError(
                 f"{path}: the arm cannot be read from this filename; a PnL export must be "
@@ -884,24 +884,6 @@ def spans_a_funding_interval(record: dict) -> bool:
     return (close_secs // FUNDING_INTERVAL_SECS) != (opened // FUNDING_INTERVAL_SECS)
 
 
-def matching_pnl_arms(name: str, known_arms: Iterable[str] = ()) -> list[str]:
-    """Every known arm the filename could be naming, sorted.
-
-    One predicate, used by `arm_from_pnl_filename` to decide and by the
-    refusal message to explain. They were written separately -- the
-    message used a substring test -- so with arms `{freq, lighter-freq,
-    pair}` it listed `pair` as a candidate for
-    `pnl-debot-pair-robinhood-lighter-freq-...`, sending the operator to
-    rename an arm that was never in the running. Two predicates for one
-    question is the defect, not the wording (Codex, PR #297).
-    """
-    stem = _pnl_service_and_arm(name)
-    if stem is None:
-        return []
-    return sorted({candidate for candidate in known_arms
-                   if stem.endswith(f"-{candidate}")})
-
-
 def _pnl_service_and_arm(name: str) -> str | None:
     """The `<service>-<arm>` part of `pnl-<service>-<arm>-<date>.jsonl`."""
     if not name.startswith("pnl-") or not name.endswith(".jsonl"):
@@ -913,46 +895,36 @@ def _pnl_service_and_arm(name: str) -> str | None:
     return service_and_arm
 
 
-def arm_from_pnl_filename(name: str, known_arms: Iterable[str] = ()) -> str | None:
+def arm_from_pnl_filename(name: str, service: str | None = None) -> str | None:
     """`pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl` -> `freq`.
 
-    `pnl-<service>-<arm>-<date>` is genuinely ambiguous when both the
-    service and the arm may contain hyphens: nothing in
-    `pnl-a-b-c-20260908.jsonl` says whether the arm is `c` or `b-c`. The
-    last token is right for every production filename, but it silently
-    truncated a hyphenated arm -- `brand-new` became `new`, so its cost
-    landed on a separate zero-volume arm while the real one reported
-    uncosted (Codex, PR #297).
+    `pnl-<service>-<arm>-<date>` is ambiguous whenever both parts may
+    contain hyphens: nothing in `pnl-a-b-c-20260908.jsonl` says whether
+    the arm is `c` or `b-c`. Three rounds of this review tried to infer
+    it -- the last token, then the longest arm known from another input,
+    then refusing when two known arms fit -- and each inference had its
+    own way of attributing one arm's realized PnL to another, which is
+    the failure the inference existed to prevent. The last of them still
+    accepted a sole suffix match, which is not evidence either: the
+    other inputs may simply not mention the real arm (Codex, PR #297).
 
-    So the other inputs settle it: any arm already seen in the execution
-    ledger, the points file or `--equity` is matched as a whole suffix.
-    That is exactly the case where the bug bites -- the arm exists
-    elsewhere and only its PnL was misfiled. With nothing to match
-    against, the last token remains the answer, which is right for every
-    production filename.
-
-    When *two* known arms both match, the filename genuinely does not
-    say which: with arms `freq` and `lighter-freq`,
-    `pnl-debot-pair-robinhood-lighter-freq-...` fits both, and the
-    longer one is only longer because it ate the service's trailing
-    `lighter`. "Longest wins" traded one silent mis-attribution for
-    another, so this returns `None` and the caller refuses the file --
-    the same thing this module does with every other ambiguity rather
-    than guessing (Codex, PR #297).
+    So it is not inferred. `--pnl-service` names the prefix and the arm
+    is exactly what follows it, which is decidable. Without it the last
+    token is used -- correct for every filename this project produces,
+    and documented as not supporting a hyphenated arm, which needs
+    `--pnl-service`. Either way `None` makes the caller refuse the file
+    rather than file it under a guess.
     """
     service_and_arm = _pnl_service_and_arm(name)
     if service_and_arm is None:
         return None
-    matches = matching_pnl_arms(name, known_arms)
-    if len(matches) > 1:
-        return None
-    if matches:
-        return matches[0]
-    arm = service_and_arm.rsplit("-", 1)[-1]
-    # A filename is operator-supplied, so this is not the machine source
-    # the round-33 comment took it for: `pnl-service-freq -20260908.jsonl`
-    # parses to `"freq "`, which keys separately from the execution and
-    # points rows for `freq` (Codex, PR #297).
+    if service is not None:
+        prefix = f"{service}-"
+        if not service_and_arm.startswith(prefix):
+            return None
+        arm = service_and_arm[len(prefix):]
+    else:
+        arm = service_and_arm.rsplit("-", 1)[-1]
     return arm if is_bare_arm(arm) else None
 
 
@@ -1788,6 +1760,13 @@ def main(argv: list[str] | None = None) -> int:
         metavar="ARM=PATH",
         help="equity_history.jsonl for an arm, used only for days the PnL ledger misses",
     )
+    parser.add_argument(
+        "--pnl-service",
+        default=None,
+        help="the <service> part of pnl-<service>-<arm>-<YYYYMMDD>.jsonl; required "
+             "for an arm whose own name contains a hyphen, since the filename alone "
+             "cannot say where the service ends",
+    )
     parser.add_argument("--points", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None, help="write the rows as JSONL")
     args = parser.parse_args(argv)
@@ -1843,12 +1822,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     execution = load_execution(exec_paths)
     points = load_points(args.points)
-    # The PnL filename format cannot express a hyphenated arm on its own,
-    # so the arms the other inputs already name are what disambiguate it
-    # (Codex, PR #297).
-    known_arms = {arm for _, arm in execution} | {arm for _, arm in points}
-    known_arms |= {spec.partition("=")[0] for spec in args.equity}
-    pnl = load_pnl(pnl_paths, known_arms)
+    pnl = load_pnl(pnl_paths, args.pnl_service)
     equity_costs: dict[str, dict[str, float]] = {}
     equity_sources: dict[tuple, str] = {}
     for spec in args.equity:

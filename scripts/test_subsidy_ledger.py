@@ -21,7 +21,6 @@ from subsidy_ledger import (  # noqa: E402
     load_execution,
     load_pnl,
     load_points,
-    matching_pnl_arms,
     render_table,
     funding_ticks_are_zero,
     funding_tick_claim,
@@ -1502,6 +1501,36 @@ def test_two_equity_closes_at_the_same_instant_settle_nothing():
     assert repeated.get("2026-09-09") == 100.0, repeated
 
 
+def test_pnl_service_is_how_a_hyphenated_arm_is_named(monkeypatch=None):
+    """Codex's case: the other inputs cover `lighter-freq`, not `freq`.
+
+    The suffix heuristic then had exactly one match and attributed
+    `freq`'s realized PnL to `lighter-freq`. A sole match is not
+    evidence -- the other inputs may simply omit the real arm -- so the
+    inference is gone and `--pnl-service` states where the service ends
+    (Codex, PR #297).
+    """
+    service = "debot-pair-robinhood-lighter"
+    production = f"pnl-{service}-freq-20260908.jsonl"
+    # Nothing about the other inputs can move this any more.
+    assert arm_from_pnl_filename(production) == "freq"
+    assert arm_from_pnl_filename(production, service) == "freq"
+    # And the CLI carries it end to end.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        execution = write(root / "execution-lighter-freq.jsonl",
+                          [{"event": "leg_fill", "ts_ms": TS * 1000,
+                            "variant": "lighter-freq", "fill_value": 1.0}])
+        pnl_path = write(root / production,
+                         [{"ts": TS, "source": "exit_fill", "pnl": -40.0,
+                           "hold_secs": 600}])
+        assert ledger_main(["--exec-glob", str(execution),
+                            "--pnl-glob", str(pnl_path),
+                            "--pnl-service", service]) == 0
+        loaded = load_pnl([pnl_path], service)
+        assert list(loaded) == [("2026-09-08", "freq")], list(loaded)
+
+
 def test_a_hyphenated_arm_keeps_its_pnl(monkeypatch=None):
     """End to end: execution names the arm, so the PnL joins it.
 
@@ -1516,9 +1545,8 @@ def test_a_hyphenated_arm_keeps_its_pnl(monkeypatch=None):
         write(root / "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl",
               [{"ts": TS, "source": "exit_fill", "pnl": -40.0, "hold_secs": 600}])
         execution = load_execution([root / "execution-brand-new.jsonl"])
-        known = {arm for _, arm in execution}
         pnl = load_pnl([root / "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl"],
-                       known)
+                       "debot-pair-robinhood-lighter")
         assert list(pnl) == [("2026-09-08", "brand-new")], list(pnl)
         rows = build_rows(execution, pnl)
         assert len(rows) == 1, [(r.date, r.arm) for r in rows]
@@ -1950,48 +1978,32 @@ def test_a_padded_arm_in_a_pnl_filename_is_not_an_arm():
     # inputs name settle it (Codex, PR #297).
     hyphenated = "pnl-debot-pair-robinhood-lighter-brand-new-20260908.jsonl"
     assert arm_from_pnl_filename(hyphenated) == "new", "unaided, the last token"
-    assert arm_from_pnl_filename(hyphenated, {"brand-new"}) == "brand-new"
-    # An unrelated hint changes nothing.
-    assert arm_from_pnl_filename(hyphenated, {"freq"}) == "new"
-    assert arm_from_pnl_filename("pnl-svc-freq-20260908.jsonl", {"freq"}) == "freq"
+    assert arm_from_pnl_filename("pnl-svc-freq-20260908.jsonl") == "freq"
 
-    # When two known arms both fit, the filename does not say which, and
-    # "longest wins" only looked right: with arms `freq` and
-    # `lighter-freq` the longer match is longer because it ate the
-    # service's trailing `lighter`, so it attributed freq's PnL to the
-    # wrong arm. Refused, like every other ambiguity here
-    # (Codex, PR #297).
-    production = "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl"
+    # The arm is no longer inferred from the other inputs. Three rounds
+    # of this review tried -- last token, longest known arm, refuse when
+    # two fit -- and each had its own way of attributing one arm's PnL
+    # to another; the last still accepted a sole suffix match, which is
+    # not evidence when the other inputs simply omit the real arm.
+    # `--pnl-service` states where the service ends (Codex, PR #297).
+    service = "debot-pair-robinhood-lighter"
+    production = f"pnl-{service}-freq-20260908.jsonl"
     assert arm_from_pnl_filename(production) == "freq"
-    assert arm_from_pnl_filename(production, {"freq"}) == "freq"
-    assert arm_from_pnl_filename(production, {"freq", "lighter-freq"}) is None
-    assert arm_from_pnl_filename(hyphenated, {"new", "brand-new"}) is None
+    assert arm_from_pnl_filename(production, service) == "freq"
+    assert arm_from_pnl_filename(hyphenated, service) == "brand-new"
+    # A service that does not prefix the name proves nothing about it.
+    assert arm_from_pnl_filename(production, "some-other-service") is None
 
-    # And the refusal names the candidates rather than only saying the
-    # arm is unreadable.
+    # And the refusal says what to do about it.
     with tempfile.TemporaryDirectory() as tmp:
-        path = write(Path(tmp) / production,
+        path = write(Path(tmp) / hyphenated,
                      [{"ts": TS, "source": "exit_fill", "pnl": -1.0, "hold_secs": 600}])
         try:
-            load_pnl([path], {"freq", "lighter-freq", "pair"})
+            load_pnl([path], "wrong-service")
         except SubsidyLedgerError as error:
-            assert "not decidable" in str(error), error
-            assert "'lighter-freq'" in str(error), error
-            # And only the arms that could actually be it. `pair` occurs
-            # inside the *service* -- listing it sent the operator to
-            # rename an arm that was never in the running. The message
-            # and the decision use one predicate now (Codex, PR #297).
-            assert "'pair'" not in str(error), error
+            assert "--pnl-service" in str(error), error
         else:
-            raise AssertionError("an ambiguous arm must be refused")
-
-    # That predicate, directly: the decision and the diagnostic cannot
-    # disagree because there is only one of them.
-    assert matching_pnl_arms(production, {"freq", "lighter-freq", "pair"}) == [
-        "freq", "lighter-freq"]
-    assert matching_pnl_arms(production, {"freq"}) == ["freq"]
-    assert matching_pnl_arms(production, {"pair"}) == []
-    assert matching_pnl_arms("not-a-pnl-name.jsonl", {"freq"}) == []
+            raise AssertionError("a name the service does not prefix must be refused")
 
 
 def test_a_total_that_overflows_is_a_gap_not_an_infinity():
