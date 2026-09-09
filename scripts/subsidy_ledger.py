@@ -163,7 +163,16 @@ def is_bare_arm(value: object) -> bool:
     so the only genuinely machine-written arm is the execution ledger's
     `variant` (Codex, PR #297).
     """
-    return isinstance(value, str) and bool(value) and value == value.strip()
+    if not isinstance(value, str) or not value:
+        return False
+    # `value == value.strip()` was the wrong rule twice over: `strip()`
+    # only looks at the ends, so `"fr\neq"` passed and then broke the
+    # fixed-width table as well as the join, and it does not remove
+    # zero-width format characters, so a copied `"freq\u200b"` stayed a
+    # distinct key while the real arm got nothing. The rule is what an
+    # arm name actually is -- printable, and no whitespace anywhere
+    # (Codex, PR #297).
+    return value.isprintable() and not any(char.isspace() for char in value)
 
 
 def is_canonical_date(value: object) -> bool:

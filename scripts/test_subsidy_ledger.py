@@ -1420,7 +1420,8 @@ def test_a_points_date_must_be_canonical():
         # loaders that produce it -- arm_from_pnl_filename, and the
         # execution ledger's `variant` -- cannot emit a padded or
         # non-string value (Codex, PR #297).
-        for bad_arm in ("freq ", " freq", "freq\n", 1, ["freq"]):
+        for bad_arm in ("freq ", " freq", "freq\n", "fr\neq", "freq\u200b",
+                        1, ["freq"]):
             path = write(Path(tmp) / "points.jsonl",
                          [{"date": "2026-09-08", "arm": bad_arm, "points": 1000}])
             try:
@@ -1508,7 +1509,10 @@ def test_a_padded_execution_variant_is_refused():
     (Codex, PR #297).
     """
     with tempfile.TemporaryDirectory() as tmp:
-        for bad in ("freq ", " freq", "", 1):
+        # Including the two `strip()` never caught: an embedded newline
+        # (which also corrupts the fixed-width table) and an invisible
+        # zero-width suffix (Codex, PR #297).
+        for bad in ("freq ", " freq", "fr\neq", "freq\u200b", "", 1):
             path = write(Path(tmp) / "execution-freq.jsonl",
                          [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": bad,
                            "fill_value": 10_000.0}])
@@ -2209,8 +2213,17 @@ def test_an_equity_spec_needs_both_an_arm_and_a_path():
                             "--equity", f"freq={equity}"]) == 0
         # One validator behind both operator-supplied arms.
         assert is_bare_arm("freq") and is_bare_arm("brand-new")
-        for bad_arm in ("freq ", " freq", "freq\n", "", 1, None, ["freq"]):
-            assert not is_bare_arm(bad_arm), bad_arm
+        # Not just the ends, and not just ASCII space: `strip()` misses
+        # an embedded newline (which also breaks the fixed-width table)
+        # and every zero-width format character (Codex, PR #297).
+        for bad_arm in ("freq ", " freq", "freq\n", "fr\neq", "fr eq", "freq\t",
+                        "fr\u00a0eq", "freq\u200b", "\u202efreq", "freq\x00",
+                        "", 1, None, ["freq"]):
+            assert not is_bare_arm(bad_arm), repr(bad_arm)
+        # And every arm name this project actually uses still passes.
+        for good_arm in ("freq", "b", "c", "freq2", "brand-new", "xsmom-695",
+                         "dipgrid", "a_b"):
+            assert is_bare_arm(good_arm), good_arm
 
 
 def test_a_supplied_pnl_glob_that_matches_nothing_is_refused():
