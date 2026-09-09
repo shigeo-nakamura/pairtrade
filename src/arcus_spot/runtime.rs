@@ -3117,16 +3117,20 @@ impl ArcusSpotRuntime {
     }
 
     /// The fail-closed gate for a progress record whose declaration is gone
-    /// or has been replaced. Before `effective_at` the reduce-phase exit is
-    /// still forced (the units are still the quoted ones); once the window
-    /// was invalidated the units are stale and no exit may be sized from
-    /// them, exactly as for a declared event (Codex P1, pairtrade#309).
+    /// or has been replaced. It forces nothing and suppresses every exit,
+    /// whatever phase the record was in when the declaration vanished.
+    /// Without the declaration there is no `effective_at` left to say when
+    /// the tracked units stop being the quoted ones, so a record deleted in
+    /// the reduce phase could never transition to stale and would keep
+    /// forcing exits from `rotated_quantity` straight through the event --
+    /// the split under-sale / reverse-split over-sale by another road. An
+    /// open position under an undeclared window is the operator's to
+    /// reconcile, full stop (Codex P1 x3, pairtrade#309).
     fn undeclared_progress_gate(
         &self,
         progress: &ArcusSpotCorporateActionProgress,
         because: &str,
     ) -> CorporateActionGate {
-        let stale = progress.history_invalidated_at.is_some();
         CorporateActionGate {
             block_entry: Some(ArcusSpotHold::new(
                 ArcusSpotHoldCode::CorporateActionBlock,
@@ -3137,9 +3141,9 @@ impl ArcusSpotRuntime {
                     progress.event_id, progress.blocked_at, because,
                 ),
             )),
-            force_exit: !stale && self.state.regime != ArcusSpotRegime::Neutral,
+            force_exit: false,
             suppress_history: true,
-            suppress_exits: stale,
+            suppress_exits: true,
         }
     }
 
@@ -6940,6 +6944,41 @@ mod tests {
             outcome.decision,
         );
         assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+    }
+
+    #[test]
+    fn deleting_a_declaration_in_the_reduce_phase_stops_exits_for_good() {
+        // Deleted before `effective_at`: the record carries no discard stamp
+        // and, with the declaration gone, never will. If the gate kept
+        // forcing exits "until stale", it would force them straight through
+        // the real event from the pre-event quantity.
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_open_rotation(&mut runtime, anchor);
+        let reduce = anchor + Duration::seconds(2);
+        runtime.step_at(
+            &snapshot_with_route_unavailable(reduce, "200", "100"),
+            reduce,
+        );
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .is_some_and(|p| p.history_invalidated_at.is_none()));
+        runtime.config.corporate_actions.clear();
+        // Well past where the deleted declaration's effective_at (+4s) was,
+        // with a route available.
+        for offset in [3, 6, 20] {
+            let at = anchor + Duration::seconds(offset);
+            let outcome = runtime.step_at(&snapshot_with_valid_row(at), at);
+            assert!(
+                matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
+                "no exit may be sized under an undeclared window (+{offset}s): {:?}",
+                outcome.decision,
+            );
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+        assert!(runtime.state.corporate_action.is_some(), "progress is kept");
     }
 
     #[test]
