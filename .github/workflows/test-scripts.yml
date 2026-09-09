@@ -23,6 +23,8 @@ jobs:
         run: python3 scripts/test_engine_b_phase0.py
       - name: Run Engine B Phase 0 archive test
         run: bash scripts/test_engine_b_phase0_archive.sh
+      - name: Run Engine B archive monitor tests
+        run: python3 scripts/test_engine_b_archive_monitor.py
       - name: Verify Engine B trading calendar freeze (A-7)
         run: |
           python3 -m pip install -r scripts/engine_b_trading_calendar_freeze_requirements.txt

@@ -1,0 +1,32 @@
+# Prometheus rules; load into the connected ruler and route to an operator.
+groups:
+  - name: engine-b-phase0-archive
+    rules:
+      - alert: EngineBArchiveMonitorUnavailable
+        expr: absent(up{job="engine-b-phase0-archive"}) or up{job="engine-b-phase0-archive"} == 0 or engine_b_phase0_archive_probe_success == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Engine B archive monitoring is unavailable or incomplete
+      - alert: EngineBArchiveDiskLow
+        expr: engine_b_phase0_archive_disk_available_bytes < 5368709120 or engine_b_phase0_archive_disk_available_bytes / engine_b_phase0_archive_disk_size_bytes < 0.15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Engine B archive filesystem has less than 5 GiB or 15 percent free
+      - alert: EngineBArchiveFailed
+        expr: engine_b_phase0_archive_service_failed == 1 or engine_b_phase0_archive_timer_active == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Engine B archive failed or its hourly timer is inactive
+      - alert: EngineBArchiveStalled
+        expr: engine_b_phase0_archive_eligible_partition_count > 0 and (time() - engine_b_phase0_archive_last_verified_removal_timestamp_seconds > 10800)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Engine B has eligible partitions but no verified removal in three hours
