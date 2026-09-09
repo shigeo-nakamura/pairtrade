@@ -269,8 +269,16 @@ impl ArcusSpotRuntimeConfig {
         {
             return Err("exit_z_score must be finite and in [0, entry_z_score)".to_string());
         }
-        if self.corporate_action_settlement_margin_secs < 0 {
-            return Err("corporate_action_settlement_margin_secs must not be negative".to_string());
+        // Bounded, not just non-negative: `chrono::Duration::seconds`
+        // panics outside its representable range, so an absurd YAML value
+        // would terminate `hash-config` -- or, with an empty calendar,
+        // survive validation and terminate the first tick that builds the
+        // duration. A day is far beyond any real submission latency
+        // (Codex P2, pairtrade#309).
+        if !(0..=86_400).contains(&self.corporate_action_settlement_margin_secs) {
+            return Err(
+                "corporate_action_settlement_margin_secs must be between 0 and 86400".to_string(),
+            );
         }
         if self.max_quote_age_secs <= 0 || self.max_hold_secs <= 0 {
             return Err("quote age and hold limits must be positive".to_string());
@@ -504,6 +512,23 @@ mod tests {
         // a restored one, which are the two places that can actually tell.
         let mut config = valid_config();
         config.inventory_floors.token_a = Decimal::from(2);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_a_settlement_margin_outside_its_bounds() {
+        let mut config = valid_config();
+        config.corporate_action_settlement_margin_secs = -1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("between 0 and 86400"));
+        config.corporate_action_settlement_margin_secs = i64::MAX;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("between 0 and 86400"));
+        config.corporate_action_settlement_margin_secs = 86_400;
         config.validate().unwrap();
     }
 

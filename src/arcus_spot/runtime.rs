@@ -3762,13 +3762,23 @@ impl ArcusSpotRuntime {
         {
             return true;
         }
-        // The first tick inside a window has no progress record yet -- the
-        // gate writes it after the risk marks -- so there is no pin to
-        // compare against. The identity the previous observation saw is the
-        // same evidence, and a change from it during a declared window is
-        // the same drift.
         if self.state.corporate_action.is_some() {
-            return false;
+            // A pin that was never taken is not a passed comparison: the
+            // marks are unverifiable, so they may not engage a halt either
+            // (Codex P1, pairtrade#309).
+            return self.corporate_action_unpinned_symbol(&event).is_some();
+        }
+        // The first tick inside a window has no progress record yet -- the
+        // gate writes it after the risk marks. The pin it is about to take
+        // is only meaningful if the last observation predates the window;
+        // otherwise the cached identity may already be the replacement and
+        // comparing it with itself proves nothing.
+        let pre_event_observed = self
+            .state
+            .last_token_identity_at
+            .is_some_and(|observed_at| observed_at < event.entry_block_at);
+        if !pre_event_observed {
+            return true;
         }
         event.symbols.iter().any(|symbol| {
             let (last, token) = if symbol.eq_ignore_ascii_case(&self.config.pair.sell_symbol) {
@@ -3776,7 +3786,7 @@ impl ArcusSpotRuntime {
             } else {
                 (self.state.last_token_b_identity.as_ref(), &price.token_b)
             };
-            last.is_some_and(|last| !last.matches(token))
+            last.is_none_or(|last| !last.matches(token))
         })
     }
 
@@ -7123,6 +7133,23 @@ mod tests {
     /// A rotated regime holding well inside `max_hold_secs`, on a perfectly
     /// flat history so nothing but the corporate-action window can produce
     /// an exit.
+    /// The identities a runtime that has been observing carries, pinned a
+    /// minute before `at`. Fixtures that want the "never observed" shape
+    /// clear them explicitly.
+    fn seed_observed_identities(runtime: &mut ArcusSpotRuntime, at: DateTime<Utc>) {
+        runtime.state.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        });
+        runtime.state.last_token_b_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "AMD".to_string(),
+            address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
+            decimals: 18,
+        });
+        runtime.state.last_token_identity_at = Some(at - Duration::minutes(1));
+    }
+
     fn seed_open_rotation(runtime: &mut ArcusSpotRuntime, at: DateTime<Utc>) {
         // A runtime holding an open rotation has necessarily been observing,
         // so it carries the token identities a live one would. Fixtures that
@@ -7696,6 +7723,7 @@ mod tests {
         runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         // A prior rotation left the wallet 0.005 NVDA short of its basket:
         // $1.00 at 200, but $4.00 at the replacement's 800.
         runtime.state.inventory.token_a = Decimal::new(995, 3);
@@ -7732,6 +7760,7 @@ mod tests {
             ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
         control.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
         control.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut control, anchor);
         control.state.inventory.token_a = Decimal::new(995, 3);
         control.step_at(&snapshot_with_valid_row(anchor), anchor);
         control.step_at(
@@ -7742,6 +7771,45 @@ mod tests {
             control.state.risk_halt.is_some(),
             "a real shortfall still halts"
         );
+    }
+
+    #[test]
+    fn an_unpinned_identity_also_suppresses_halt_engagement() {
+        // A window declared after it opened leaves the identity unpinned.
+        // The marks are then unverifiable, and a halt engaged from one is
+        // artificial *and* sticky -- it would wedge the relisting recovery,
+        // since the window refuses the exit and clear-risk-halt refuses the
+        // clearance.
+        let anchor = event_time();
+        let mut runtime =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        runtime.state.inventory.token_a = Decimal::new(995, 3);
+        // No observation before the window: nothing can be pinned.
+        let inside = anchor + Duration::seconds(3);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(inside, "800", "100"),
+            inside,
+        );
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .is_some_and(|p| p.pre_event_token_a.is_none()));
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "unverifiable marks may not halt"
+        );
+
+        // A later tick, with the record now in place, still suppresses.
+        let later = anchor + Duration::seconds(4);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(later, "800", "100"),
+            later,
+        );
+        assert_eq!(runtime.state.risk_halt, None);
     }
 
     #[test]
@@ -7989,6 +8057,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         runtime.state.inventory.token_a = Decimal::new(995, 3);
         let reduce = anchor + Duration::seconds(2);
         runtime.step_at(&snapshot_with_valid_row(reduce), reduce);
@@ -8135,6 +8204,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         // 0.02 NVDA short: $4.00 at the pre-event price, over the $2 limit.
         runtime.state.inventory.token_a = Decimal::new(98, 2);
 
@@ -8155,6 +8225,7 @@ mod tests {
         let mut straddling = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
         seed_entry_signal_history(&mut straddling);
         straddling.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut straddling, anchor);
         straddling.state.inventory.token_a = Decimal::new(98, 2);
         straddling.step_at(
             &snapshot_with_overview_received_at(
@@ -8172,6 +8243,7 @@ mod tests {
         let mut later = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
         seed_entry_signal_history(&mut later);
         later.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut later, anchor);
         later.state.inventory.token_a = Decimal::new(98, 2);
         let post = anchor + Duration::seconds(5);
         later.step_at(&snapshot_with_overview_received_at(post, post), post);
@@ -8185,6 +8257,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         // A real $4 shortfall, halted before the event.
         runtime.state.inventory.token_a = Decimal::new(98, 2);
         runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
@@ -8211,6 +8284,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         runtime.state.inventory.token_a = Decimal::new(98, 2);
         runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
         assert!(runtime.state.risk_halt.is_some());
@@ -8984,6 +9058,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         // A prior rotation left the wallet 0.005 NVDA short of its basket.
         runtime.state.inventory.token_a = Decimal::new(995, 3);
 
@@ -9037,6 +9112,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         let basket = runtime.state.inventory;
         runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
         // 0.02 NVDA short: $4.00 at the pre-split price, over the $2 limit.
         runtime.state.inventory.token_a = Decimal::new(98, 2);
 
