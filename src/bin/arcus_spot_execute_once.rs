@@ -3718,6 +3718,7 @@ fn corporate_action_continuity(
     baseline: &ArcusSpotRuntimeState,
     current: &ArcusSpotRuntimeState,
     sequence_advance: u64,
+    verified_at: DateTime<Utc>,
 ) -> Result<ArcusSpotCorporateActionContinuity> {
     let mut authorized = ArcusSpotCorporateActionContinuity::default();
 
@@ -3828,6 +3829,7 @@ fn corporate_action_continuity(
         current,
         sequence_advance,
         !resumed.is_empty(),
+        verified_at,
     )?;
 
     // The discard is its own tick, at `effective_at`, and leaves the window
@@ -3864,6 +3866,7 @@ fn require_corporate_action_progress_transition(
     current: &ArcusSpotRuntimeState,
     sequence_advance: u64,
     resumed: bool,
+    verified_at: DateTime<Utc>,
 ) -> Result<()> {
     if sequence_advance == 0 {
         if current.corporate_action != baseline.corporate_action {
@@ -3898,10 +3901,13 @@ fn require_corporate_action_progress_transition(
                 })
                 .map(|event| event.effective_at)
         });
-        cutoff.is_some_and(|cutoff| stamped_at >= cutoff)
-            && current
-                .last_observation_at
-                .is_some_and(|observed_at| stamped_at <= observed_at)
+        // Lower bound: the cutoff it claims to mark. Upper bound: the clock
+        // this verification runs at -- *not* `last_observation_at`. The
+        // runtime stamps with `evaluation_time`, which `live-tick` takes
+        // with `Utc::now()` after fetching the snapshot, so the stamp is
+        // normally later than the observation watermark and bounding it
+        // there rejected every genuine discard (Codex P1, pairtrade#309).
+        cutoff.is_some_and(|cutoff| stamped_at >= cutoff) && stamped_at <= verified_at
     };
     match (&baseline.corporate_action, &current.corporate_action) {
         (None, None) => {}
@@ -3952,6 +3958,18 @@ fn require_corporate_action_progress_transition(
                 bail!(
                     "Arcus corporate action {} pinned a pre-event identity the backup never observed",
                     opened.event_id
+                );
+            }
+            // The runtime only writes this record once the evaluation clock
+            // reaches `entry_block_at`, so a record opened earlier is not a
+            // transition -- and restoring one makes pre-window ticks treat
+            // it as unresolved progress, blocking entries and suppressing
+            // history before the window exists (Codex P2, pairtrade#309).
+            if opened.blocked_at < event.entry_block_at || opened.blocked_at > verified_at {
+                bail!(
+                    "Arcus corporate action {} opened at {}, outside its declared window",
+                    opened.event_id,
+                    opened.blocked_at
                 );
             }
             if let Some(stamped_at) = opened.history_invalidated_at {
@@ -4083,6 +4101,7 @@ fn require_arcus_state_continuity(
         baseline_runtime,
         current_runtime,
         sequence_advance,
+        acceptance_not_after,
     )?;
     require_signal_history_continuity(
         &baseline_runtime.relative_log_price_history,
@@ -10512,7 +10531,8 @@ runtime:
     fn a_declared_corporate_action_resume_is_authorized() {
         let config = config_with_corporate_action(Some(("4", "1")));
         let (baseline, current) = resume_pair();
-        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
         assert_eq!(
             authorized.resumed_inventory,
             Some(ArcusSpotInventory {
@@ -10528,7 +10548,7 @@ runtime:
         let mut config = config_with_corporate_action(Some(("4", "1")));
         config.corporate_actions.clear();
         let (baseline, current) = resume_pair();
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not declare"), "{error}");
@@ -10538,7 +10558,7 @@ runtime:
     fn a_resume_without_a_reconciled_holding_is_rejected() {
         let config = config_with_corporate_action(None);
         let (baseline, current) = resume_pair();
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("post_event_inventory"), "{error}");
@@ -10550,7 +10570,7 @@ runtime:
         let config = config_with_corporate_action(Some(("4", "1")));
         let (baseline, mut current) = resume_pair();
         current.inventory.token_a = Decimal::from(5);
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(
@@ -10565,7 +10585,7 @@ runtime:
         let (baseline, mut current) = resume_pair();
         current.regime = ArcusSpotRegime::RotatedAToB;
         current.rotated_quantity = Some(Decimal::ONE);
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("rotation still open"), "{error}");
@@ -10575,7 +10595,7 @@ runtime:
     fn a_resume_without_a_new_observation_is_rejected() {
         let config = config_with_corporate_action(Some(("4", "1")));
         let (baseline, current) = resume_pair();
-        let error = corporate_action_continuity(&config, &baseline, &current, 0)
+        let error = corporate_action_continuity(&config, &baseline, &current, 0, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("single new observation"), "{error}");
@@ -10586,7 +10606,7 @@ runtime:
         let config = config_with_corporate_action(Some(("4", "1")));
         let (baseline, mut current) = resume_pair();
         current.handled_corporate_action_fingerprints.clear();
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(
@@ -10598,7 +10618,7 @@ runtime:
         // declaration does not make the rename guard's record.
         let (baseline, mut current) = resume_pair();
         current.handled_corporate_action_fingerprints = vec!["deadbeef".to_string()];
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(
@@ -10631,7 +10651,7 @@ runtime:
                 address: "0xdeadbeef00000000000000000000000000000000".to_string(),
                 ..pinned.clone()
             });
-        let error = corporate_action_continuity(&config, &baseline, &edited, 0)
+        let error = corporate_action_continuity(&config, &baseline, &edited, 0, verified_now())
             .unwrap_err()
             .to_string();
         assert!(
@@ -10643,7 +10663,7 @@ runtime:
         let mut edited = baseline.clone();
         edited.sequence = 8;
         edited.corporate_action.as_mut().unwrap().pre_event_token_a = None;
-        let error = corporate_action_continuity(&config, &baseline, &edited, 1)
+        let error = corporate_action_continuity(&config, &baseline, &edited, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("no observation produces"), "{error}");
@@ -10668,13 +10688,13 @@ runtime:
             .as_mut()
             .unwrap()
             .history_invalidated_at = Some("2026-08-16T02:00:01Z".parse().unwrap());
-        corporate_action_continuity(&config, &before, &stamped, 1).unwrap();
+        corporate_action_continuity(&config, &before, &stamped, 1, verified_now()).unwrap();
 
         // Cleared without a resume: not a transition either.
         let mut cleared = baseline.clone();
         cleared.sequence = 8;
         cleared.corporate_action = None;
-        let error = corporate_action_continuity(&config, &baseline, &cleared, 1)
+        let error = corporate_action_continuity(&config, &baseline, &cleared, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("cleared without a resume"), "{error}");
@@ -10691,7 +10711,8 @@ runtime:
         let mut baseline = continuity_state(7, ("1", "1"));
         baseline.last_token_a_identity = Some(observed.clone());
         baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
-        corporate_action_continuity(&config, &baseline, &baseline.clone(), 0).unwrap();
+        corporate_action_continuity(&config, &baseline, &baseline.clone(), 0, verified_now())
+            .unwrap();
 
         // The post-event contract, dropped into the cache at the same
         // sequence: a later window would pin it as the *pre-event* identity.
@@ -10700,17 +10721,79 @@ runtime:
             address: "0xdeadbeef00000000000000000000000000000000".to_string(),
             ..observed
         });
-        let error = corporate_action_continuity(&config, &baseline, &forged, 0)
+        let error = corporate_action_continuity(&config, &baseline, &forged, 0, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("cached token identities"), "{error}");
 
         let mut restamped = baseline.clone();
         restamped.last_token_identity_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
-        let error = corporate_action_continuity(&config, &baseline, &restamped, 0)
+        let error = corporate_action_continuity(&config, &baseline, &restamped, 0, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("cached token identities"), "{error}");
+    }
+
+    #[test]
+    fn a_window_may_not_open_before_its_declared_entry_block() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let event = fixture_event();
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        let opened_at = |at: &str| {
+            let mut current = continuity_state(8, ("1", "1"));
+            current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+                event_id: event.event_id.clone(),
+                blocked_at: at.parse().unwrap(),
+                pre_event_token_a: Some(observed.clone()),
+                pre_event_token_b: None,
+                history_invalidated_at: None,
+                fingerprint: event.fingerprint(),
+                effective_at: Some(event.effective_at),
+                symbols: event.symbols.clone(),
+            });
+            current
+        };
+        // entry_block_at is 2026-08-16T00:00:00Z.
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened_at("2026-08-16T00:00:01Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap();
+
+        // Opened before the window exists: restoring this blocks entries and
+        // suppresses history early.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened_at("2026-08-15T20:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outside its declared window"), "{error}");
+
+        // Opened after the verification clock.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened_at("2026-08-18T00:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outside its declared window"), "{error}");
     }
 
     #[test]
@@ -10741,9 +10824,15 @@ runtime:
             current
         };
         // Unstamped, and stamped at the cutoff: both are transitions.
-        corporate_action_continuity(&config, &baseline, &opened(None), 1).unwrap();
-        corporate_action_continuity(&config, &baseline, &opened(Some("2026-08-16T02:00:01Z")), 1)
-            .unwrap();
+        corporate_action_continuity(&config, &baseline, &opened(None), 1, verified_now()).unwrap();
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened(Some("2026-08-16T02:00:01Z")),
+            1,
+            verified_now(),
+        )
+        .unwrap();
 
         // Stamped before the cutoff: after a restore this would suppress
         // halts and refuse exits before effective_at ever arrived.
@@ -10752,6 +10841,7 @@ runtime:
             &baseline,
             &opened(Some("2026-08-16T00:30:00Z")),
             1,
+            verified_now(),
         )
         .unwrap_err()
         .to_string();
@@ -10778,22 +10868,51 @@ runtime:
         };
 
         // The cutoff is 02:00Z and the observation 12:00Z.
-        corporate_action_continuity(&config, &baseline, &stamped("2026-08-16T02:00:01Z"), 1)
-            .unwrap();
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-16T02:00:01Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap();
 
         // Stamped before the cutoff: a premature discard, which would also
         // make dispatch treat the units as stale early.
-        let error =
-            corporate_action_continuity(&config, &baseline, &stamped("2026-08-16T01:00:00Z"), 1)
-                .unwrap_err()
-                .to_string();
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-16T01:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("no observation produces"), "{error}");
 
-        // Stamped after the observation that supposedly produced it.
-        let error =
-            corporate_action_continuity(&config, &baseline, &stamped("2026-08-16T13:00:00Z"), 1)
-                .unwrap_err()
-                .to_string();
+        // The runtime stamps with `evaluation_time`, which live-tick takes
+        // after fetching the snapshot, so a stamp later than the observation
+        // watermark is normal and must verify.
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-16T13:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap();
+
+        // Stamped after the verification clock: not a transition this backup
+        // can have produced.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-18T00:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("no observation produces"), "{error}");
     }
 
@@ -10821,7 +10940,7 @@ runtime:
             symbols: event.symbols.clone(),
         };
         current.corporate_action = Some(opened.clone());
-        corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
 
         // A pin the backup never observed.
         let mut forged = current.clone();
@@ -10830,7 +10949,7 @@ runtime:
                 address: "0xdeadbeef00000000000000000000000000000000".to_string(),
                 ..observed.clone()
             });
-        let error = corporate_action_continuity(&config, &baseline, &forged, 1)
+        let error = corporate_action_continuity(&config, &baseline, &forged, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("never observed"), "{error}");
@@ -10839,7 +10958,7 @@ runtime:
         // pinned.
         let mut late = baseline.clone();
         late.last_token_identity_at = Some("2026-08-16T00:00:00Z".parse().unwrap());
-        let error = corporate_action_continuity(&config, &late, &current, 1)
+        let error = corporate_action_continuity(&config, &late, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("never observed"), "{error}");
@@ -10852,7 +10971,8 @@ runtime:
         let mut config = config_with_corporate_action(Some(("4", "1")));
         let (baseline, current) = resume_pair();
         config.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
-        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
         assert!(authorized.resumed_inventory.is_some());
 
         // ... including across legacy padding: the backup has an id with no
@@ -10867,14 +10987,20 @@ runtime:
             vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
         legacy_current.handled_corporate_action_fingerprints =
             vec![String::new(), fixture_event().fingerprint()];
-        let authorized =
-            corporate_action_continuity(&config, &legacy_baseline, &legacy_current, 1).unwrap();
+        let authorized = corporate_action_continuity(
+            &config,
+            &legacy_baseline,
+            &legacy_current,
+            1,
+            verified_now(),
+        )
+        .unwrap();
         assert!(authorized.resumed_inventory.is_some());
 
         // A genuinely undeclared resume is still refused.
         let mut gone = config.clone();
         gone.corporate_actions.clear();
-        let error = corporate_action_continuity(&gone, &baseline, &current, 1)
+        let error = corporate_action_continuity(&gone, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not declare"), "{error}");
@@ -10890,12 +11016,12 @@ runtime:
             vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
         current.handled_corporate_action_fingerprints =
             vec![String::new(), fixture_event().fingerprint()];
-        corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
 
         // Appended without padding: the fingerprint sits beside OLDER.
         let mut misaligned = current.clone();
         misaligned.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
-        let error = corporate_action_continuity(&config, &baseline, &misaligned, 1)
+        let error = corporate_action_continuity(&config, &baseline, &misaligned, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("beside its id"), "{error}");
@@ -10910,7 +11036,7 @@ runtime:
         current.handled_corporate_action_ids =
             vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
         // The older fingerprint is gone.
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("fingerprints"), "{error}");
@@ -10921,7 +11047,7 @@ runtime:
         let config = config_with_corporate_action(Some(("4", "1")));
         let (mut baseline, current) = resume_pair();
         baseline.handled_corporate_action_ids = vec!["SOMETHING-ELSE".to_string()];
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("lost or reordered"), "{error}");
@@ -10943,7 +11069,7 @@ runtime:
             symbols: vec!["NVDA".to_string()],
         });
         assert!(!current.relative_log_price_history.is_empty());
-        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(
@@ -10968,7 +11094,8 @@ runtime:
             effective_at: Some(fixture_event().effective_at),
             symbols: vec!["NVDA".to_string()],
         });
-        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
         assert!(authorized.history_discarded);
         assert_eq!(authorized.resumed_inventory, None);
         // And that is exactly what lets the history check accept it.
@@ -10988,6 +11115,11 @@ runtime:
             &ArcusSpotCorporateActionContinuity::default(),
         )
         .unwrap_err();
+    }
+
+    /// A verification clock comfortably after every fixture timestamp.
+    fn verified_now() -> DateTime<Utc> {
+        "2026-08-17T00:00:00Z".parse().unwrap()
     }
 
     fn stale_unit_progress() -> ArcusSpotCorporateActionProgress {
@@ -11196,7 +11328,8 @@ runtime:
         // sample.
         baseline.relative_log_price_history = vec![0.10, 0.11, 0.12];
         baseline.corporate_action = None;
-        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
         assert!(authorized.history_discarded);
         assert!(authorized.resumed_inventory.is_some());
         assert_eq!(current.relative_log_price_history.len(), 1);
@@ -11239,7 +11372,8 @@ runtime:
         baseline.relative_log_price_history = vec![0.10, 0.11, 0.12];
         baseline.corporate_action = None;
         current.relative_log_price_history = vec![0.25, 0.26];
-        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
         require_signal_history_continuity(
             &baseline.relative_log_price_history,
             &current.relative_log_price_history,
