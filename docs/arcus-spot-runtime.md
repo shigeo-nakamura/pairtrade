@@ -420,7 +420,13 @@ At `resume_not_before` the runtime resumes only when all three hold:
    instrument and needs a new `pair`, i.e. a config change and
    `reset-window`, not a resume. If the runtime never observed the pre-event
    side (it was down, or the window was declared after the fact) there is
-   nothing to compare and it says so rather than inventing a comparison. Only
+   nothing to compare and it says so rather than inventing a comparison.
+   **With no pinned identity an open rotation is not unwound either**: the
+   ticker may already have been repointed, and an exit sized from
+   `rotated_quantity` would route the old instrument's quantity to whatever
+   the symbol now resolves to. Declaring a window a runtime never observed
+   the other side of therefore hands an open position to the operator
+   (bot-strategy#977) -- declare windows before `entry_block_at`. Only
    an observation taken **strictly before** `entry_block_at` counts: a
    calendar installed mid-window on a runtime that kept ticking holds an
    identity from inside the event, and pinning that would compare the new

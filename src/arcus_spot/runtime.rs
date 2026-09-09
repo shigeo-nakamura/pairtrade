@@ -3194,6 +3194,33 @@ impl ArcusSpotRuntime {
             };
         }
 
+        // A pin the runtime never took is not a passed check. The window may
+        // have been declared after it opened, or the first observation may
+        // have arrived after downtime -- either way the ticker could already
+        // have been repointed, and an exit sized from `rotated_quantity`
+        // would route the old instrument's quantity to whatever the symbol
+        // now resolves to. The resume is still allowed without a pin (the
+        // operator's reconciled holding carries it, and it requires a flat
+        // wallet anyway); only exits are refused (Codex P1, pairtrade#309).
+        if self.state.regime != ArcusSpotRegime::Neutral {
+            if let Some(symbol) = self.corporate_action_unpinned_symbol(&event) {
+                return CorporateActionGate {
+                    block_entry: Some(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::CorporateActionUnresolved,
+                        format!(
+                            "corporate action {} has no pre-event identity for {symbol}, so an \
+                             exit cannot be checked against the instrument the tracked open \
+                             quantity refers to; reconcile the position",
+                            event.event_id,
+                        ),
+                    )),
+                    force_exit: false,
+                    suppress_history: evaluation_time >= event.effective_at,
+                    suppress_exits: true,
+                };
+            }
+        }
+
         // The evaluation clock reaching `resume_not_before` is not enough.
         // The resume values the reconciled holding at *this* observation's
         // prices and seeds the emptied window with their ratio, so the
@@ -3653,6 +3680,28 @@ impl ArcusSpotRuntime {
     /// pairtrade#309). Records that predate fingerprints match by id alone.
     fn handled_record_for(&self, event: &ArcusSpotCorporateActionEvent) -> Option<HandledMatch> {
         handled_corporate_action_record(&self.state, event)
+    }
+
+    /// An affected symbol whose pre-event identity was never observed, if
+    /// any: `corporate_action_identity_drift` skips those, so on its own it
+    /// reports "no drift" for a comparison it could not make.
+    fn corporate_action_unpinned_symbol(
+        &self,
+        event: &ArcusSpotCorporateActionEvent,
+    ) -> Option<String> {
+        let progress = self.state.corporate_action.as_ref()?;
+        event
+            .symbols
+            .iter()
+            .find(|symbol| {
+                let pinned = if symbol.eq_ignore_ascii_case(&self.config.pair.sell_symbol) {
+                    progress.pre_event_token_a.as_ref()
+                } else {
+                    progress.pre_event_token_b.as_ref()
+                };
+                pinned.is_none()
+            })
+            .cloned()
     }
 
     /// Compares each affected symbol's contract and decimals against what
@@ -6977,6 +7026,20 @@ mod tests {
     /// flat history so nothing but the corporate-action window can produce
     /// an exit.
     fn seed_open_rotation(runtime: &mut ArcusSpotRuntime, at: DateTime<Utc>) {
+        // A runtime holding an open rotation has necessarily been observing,
+        // so it carries the token identities a live one would. Fixtures that
+        // want the "never observed" shape clear them explicitly.
+        runtime.state.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        });
+        runtime.state.last_token_b_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "AMD".to_string(),
+            address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
+            decimals: 18,
+        });
+        runtime.state.last_token_identity_at = Some(at - Duration::minutes(1));
         let flat_price = (200.0_f64 / 100.0_f64).ln();
         runtime.state.relative_log_price_history = vec![flat_price; 3];
         runtime.state.regime = ArcusSpotRegime::RotatedAToB;
@@ -7119,6 +7182,19 @@ mod tests {
         runtime.state.regime = ArcusSpotRegime::RotatedAToB;
         runtime.state.rotated_quantity = Some(Decimal::new(49, 3));
         runtime.state.last_rotation_at = Some(anchor - Duration::seconds(1));
+        // A runtime holding a rotation has been observing, so the window
+        // opening pins the identity it saw beforehand.
+        runtime.state.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        });
+        runtime.state.last_token_b_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "AMD".to_string(),
+            address: "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC".to_string(),
+            decimals: 18,
+        });
+        runtime.state.last_token_identity_at = Some(anchor - Duration::minutes(1));
 
         let event = runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
 
@@ -7412,6 +7488,55 @@ mod tests {
         let later = anchor + Duration::seconds(14);
         runtime.step_at(&snapshot_with_overview_received_at(later, later), later);
         assert_eq!(runtime.state.inventory, reconciled);
+    }
+
+    #[test]
+    fn an_unpinned_identity_refuses_the_forced_exit() {
+        // The window was declared after it opened, so no pre-event identity
+        // was ever observed. The drift check has nothing to compare, which
+        // is not the same as a passed comparison.
+        let anchor = event_time();
+        let mut runtime =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        seed_open_rotation(&mut runtime, anchor);
+        // The window was declared after it opened: no identity was observed
+        // before it, so nothing can be pinned.
+        runtime.state.last_token_a_identity = None;
+        runtime.state.last_token_b_identity = None;
+        runtime.state.last_token_identity_at = None;
+        let reduce = anchor + Duration::seconds(4);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(reduce), reduce);
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .is_some_and(|p| p.pre_event_token_a.is_none()));
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected no exit without an identity to check, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+
+        // Control: one observation before the window pins the identity, and
+        // the reduce phase then exits as declared.
+        let mut control =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        control.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        control.step_at(&snapshot_with_valid_row(anchor), anchor);
+        seed_open_rotation(&mut control, anchor);
+        let reduce = anchor + Duration::seconds(4);
+        assert!(matches!(
+            control
+                .step_at(&snapshot_with_valid_row(reduce), reduce)
+                .decision,
+            ArcusSpotDecision::SimulatedFill { .. }
+        ));
     }
 
     #[test]
