@@ -627,6 +627,44 @@ class ActivityLedgerTests(unittest.TestCase):
             self.assertEqual(clean["coverage"]["unresolved_attempts"], [], phase)
             self.assertTrue(clean["coverage"]["complete"], phase)
 
+    def test_a_pending_attempt_for_the_final_event_stays_a_coverage_hole(self):
+        """The ordinary seam: the event is committed, then dispatched against.
+
+        An export ending on that event holds a dispatch stamped after its
+        own last observation, so a timestamp comparison alone calls the
+        in-flight attempt "outside the window" and publishes a clean
+        verdict over a transaction that may already be on chain.
+        """
+        events, history = baseline_round_trip()
+        # The export ends on the entry event; the attempt built from it
+        # is still confirmed-not-reconciled.
+        pending = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
+                          sell_quantity="0.347094", buy_quantity="0.323269",
+                          dispatched=ENTRY_AT + timedelta(seconds=3),
+                          phase="confirmed")
+        report = report_for(events[:1], [], active=pending)
+
+        self.assertEqual(report["coverage"]["unresolved_attempts"],
+                         [{"sequence": 8, "phase": "confirmed"}])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+
+    def test_the_configured_plan_age_limit_is_honoured(self):
+        """`validate_plan_age` compares against the configured value.
+
+        A deployment running `max_plan_age_secs: 30` could not have
+        dispatched a plan quoted 45 seconds earlier, so matching under
+        the 60s hard cap can select an event the runtime refused.
+        """
+        events, history = baseline_round_trip()
+        events[0]["decision"]["plan"]["quote_received_at"] = stamp(
+            ENTRY_AT - timedelta(seconds=45))
+        # Under the hard cap this matches and the rotation prices.
+        self.assertEqual(report_for(events, history)["totals"]["round_trips"], 1)
+        # Under the deployment's own 30s bound it cannot have been the one.
+        with self.assertRaises(ledger_tool.ActivityLedgerError):
+            report_for(events, history, max_plan_age_secs=30)
+
     def test_a_pending_attempt_outside_the_window_is_named_not_fatal(self):
         """A historical export must not be spoiled by activity after it.
 

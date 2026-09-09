@@ -271,6 +271,7 @@ def would_rotate_index(events: Iterable[dict[str, Any]]) -> dict[tuple, list[dic
 
 
 def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
+               max_plan_age_secs: int = HARD_MAX_PLAN_AGE_SECS,
                ) -> dict[str, Any] | None:
     """The would-rotate observation this dispatch was built from, if present.
 
@@ -328,7 +329,7 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
             if quoted_at
             else event_stream.parse_timestamp(event["observed_at"])
         )
-        if not within_plan_age(reference, prepared_at):
+        if not within_plan_age(reference, prepared_at, max_plan_age_secs):
             continue
         if not token_addresses_match(intent, plan):
             continue
@@ -338,14 +339,15 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
     if len(candidates) > 1:
         raise ActivityLedgerError(
             f"ledger sequence {attempt.get('sequence')}: {len(candidates)} would-rotate events "
-            f"within {HARD_MAX_PLAN_AGE_SECS}s before {attempt['prepared_at']} match this swap's "
+            f"within {max_plan_age_secs}s before {attempt['prepared_at']} match this swap's "
             "venue/symbols/amount/token addresses, so which marks and trigger priced it cannot "
             "be proven -- refusing rather than guessing at "
             + ", ".join(str(event["sequence"]) for event in candidates))
     return candidates[0]
 
 
-def within_plan_age(observed_at: datetime, prepared_at: datetime) -> bool:
+def within_plan_age(observed_at: datetime, prepared_at: datetime,
+                    limit_secs: int = HARD_MAX_PLAN_AGE_SECS) -> bool:
     """The freshness bound the runtime actually applies, to the second.
 
     `validate_plan_age` compares `plan_age.num_seconds()` against
@@ -357,7 +359,7 @@ def within_plan_age(observed_at: datetime, prepared_at: datetime) -> bool:
     same way keeps the two in step.
     """
     age = int((prepared_at - observed_at).total_seconds())
-    return 0 <= age <= HARD_MAX_PLAN_AGE_SECS
+    return 0 <= age <= limit_secs
 
 
 def token_addresses_match(intent: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -502,6 +504,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                      window: tuple[datetime, datetime],
                      since: datetime | None = None,
                      until: datetime | None = None,
+                     max_plan_age_secs: int = HARD_MAX_PLAN_AGE_SECS,
                      ) -> tuple[list[Swap], list[tuple[int, datetime]]]:
     """Price every reconciled swap the event window actually covers.
 
@@ -525,7 +528,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     out_of_window: list[tuple[int, datetime]] = []
     for attempt in reconciled_attempts(ledger):
         dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
-        event = find_event(attempt, index)
+        event = find_event(attempt, index, max_plan_age_secs)
         if event is None:
             # Inside the stream *and* inside what the caller asked about.
             # A stream can span more than the requested report, and a
@@ -699,7 +702,8 @@ def event_window(events: Sequence[dict[str, Any]], since: datetime | None,
 def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
                  ceiling: Decimal, gas_price_usd: Decimal,
                  since: datetime | None = None,
-                 until: datetime | None = None) -> dict[str, Any]:
+                 until: datetime | None = None,
+                 max_plan_age_secs: int = HARD_MAX_PLAN_AGE_SECS) -> dict[str, Any]:
     index = would_rotate_index(events)
     # Two different windows, and conflating them dropped whole rotations.
     # The stream window is what the marks can price at all; the report
@@ -715,7 +719,8 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # belongs to the day the caller named.
     if since is not None and until is not None and since > until:
         raise ActivityLedgerError("--since is after --until")
-    swaps, out_of_window = reconciled_swaps(ledger, index, stream, since, until)
+    swaps, out_of_window = reconciled_swaps(
+        ledger, index, stream, since, until, max_plan_age_secs)
     # Pair over everything the stream priced, so a rotation that spans a
     # requested bound is still recognised as one rotation.
     round_trips, orphan_exits = pair_round_trips(swaps)
@@ -832,7 +837,23 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     pending_row = (
         {"sequence": pending[0], "phase": pending[2]} if pending is not None else None
     )
-    in_window = pending is not None and within(pending[1], *asked)
+    # The normal seam: live-tick commits the would-rotate event and only
+    # then dispatches against it, so an in-flight attempt's dispatch is
+    # always *after* the last event of an export that ends on that event.
+    # Comparing timestamps alone therefore called the ordinary case
+    # "outside the window". If this export holds the very event the
+    # attempt was built from, it belongs to the period being reported
+    # however its clock reads; a genuinely newer attempt from a
+    # historical export matches nothing here and stays outside
+    # (PR #298 Codex review).
+    pending_event = (
+        find_event(ledger["active"], index, max_plan_age_secs)
+        if pending is not None and isinstance(ledger.get("active"), dict)
+        else None
+    )
+    in_window = pending is not None and (
+        within(pending[1], *asked) or pending_event is not None
+    )
     unresolved = [pending_row] if in_window else []
     # Outside the reported window it is still worth naming -- the ledger
     # holds an unfinished attempt right now -- but it does not spoil a
@@ -1018,6 +1039,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="ignore swaps before this RFC3339 instant")
     parser.add_argument("--until", type=event_stream.parse_timestamp,
                         help="ignore swaps after this RFC3339 instant")
+    parser.add_argument(
+        "--max-plan-age-secs",
+        type=int,
+        default=HARD_MAX_PLAN_AGE_SECS,
+        help=(
+            "the executor's own `max_plan_age_secs` for this deployment "
+            f"(1..={HARD_MAX_PLAN_AGE_SECS}; default {HARD_MAX_PLAN_AGE_SECS}, the hard cap). "
+            "A swap is matched to its pricing event under the same bound the runtime "
+            "applied when it dispatched, so a deployment configured tighter must say so "
+            "here -- otherwise events the runtime would have refused can be matched"
+        ),
+    )
     parser.add_argument("--markdown", action="store_true",
                         help="print the daily table instead of JSON")
     parser.add_argument("--json-out", type=Path)
@@ -1025,10 +1058,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(arguments: argparse.Namespace) -> dict[str, Any]:
+    if not 1 <= arguments.max_plan_age_secs <= HARD_MAX_PLAN_AGE_SECS:
+        raise ActivityLedgerError(
+            f"--max-plan-age-secs must be in 1..={HARD_MAX_PLAN_AGE_SECS}, the range the "
+            f"runtime itself enforces; got {arguments.max_plan_age_secs}")
     events, _ = event_stream.verify_paths(arguments.stream)
     ledger = json.loads(arguments.ledger.read_text(encoding="utf-8"))
     report = build_report(ledger, events, arguments.ceiling_per_1k,
-                          arguments.gas_price_usd, arguments.since, arguments.until)
+                          arguments.gas_price_usd, arguments.since, arguments.until,
+                          arguments.max_plan_age_secs)
     if arguments.json_out:
         arguments.json_out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
