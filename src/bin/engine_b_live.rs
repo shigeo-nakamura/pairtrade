@@ -55,9 +55,11 @@
 //!   yet at any meaningful sample size) -- see bot-strategy#872.
 //! - Entry/exit price is the WS mid at/after the boundary, not a full
 //!   top-5-depth VWAP walk (requirements doc §4.5.2's `P_exec_entry`/
-//!   `P_exec_exit`). No slippage modeling beyond what
-//!   `create_order(price=None)` (Lighter-native IOC + 20% protection
-//!   price) already gives. Fill *quantity* is no longer assumed from the
+//!   `P_exec_exit`), but the *send* is now bounded: both legs go out as
+//!   `create_order_taker_ioc` marketable limits capped `slippage_bps`
+//!   from the touch (default 50 bps, bot-strategy#918), replacing
+//!   `create_order(price=None)`'s ±20% protection price -- which is a
+//!   fill guarantee, not a price constraint. Fill *quantity* is no longer assumed from the
 //!   HTTP 200 (bot-strategy#875 G-2/G-4, `docs/engine-b-order-spec.md`
 //!   §4 -- that document lands with pairtrade#272): live entries and
 //!   exits are confirmed against the exchange's own
@@ -305,6 +307,17 @@ struct EngineBLiveConfig {
     /// within ~1 s of the fill; 15 s leaves room for a WS hiccup without
     /// eating the 180 s entry window (bot-strategy#875 G-2).
     fill_confirm_timeout_secs: i64,
+    /// How far from the touch, in basis points, an entry or exit send may
+    /// cross before the remainder is cancelled rather than filled
+    /// (bot-strategy#918). The predecessor path, `create_order(price =
+    /// None)`, priced its IOC off the ticker with a ±20% protection
+    /// price: that bounds nothing a thin book can do to a $100 lot, and
+    /// the requirements ask for a marketable limit of <=50 bps. The
+    /// connector itself rejects anything outside `1..=1000`, so the old
+    /// 2,000 bps is unreachable through this path; `validate` refuses the
+    /// same range at startup rather than letting a typo surface as a
+    /// failed send in the 180 s entry window.
+    slippage_bps: u32,
     /// Maximum age (seconds) a price observation may have and still be
     /// usable for an *entry* decision -- boundary capture (t0/t1), the
     /// `compute_epsilon` inputs and the order-sizing price
@@ -410,6 +423,12 @@ impl EngineBLiveConfig {
             entry_deadline_secs: env_i64("ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
             exit_deadline_secs: env_i64("ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
             fill_confirm_timeout_secs: env_i64("ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS", 15),
+            // The requirements doc's marketable-limit bound (<=50 bps).
+            // The 2026-09-05 feasibility study measured a round trip on
+            // SNDK at 2.86-3.42 bps, so 50 bps is ~15x the observed cost
+            // -- loose enough not to reject a normal fill, tight enough
+            // that a torn book costs $0.50 on a $100 lot rather than $20.
+            slippage_bps: env_u32("ENGINE_B_LIVE_SLIPPAGE_BPS", 50),
             // 30 s is the requirements doc's staleness bound for a
             // boundary price (bot-strategy#916).
             max_price_staleness_secs: env_i64("ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS", 30),
@@ -452,6 +471,24 @@ impl EngineBLiveConfig {
             )),
             instance_id,
         }
+    }
+
+    /// Refuse a configuration the order path cannot honour, at startup
+    /// rather than at 06:30 UTC. `create_order_taker_ioc` rejects a
+    /// `slippage_bps` outside `1..=1000` itself, but discovering that
+    /// from a send means the entry window is already open and burning:
+    /// `entry_deadline_secs` is 180 s and bot-strategy#875 G-4 allows at
+    /// most one entry `sendTx` per session day, so a rejected send is a
+    /// lost day, not a retry.
+    fn validate(&self) -> Result<()> {
+        if !(1..=1000).contains(&self.slippage_bps) {
+            anyhow::bail!(
+                "ENGINE_B_LIVE_SLIPPAGE_BPS={} is outside the connector's accepted 1..=1000 \
+                 (bot-strategy#918); 50 is the requirements doc's marketable-limit bound",
+                self.slippage_bps
+            );
+        }
+        Ok(())
     }
 
     /// All symbols this process needs price updates for.
@@ -1620,24 +1657,24 @@ impl EngineBLiveEngine {
         let size_dec = Decimal::from_str(&format!("{size:.8}")).context("size to Decimal")?;
         if self.cfg.dry_run {
             log::info!(
-                "[DRY_RUN] would submit {side} size={size_dec} reduce_only={reduce_only} symbol={}",
-                self.cfg.us_primary_symbol
+                "[DRY_RUN] would submit {side} size={size_dec} reduce_only={reduce_only} symbol={} \
+                 as a taker IOC bounded {}bps from the touch",
+                self.cfg.us_primary_symbol,
+                self.cfg.slippage_bps
             );
             return Ok(size_dec);
         }
         let resp = self
             .connector
-            .create_order(
+            .create_order_taker_ioc(
                 &self.cfg.us_primary_symbol,
                 size_dec,
                 side,
-                None,
-                None,
+                self.cfg.slippage_bps,
                 reduce_only,
-                None,
             )
             .await
-            .context("create_order failed")?;
+            .context("create_order_taker_ioc failed")?;
         resp.ordered_size
             .to_f64()
             .map(|f| Decimal::from_str(&format!("{f:.8}")).unwrap_or(size_dec))
@@ -3175,7 +3212,7 @@ async fn main() -> Result<()> {
     log::info!(
         "[CONFIG] instance={} dry_run={} kr_primary={} us_primary={} lot_usd=${:.0} leverage={} \
          epsilon_threshold={:.5} direction_multiplier={} signal_model={} entry_deadline={}s exit_deadline={}s \
-         min_daily_volume_usd=${:.0}",
+         slippage_bps={} min_daily_volume_usd=${:.0}",
         cfg.instance_id,
         cfg.dry_run,
         cfg.kr_primary_symbol,
@@ -3187,8 +3224,10 @@ async fn main() -> Result<()> {
         cfg.signal_model,
         cfg.entry_deadline_secs,
         cfg.exit_deadline_secs,
+        cfg.slippage_bps,
         cfg.min_daily_volume_usd,
     );
+    cfg.validate()?;
 
     // Mirrors robinhood_dipgrid.rs's explicit live-refusal gate: flipping
     // ENGINE_B_LIVE_DRY_RUN=false alone is not enough. This prototype has
@@ -3401,6 +3440,7 @@ mod tests {
             entry_deadline_secs: 180,
             exit_deadline_secs: 900,
             fill_confirm_timeout_secs: 15,
+            slippage_bps: 50,
             lighter_rest_url: "https://mainnet.zklighter.elliot.ai".to_string(),
             min_daily_volume_usd: 100_000.0,
             equity_usd_reference: 1000.0,
@@ -4236,14 +4276,20 @@ mod tests {
     // Engine-level fail-closed behaviour (bot-strategy#916).
     //
     // These drive the real `maybe_capture_t0` / `maybe_enter` /
-    // `maybe_exit` against a stub connector that counts `create_order`
-    // calls, so "no order was sent" is asserted against the send itself
-    // rather than against an intermediate flag.
+    // `maybe_exit` against a stub connector that counts
+    // `create_order_taker_ioc` calls, so "no order was sent" is asserted
+    // against the send itself rather than against an intermediate flag.
+    // The stub's `create_order` panics on purpose (bot-strategy#918):
+    // the unbounded ±20% path must stay unreachable from this binary.
     // -------------------------------------------------------------
 
     #[derive(Default)]
     struct StubConnector {
         orders: std::sync::Mutex<Vec<(String, Decimal, OrderSide, bool)>>,
+        /// The `slippage_bps` each send carried, in send order. Separate
+        /// from `orders` so the existing order assertions keep their
+        /// shape while bot-strategy#918's bound is asserted on its own.
+        taker_ioc_bps: std::sync::Mutex<Vec<u32>>,
         positions: std::sync::Mutex<Vec<PositionSnapshot>>,
         /// Runs inside `get_positions`, standing in for whatever the
         /// feed task does to the shared `PriceFeed` while `maybe_enter`
@@ -4255,6 +4301,10 @@ mod tests {
     impl StubConnector {
         fn order_count(&self) -> usize {
             self.orders.lock().unwrap().len()
+        }
+
+        fn taker_ioc_bounds(&self) -> Vec<u32> {
+            self.taker_ioc_bps.lock().unwrap().clone()
         }
     }
 
@@ -4364,25 +4414,20 @@ mod tests {
         }
         async fn create_order(
             &self,
-            symbol: &str,
-            size: Decimal,
-            side: OrderSide,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
             _price: Option<Decimal>,
             _spread: Option<i64>,
-            reduce_only: bool,
+            _reduce_only: bool,
             _expiry_secs: Option<u64>,
         ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
-            self.orders
-                .lock()
-                .unwrap()
-                .push((symbol.to_string(), size, side, reduce_only));
-            Ok(dex_connector::CreateOrderResponse {
-                order_id: "stub".to_string(),
-                exchange_order_id: None,
-                ordered_price: Decimal::ZERO,
-                ordered_size: size,
-                client_order_id: None,
-            })
+            // Deliberately fatal: every order this binary sends must carry
+            // a price bound (bot-strategy#918). Reintroducing a
+            // `create_order` send anywhere in the entry/exit path fails
+            // the whole suite here rather than silently restoring the
+            // ±20% protection price.
+            unimplemented!("engine_b_live must send bounded taker IOCs, not create_order")
         }
         #[allow(clippy::too_many_arguments)]
         async fn create_advanced_trigger_order(
@@ -4402,13 +4447,24 @@ mod tests {
         }
         async fn create_order_taker_ioc(
             &self,
-            _symbol: &str,
-            _size: Decimal,
-            _side: OrderSide,
-            _slippage_bps: u32,
-            _reduce_only: bool,
+            symbol: &str,
+            size: Decimal,
+            side: OrderSide,
+            slippage_bps: u32,
+            reduce_only: bool,
         ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
-            unimplemented!("engine_b_live does not call create_order_taker_ioc")
+            self.orders
+                .lock()
+                .unwrap()
+                .push((symbol.to_string(), size, side, reduce_only));
+            self.taker_ioc_bps.lock().unwrap().push(slippage_bps);
+            Ok(dex_connector::CreateOrderResponse {
+                order_id: "stub".to_string(),
+                exchange_order_id: None,
+                ordered_price: Decimal::ZERO,
+                ordered_size: size,
+                client_order_id: None,
+            })
         }
         #[allow(clippy::too_many_arguments)]
         async fn modify_order(
@@ -5154,6 +5210,82 @@ mod tests {
         assert_eq!(symbol, "SNDK");
         assert_eq!(*side, OrderSide::Short, "reduce-only close of a long");
         assert!(*reduce_only);
+    }
+
+    // -------------------------------------------------------------
+    // Bounded taker IOC (bot-strategy#918)
+    // -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_entry_send_carries_the_configured_price_bound() {
+        let mut h = harness();
+        h.engine.cfg.slippage_bps = 25;
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.taker_ioc_bounds(),
+            vec![25],
+            "the entry must cross as a bounded marketable limit, not an \
+             unbounded protection-price IOC"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_send_carries_the_same_bound_as_the_entry() {
+        // The exit is the leg that gets sent on a torn book -- a t2 that
+        // lands during a gap is exactly when the +/-20% protection price
+        // used to be able to pay 20%.
+        let mut h = harness();
+        h.engine.cfg.slippage_bps = 25;
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            size: 0.058,
+            open_size: 0.058,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: 1,
+                entry_price: Some(Decimal::from_str("1700").unwrap()),
+            });
+        h.observe_at("SNDK", 1710.0, T2_US, 0);
+        h.set_now(T2_US + 1_000_000);
+        h.engine.maybe_exit(T2_US + 1_000_000).await;
+        assert_eq!(h.connector.taker_ioc_bounds(), vec![25]);
+        let orders = h.connector.orders.lock().unwrap();
+        assert!(orders[0].3, "and it is still the reduce-only close");
+    }
+
+    #[test]
+    fn a_bound_the_connector_would_reject_is_refused_at_startup() {
+        // 2000 bps is the old protection price. Reaching the send with it
+        // costs the whole session day (one entry sendTx, #875 G-4), so it
+        // has to fail here instead.
+        let mut cfg = fixture_config();
+        cfg.slippage_bps = 2000;
+        let err = cfg.validate().expect_err("2000 bps must not start");
+        assert!(err.to_string().contains("1..=1000"), "unexpected: {err}");
+        cfg.slippage_bps = 0;
+        assert!(cfg.validate().is_err(), "a zero bound is not a bound");
+        cfg.slippage_bps = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.slippage_bps = 1000;
+        assert!(cfg.validate().is_ok());
+        cfg.slippage_bps = 50;
+        assert!(cfg.validate().is_ok(), "the shipped default must start");
     }
 
     #[test]
