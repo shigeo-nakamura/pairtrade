@@ -2959,14 +2959,40 @@ fn reconciled_fill_for_continuity(
     let bought_raw = post_buy
         .checked_sub(pre_buy)
         .context("reconciled Arcus acceptance buy balance decreased")?;
-    // Upper bound, not equality: a settlement transaction can refund part
-    // of the signed sell amount inside the same transaction, so the wallet
-    // may part with less than was signed for (bot-strategy#979). More than
-    // the signed amount remains impossible under Permit2 and stays fatal,
-    // and the quantity committed below is derived from what actually moved.
+    // A settlement transaction can refund part of the signed sell amount
+    // inside the same transaction, so the wallet may part with less than
+    // was signed for (bot-strategy#979). More than the signed amount
+    // remains impossible under Permit2 and stays fatal.
     let signed_sell_raw = parse_raw_amount("intent sell amount", &attempt.intent.sell_amount_raw)?;
     if sold_raw > signed_sell_raw {
         bail!("Arcus acceptance sell delta exceeds its intent");
+    }
+    // What that shortfall is allowed to be is not this function's judgement
+    // call: it must equal the settled input the reconciliation read derived
+    // from the transaction's own transfers, exactly as the live commit path
+    // requires (Codex P1 follow-up, bot-strategy#979). Accepting any delta
+    // below the signed amount would let altered post-balances -- with a
+    // runtime state altered to match -- pass continuity verification.
+    //
+    // An attempt reconciled before that evidence existed keeps the former
+    // exact-equality invariant instead: those binaries could not have
+    // reconciled a refund at all, so a short delta there is unexplained,
+    // not merely unproven.
+    match attempt.settled_sell_amount_raw.as_deref() {
+        Some(settled_sell_raw) => {
+            let settled_sell_raw = parse_raw_amount("settled sell amount", settled_sell_raw)?;
+            if settled_sell_raw > signed_sell_raw {
+                bail!("Arcus acceptance settled swap input exceeds its intent");
+            }
+            if sold_raw != settled_sell_raw {
+                bail!("Arcus acceptance sell delta does not match its settled swap input");
+            }
+        }
+        None => {
+            if sold_raw != signed_sell_raw {
+                bail!("Arcus acceptance sell delta does not match its intent");
+            }
+        }
     }
     let planned_buy_raw = parse_raw_amount("plan buy amount", &plan.buy_amount_raw)?;
     if planned_buy_raw.is_zero() || plan.buy_quantity <= Decimal::ZERO {
@@ -6938,8 +6964,10 @@ runtime:
         let plan = continuity_plan();
         let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
         // pre 1000000000000000000 - post 950000000000000016 = 49999999999999984,
-        // i.e. the signed 50000000000000000 less a 16-wei refund.
+        // i.e. the signed 50000000000000000 less a 16-wei refund, which is
+        // what the settlement read derived from the transaction's transfers.
         attempt.post_balances.as_mut().unwrap().sell_balance_raw = "950000000000000016".to_string();
+        attempt.settled_sell_amount_raw = Some("49999999999999984".to_string());
 
         let (actual_sell_quantity, _actual_buy_quantity, _filled_at) =
             reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at).unwrap();
@@ -6969,6 +6997,65 @@ runtime:
             .unwrap_err();
 
         assert!(error.to_string().contains("sell delta exceeds its intent"));
+    }
+
+    /// Codex P1 follow-up (bot-strategy#979): a short sell delta is only
+    /// acceptable because the settlement's own transfers say so. Post
+    /// balances edited to fabricate a shortfall -- with runtime state
+    /// edited to match -- must not pass continuity verification just
+    /// because the delta stays under the signed amount.
+    #[test]
+    fn continuity_fill_binds_a_short_sell_delta_to_the_settled_input() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = continuity_plan();
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.post_balances.as_mut().unwrap().sell_balance_raw = "950000000000000016".to_string();
+
+        // The recorded settlement still says the full signed amount left.
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match its settled swap input"));
+
+        // A settled input above the signed amount is impossible under
+        // Permit2 and is refused before the delta is even consulted.
+        attempt.settled_sell_amount_raw = Some("50000000000000001".to_string());
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("settled swap input exceeds its intent"));
+    }
+
+    /// An attempt reconciled before the settled input was recorded keeps
+    /// the former exact-equality invariant: such a binary could not have
+    /// reconciled a refund, so a short delta there is unexplained
+    /// (bot-strategy#979).
+    #[test]
+    fn continuity_fill_refuses_a_short_sell_delta_on_a_legacy_attempt() {
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = continuity_plan();
+        let mut attempt = reconciled_entry_attempt(&config, &plan, 1);
+        attempt.post_balances.as_mut().unwrap().sell_balance_raw = "950000000000000016".to_string();
+        attempt.settled_sell_amount_raw = None;
+
+        let error = reconciled_fill_for_continuity(&config, &plan, &attempt, attempt.prepared_at)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("sell delta does not match its intent"));
     }
 
     #[test]
