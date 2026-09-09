@@ -639,27 +639,50 @@ struct PersistedPosition {
 /// still describes the same position (same side), because a flip makes
 /// the basis meaningless for what is there now (pairtrade#300 Codex
 /// review).
-fn refreshed_unmanaged(record: PersistedPosition, live: &ExchangePosition) -> PersistedPosition {
+fn refreshed_unmanaged(
+    record: PersistedPosition,
+    live: &ExchangePosition,
+    ws_price: Option<f64>,
+) -> PersistedPosition {
     let same_side = side_from_str(&record.side) == Some(live.side);
+    // Growth carries the same trap as adoption: keeping the old basis
+    // while taking the larger size makes the record look fully
+    // reconciled, so a later `us_primary` change back to this symbol
+    // resumes it as `Resume` -- bypassing the growth handling entirely --
+    // and the exit prices the externally added quantity at the original
+    // entry (pairtrade#300 Codex review).
+    let grown = same_side && live.size > record.open_size + 1e-12;
+    let (entry_price, estimated, unknown) = match (live.entry_price, same_side, grown) {
+        (Some(e), _, _) => (e, false, false),
+        (None, true, false) => (
+            record.entry_price,
+            record.entry_price_estimated,
+            record.entry_price_unknown,
+        ),
+        (None, true, true) => match ws_price.filter(|m| *m > 0.0) {
+            Some(mid) if !record.entry_price_unknown => {
+                let added = live.size - record.open_size;
+                (
+                    (record.entry_price * record.open_size + mid * added) / live.size,
+                    true,
+                    false,
+                )
+            }
+            _ => (0.0, true, true),
+        },
+        (None, false, _) => (0.0, true, true),
+    };
     PersistedPosition {
         side: live.side.to_string(),
-        size: if same_side { record.size } else { live.size },
+        size: if same_side {
+            record.size.max(live.size)
+        } else {
+            live.size
+        },
         open_size: live.size,
-        entry_price: match live.entry_price {
-            Some(e) => e,
-            None if same_side => record.entry_price,
-            None => 0.0,
-        },
-        entry_price_estimated: match live.entry_price {
-            Some(_) => false,
-            None if same_side => record.entry_price_estimated,
-            None => true,
-        },
-        entry_price_unknown: match live.entry_price {
-            Some(_) => false,
-            None if same_side => record.entry_price_unknown,
-            None => true,
-        },
+        entry_price,
+        entry_price_estimated: estimated,
+        entry_price_unknown: unknown,
         realized_partial_pnl: if same_side {
             record.realized_partial_pnl
         } else {
@@ -1893,10 +1916,26 @@ impl EngineBLiveEngine {
             // entries, and `maybe_exit` only ever closes `self.position`
             // (pairtrade#300 Codex review).
             if let Some(stale_record) = self.state.open_position.take() {
+                // Through the same refresh every other parked record
+                // gets: this restart may be the one on which the old
+                // exposure changed side or size, and `reconcile_unmanaged`
+                // has already run for this startup, so an unrefreshed
+                // record would describe the wrong exposure for the whole
+                // process lifetime (pairtrade#300 Codex review).
+                if side_from_str(&stale_record.side) != Some(stale_live.side) {
+                    self.book_orphaned_partial_pnl(
+                        &stale_record,
+                        "the venue reports the opposite side on the symbol being parked",
+                    );
+                }
+                let mid = self
+                    .exit_accounting_price(&stale_record.symbol)
+                    .map(|(mid, _)| mid);
+                let refreshed = refreshed_unmanaged(stale_record, &stale_live, mid);
                 self.state
                     .unmanaged_positions
-                    .retain(|q| q.symbol != stale_record.symbol);
-                self.state.unmanaged_positions.push(stale_record);
+                    .retain(|q| q.symbol != refreshed.symbol);
+                self.state.unmanaged_positions.push(refreshed);
             }
             self.state_write_pending = true;
             if let Some(live) = live.as_ref() {
@@ -2091,7 +2130,8 @@ impl EngineBLiveEngine {
                         );
                     }
                     self.state_write_pending = true;
-                    kept.push(refreshed_unmanaged(p, &live));
+                    let mid = self.exit_accounting_price(&p.symbol).map(|(mid, _)| mid);
+                    kept.push(refreshed_unmanaged(p, &live, mid));
                 }
                 None => {
                     log::warn!(
@@ -6937,6 +6977,88 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 10: the record is parked through
+    /// the same refresh every other one gets, growth included.
+    #[tokio::test]
+    async fn parking_a_stale_symbol_records_what_the_venue_now_holds() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Saved long 0.057 on SNDK; the venue now shows a short 0.030,
+        // and this is the restart that moves us_primary to MU.
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.realized_partial_pnl = 0.42;
+        h.engine.state.open_position = Some(saved);
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.030", -1, Some("1750.0")));
+        h.set_now(T1_US);
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.tick().await;
+        let parked = h
+            .engine
+            .state
+            .unmanaged_positions
+            .first()
+            .cloned()
+            .expect("parked");
+        assert_eq!(parked.side, "short", "the alert must name what is there");
+        assert!((parked.open_size - 0.030).abs() < 1e-12);
+        assert!(
+            ((h.engine.state.realized_pnl_session - before) - 0.42).abs() < 1e-12,
+            "the retired leg's realized PnL is booked, not carried onto the flip"
+        );
+        assert_eq!(parked.realized_partial_pnl, 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 10: a parked record that grew must
+    /// not look fully reconciled, or a later `Resume` prices the added
+    /// quantity at the old entry.
+    #[test]
+    fn refreshing_a_grown_parked_record_does_not_keep_the_old_basis() {
+        let record = PersistedPosition {
+            symbol: "AAA".to_string(),
+            side: "long".to_string(),
+            entry_price: 100.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 1.0,
+            open_size: 1.0,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            session_date: TODAY.to_string(),
+            exit_deadline_us: None,
+        };
+        let grew = ExchangePosition {
+            side: OrderSide::Long,
+            size: 2.0,
+            entry_price: None,
+        };
+        // With a mid, the added unit is blended in.
+        let blended = refreshed_unmanaged(record.clone(), &grew, Some(120.0));
+        assert!(
+            (blended.entry_price - 110.0).abs() < 1e-9,
+            "{}",
+            blended.entry_price
+        );
+        assert!(blended.entry_price_estimated && !blended.entry_price_unknown);
+        // Without one, the basis is unknown rather than the old entry.
+        let blind = refreshed_unmanaged(record.clone(), &grew, None);
+        assert!(blind.entry_price_unknown);
+        // A reduction still keeps the known basis exactly.
+        let shrank = ExchangePosition {
+            side: OrderSide::Long,
+            size: 0.5,
+            entry_price: None,
+        };
+        let kept = refreshed_unmanaged(record, &shrank, Some(120.0));
+        assert!((kept.entry_price - 100.0).abs() < 1e-9);
+        assert!(!kept.entry_price_estimated && !kept.entry_price_unknown);
     }
 
     /// pairtrade#300 Codex review round 9, P1: booking an orphaned

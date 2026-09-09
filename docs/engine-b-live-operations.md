@@ -330,7 +330,8 @@ make the service fail to start (fail-closed, not a silent bad default).
   |---|---|---|
   | no position | flat | clean start |
   | matching position | same side and size | resumed; exits at its own `t2`, or at once if that window has already passed |
-  | position | *different* side/size/symbol | the exchange's position is adopted for immediate close **and** the session halts |
+  | position | *different* side or size, same symbol | the exchange's position is adopted for immediate close **and** the session halts |
+  | position on a symbol `us_primary` no longer names | that symbol still open | **not** closed here: this engine only ever submits orders for `us_primary`. The record is parked in `unmanaged_positions`, the session halts, and **an operator must flatten it by hand**. It stays in `status.json`'s position list and in the shutdown alert, refreshed from the venue on every start, until the venue reports it gone |
   | position | flat | halt: it was closed at a price this process never saw, so its PnL is unbooked |
   | no position | holds one | adopted for immediate close **and** the session halts |
 
