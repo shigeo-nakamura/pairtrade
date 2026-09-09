@@ -1632,6 +1632,78 @@ def test_an_uncosted_arm_still_reports_a_points_file_that_skipped_it():
     assert "points" not in plain.split("money up):")[1], plain
 
 
+def test_a_record_that_says_two_things_is_refused():
+    """`json.loads` keeps the last value for a repeated field.
+
+    A points row holding both `"points": 100` and `"points": 1000`
+    priced the day at 1000 and exited 0; a repeated field in a machine
+    ledger moves volume, PnL or a join key the same way
+    (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        dup_points = root / "points.jsonl"
+        dup_points.write_text(
+            '{"date": "2026-09-08", "arm": "freq", "points": 100, "points": 1000}\n',
+            encoding="utf-8")
+        try:
+            load_points(dup_points)
+        except SubsidyLedgerError as error:
+            assert "appears twice" in str(error), error
+        else:
+            raise AssertionError("a repeated field must be refused")
+
+        # Machine ledgers too, including a repeated join key.
+        dup_exec = root / "execution-freq.jsonl"
+        dup_exec.write_text(
+            '{"event": "leg_fill", "ts_ms": %d, "variant": "freq", '
+            '"variant": "other", "fill_value": 1}\n' % (TS * 1000),
+            encoding="utf-8")
+        try:
+            load_execution([dup_exec])
+        except SubsidyLedgerError as error:
+            assert "appears twice" in str(error), error
+        else:
+            raise AssertionError("a repeated join key must be refused")
+
+        # Distinct fields are of course fine.
+        ok = write(root / "execution-freq.jsonl",
+                   [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                     "fill_value": 1.0}])
+        assert load_execution([ok])[("2026-09-08", "freq")].fills == 1
+
+
+def test_hard_linked_ledgers_are_read_once():
+    """Two names for one inode are one ledger.
+
+    `Path.resolve()` keeps both pathnames, so a broad archive glob
+    holding both read every record twice and doubled that arm's volume,
+    exit 0 (Codex, PR #297).
+    """
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        first = write(root / "execution-freq-1.jsonl",
+                      [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                        "fill_value": 100.0}])
+        os.link(first, root / "execution-freq-2.jsonl")
+        paths = expand([str(root / "execution-freq-*.jsonl")])
+        assert len(paths) == 1, paths
+        day = load_execution(paths)[("2026-09-08", "freq")]
+        assert day.fills == 1 and day.volume_usd == 100.0, day
+
+        # Two genuinely different files are still both read.
+        write(root / "execution-b-1.jsonl",
+              [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "b",
+                "fill_value": 5.0}])
+        write(root / "execution-b-2.jsonl",
+              [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "b",
+                "fill_value": 7.0}])
+        both = expand([str(root / "execution-b-*.jsonl")])
+        assert len(both) == 2, both
+        assert load_execution(both)[("2026-09-08", "b")].volume_usd == 12.0
+
+
 def test_out_may_not_name_an_input_ledger():
     """Every record is read before the write, so this truncates.
 

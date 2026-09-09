@@ -101,7 +101,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 def add_or_none(total: float | None, addend: float | None) -> float | None:
@@ -352,7 +352,9 @@ def read_jsonl(path: Path, tolerate_torn_tail: bool = True) -> Iterable[dict]:
         if not stripped:
             continue
         try:
-            yield json.loads(stripped)
+            yield json.loads(stripped, object_pairs_hook=_no_duplicate_keys)
+        except SubsidyLedgerError as error:
+            raise SubsidyLedgerError(f"{path}:{number}: {error}") from error
         except json.JSONDecodeError as error:
             if number == len(lines) and tail_may_be_torn:
                 return
@@ -1418,6 +1420,27 @@ def cross_day_reason(arm: dict, which: str) -> str:
     return " and ".join(parts) if parts else "cost and volume span two days"
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    """Refuse an object that names the same field twice.
+
+    `json.loads` keeps the last value silently, so a points row holding
+    both `"points": 100` and `"points": 1000` prices the day at 1000 and
+    exits 0 -- and a repeated field in a machine ledger can move volume,
+    PnL or a join key the same way. Which value a reader takes is a
+    parser detail; a record that says two things is not a record
+    (Codex, PR #297).
+    """
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise SubsidyLedgerError(
+                f"the field {key!r} appears twice in one record; which value applies "
+                "is not decidable from the file"
+            )
+        seen[key] = value
+    return seen
+
+
 def _path_key(path: Path) -> tuple:
     """An identity for a path that survives symlinks and spellings.
 
@@ -1641,14 +1664,19 @@ def expand(patterns: list[str]) -> list[Path]:
     compared, so two patterns reaching the same file by different spellings
     still collapse to one.
     """
-    seen: set[Path] = set()
+    seen: set[tuple] = set()
     paths: list[Path] = []
     for pattern in patterns:
         for match in sorted(glob.glob(pattern)):
-            resolved = Path(match).resolve()
-            if resolved in seen:
+            # Filesystem identity, not the resolved name: two hard links
+            # to one ledger resolve to two distinct pathnames, so a broad
+            # archive glob holding both read every record twice and
+            # doubled that arm's volume or PnL, exit 0. Same helper the
+            # `--out` guard uses, for the same reason (Codex, PR #297).
+            key = _path_key(Path(match))
+            if key in seen:
                 continue
-            seen.add(resolved)
+            seen.add(key)
             paths.append(Path(match))
     return paths
 
