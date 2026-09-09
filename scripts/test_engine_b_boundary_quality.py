@@ -164,6 +164,19 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(report['days'][0]['status'], 'market_closed')
         self.assertEqual(report['inputs'], {})
 
+    def test_non_boolean_session_flags_are_rejected(self):
+        # The collector's own TradingCalendar.load refuses these, so a report
+        # that quietly read 0/1 or "true" as a session state would be built
+        # from a calendar the producer would not accept -- and would render
+        # as a plausible `market_closed` or even a pass.
+        for value in (0, 1, 'true', None):
+            with self.subTest(value=value):
+                calendar = json.loads(self.calendar.read_text())
+                calendar['sessions']['2026-09-08']['us_is_open'] = value
+                self.calendar.write_text(json.dumps(calendar))
+                with self.assertRaisesRegex(ValueError, 'must be booleans'):
+                    self.report()
+
     def test_conflicting_alias_snapshot_is_ambiguous(self):
         combined = json.loads(json.dumps(self.config))
         old = dict(combined['venues'][0], name='lighter_mainnet_context')

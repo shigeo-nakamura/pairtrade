@@ -203,7 +203,10 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
         while day <= last:
             session = calendar["sessions"][day.isoformat()]
             row = {"date": day.isoformat(), "g0_2": "not_evaluated"}
-            if not (session["krx_is_open"] and session["us_is_open"]):
+            flags = [session["krx_is_open"], session["us_is_open"]]
+            if any(type(f) is not bool for f in flags):
+                raise ValueError(f"{day}: krx_is_open/us_is_open must be booleans")
+            if not all(flags):
                 row["status"] = "market_closed"
             else:
                 times = [session["krx_open_utc_us"], session["krx_close_utc_us"], session["us_open_utc_us"]]
