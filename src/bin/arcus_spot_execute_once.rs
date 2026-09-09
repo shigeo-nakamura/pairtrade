@@ -3723,10 +3723,21 @@ fn corporate_action_continuity(
             if current.corporate_action.is_some() {
                 bail!("Arcus corporate action {event_id} resumed without clearing its progress");
             }
-            if resumed_fingerprints != [event.fingerprint()] {
+            // The pair is appended in step. A legacy record (ids without
+            // fingerprints) is padded with empty entries first so the new
+            // fingerprint lands beside its own id, never beside an older one
+            // (Codex P1, pairtrade#309).
+            let ids = current.handled_corporate_action_ids.len();
+            let fingerprints = &current.handled_corporate_action_fingerprints;
+            let aligned = fingerprints.len() == ids
+                && fingerprints[fingerprints_before..ids - 1]
+                    .iter()
+                    .all(String::is_empty)
+                && fingerprints[ids - 1] == event.fingerprint();
+            if !aligned {
                 bail!(
                     "Arcus corporate action {event_id} resumed without recording the fingerprint \
-                     of the declared event"
+                     of the declared event beside its id"
                 );
             }
             authorized.resumed_inventory = Some(inventory);
@@ -10304,6 +10315,27 @@ runtime:
             error.contains("without recording the fingerprint"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_resume_after_a_legacy_record_pads_before_appending() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, mut current) = resume_pair();
+        baseline.handled_corporate_action_ids = vec!["OLDER".to_string()];
+        baseline.handled_corporate_action_fingerprints.clear();
+        current.handled_corporate_action_ids =
+            vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
+        current.handled_corporate_action_fingerprints =
+            vec![String::new(), fixture_event().fingerprint()];
+        corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+
+        // Appended without padding: the fingerprint sits beside OLDER.
+        let mut misaligned = current.clone();
+        misaligned.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
+        let error = corporate_action_continuity(&config, &baseline, &misaligned, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("beside its id"), "{error}");
     }
 
     #[test]

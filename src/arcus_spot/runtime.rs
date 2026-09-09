@@ -3150,6 +3150,17 @@ impl ArcusSpotRuntime {
         self.state
             .handled_corporate_action_ids
             .push(event.event_id.clone());
+        // The two lists are read side by side by index. A checkpoint from
+        // before fingerprints existed has ids and no fingerprints, so the
+        // first fingerprint pushed after loading it would sit at index 0,
+        // beside the *oldest* legacy id -- which `handled_record_for` would
+        // then read as that id having been reused, blocking entries for
+        // good. Pad the legacy entries first so the new pair lines up
+        // (Codex P1, pairtrade#309).
+        let ids = self.state.handled_corporate_action_ids.len();
+        self.state
+            .handled_corporate_action_fingerprints
+            .resize(ids - 1, String::new());
         self.state
             .handled_corporate_action_fingerprints
             .push(event.fingerprint());
@@ -3307,7 +3318,9 @@ impl ArcusSpotRuntime {
             .iter()
             .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))?;
         match self.state.handled_corporate_action_fingerprints.get(index) {
+            // Absent, or the empty padding a later resume wrote beside it.
             None => Some(HandledMatch::LegacyById),
+            Some(recorded) if recorded.is_empty() => Some(HandledMatch::LegacyById),
             Some(recorded) if *recorded == fingerprint => Some(HandledMatch::Same),
             Some(_) => Some(HandledMatch::ReusedId),
         }
@@ -7252,6 +7265,66 @@ mod tests {
         }
         assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
         assert_eq!(runtime.state.corporate_action, None);
+    }
+
+    #[test]
+    fn a_resume_after_a_legacy_checkpoint_keeps_the_records_aligned() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        // The supported legacy shape: an id with no fingerprint beside it,
+        // and the historical event still declared.
+        let mut legacy = corporate_action_event(anchor - Duration::days(60));
+        legacy.event_id = "NVDA-2026-06-SPLIT".to_string();
+        legacy.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::ONE,
+            token_b: Decimal::ONE,
+        });
+        runtime.config.corporate_actions.insert(0, legacy.clone());
+        runtime.state.handled_corporate_action_ids = vec!["NVDA-2026-06-SPLIT".to_string()];
+        assert!(runtime
+            .state
+            .handled_corporate_action_fingerprints
+            .is_empty());
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+
+        assert_eq!(
+            runtime.state.handled_corporate_action_ids,
+            vec![
+                "NVDA-2026-06-SPLIT".to_string(),
+                "NVDA-2026-10-4FOR1".to_string()
+            ],
+        );
+        assert_eq!(
+            runtime.state.handled_corporate_action_fingerprints,
+            vec![
+                String::new(),
+                runtime.config.corporate_actions[1].fingerprint()
+            ],
+        );
+        assert_eq!(
+            runtime.handled_record_for(&legacy),
+            Some(HandledMatch::LegacyById),
+            "the padded legacy id is still legacy, not a reused id",
+        );
+        assert_eq!(
+            runtime.handled_record_for(&runtime.config.corporate_actions[1]),
+            Some(HandledMatch::Same),
+        );
+        // And nothing blocks: no overlay from a phantom reuse.
+        runtime.state.relative_log_price_history = vec![0.25, 0.26, 0.27];
+        let later = resumed_at + Duration::seconds(60);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        if let ArcusSpotDecision::Observe { hold } = &outcome.decision {
+            assert_ne!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionBlock,
+                "{}",
+                hold.detail
+            );
+        }
     }
 
     #[test]
