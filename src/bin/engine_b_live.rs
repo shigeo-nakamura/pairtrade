@@ -2224,28 +2224,63 @@ impl EngineBLiveEngine {
         self.state_write_pending = true;
     }
 
-    /// Keep looking for an exposure created by an order sent for a symbol
-    /// `us_primary` no longer names. `try_adopt_unconfirmed` cannot do
-    /// it -- that polls the configured symbol -- and startup
-    /// reconciliation runs once, so without this a single flat snapshot
-    /// would end the search (pairtrade#300 Codex review).
-    async fn poll_foreign_in_flight(&mut self, now_us: i64) {
-        let Some(sent_for) = self
+    /// Keep the two durable claims that gate entry in step with the
+    /// venue, on every tick rather than only at startup.
+    ///
+    /// Both are held by `entries_allowed`, and neither can be retired by
+    /// an operator's `RISK_ACK`: the in-flight marker is retired by a
+    /// sighting, and a parked record by the venue reporting that symbol
+    /// flat. `reconcile_unmanaged` used to run only from
+    /// `reconcile_startup`, which stops once `reconciled` is true, so an
+    /// operator who flattened a parked exposure by hand had no way to
+    /// re-open entries short of a restart (pairtrade#300 Codex review).
+    ///
+    /// One account read serves both, deliberately: the two conditions
+    /// coincide exactly when the account is in its worst state, and two
+    /// serial REST awaits in a tick is how the loop's latency budget gets
+    /// spent.
+    async fn poll_unresolved_claims(&mut self, now_us: i64) {
+        let foreign = self
             .state
             .entry_in_flight
             .clone()
-            .filter(|s| *s != self.cfg.us_primary_symbol)
-        else {
+            .filter(|s| *s != self.cfg.us_primary_symbol);
+        if foreign.is_none() && self.state.unmanaged_positions.is_empty() {
             return;
-        };
+        }
         let positions = match self.connector.get_positions().await {
             Ok(positions) => positions,
             Err(e) => {
-                log::warn!("[RECONCILE] get_positions failed while watching {sent_for} ({e:?})");
+                log::warn!(
+                    "[RECONCILE] get_positions failed while watching unresolved claims ({e:?})"
+                );
                 return;
             }
         };
-        let Some(live) = exchange_position_for(&positions, &sent_for) else {
+        if let Some(sent_for) = foreign {
+            self.sight_foreign_in_flight(&positions, &sent_for, now_us);
+        }
+        // After the sighting, so an exposure recorded above is checked
+        // against this same snapshot rather than waiting a tick.
+        if !self.state.unmanaged_positions.is_empty() {
+            self.reconcile_unmanaged(&positions);
+        }
+        if self.state_write_pending {
+            self.persist_state();
+        }
+    }
+
+    /// The in-flight half of `poll_unresolved_claims`: an order went out
+    /// for a symbol `us_primary` no longer names, and only a *sighting*
+    /// resolves it. `try_adopt_unconfirmed` cannot do this -- that polls
+    /// the configured symbol (pairtrade#300 Codex review).
+    fn sight_foreign_in_flight(
+        &mut self,
+        positions: &[PositionSnapshot],
+        sent_for: &str,
+        now_us: i64,
+    ) {
+        let Some(live) = exchange_position_for(positions, sent_for) else {
             return;
         };
         log::error!(
@@ -2255,9 +2290,9 @@ impl EngineBLiveEngine {
             live.side,
             live.size
         );
-        let mid = self.exit_accounting_price(&sent_for).map(|(mid, _)| mid);
+        let mid = self.exit_accounting_price(sent_for).map(|(mid, _)| mid);
         let today = self.current_date.map(|d| d.to_string()).unwrap_or_default();
-        let record = unmanaged_from_live(&sent_for, &live, mid, &today);
+        let record = unmanaged_from_live(sent_for, &live, mid, &today);
         self.state
             .unmanaged_positions
             .retain(|q| q.symbol != record.symbol);
@@ -2281,11 +2316,19 @@ impl EngineBLiveEngine {
         let _ = now_us;
     }
 
-    /// Check the exposure this engine cannot manage against the exchange
-    /// on every start: cleared when the venue says it is gone, and kept
-    /// with the session halted while it is still there. Without this the
-    /// claim survives on disk but nothing ever looks at it again
-    /// (pairtrade#300 Codex review).
+    /// Check the exposure this engine cannot manage against the exchange:
+    /// cleared when the venue says it is gone, and kept with the session
+    /// halted while it is still there. Without this the claim survives on
+    /// disk but nothing ever looks at it again (pairtrade#300 Codex
+    /// review).
+    ///
+    /// Run from `reconcile_startup` *and* from every tick via
+    /// `poll_unresolved_claims`, because the record gates entry and only
+    /// the venue can retire it. Safe to repeat: the promotion branch
+    /// needs `p.symbol == us_primary`, which cannot become true while the
+    /// process runs, so a tick only refreshes side/size from the venue,
+    /// re-engages the halt (a no-op when one is engaged) or retires a
+    /// record the venue no longer reports.
     fn reconcile_unmanaged(&mut self, positions: &[PositionSnapshot]) {
         if self.state.unmanaged_positions.is_empty() {
             return;
@@ -2660,6 +2703,20 @@ impl EngineBLiveEngine {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// The saved record the shutdown alert should describe as
+    /// "unreconciled", or `None`.
+    ///
+    /// Deliberately only `open_position`. A parked record is a claim too,
+    /// but it is already logged and alerted by the aggregate block, which
+    /// names *every* parked symbol and describes them for what they are;
+    /// routing one through the unreconciled arm as well sent a second,
+    /// contradictory alert calling a record that reconciliation
+    /// deliberately parked one this process "never confirmed"
+    /// (pairtrade#300 Codex review).
+    fn unreconciled_saved_record(&self) -> Option<&PersistedPosition> {
+        self.state.open_position.as_ref()
+    }
+
     /// The unconfirmed claim that the shutdown match below would *not*
     /// report, because some other exposure claims the arm first.
     ///
@@ -2760,15 +2817,14 @@ impl EngineBLiveEngine {
             // only thing that knows about an exposure. Reporting "no open
             // position" there would be falsely reassuring
             // (pairtrade#300 Codex review).
-            // `unmanaged_position` counts as a claim too: it is an
-            // exposure this engine refused to manage, not one that went
-            // away (pairtrade#300 Codex review).
-            None => match self
-                .state
-                .open_position
-                .as_ref()
-                .or(self.state.unmanaged_positions.first())
-            {
+            // A parked exposure is a claim too, and it is still reported
+            // as one -- but by the aggregate block at the top, which names
+            // *every* parked symbol and describes them accurately. This
+            // arm is only for `open_position`: routing a parked record
+            // through it sent a second, contradictory alert calling a
+            // record that reconciliation deliberately parked one this
+            // process "never confirmed" (pairtrade#300 Codex review).
+            None => match self.unreconciled_saved_record() {
                 Some(p) => {
                     log::error!(
                         "[SHUTDOWN] {signal}: nothing is tracked in memory, but the saved record \
@@ -2787,6 +2843,12 @@ impl EngineBLiveEngine {
                             p.side, p.symbol, p.open_size, p.session_date
                         ),
                     );
+                    ShutdownReport::UnreconciledClaim
+                }
+                // Parked exposures with nothing else claimed: already
+                // logged and alerted above, so the classification is
+                // returned without a second notification.
+                None if !self.state.unmanaged_positions.is_empty() => {
                     ShutdownReport::UnreconciledClaim
                 }
                 // An accepted order whose fill was never confirmed leaves
@@ -4574,7 +4636,7 @@ impl EngineBLiveEngine {
         if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
             self.try_adopt_unconfirmed(now).await;
         }
-        self.poll_foreign_in_flight(now).await;
+        self.poll_unresolved_claims(now).await;
         if self.pending.is_some() {
             // One exchange read per tick until the in-flight entry/exit is
             // confirmed or its window ends; no new decisions meanwhile.
@@ -8835,7 +8897,7 @@ mod tests {
             .unwrap()
             .push(snap("SNDK", "0.057", 1, Some("1756.92")));
         h.set_now(T1_US);
-        h.engine.poll_foreign_in_flight(T1_US).await;
+        h.engine.poll_unresolved_claims(T1_US).await;
         assert_eq!(
             unmanaged_symbols(&h.engine.state),
             vec!["SNDK".to_string()],
@@ -8962,6 +9024,131 @@ mod tests {
         // Only the venue reporting it gone retires the claim.
         h.engine.state.unmanaged_positions.clear();
         assert!(h.engine.entries_allowed());
+    }
+
+    /// pairtrade#300 Codex review round 19, P2: the round-18 gate is
+    /// retired by the venue, not by RISK_ACK -- so the venue has to be
+    /// asked on every tick, not only at startup. Without this an operator
+    /// who flattened a parked exposure by hand could not re-open entries
+    /// short of a restart.
+    #[tokio::test]
+    async fn a_hand_flattened_parked_exposure_retires_without_a_restart() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.state.unmanaged_positions = vec![PersistedPosition {
+            symbol: "SNDK".to_string(),
+            side: OrderSide::Long.to_string(),
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: 0,
+            flatten_asap: true,
+            session_date: "2026-09-08".to_string(),
+            exit_deadline_us: None,
+        }];
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        h.set_now(T1_US);
+
+        // Still open on the venue: the claim is kept and re-halted.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.engine.poll_unresolved_claims(T1_US).await;
+        assert_eq!(unmanaged_symbols(&h.engine.state), vec!["SNDK".to_string()]);
+        assert!(h.engine.state.session_halted, "still open, still halted");
+        assert!(!h.engine.entries_allowed());
+
+        // The operator flattens it by hand, and RISK_ACKs.
+        h.connector.positions.lock().unwrap().clear();
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        h.engine.poll_unresolved_claims(T1_US).await;
+        assert!(
+            h.engine.state.unmanaged_positions.is_empty(),
+            "the venue says it is gone, so the claim is retired without a restart"
+        );
+        assert!(
+            load_state(&h.engine.cfg.state_path)
+                .unmanaged_positions
+                .is_empty(),
+            "and that reaches disk"
+        );
+        assert!(h.engine.entries_allowed(), "entries re-open");
+    }
+
+    /// pairtrade#300 Codex review round 19, P2: the aggregate block
+    /// already names every parked exposure, so the saved-record arm must
+    /// not send a second, contradictory alert about the same one.
+    #[tokio::test]
+    async fn a_parked_exposure_is_not_also_reported_as_unreconciled() {
+        let mut h = harness();
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.position = None;
+        h.engine.state.open_position = None;
+        h.engine.state.entry_in_flight = None;
+        h.engine.state.position_unconfirmed = false;
+        h.engine.state.unmanaged_positions = vec![PersistedPosition {
+            symbol: "SNDK".to_string(),
+            side: OrderSide::Long.to_string(),
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: 0,
+            flatten_asap: true,
+            session_date: "2026-09-08".to_string(),
+            exit_deadline_us: None,
+        }];
+        // The exposure is still classified as a claim, so the exit code
+        // and the operator's checklist are unchanged ...
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnreconciledClaim
+        );
+        // ... but nothing invents a second story about it. The
+        // unreconciled-record arm must not see it at all: the aggregate
+        // block above already named it, accurately.
+        assert!(
+            h.engine.unreconciled_saved_record().is_none(),
+            "a parked record must not also be alerted as never-confirmed"
+        );
+        // And there is no unconfirmed order here either, so that alert is
+        // silent too.
+        assert!(h.engine.coexisting_unconfirmed_note().is_none());
+        // A genuinely unreconciled *managed* record still takes the arm.
+        // `reconciled = false` is what makes it unreconciled: with it
+        // true and nothing tracked, `persist_position` would rightly
+        // clear the record before the match ever sees it.
+        h.engine.reconciled = false;
+        h.engine.state.unmanaged_positions.clear();
+        h.engine.state.open_position = Some(PersistedPosition {
+            symbol: "MU".to_string(),
+            side: OrderSide::Long.to_string(),
+            entry_price: 100.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 1.0,
+            open_size: 1.0,
+            realized_partial_pnl: 0.0,
+            entered_at_us: 0,
+            flatten_asap: false,
+            session_date: "2026-09-08".to_string(),
+            exit_deadline_us: None,
+        });
+        assert!(h.engine.unreconciled_saved_record().is_some());
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnreconciledClaim
+        );
     }
 
     /// pairtrade#300 Codex review round 15, P1: a tracked position does
