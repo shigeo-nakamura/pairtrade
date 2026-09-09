@@ -10135,6 +10135,7 @@ runtime:
             pre_event_token_a: None,
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: String::new(),
         });
 
         let mut current = continuity_state(8, ("4", "1"));
@@ -10289,6 +10290,7 @@ runtime:
             pre_event_token_a: None,
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: String::new(),
         });
         assert!(!current.relative_log_price_history.is_empty());
         let error = corporate_action_continuity(&config, &baseline, &current, 1)
@@ -10312,6 +10314,7 @@ runtime:
             pre_event_token_a: None,
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: String::new(),
         });
         let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
         assert!(authorized.history_discarded);
@@ -10342,6 +10345,7 @@ runtime:
             pre_event_token_a: None,
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: String::new(),
         }
     }
 

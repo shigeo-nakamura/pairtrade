@@ -237,6 +237,14 @@ pub struct ArcusSpotCorporateActionProgress {
     /// relative-price history was discarded.
     #[serde(default)]
     pub history_invalidated_at: Option<DateTime<Utc>>,
+    /// `ArcusSpotCorporateActionEvent::fingerprint` of the declaration this
+    /// progress belongs to. Matching on it rather than on `event_id` is what
+    /// lets an operator rename an *active* entry without the runtime
+    /// discarding the pinned pre-event identity -- and what stops a
+    /// different declaration under the same label from inheriting it.
+    /// Empty on records written before it existed; those match by id.
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2781,6 +2789,12 @@ struct CorporateActionGate {
     /// window would just rebuild the same contamination the discard
     /// removed.
     suppress_history: bool,
+    /// From `effective_at` until the resume: the tracked open quantity is
+    /// in units the venue no longer quotes, so *no* runtime-generated exit
+    /// -- forced, max-hold or mean-reversion -- may be sized from it. The
+    /// reduce phase before `effective_at` is where exits happen; past it the
+    /// position is the operator's to reconcile (Codex P1, pairtrade#309).
+    suppress_exits: bool,
 }
 
 impl ArcusSpotRuntime {
@@ -2819,20 +2833,7 @@ impl ArcusSpotRuntime {
             // live entry is not a way to cancel a window (Codex P1,
             // pairtrade#309).
             if let Some(progress) = self.state.corporate_action.clone() {
-                return CorporateActionGate {
-                    block_entry: Some(ArcusSpotHold::new(
-                        ArcusSpotHoldCode::CorporateActionBlock,
-                        format!(
-                            "corporate action {} opened at {} and is no longer declared in the \
-                             approved config; restore the declaration and its reconciled \
-                             post_event_inventory to resume -- the tracked inventory is still \
-                             the pre-event holding",
-                            progress.event_id, progress.blocked_at,
-                        ),
-                    )),
-                    force_exit: self.state.regime != ArcusSpotRegime::Neutral,
-                    suppress_history: true,
-                };
+                return self.undeclared_progress_gate(&progress, "is no longer declared in");
             }
             self.state.corporate_action = None;
             return CorporateActionGate::default();
@@ -2843,12 +2844,33 @@ impl ArcusSpotRuntime {
         // the last observation taken *before* this one. Reading it from the
         // current snapshot instead would pin whatever the event may already
         // have changed.
-        if self
-            .state
-            .corporate_action
-            .as_ref()
-            .is_none_or(|progress| progress.event_id != event.event_id)
-        {
+        match self.state.corporate_action.as_mut() {
+            Some(progress) if Self::progress_matches(progress, &event) => {
+                // Same declaration, possibly under a new label: keep the
+                // pins and the discard stamp, adopt the name (Codex P1,
+                // pairtrade#309).
+                if progress.event_id != event.event_id {
+                    progress.event_id = event.event_id.clone();
+                }
+                if progress.fingerprint.is_empty() {
+                    progress.fingerprint = event.fingerprint();
+                }
+            }
+            Some(progress) => {
+                // A different declaration under this label (other symbols
+                // or other instants). Replacing the record would hand the
+                // new event pins taken inside the old window -- or none --
+                // and drop the discard stamp; the old one has to be
+                // resolved first.
+                let progress = progress.clone();
+                return self.undeclared_progress_gate(
+                    &progress,
+                    "was replaced by a different declaration in",
+                );
+            }
+            None => {}
+        }
+        if self.state.corporate_action.is_none() {
             // Only an observation taken strictly before the window opened
             // describes the pre-event instrument. A calendar installed after
             // `entry_block_at` on a runtime that kept ticking has a
@@ -2872,6 +2894,7 @@ impl ArcusSpotRuntime {
                     .then(|| self.state.last_token_b_identity.clone())
                     .flatten(),
                 history_invalidated_at: None,
+                fingerprint: event.fingerprint(),
             });
         }
 
@@ -2900,6 +2923,7 @@ impl ArcusSpotRuntime {
                     block_entry: Some(hold),
                     force_exit: false,
                     suppress_history: true,
+                    suppress_exits: true,
                 };
             }
             // And a rotation still open here is not unwound by the runtime.
@@ -2925,6 +2949,7 @@ impl ArcusSpotRuntime {
                     )),
                     force_exit: false,
                     suppress_history: true,
+                    suppress_exits: true,
                 };
             }
         }
@@ -2974,6 +2999,7 @@ impl ArcusSpotRuntime {
                     && evaluation_time < event.effective_at
                     && self.state.regime != ArcusSpotRegime::Neutral,
                 suppress_history: evaluation_time >= event.effective_at,
+                suppress_exits: evaluation_time >= event.effective_at,
             };
         }
 
@@ -2993,6 +3019,7 @@ impl ArcusSpotRuntime {
                 )),
                 force_exit: false,
                 suppress_history: true,
+                suppress_exits: true,
             };
         };
 
@@ -3025,6 +3052,7 @@ impl ArcusSpotRuntime {
                 )),
                 force_exit: false,
                 suppress_history: true,
+                suppress_exits: true,
             };
         };
         self.state.inventory = post_event_inventory;
@@ -3086,6 +3114,46 @@ impl ArcusSpotRuntime {
             .iter()
             .filter(|event| !self.corporate_action_is_handled(event))
             .find(|event| evaluation_time >= event.entry_block_at)
+    }
+
+    /// The fail-closed gate for a progress record whose declaration is gone
+    /// or has been replaced. Before `effective_at` the reduce-phase exit is
+    /// still forced (the units are still the quoted ones); once the window
+    /// was invalidated the units are stale and no exit may be sized from
+    /// them, exactly as for a declared event (Codex P1, pairtrade#309).
+    fn undeclared_progress_gate(
+        &self,
+        progress: &ArcusSpotCorporateActionProgress,
+        because: &str,
+    ) -> CorporateActionGate {
+        let stale = progress.history_invalidated_at.is_some();
+        CorporateActionGate {
+            block_entry: Some(ArcusSpotHold::new(
+                ArcusSpotHoldCode::CorporateActionBlock,
+                format!(
+                    "corporate action {} opened at {} and {} the approved config; restore \
+                     that declaration and its reconciled post_event_inventory to resume -- \
+                     the tracked inventory is still the pre-event holding",
+                    progress.event_id, progress.blocked_at, because,
+                ),
+            )),
+            force_exit: !stale && self.state.regime != ArcusSpotRegime::Neutral,
+            suppress_history: true,
+            suppress_exits: stale,
+        }
+    }
+
+    /// Whether `progress` was written for `event`: by fingerprint when the
+    /// record carries one, by id for records that predate it.
+    fn progress_matches(
+        progress: &ArcusSpotCorporateActionProgress,
+        event: &ArcusSpotCorporateActionEvent,
+    ) -> bool {
+        if progress.fingerprint.is_empty() {
+            progress.event_id.eq_ignore_ascii_case(&event.event_id)
+        } else {
+            progress.fingerprint == event.fingerprint()
+        }
     }
 
     /// Handled by label *or* by identity. A completed entry an operator
@@ -3180,15 +3248,23 @@ impl GatedRotationSignal {
 }
 
 impl CorporateActionGate {
-    /// Exits are never suppressed: a window exists to get the bot *out*
-    /// before an event, so one that could also trap it in is self-defeating.
-    /// Everything else -- an entry, or simply having nothing to do -- is
-    /// reported as blocked while the window stands.
+    /// Before `effective_at` exits are never suppressed: a window exists to
+    /// get the bot *out* before an event, so one that could trap it in is
+    /// self-defeating. From `effective_at` the opposite holds (see
+    /// `suppress_exits`). Everything else -- an entry, or simply having
+    /// nothing to do -- is reported as blocked while the window stands.
     fn apply(
         &self,
         signal: Option<(ArcusSpotDirection, ArcusSpotRotationTrigger)>,
         regime: ArcusSpotRegime,
     ) -> GatedRotationSignal {
+        // Stale units: every signal, exits included, is replaced by the
+        // gate's own hold. `force_exit` is never set alongside this.
+        if self.suppress_exits {
+            if let Some(hold) = self.block_entry.as_ref() {
+                return GatedRotationSignal::Blocked(hold.clone());
+            }
+        }
         if self.force_exit {
             if let Some(direction) = unwind_direction(regime) {
                 return GatedRotationSignal::ForcedExit(
@@ -6795,6 +6871,137 @@ mod tests {
                     .address
                     .eq_ignore_ascii_case(RELISTED_TOKEN_A_ADDRESS)
             })
+    }
+
+    #[test]
+    fn a_max_hold_exit_is_not_taken_from_stale_units() {
+        // The forced exit is gone past `effective_at`; the ordinary
+        // max-hold exit must not slip through the gate's exit pass-through
+        // in its place -- it sizes from the same stale `rotated_quantity`.
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        // Opened two hours ago against a 3,600s max hold: overdue.
+        seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
+        let effective = anchor + Duration::seconds(6);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(effective), effective);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected no exit from stale units, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+
+        // Control: the same overdue rotation before `effective_at` exits
+        // (forced by the reduce phase here, at +2s).
+        let mut control = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_open_rotation(&mut control, anchor - Duration::hours(2));
+        let reduce = anchor + Duration::seconds(2);
+        assert!(matches!(
+            control
+                .step_at(&snapshot_with_valid_row(reduce), reduce)
+                .decision,
+            ArcusSpotDecision::SimulatedFill { .. }
+        ));
+    }
+
+    #[test]
+    fn deleting_a_declaration_after_the_effective_time_does_not_force_an_exit() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_open_rotation(&mut runtime, anchor);
+        // Reduce phase, no route: the exit was attempted and blocked.
+        let reduce = anchor + Duration::seconds(2);
+        runtime.step_at(
+            &snapshot_with_route_unavailable(reduce, "200", "100"),
+            reduce,
+        );
+        // Past `effective_at` the window is invalidated; the operator then
+        // deletes the entry.
+        let effective = anchor + Duration::seconds(6);
+        runtime.step_at(
+            &snapshot_with_route_unavailable(effective, "200", "100"),
+            effective,
+        );
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .is_some_and(|p| p.history_invalidated_at.is_some()));
+        runtime.config.corporate_actions.clear();
+        let later = anchor + Duration::seconds(8);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        assert!(
+            matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
+            "an undeclared window with stale units must not size an exit: {:?}",
+            outcome.decision,
+        );
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+    }
+
+    #[test]
+    fn renaming_an_active_event_keeps_its_identity_pins() {
+        let anchor = event_time();
+        let mut runtime =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let inside = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        let pinned = runtime.state.corporate_action.clone().unwrap();
+        assert!(pinned.pre_event_token_a.is_some());
+
+        runtime.config.corporate_actions[0].event_id = "NVDA-2026-10-4FOR1-v2".to_string();
+        let resumed_at = anchor + Duration::seconds(14);
+        let outcome = runtime.step_at(&snapshot_with_relisted_token_a(resumed_at), resumed_at);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "the rename must not have dropped the pins: {}",
+                hold.detail
+            ),
+            other => panic!("expected the relisting to be caught, got {other:?}"),
+        }
+        let progress = runtime.state.corporate_action.clone().unwrap();
+        assert_eq!(progress.event_id, "NVDA-2026-10-4FOR1-v2");
+        assert_eq!(progress.pre_event_token_a, pinned.pre_event_token_a);
+        assert_eq!(progress.fingerprint, pinned.fingerprint);
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+    }
+
+    #[test]
+    fn a_different_declaration_under_the_same_label_fails_closed() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let inside = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        let before = runtime.state.corporate_action.clone().unwrap();
+
+        // Same id, other instants: not the event this progress was written for.
+        runtime.config.corporate_actions[0].effective_at = anchor + Duration::seconds(30);
+        runtime.config.corporate_actions[0].resume_not_before = anchor + Duration::seconds(40);
+        let later = anchor + Duration::seconds(3);
+        runtime.step_at(&snapshot_with_valid_row(later), later);
+        assert_eq!(
+            runtime.state.corporate_action,
+            Some(before),
+            "progress must survive"
+        );
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+        // The new declaration's history discard (at its +30s) is not taken
+        // on the old record: the window is still the pre-effective one.
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .unwrap()
+            .history_invalidated_at
+            .is_none());
     }
 
     #[test]
