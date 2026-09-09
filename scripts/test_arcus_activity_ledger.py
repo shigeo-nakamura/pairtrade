@@ -594,6 +594,46 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertEqual(asked["coverage"]["requested_but_unpriceable"], [5])
         self.assertTrue(asked["stop_rule"]["undecidable"])
 
+    def test_plan_freshness_is_measured_from_the_quote_not_the_observation(self):
+        """`validate_plan_age` measures from `plan.quote_received_at`.
+
+        An event observed recently whose quote was already too old to
+        dispatch cannot have produced the attempt, so matching on the
+        observation admits a candidate the runtime would have refused.
+        """
+        events, history = baseline_round_trip()
+        stale = events[0]["decision"]["plan"]
+        # Observed 1s before preparation (fresh), quoted 10 minutes before
+        # (far past HARD_MAX_PLAN_AGE_SECS).
+        stale["quote_received_at"] = stamp(ENTRY_AT - timedelta(minutes=10))
+        with self.assertRaises(ledger_tool.ActivityLedgerError) as caught:
+            report_for(events, history)
+        self.assertIn("no would-rotate event", str(caught.exception))
+
+        # A quote inside the bound still matches.
+        stale["quote_received_at"] = stamp(ENTRY_AT - timedelta(seconds=1))
+        report = report_for(events, history)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+
+    def test_an_unmatched_attempt_outside_the_requested_bounds_is_not_fatal(self):
+        """A stream can span more than the report the caller asked for.
+
+        A manual or offline attempt with no `would_rotate` event, outside
+        the requested bounds, is something `--since` promises to ignore --
+        it must not refuse to produce the report.
+        """
+        events, history = baseline_round_trip()
+        orphan_at = ENTRY_AT + timedelta(minutes=5)
+        history.append(attempt(20, orphan_at, sell="NVDA", buy="AMD",
+                               sell_quantity="0.1", buy_quantity="0.2"))
+        # Inside the stream and inside the question: still a hard error.
+        with self.assertRaises(ledger_tool.ActivityLedgerError):
+            report_for(events, history)
+        # Inside the stream but outside the requested bounds: reported,
+        # not fatal.
+        report = report_for(events, history, since=orphan_at + timedelta(minutes=1))
+        self.assertIn(20, report["ledger_swaps_outside_window"])
+
     def test_a_gas_top_up_across_a_swap_is_not_a_negative_cost(self):
         """A wallet inflow between the two snapshots is not cheaper gas.
 

@@ -293,10 +293,23 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
     prepared_at = event_stream.parse_timestamp(attempt["prepared_at"])
     candidates = []
     for event in index.get(key, []):
-        observed_at = event_stream.parse_timestamp(event["observed_at"])
-        if not within_plan_age(observed_at, prepared_at):
-            continue
         plan = event["decision"]["plan"]
+        # The runtime's own clock for this: `validate_plan_age` measures
+        # from `plan.quote_received_at`, not from when the event was
+        # observed. Every archived plan carries it. Measuring from
+        # `observed_at` instead admits a plan whose quote was already too
+        # old to dispatch -- so it can match an unrelated candidate and
+        # price the swap at its marks, or manufacture ambiguity between
+        # two events (PR #298 Codex review). `observed_at` remains the
+        # fallback for an event that predates the field.
+        quoted_at = plan.get("quote_received_at")
+        reference = (
+            event_stream.parse_timestamp(quoted_at)
+            if quoted_at
+            else event_stream.parse_timestamp(event["observed_at"])
+        )
+        if not within_plan_age(reference, prepared_at):
+            continue
         if not token_addresses_match(intent, plan):
             continue
         candidates.append(event)
@@ -434,6 +447,8 @@ def reconciled_attempts(ledger: dict[str, Any]) -> list[dict[str, Any]]:
 
 def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
                      window: tuple[datetime, datetime],
+                     since: datetime | None = None,
+                     until: datetime | None = None,
                      ) -> tuple[list[Swap], list[tuple[int, datetime]]]:
     """Price every reconciled swap the event window actually covers.
 
@@ -459,7 +474,13 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
         dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
         event = find_event(attempt, index)
         if event is None:
-            if start <= dispatched_at <= end:
+            # Inside the stream *and* inside what the caller asked about.
+            # A stream can span more than the requested report, and a
+            # manual or offline attempt outside the requested bounds is
+            # something the CLI promises to ignore -- raising on it
+            # refused to produce a report the caller can legitimately ask
+            # for (PR #298 Codex review).
+            if start <= dispatched_at <= end and within(dispatched_at, since, until):
                 raise ActivityLedgerError(
                     f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or "
                     f"before {attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- "
@@ -641,7 +662,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # belongs to the day the caller named.
     if since is not None and until is not None and since > until:
         raise ActivityLedgerError("--since is after --until")
-    swaps, out_of_window = reconciled_swaps(ledger, index, stream)
+    swaps, out_of_window = reconciled_swaps(ledger, index, stream, since, until)
     # Pair over everything the stream priced, so a rotation that spans a
     # requested bound is still recognised as one rotation.
     round_trips, orphan_exits = pair_round_trips(swaps)
