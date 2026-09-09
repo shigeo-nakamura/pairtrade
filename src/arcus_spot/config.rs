@@ -162,7 +162,13 @@ pub struct ArcusSpotRuntimeConfig {
     /// Operator-declared corporate-action windows, ordered and
     /// non-overlapping. Empty -- the default, and what every existing
     /// deployment deserializes to -- leaves behaviour exactly as it was.
-    #[serde(default)]
+    /// Skipped when empty, and the margin likewise when it is the default:
+    /// `auto_execute_config_digest` hashes this struct's serialization, so
+    /// a field that a deployment's YAML never mentions must not change the
+    /// digest of that unchanged YAML -- otherwise replacing only the binary
+    /// rejects every later `live-tick`/`auto-execute` until an operator
+    /// rotates the approved policy (Codex P1, pairtrade#309).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub corporate_actions: Vec<ArcusSpotCorporateActionEvent>,
     /// How long before a declared `effective_at` the runtime stops
     /// submitting exits.
@@ -174,12 +180,19 @@ pub struct ArcusSpotRuntimeConfig {
     /// guard is a margin instead: exits stop this many seconds early and the
     /// reduce phase is expected to be sized accordingly (Codex P1,
     /// pairtrade#309). Defaults to 300s; deployments deserialize without it.
-    #[serde(default = "default_corporate_action_settlement_margin_secs")]
+    #[serde(
+        default = "default_corporate_action_settlement_margin_secs",
+        skip_serializing_if = "is_default_corporate_action_settlement_margin_secs"
+    )]
     pub corporate_action_settlement_margin_secs: i64,
 }
 
 fn default_corporate_action_settlement_margin_secs() -> i64 {
     300
+}
+
+fn is_default_corporate_action_settlement_margin_secs(value: &i64) -> bool {
+    *value == default_corporate_action_settlement_margin_secs()
 }
 
 impl ArcusSpotRuntimeConfig {
@@ -621,6 +634,35 @@ corporate_action:
         .validate()
         .unwrap_err();
         assert!(error.contains("not unique"), "{error}");
+    }
+
+    #[test]
+    fn an_unchanged_yaml_serializes_without_the_defaulted_fields() {
+        // `auto_execute_config_digest` hashes this struct's serialization,
+        // and the deployed policy holds a digest generated before these
+        // fields existed. A YAML that never mentions them must therefore
+        // still serialize without them, or replacing only the binary
+        // rejects every later live-tick until the policy is rotated.
+        let config = valid_config();
+        assert!(config.corporate_actions.is_empty());
+        assert_eq!(config.corporate_action_settlement_margin_secs, 300);
+        let value = serde_json::to_value(&config).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("corporate_actions"), "{object:?}");
+        assert!(
+            !object.contains_key("corporate_action_settlement_margin_secs"),
+            "{object:?}"
+        );
+
+        // A deployment that uses either one is a deliberate config change
+        // and does move the digest.
+        let mut declared = valid_config();
+        declared.corporate_actions = vec![split_event("NVDA-2026-08-SPLIT", anchor())];
+        declared.corporate_action_settlement_margin_secs = 1800;
+        let value = serde_json::to_value(&declared).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(object.contains_key("corporate_actions"));
+        assert!(object.contains_key("corporate_action_settlement_margin_secs"));
     }
 
     #[test]

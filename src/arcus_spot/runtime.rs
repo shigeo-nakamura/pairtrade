@@ -3161,15 +3161,19 @@ impl ArcusSpotRuntime {
                     )
                 },
             );
+            let settlement_cutoff =
+                self.corporate_action_settlement_cutoff_reached(&event, evaluation_time);
             return CorporateActionGate {
                 block_entry: Some(hold),
-                // Only in the reduce phase. Past `effective_at` an open
-                // rotation has already returned above with its own hold.
+                // Only in the reduce phase, and only while an exit could
+                // still settle before the cutoff. Past `effective_at` an
+                // open rotation has already returned above with its own
+                // hold.
                 force_exit: evaluation_time >= event.reduce_exit_at
-                    && evaluation_time < event.effective_at
+                    && !settlement_cutoff
                     && self.state.regime != ArcusSpotRegime::Neutral,
                 suppress_history: evaluation_time >= event.effective_at,
-                suppress_exits: evaluation_time >= event.effective_at,
+                suppress_exits: settlement_cutoff,
             };
         }
 
@@ -3408,6 +3412,8 @@ impl ArcusSpotRuntime {
             }
         }
         let effective = evaluation_time >= event.effective_at;
+        let settlement_cutoff =
+            self.corporate_action_settlement_cutoff_reached(event, evaluation_time);
         CorporateActionGate {
             block_entry: Some(ArcusSpotHold::new(
                 ArcusSpotHoldCode::CorporateActionBlock,
@@ -3417,11 +3423,11 @@ impl ArcusSpotRuntime {
                     event.event_id,
                 ),
             )),
-            force_exit: !effective
+            force_exit: !settlement_cutoff
                 && evaluation_time >= event.reduce_exit_at
                 && self.state.regime != ArcusSpotRegime::Neutral,
             suppress_history: effective,
-            suppress_exits: effective,
+            suppress_exits: settlement_cutoff,
         }
     }
 
@@ -3490,6 +3496,23 @@ impl ArcusSpotRuntime {
     /// past window whose `entry_block_at` is long gone would become active
     /// again on the next tick, clear the live signal history and re-apply
     /// its `post_event_inventory` over every trade made since.
+    /// True once this window's settlement cutoff is reached: exits planned
+    /// from here could settle after the venue changes units, so the planning
+    /// gate stops producing them at the same instant
+    /// `validate_plan_consistent_with_state` starts refusing them. Without
+    /// that agreement `live-tick` writes a pending plan its own dispatch
+    /// rejects, and `ReplaySimulation` -- which never runs the live-only
+    /// validator -- records a fill production would not send (Codex P1,
+    /// pairtrade#309).
+    fn corporate_action_settlement_cutoff_reached(
+        &self,
+        event: &ArcusSpotCorporateActionEvent,
+        at: DateTime<Utc>,
+    ) -> bool {
+        at + Duration::seconds(self.config.corporate_action_settlement_margin_secs)
+            >= event.effective_at
+    }
+
     /// A declared window whose `effective_at` is inside the settlement
     /// margin (or already past it, with the units not yet observed as
     /// stale). Reused-id declarations count too: they never become active,
@@ -8432,6 +8455,45 @@ mod tests {
             config().initial_inventory,
             "a relisted token must not have a reconciled inventory adopted on top of it",
         );
+    }
+
+    #[test]
+    fn planning_stops_exits_at_the_settlement_cutoff() {
+        // The planning gate and the dispatch validator must agree on when
+        // exits stop: otherwise live-tick writes a plan its own dispatch
+        // rejects, and ReplaySimulation -- which never runs the live-only
+        // validator -- records a fill production would not send.
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor);
+        cfg.corporate_action_settlement_margin_secs = 1;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_open_rotation(&mut runtime, anchor);
+
+        // reduce_exit_at is +2s and effective_at +4s, so with a 1s margin
+        // the last dispatchable tick is +2s.
+        let at = anchor + Duration::seconds(2);
+        match runtime.step_at(&snapshot_with_valid_row(at), at).decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::CorporateActionExit)
+            }
+            other => panic!("expected the forced exit while it can still settle, got {other:?}"),
+        }
+
+        // At +3s the margin reaches the cutoff: no plan is produced at all --
+        // not the forced unwind, and not the max-hold exit an overdue
+        // rotation would otherwise take.
+        let mut late = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        late.config.corporate_action_settlement_margin_secs = 1;
+        seed_open_rotation(&mut late, anchor - Duration::hours(2));
+        let at = anchor + Duration::seconds(3);
+        assert!(
+            matches!(
+                late.step_at(&snapshot_with_valid_row(at), at).decision,
+                ArcusSpotDecision::Observe { .. }
+            ),
+            "no exit may be planned once dispatch would refuse it",
+        );
+        assert_eq!(late.state.regime, ArcusSpotRegime::RotatedAToB);
     }
 
     #[test]

@@ -776,7 +776,12 @@ mod tests {
         let stored = live_runtime_config();
         let current = maximally_different_config();
 
-        let field_count = serde_json::to_value(&stored)
+        // Counted from `current`, not `stored`: fields whose value is the
+        // default are skipped in the canonical serialization (so an
+        // unchanged YAML keeps its auto-execute digest across a binary
+        // upgrade), and `maximally_different_config` populates every one of
+        // them, so its object has a key per field.
+        let field_count = serde_json::to_value(&current)
             .unwrap()
             .as_object()
             .expect("runtime config serializes as an object")
