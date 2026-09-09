@@ -25,8 +25,10 @@ from subsidy_ledger import (  # noqa: E402
     summarize,
 )
 
-# 2026-09-08 12:00 UTC.
-TS = 1788868800
+# 2026-09-08 12:30 UTC. Mid-hour on purpose: the short holds below are
+# meant to be genuine no-funding rows, and a close on the hour would make
+# every one of them span a funding boundary.
+TS = 1788870600
 
 
 def write(path: Path, records: list[dict]) -> Path:
@@ -516,6 +518,118 @@ def test_arm_is_taken_from_the_pnl_filename():
     assert arm_from_pnl_filename("pnl-debot-pair-robinhood-lighter-b-20260908.jsonl") == "b"
     assert arm_from_pnl_filename("execution-debot-pair-robinhood-lighter_20260908.jsonl") is None
     assert arm_from_pnl_filename("pnl-no-date.jsonl") is None
+
+
+def test_a_short_hold_that_crosses_a_funding_boundary_is_a_gap():
+    """`hold_secs < 3600` is not evidence that no funding tick landed.
+
+    Lighter funds on the hour, so a position opened at 11:55 and closed
+    at 12:05 was charged the 12:00 tick while holding for 600 seconds.
+    Reading the absent `funding_carry_usd` on that row as a real zero
+    understates the day's cost and still marks it complete.
+    """
+    on_the_hour = 1788868800  # 2026-09-08 12:00:00 UTC
+    with tempfile.TemporaryDirectory() as tmp:
+        crossing = pnl_file(
+            Path(tmp),
+            [{"ts": on_the_hour + 300, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}],
+        )
+        day = load_pnl([crossing])[("2026-09-08", "freq")]
+        assert day.incomplete and day.incomplete_reasons == {"funding_gap"}, day.incomplete_reasons
+
+        # The same duration wholly inside one funding hour stays a real zero.
+        inside = pnl_file(
+            Path(tmp),
+            [{"ts": on_the_hour + 1800, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}],
+            arm="b",
+        )
+        clean = load_pnl([inside])[("2026-09-08", "b")]
+        assert not clean.incomplete, clean.incomplete_reasons
+
+
+def test_a_zero_valued_fill_that_moved_quantity_is_unvalued_volume():
+    """$0 notional on a fill that moved size is a missing value, not $0 of volume.
+
+    Counted as a valued fill it adds nothing to the denominator while
+    leaving the day marked complete, so every per-volume rate computed
+    from that day is divided by a number known to be short.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 10_000.0, "filled_qty": 1.0},
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 0.0, "filled_qty": 2.0},
+            ],
+        )
+        day = load_execution([path])[("2026-09-08", "freq")]
+        assert day.volume_usd == 10_000.0
+        assert day.fills == 1
+        assert day.fills_without_value == 1
+
+        # A fill that moved nothing and is worth nothing is not a gap.
+        none_moved = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260907.jsonl",
+            [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "b",
+              "fill_value": 0.0, "filled_qty": 0.0}],
+        )
+        quiet = load_execution([none_moved])[("2026-09-08", "b")]
+        assert quiet.fills_without_value == 0 and quiet.fills == 1
+
+
+def test_a_malformed_equity_sample_invalidates_its_day_and_the_next():
+    """A day whose closing sample cannot be read has no known close.
+
+    Stepping over the bad row leaves the last readable sample standing
+    as the day's close, so the day's cost -- and the next day's, which
+    is measured from that same baseline -- is computed from a number
+    that is not a close.
+    """
+    costs = equity_daily_costs([
+        {"ts": 1788595200000, "equity": 5000.0},   # 2026-09-05
+        {"ts": 1788681600000, "equity": 4900.0},   # 2026-09-06 morning
+        {"ts": 1788703200000, "equity": "n/a"},    # 2026-09-06 close, unreadable
+        {"ts": 1788768000000, "equity": 4950.0},   # 2026-09-07
+        {"ts": 1788854400000, "equity": 4900.0},   # 2026-09-08
+    ])
+    assert "2026-09-06" not in costs           # its own close is unknown
+    assert "2026-09-07" not in costs           # measured from that unknown close
+    assert costs["2026-09-08"] == 50.0         # clean pair, still measured
+
+    # A row that cannot be attributed to a day at all is a broken writer.
+    try:
+        equity_daily_costs([{"equity": 5000.0}])
+    except SubsidyLedgerError as error:
+        assert "no `ts`" in str(error), error
+    else:
+        raise AssertionError("an equity row with no ts should raise")
+
+
+def test_an_equity_only_or_points_only_date_still_appears():
+    """The four inputs are selected independently, so any one can stand alone.
+
+    An equity delta for a date absent from both ledgers is a known cost,
+    and points for such a date belong in `uncosted_points`. Unioning
+    only the two ledgers dropped both without saying so.
+    """
+    rows = build_rows(
+        {},
+        {},
+        equity_costs={"freq": {"2026-09-06": 31.0}},
+        points={("2026-09-07", "freq"): 2000.0},
+    )
+    by_date = {row.date: row for row in rows}
+    assert by_date["2026-09-06"].cost_usd == 31.0
+    assert by_date["2026-09-06"].cost_source == "equity_delta"
+    assert by_date["2026-09-07"].points == 2000.0
+    assert by_date["2026-09-07"].cost_usd is None
+
+    arm = summarize(rows)["arms"][0]
+    assert arm["cost_usd"] == 31.0
+    assert arm["uncosted_points"] == 2000.0
+    assert arm["points"] == 0.0
 
 
 def main() -> int:

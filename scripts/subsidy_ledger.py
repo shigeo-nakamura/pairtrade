@@ -216,10 +216,20 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                     day.fills_without_value += 1
             else:
                 try:
-                    day.volume_usd += abs(float(notional))
-                    day.fills += 1
+                    value = abs(float(notional))
                 except (TypeError, ValueError):
                     day.fills_without_value += 1
+                else:
+                    # Zero notional on a fill that moved quantity is the
+                    # same gap as no notional at all: the volume happened
+                    # and its value is missing. Counting it as a valued
+                    # fill of $0 leaves the day marked complete on a
+                    # denominator that is short by that fill.
+                    if value == 0.0 and quantity_moved(record):
+                        day.fills_without_value += 1
+                    else:
+                        day.volume_usd += value
+                        day.fills += 1
             slip = record.get("slippage_usd_vs_decision")
             if slip is not None:
                 try:
@@ -244,9 +254,11 @@ REALIZED_PNL_SOURCES = frozenset({"exit_fill"})
 # accrued rather than writing a zero, and the archived ledgers agree
 # exactly: of 514 `exit_fill` rows, all 101 without the field were held
 # under an hour, and none of the 413 with it observed zero ticks. So an
-# absent field on a *short* hold is a real zero, while a hold that spans
-# an interval with no funding coverage is a feed gap -- and a gap read as
-# zero understates the subsidy cost silently.
+# absent field on a hold that never met a funding timestamp is a real
+# zero, while a hold that spans one with no funding coverage is a feed
+# gap -- and a gap read as zero understates the subsidy cost silently.
+# What decides that is the interval the position spanned, not its
+# duration: a hold of ten minutes across the hour met a tick.
 FUNDING_INTERVAL_SECS = 3600
 
 
@@ -331,16 +343,38 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
 
 
 def spans_a_funding_interval(record: dict) -> bool:
-    """Was this position held long enough for funding to have accrued?"""
+    """Could a funding tick have landed inside this position's life?
+
+    A full hour of hold is sufficient but not necessary: a position opened
+    five minutes before an hourly boundary and closed five minutes after it
+    was charged that tick while `hold_secs` reads 600. Testing the duration
+    alone accepts such a row as a real zero, so the interval the position
+    actually spans is what is tested -- `[close - hold, close]` against the
+    hourly grid -- and the duration test remains as the answer when the
+    close timestamp is unreadable.
+    """
     hold = record.get("hold_secs")
     if hold is None:
         # Unknown hold, so the absence of funding cannot be read as a real
         # zero either.
         return True
     try:
-        return float(hold) >= FUNDING_INTERVAL_SECS
+        hold_secs = float(hold)
     except (TypeError, ValueError):
         return True
+    if hold_secs >= FUNDING_INTERVAL_SECS:
+        return True
+    close = record.get("ts")
+    if close is None:
+        return True
+    try:
+        close_secs = float(close)
+    except (TypeError, ValueError):
+        return True
+    if hold_secs < 0:
+        return True
+    opened = close_secs - hold_secs
+    return (close_secs // FUNDING_INTERVAL_SECS) != (opened // FUNDING_INTERVAL_SECS)
 
 
 def arm_from_pnl_filename(name: str) -> str | None:
@@ -371,23 +405,43 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     only the 7th's volume -- reports a day that never happened. The 7th
     is left uncosted, which `summarize` already reports as uncovered
     volume.
+
+    A row whose `equity` cannot be read is the same kind of gap rather
+    than a row to step over. Skipping it leaves the last *readable*
+    sample standing as that day's close, which is not the day's close if
+    the unreadable row came later -- so the day is invalidated, and so is
+    the following day, whose cost is measured from that same baseline. A
+    row with no readable `ts` cannot be blamed on a day at all and is a
+    broken writer, so it raises, as an unattributable row does in the
+    other two loaders.
     """
     last_by_day: dict[str, float] = {}
+    invalid_days: set[str] = set()
     for row in rows:
         ts = row.get("ts")
-        equity = row.get("equity")
-        if ts is None or equity is None:
-            continue
+        if ts is None:
+            raise SubsidyLedgerError(
+                "an equity_history row has no `ts`, so the day it belongs to "
+                f"cannot be determined: {row!r}")
         try:
             # equity_history stamps milliseconds.
             day = utc_date(float(ts) / 1000.0)
+        except (TypeError, ValueError) as error:
+            raise SubsidyLedgerError(
+                f"unreadable `ts` {ts!r} in an equity_history row") from error
+        equity = row.get("equity")
+        if equity is None:
+            invalid_days.add(day)
+            continue
+        try:
             last_by_day[day] = float(equity)
         except (TypeError, ValueError):
-            continue
+            invalid_days.add(day)
     costs: dict[str, float] = {}
     previous_day: str | None = None
     for day in sorted(last_by_day):
-        if previous_day is not None and is_next_calendar_day(previous_day, day):
+        if (previous_day is not None and is_next_calendar_day(previous_day, day)
+                and day not in invalid_days and previous_day not in invalid_days):
             costs[day] = -(last_by_day[day] - last_by_day[previous_day])
         previous_day = day
     return costs
@@ -430,7 +484,13 @@ def build_rows(
 ) -> list[Row]:
     equity_costs = equity_costs or {}
     points = points or {}
-    keys = set(execution) | set(pnl)
+    # The four inputs are selected independently, so a date can exist in
+    # any one of them alone. Unioning only the two ledgers dropped an
+    # equity-only cost outright, and hid a points-only day from
+    # `uncosted_points` -- both of which the row-alignment rule is
+    # supposed to report rather than discard.
+    keys = set(execution) | set(pnl) | set(points)
+    keys |= {(date, arm) for arm, days in equity_costs.items() for date in days}
     rows: list[Row] = []
     for date, arm in sorted(keys):
         row = Row(date=date, arm=arm)
