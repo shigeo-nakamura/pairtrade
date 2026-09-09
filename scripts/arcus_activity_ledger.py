@@ -309,16 +309,10 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
     # [prepared_at, dispatched_at]. Age only grows, so `prepared_at` is
     # the sound admission bound -- an event too old there could not have
     # passed at any later instant -- while `dispatched_at` is a separate,
-    # later `Utc::now()` and using it to *reject* discards a real event
-    # whose quote crossed the whole-second boundary in between
-    # (PR #298 Codex review, rounds 8 and 9). The dispatch bound is
-    # therefore applied only to break a tie, below.
+    # later `Utc::now()` that can neither reject a real event (its quote
+    # may have crossed the whole-second boundary in between) nor pick
+    # between two, for the same reason (PR #298 Codex review).
     prepared_at = event_stream.parse_timestamp(attempt["prepared_at"])
-    dispatched_at = (
-        event_stream.parse_timestamp(attempt["dispatched_at"])
-        if attempt.get("dispatched_at")
-        else prepared_at
-    )
     candidates = []
     for event in index.get(key, []):
         plan = event["decision"]["plan"]
@@ -343,19 +337,13 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
         candidates.append((event, reference))
     if not candidates:
         return None
-    if len(candidates) > 1:
-        # The tighter bound the runtime applied last, used to choose
-        # between candidates rather than to reject any: an event still
-        # fresh at dispatch is the one that could have been re-validated
-        # there. If that narrows it to exactly one, take it; otherwise
-        # the ambiguity is real and is refused below.
-        fresh_at_dispatch = [
-            (event, reference)
-            for event, reference in candidates
-            if within_plan_age(reference, dispatched_at, max_plan_age_secs)
-        ]
-        if len(fresh_at_dispatch) == 1:
-            candidates = fresh_at_dispatch
+    # The dispatch stamp is deliberately *not* used to choose between
+    # candidates. It cannot prove identity either: the real plan can
+    # cross the whole-second boundary after the runtime's validation and
+    # before that later stamp, while a newer decoy is still fresh there,
+    # so "still fresh at dispatch" would pick the decoy and price the
+    # swap at unrelated marks. Ambiguity is kept and refused, which is
+    # what this file does everywhere else (PR #298 Codex review).
     candidates = [event for event, _ in candidates]
     if len(candidates) > 1:
         raise ActivityLedgerError(
@@ -867,21 +855,25 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # however its clock reads; a genuinely newer attempt from a
     # historical export matches nothing here and stays outside
     # (PR #298 Codex review).
-    pending_event = (
-        find_event(ledger["active"], index, max_plan_age_secs)
-        if pending is not None and isinstance(ledger.get("active"), dict)
-        else None
-    )
     # The bridge is for the *seam*, so it only applies where the endpoint
     # is open. An explicit `--until` is the caller saying where the
-    # question stops, and an event match must not override it
+    # question stops, and an event match must not override it. The lookup
+    # itself is therefore also gated: run unconditionally it could raise
+    # on an ambiguous in-flight attempt and refuse to produce an
+    # explicitly bounded historical report that does not cover it
     # (PR #298 Codex review).
-    bridges_seam = (
-        pending is not None
-        and until is None
-        and pending_event is not None
-        and within(pending[1], since, None)
+    bridge_eligible = (
+        pending is not None and until is None and within(pending[1], since, None)
     )
+    bridges_seam = False
+    if bridge_eligible:
+        try:
+            bridges_seam = find_event(ledger["active"], index, max_plan_age_secs) is not None
+        except ActivityLedgerError:
+            # Ambiguous rather than absent: an attempt whose own pricing
+            # event cannot be identified is certainly not resolved, and
+            # it is inside the period being reported.
+            bridges_seam = True
     in_window = pending is not None and (within(pending[1], *asked) or bridges_seam)
     unresolved = [pending_row] if in_window else []
     # Outside the reported window it is still worth naming -- the ledger

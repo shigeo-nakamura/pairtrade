@@ -665,6 +665,36 @@ class ActivityLedgerTests(unittest.TestCase):
         with self.assertRaises(ledger_tool.ActivityLedgerError):
             report_for(events, history, max_plan_age_secs=30)
 
+    def test_an_ambiguous_pending_attempt_does_not_block_a_bounded_report(self):
+        """The seam lookup must not raise outside the bounds it serves.
+
+        An in-flight attempt whose own pricing event is ambiguous is not
+        part of an explicitly bounded historical question, and running
+        the lookup for it anyway refused to produce that report at all.
+        """
+        events, history = baseline_round_trip()
+        # Two same-shaped events for a pair nothing in `history` uses, so
+        # only the *pending* attempt's lookup is ambiguous.
+        twins = [
+            would_rotate_event(
+                20 + i, ENTRY_AT - timedelta(seconds=5 * (i + 1)),
+                trigger="entry_signal", sell="NVDA", buy="AMD",
+                sell_quantity="0.1", buy_quantity="0.2",
+                spy_mark="700.00", qqq_mark="650.00")
+            for i in range(2)
+        ]
+        pending = attempt(11, ENTRY_AT, sell="NVDA", buy="AMD",
+                          sell_quantity="0.1", buy_quantity="0.2",
+                          dispatched=ENTRY_AT + timedelta(seconds=3),
+                          phase="confirmed")
+        # `--until` before the attempt: it is not part of the question,
+        # so its ambiguity must not be raised while answering.
+        report = report_for(twins + events, history, active=pending,
+                            until=ENTRY_AT - timedelta(hours=1))
+        self.assertEqual(report["coverage"]["unresolved_attempts"], [])
+        self.assertEqual(report["coverage"]["pending_outside_window"],
+                         [{"sequence": 11, "phase": "confirmed"}])
+
     def test_an_explicit_until_still_excludes_a_matched_pending_attempt(self):
         """The seam bridge is for an open endpoint, not for any bound.
 
@@ -727,16 +757,16 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, history)
         self.assertEqual(report["totals"]["round_trips"], 1)
 
-    def test_the_dispatch_bound_breaks_ties_without_rejecting(self):
-        """Neither stamp is the validation clock, so only one may reject.
+    def test_the_admission_bound_is_preparation_and_ambiguity_is_refused(self):
+        """Neither stamp is the validation clock, so only one may admit.
 
         The runtime validates between `prepared_at` and `dispatched_at`,
         and age only grows: an event too old at preparation could not
         have passed at any later instant, so that is the sound bound.
-        `dispatched_at` is a separate, later `Utc::now()`, so rejecting on
-        it discards a real event whose quote crossed the whole-second
-        boundary in between -- it is used to choose between candidates
-        instead.
+        `dispatched_at` is a separate, later `Utc::now()` -- it can
+        neither reject a real event whose quote crossed the whole-second
+        boundary in between, nor pick between two candidates, since the
+        real one may be the stale-looking one. Ambiguity is refused.
         """
         events, history = baseline_round_trip()
         plan = events[0]["decision"]["plan"]
@@ -750,20 +780,22 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, history)
         self.assertEqual(report["totals"]["round_trips"], 1)
 
-        # Two same-shaped candidates, only one of which was still fresh
-        # at dispatch: the tie is broken rather than refused.
-        stale_twin = would_rotate_event(
+        # Two same-shaped candidates, both admissible at preparation:
+        # the dispatch stamp cannot tell them apart, so this is refused
+        # rather than guessed at.
+        twin = would_rotate_event(
             0, ENTRY_AT - timedelta(seconds=50), trigger="entry_signal",
             sell="QQQ", buy="SPY", sell_quantity="0.347094",
             buy_quantity="0.323269", spy_mark="700.00", qqq_mark="650.00")
-        stale_twin["decision"]["plan"]["quote_received_at"] = stamp(
+        twin["decision"]["plan"]["quote_received_at"] = stamp(
             ENTRY_AT - timedelta(seconds=50))
         plan["quote_received_at"] = stamp(ENTRY_AT - timedelta(seconds=1))
         history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
                              sell_quantity="0.347094", buy_quantity="0.323269",
                              dispatched=ENTRY_AT + timedelta(seconds=20))
-        picked = report_for([stale_twin] + events, history)
-        self.assertEqual(picked["totals"]["round_trips"], 1)
+        with self.assertRaises(ledger_tool.ActivityLedgerError) as caught:
+            report_for([twin] + events, history)
+        self.assertIn("refusing rather than guessing", str(caught.exception))
 
     def test_an_unmatched_attempt_outside_the_requested_bounds_is_not_fatal(self):
         """A stream can span more than the report the caller asked for.
