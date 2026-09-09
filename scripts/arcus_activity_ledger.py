@@ -61,6 +61,11 @@ class Swap:
     sell_mark_usd: Decimal
     buy_mark_usd: Decimal
     gas_wei: Decimal
+    # True when the wallet's native balance *rose* across the swap -- a
+    # top-up landing between the two snapshots -- so the transaction's own
+    # gas cannot be read from the delta. `gas_wei` is then zero rather
+    # than a credit (PR #298 Codex review).
+    gas_unmeasurable: bool
     event_sequence: int
     # When the marks this swap was priced at were observed. Every window
     # question is answered with this rather than with `at` (the dispatch),
@@ -353,6 +358,17 @@ def swap_from_attempt(attempt: dict[str, Any], event: dict[str, Any]) -> Swap:
     sell_mark, buy_mark = marks_for(event, intent["sell_symbol"], intent["buy_symbol"])
     gas_wei = (parse_decimal(pre["gas_balance_wei"], "pre gas balance")
                - parse_decimal(post["gas_balance_wei"], "post gas balance"))
+    # A negative delta means the wallet gained native tokens across the
+    # swap -- a gas top-up between the pre-swap snapshot and the delayed
+    # reconciliation, which the runtime allows because it validates only
+    # the sell and buy legs. That inflow is not a negative transaction
+    # cost: counted as one it credits an unrelated deposit against a
+    # round trip's loss and can suppress a stop signal that is really
+    # there. The gas is unknown, so it is zero and said to be unknown
+    # (PR #298 Codex review).
+    gas_unmeasurable = gas_wei < 0
+    if gas_unmeasurable:
+        gas_wei = Decimal(0)
     at = event_stream.parse_timestamp(attempt["dispatched_at"])
     return Swap(
         sequence=int(attempt["sequence"]),
@@ -367,6 +383,7 @@ def swap_from_attempt(attempt: dict[str, Any], event: dict[str, Any]) -> Swap:
         sell_mark_usd=sell_mark,
         buy_mark_usd=buy_mark,
         gas_wei=gas_wei,
+        gas_unmeasurable=gas_unmeasurable,
         event_sequence=int(event["sequence"]),
         event_at=event_stream.parse_timestamp(event["observed_at"]),
     )
@@ -646,10 +663,21 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # but before its dispatch -- the midnight straddle live-tick produces --
     # `stream[1]` as the end sits *before* the start, and the report then
     # described a real row with an inverted interval.
+    #
+    # Only the *derived* endpoint may move: clamping both was the mirror
+    # bug -- an `--until` before the stream pushed `window.to` forward to
+    # the stream start, so a report answering "nothing up to Sep 3"
+    # described its window as `from = to = Sep 4`, after the cutoff it was
+    # asked about (PR #298 Codex review). A caller who supplies both
+    # bounds gets exactly those bounds back, empty intersection included.
     dispatches = [swap.at for swap in swaps]
     window_from = since if since is not None else min([stream[0], *dispatches])
     window_to = until if until is not None else max([stream[1], *dispatches])
-    report_window = (window_from, max(window_to, window_from))
+    if until is None:
+        window_to = max(window_to, window_from)
+    if since is None:
+        window_from = min(window_from, window_to)
+    report_window = (window_from, window_to)
 
     # Two ways this window can be short a rotation, and both make the stop
     # verdict undecidable. The report still says what it can measure, but it
@@ -681,7 +709,11 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # `undecidable` over a swap outside the period it reports on.
     unpriceable = sorted(sequence for sequence, dispatched_at in out_of_window
                          if within(dispatched_at, *asked))
-    complete = not orphaned and not unpriceable
+    # A swap whose gas could not be read is a hole of the same kind: its
+    # cost is understated by an unknown amount, so no definitive stop
+    # verdict is given for a window containing one.
+    unmeasured_gas = sorted(swap.sequence for swap in swaps if swap.gas_unmeasurable)
+    complete = not orphaned and not unpriceable and not unmeasured_gas
     return {
         "schema_version": 1,
         "window": {
@@ -733,6 +765,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "complete": complete,
             "exits_without_entry": orphaned,
             "requested_but_unpriceable": unpriceable,
+            "gas_unmeasurable": unmeasured_gas,
         },
         "stop_rule": {
             "consecutive_days_required": STOP_RULE_CONSECUTIVE_DAYS,
@@ -779,6 +812,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             reasons.append(
                 "covers swaps the event stream cannot price at all (ledger sequences "
                 + ", ".join(str(s) for s in coverage["requested_but_unpriceable"]) + ")")
+        if coverage.get("gas_unmeasurable"):
+            reasons.append(
+                "holds swaps whose gas cannot be read because the wallet was topped up across "
+                "them (ledger sequences "
+                + ", ".join(str(s) for s in coverage["gas_unmeasurable"]) + ")")
         lines.append(
             "⚠️ This window " + " and ".join(reasons)
             + ", so their cost is in none of the figures above and no stop verdict is given. "

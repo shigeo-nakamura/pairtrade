@@ -594,6 +594,37 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertEqual(asked["coverage"]["requested_but_unpriceable"], [5])
         self.assertTrue(asked["stop_rule"]["undecidable"])
 
+    def test_a_gas_top_up_across_a_swap_is_not_a_negative_cost(self):
+        """A wallet inflow between the two snapshots is not cheaper gas.
+
+        Reconciliation validates only the sell and buy legs, so an attempt
+        whose native balance rose is still accepted; the delta then went
+        into `cost_usd` as a credit and could suppress a real stop signal.
+        """
+        events, history = baseline_round_trip()
+        # The wallet gains 1 native token across the closing swap.
+        history[1] = attempt(9, EXIT_AT, sell="SPY", buy="QQQ",
+                             sell_quantity="0.323269", buy_quantity="0.346345",
+                             gas_after=str(int(WEI) + 10**18))
+
+        report = report_for(events, history)
+        self.assertEqual(report["coverage"]["gas_unmeasurable"], [9])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+        # No credit: the unknown gas is zero, never negative.
+        self.assertGreaterEqual(report["totals"]["gas_usd"], 0)
+        self.assertIn("topped up across them", ledger_tool.render_markdown(report))
+
+    def test_an_explicit_until_is_never_moved_forward(self):
+        """`--until` before the stream must not be reported as after it."""
+        events, history = baseline_round_trip()
+        cutoff = ENTRY_AT - timedelta(days=1)
+        report = report_for(events, history, until=cutoff)
+        self.assertEqual(
+            report["window"]["to"], cutoff.isoformat().replace("+00:00", "Z"))
+        self.assertLessEqual(report["window"]["from"], report["window"]["to"])
+        self.assertEqual(report["days"], [])
+
     def test_a_one_sided_bound_stays_open_on_the_side_the_caller_left_open(self):
         """`--since X` with no `--until` asks about everything after X.
 
