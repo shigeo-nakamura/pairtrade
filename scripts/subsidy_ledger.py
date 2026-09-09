@@ -1147,6 +1147,11 @@ def summarize(rows: list[Row]) -> dict:
                 "uncosted_points": 0.0,
                 "points_seen": False,
                 "cost_days": 0,
+                # Costed days whose volume *is* measured but whose cost
+                # belongs partly to a cycle that opened the day before.
+                # Excluded from the rate for a third reason, and the
+                # reader has to be told which one (Codex, PR #297).
+                "measured_but_cross_day": 0,
                 "fills_without_value": 0,
                 "incomplete_volume_days": 0,
                 "cross_day_cycles": 0,
@@ -1177,6 +1182,8 @@ def summarize(rows: list[Row]) -> dict:
                 arm["costed_volume_usd"] = add_or_none(
                     arm["costed_volume_usd"], row.volume_usd)
             else:
+                if row.volume_usd > 0 and not row.fills_without_value:
+                    arm["measured_but_cross_day"] += 1
                 arm["cost_usd_without_volume"] = add_or_none(
                     arm["cost_usd_without_volume"], row.cost_usd)
             # Points ratio: likewise, only if this row supplied points
@@ -1315,6 +1322,16 @@ def render_table(rows: list[Row], summary: dict) -> str:
             out.append(
                 "         the measured-volume totals could not be represented, so the "
                 "per-$1M rate is unavailable"
+            )
+        elif arm["cost_per_musd_volume"] is None and arm["measured_but_cross_day"]:
+            # The volume is measured; it is misaligned with the cost.
+            # Saying "no costed day has fully measured volume" here sent
+            # the reader looking for missing fill values that are not
+            # missing (Codex, PR #297).
+            out.append(
+                f"         {arm['measured_but_cross_day']} costed day(s) measured their "
+                f"volume but carry a cost that opened the day before, so the per-$1M rate "
+                f"is unavailable"
             )
         elif arm["cost_per_musd_volume"] is None:
             out.append(

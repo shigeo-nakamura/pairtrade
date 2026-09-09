@@ -1633,6 +1633,18 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
     assert "points-day totals could not be represented" in cost_printed, cost_printed
     assert "no day supplied both a cost and points" not in cost_printed, cost_printed
 
+    # A third reason the rate can be missing: the volume IS measured but
+    # the cost opened the day before. Saying "no costed day has fully
+    # measured volume" sent the reader looking for absent fill values
+    # (Codex, PR #297).
+    cross = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0)}
+    cross_pnl = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                                funding_seen=True, cross_day_cycles=1)}
+    cross_rows = build_rows(cross, cross_pnl)
+    cross_printed = render_table(cross_rows, summarize(cross_rows))
+    assert "opened the day before" in cross_printed, cross_printed
+    assert "no costed day has fully measured volume" not in cross_printed, cross_printed
+
     # And an arm that genuinely has no measured volume still says so.
     unmeasured = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0,
                                                   fills_without_value=1)}
