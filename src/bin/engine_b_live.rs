@@ -3156,20 +3156,39 @@ impl EngineBLiveEngine {
     /// re-anchored on whatever the venue's touch has become by submit
     /// time -- which is the window #918 had to leave open.
     fn send_limit(&self, side: OrderSide, reduce_only: bool) -> Result<SendLimit> {
-        let obs = self
-            .feed
-            .lock()
-            .unwrap()
-            .latest
-            .get(&self.cfg.us_primary_symbol)
-            .map(|o| (o.mid, o.best_bid, o.best_ask));
-        // No observation at all: `mid` is absent alongside the touch, and
-        // the helper reads that as the no-usable-book case. An entry
-        // cannot reach it (`maybe_enter` requires fresh prices for the
-        // traded symbol before it sizes anything); an exit can, since
-        // `maybe_exit` deliberately closes on prices too stale to enter
-        // on.
-        let (mid, touch) = match obs {
+        // A *fresh* clock, not the tick's start time: the eligibility
+        // fetch, the position read and the awaits before this can take
+        // seconds, and the question here is whether the observation is
+        // still good at the moment of the send.
+        let now_us = self.now();
+        // Usability is not optional on this path, and it is the whole of
+        // pairtrade#315's P1. `maybe_exit` deliberately closes on prices
+        // too stale to *enter* on -- but an absolute limit derived from a
+        // stale mid does not re-anchor the way the old percentage did: if
+        // the market has left it behind, every reduce-only IOC comes back
+        // unmarketable and the next tick reuses the same dead quote,
+        // because a stopped feed keeps handing out the same observation.
+        // So an observation that is stale, future-dated or from an older
+        // feed generation is treated as no book, which routes the exit to
+        // the connector's own live touch (`Unchecked`).
+        //
+        // Generation is read under the same lock as the observation
+        // (pairtrade#289 Codex round 6): taking them separately races the
+        // feed task.
+        let observed = {
+            let feed = self.feed.lock().expect("price feed mutex");
+            let generation = feed.generation;
+            feed.latest
+                .get(&self.cfg.us_primary_symbol)
+                .filter(|o| o.is_usable(now_us, generation, self.cfg.max_price_staleness_secs))
+                .map(|o| (o.mid, o.best_bid, o.best_ask))
+        };
+        // Nothing usable: `mid` is absent alongside the touch, and the
+        // helper reads that as the no-usable-book case. An entry cannot
+        // normally reach it (`maybe_enter` requires fresh prices for the
+        // traded symbol before it sizes anything), and if the quote went
+        // stale between that sizing and this send, refusing is the point.
+        let (mid, touch) = match observed {
             Some((mid, bid, ask)) => (mid, Some((bid, ask))),
             None => (f64::NAN, None),
         };
@@ -3190,9 +3209,10 @@ impl EngineBLiveEngine {
             }
             SendLimit::Unchecked => {
                 log::warn!(
-                    "[EXIT] no usable book for {}; sending the configured {}bps against the \
-                     connector's own touch instead of an absolute limit",
+                    "[EXIT] no usable book for {} ({}); sending the configured {}bps against \
+                     the connector's own live touch instead of an absolute limit",
                     self.cfg.us_primary_symbol,
+                    self.freshness_debug(now_us),
                     self.cfg.slippage_bps
                 );
             }
@@ -7282,6 +7302,10 @@ mod tests {
                 generation: 0,
             },
         );
+        // Within the staleness bound, so the tear is what decides here
+        // and not the freshness gate (see
+        // `a_stale_or_lagged_quote_hands_the_exit_back_to_the_connector`).
+        h.set_now(T2_US + 1_000_000);
         assert!(
             h.engine.send_limit(OrderSide::Long, false).is_err(),
             "an entry has no price inside the bound"
@@ -7291,6 +7315,74 @@ mod tests {
             SendLimit::AtTouch(1530.0),
             "the exit crosses at the bid rather than stranding the position"
         );
+    }
+
+    #[test]
+    fn a_stale_or_lagged_quote_hands_the_exit_back_to_the_connector() {
+        // pairtrade#315 P1. `maybe_exit` deliberately closes on prices
+        // too stale to enter on, and an absolute limit off such a mid
+        // does not re-anchor: if the market has left it behind, every
+        // reduce-only IOC comes back unmarketable and the next tick
+        // reuses the same dead quote. The connector's own live touch is
+        // the only thing that still gets the position flat.
+        for (label, obs) in [
+            (
+                "stale",
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.9,
+                    best_ask: 1700.1,
+                    received_at_us: T2_US,
+                    exchange_ts_us: Some(T2_US),
+                    generation: 0,
+                },
+            ),
+            (
+                "older generation",
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.9,
+                    best_ask: 1700.1,
+                    received_at_us: T2_US + 60_000_000,
+                    exchange_ts_us: Some(T2_US + 60_000_000),
+                    generation: 0,
+                },
+            ),
+        ] {
+            let h = harness();
+            let lagged = label == "older generation";
+            if lagged {
+                h.engine.feed.lock().unwrap().note_lag();
+            }
+            h.engine
+                .feed
+                .lock()
+                .unwrap()
+                .latest
+                .insert("SNDK".to_string(), obs);
+            // A minute past the observation, i.e. past the 30 s
+            // `max_price_staleness_secs` for the stale case; the lagged
+            // case is unusable at any age.
+            h.set_now(T2_US + 60_000_000);
+            assert_eq!(
+                h.engine.send_limit(OrderSide::Short, true).unwrap(),
+                SendLimit::Unchecked,
+                "{label}: the exit must fall back to the connector's live touch"
+            );
+            assert!(
+                h.engine.send_limit(OrderSide::Long, false).is_err(),
+                "{label}: and an entry priced off it must not go out at all"
+            );
+        }
+        // The control: the same book, fresh and on the current
+        // generation, is priced here rather than by the connector.
+        let mut h = harness();
+        h.observe_at("SNDK", 1700.0, T2_US, h.engine.feed_generation());
+        h.set_now(T2_US + 1_000_000);
+        assert!(matches!(
+            h.engine.send_limit(OrderSide::Short, true).unwrap(),
+            SendLimit::Bounded(_)
+        ));
     }
 
     #[test]

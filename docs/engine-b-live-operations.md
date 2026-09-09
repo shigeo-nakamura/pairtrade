@@ -136,9 +136,17 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   deliberately carries no staleness gate of its own (there is no
   reference price in the connector to age-check), where the older
   percentage path failed the send on a book the connector considered
-  stale. The engine's own gates are what stand in for it: an entry needs
-  a usable observation (`max_staleness_secs`, same feed generation) and
-  the price it is bounded against is that same observation. If a live send is ever rejected for crossing the
+  stale. The engine's own gates stand in for it, on **both** legs: the
+  observation the limit is priced from must be usable at send time --
+  fresh clock, within `ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS`, current
+  feed generation, not future-dated. An entry priced off anything else is
+  refused; an **exit** falls back to `create_order_taker_ioc` against the
+  connector's own live touch (logged as `[EXIT] no usable book ...`).
+  That fallback is not cosmetic: `maybe_exit` deliberately closes on
+  prices too stale to enter on, and an absolute limit off a dead quote
+  does not re-anchor the way the old percentage did — a stopped feed
+  keeps handing out the same observation, so every reduce-only IOC would
+  come back unmarketable and the position would stay open. If a live send is ever rejected for crossing the
   bound, widen `ENGINE_B_LIVE_SLIPPAGE_BPS` deliberately with the
   observed book in hand — never back to an unbounded market order.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
