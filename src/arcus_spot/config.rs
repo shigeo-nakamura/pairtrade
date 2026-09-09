@@ -368,32 +368,9 @@ impl ArcusSpotRuntimeConfig {
                     &format!("corporate action {} post_event_inventory", event.event_id),
                     inventory,
                 )?;
-                // The resume persists this holding, and every later
-                // checkpoint load re-checks it against the floors. A reverse
-                // split or partial redemption that leaves a leg under its
-                // existing floor would therefore be accepted here and then
-                // wedge `live-tick` permanently on "restored Arcus inventory
-                // is below a configured floor" -- with the wedge appearing
-                // one tick *after* the config that caused it (Codex P1,
-                // pairtrade#309). The floors are token-denominated, so an
-                // event that genuinely shrinks the holding has to move them
-                // in the same change; refusing the config is what makes that
-                // a visible edit rather than an outage.
-                if inventory.token_a < self.inventory_floors.token_a
-                    || inventory.token_b < self.inventory_floors.token_b
-                {
-                    return Err(format!(
-                        "corporate action {} post_event_inventory (token_a={}, token_b={}) is \
-                         below inventory_floors (token_a={}, token_b={}); the resume would \
-                         persist a holding no later checkpoint load can accept -- lower the \
-                         floors in the same config change",
-                        event.event_id,
-                        inventory.token_a,
-                        inventory.token_b,
-                        self.inventory_floors.token_a,
-                        self.inventory_floors.token_b,
-                    ));
-                }
+                // Floors are compared at the resume, where handled state is
+                // known: a completed event's historical holding must not
+                // invalidate a later floor increase (Codex P2, pairtrade#309).
             }
             previous = Some(event);
         }
@@ -630,23 +607,6 @@ corporate_action:
         event.source = "   ".to_string();
         let error = config_with_events(vec![event]).validate().unwrap_err();
         assert!(error.contains("needs a source"), "{error}");
-    }
-
-    #[test]
-    fn rejects_a_reconciled_inventory_below_the_floors() {
-        let mut event = split_event("a", anchor());
-        // A reverse split that leaves token_a under its existing floor. The
-        // resume would persist it and every later checkpoint load would then
-        // refuse to start (Codex P1, pairtrade#309).
-        event.post_event_inventory = Some(ArcusSpotInventory {
-            token_a: Decimal::new(5, 2),
-            token_b: Decimal::ONE,
-        });
-        let config = config_with_events(vec![event]);
-        assert!(config.inventory_floors.token_a > Decimal::new(5, 2));
-        let error = config.validate().unwrap_err();
-        assert!(error.contains("below inventory_floors"), "{error}");
-        assert!(error.contains("lower the floors"), "{error}");
     }
 
     #[test]

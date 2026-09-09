@@ -767,12 +767,8 @@ impl ArcusSpotRuntime {
                         "cannot dispatch an entry plan while the risk halt is active: {halt:?}"
                     ));
                 }
-                if let Some(event) = self.active_corporate_action(dispatched_at) {
-                    return Err(format!(
-                        "cannot dispatch an entry plan inside corporate action {}'s window \
-                         (entries blocked from {})",
-                        event.event_id, event.entry_block_at
-                    ));
+                if let Some(reason) = self.corporate_action_blocks_entries(dispatched_at) {
+                    return Err(format!("cannot dispatch an entry plan: {reason}"));
                 }
             }
             ArcusSpotRotationTrigger::MeanReversionExit
@@ -2880,6 +2876,17 @@ impl ArcusSpotRuntime {
                     ),
                 )
             });
+            // No progress record is ever written for a refused declaration,
+            // so its effective phase has to be honoured here: once its
+            // cutoff is reached the venue may be quoting new units, and the
+            // same rule as for a declared event applies -- no exit sized
+            // from the tracked quantity, no post-event prints into the
+            // window (Codex P1, pairtrade#309).
+            if evaluation_time >= reused.effective_at {
+                gate.force_exit = false;
+                gate.suppress_history = true;
+                gate.suppress_exits = true;
+            }
         }
         gate
     }
@@ -3123,6 +3130,36 @@ impl ArcusSpotRuntime {
         // valuation, and the event is already in
         // `handled_corporate_action_ids`, so corrected quantities can never
         // be applied. Keep it pending instead.
+        // Floors are checked here, on the pending reconciliation, rather
+        // than in config validation: there the check also ran against every
+        // *handled* event's historical holding, so raising a floor later
+        // invalidated the whole config over a quantity that will never be
+        // applied again (Codex P2, pairtrade#309). A reconciled holding
+        // under a floor is still refused -- it would persist a holding no
+        // later checkpoint load accepts -- but as a pending hold the
+        // operator can act on, not a wedge one tick later.
+        if post_event_inventory.token_a < self.config.inventory_floors.token_a
+            || post_event_inventory.token_b < self.config.inventory_floors.token_b
+        {
+            return CorporateActionGate {
+                block_entry: Some(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::CorporateActionResumePending,
+                    format!(
+                        "corporate action {} has a reconciled post_event_inventory (token_a={}, \
+                         token_b={}) below inventory_floors (token_a={}, token_b={}); the resume \
+                         waits for the floors to be lowered or the quantities corrected",
+                        event.event_id,
+                        post_event_inventory.token_a,
+                        post_event_inventory.token_b,
+                        self.config.inventory_floors.token_a,
+                        self.config.inventory_floors.token_b,
+                    ),
+                )),
+                force_exit: false,
+                suppress_history: true,
+                suppress_exits: true,
+            };
+        }
         let Some(equity) = post_event_inventory
             .checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)
         else {
@@ -3289,6 +3326,37 @@ impl ArcusSpotRuntime {
     /// past window whose `entry_block_at` is long gone would become active
     /// again on the next tick, clear the live signal history and re-apply
     /// its `post_event_inventory` over every trade made since.
+    /// Every reason the planning gate would refuse to open a rotation right
+    /// now, for the dispatch validator to refuse the same plan: a declared
+    /// window that has opened, a persisted progress record whose declaration
+    /// was removed or replaced (the planner keeps it and fails closed, so the
+    /// dispatch of a still-fresh signed entry must not be the way around it),
+    /// and a reused handled id (Codex P1, pairtrade#309).
+    fn corporate_action_blocks_entries(&self, at: DateTime<Utc>) -> Option<String> {
+        if let Some(event) = self.active_corporate_action(at) {
+            return Some(format!(
+                "inside corporate action {}'s window (entries blocked from {})",
+                event.event_id, event.entry_block_at
+            ));
+        }
+        if let Some(progress) = self.state.corporate_action.as_ref() {
+            return Some(format!(
+                "corporate action {} opened at {} and is unresolved",
+                progress.event_id, progress.blocked_at
+            ));
+        }
+        self.config
+            .corporate_actions
+            .iter()
+            .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
+            .map(|event| {
+                format!(
+                    "corporate action {} reuses the id of an already handled event",
+                    event.event_id
+                )
+            })
+    }
+
     /// Anything with a handled record is excluded from becoming active --
     /// including a reused id, which is refused by the gate's overlay rather
     /// than allowed to open a window under an old name.
@@ -7325,6 +7393,100 @@ mod tests {
                 hold.detail
             );
         }
+    }
+
+    #[test]
+    fn a_reconciled_holding_under_a_floor_stays_pending() {
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        // Floors are 0.1/0.1; a partial redemption leaves token_b under.
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::new(5, 2),
+        });
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let before = runtime.state.inventory;
+        let resumed_at = anchor + Duration::seconds(12);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionResumePending);
+                assert!(
+                    hold.detail.contains("below inventory_floors"),
+                    "{}",
+                    hold.detail
+                );
+            }
+            other => panic!("expected the resume to stay pending, got {other:?}"),
+        }
+        assert_eq!(runtime.state.inventory, before);
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn an_entry_plan_is_refused_at_dispatch_while_progress_is_unresolved() {
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor + Duration::seconds(5));
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        // A fresh signed entry plan from before the window.
+        let plan = runtime
+            .build_plan(
+                &context(anchor - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                anchor,
+                runtime.state.inventory,
+            )
+            .unwrap();
+        // The window opens, then the declaration is removed: the planner
+        // keeps the record and fails closed; so must dispatch.
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        let inside = anchor + Duration::seconds(6);
+        runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        assert!(runtime.state.corporate_action.is_some());
+        runtime.config.corporate_actions.clear();
+        let error = runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(7))
+            .unwrap_err();
+        assert!(error.contains("is unresolved"), "{error}");
+    }
+
+    #[test]
+    fn a_reused_id_past_its_cutoff_is_fail_closed_for_history_and_exits() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+
+        // A distinct later action under the old id, already effective, with
+        // an overdue rotation open.
+        let later = resumed_at + Duration::seconds(60);
+        let mut reused = corporate_action_event(later - Duration::seconds(10));
+        reused.post_event_inventory = None;
+        runtime.config.corporate_actions = vec![reused];
+        seed_open_rotation(&mut runtime, later - Duration::hours(2));
+        let samples_before = runtime.state.relative_log_price_history.len();
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        assert!(
+            matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
+            "no exit from stale units under a refused declaration: {:?}",
+            outcome.decision
+        );
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+        assert_eq!(
+            runtime.state.relative_log_price_history.len(),
+            samples_before,
+            "no post-event prints"
+        );
     }
 
     #[test]
