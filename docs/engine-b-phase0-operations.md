@@ -726,3 +726,65 @@ filling the disk, verify delivery to the contact point, and record the result in
 #915. Do not mark persistent monitoring complete merely because this endpoint
 or the rule file exists. Weekday recovered-feed write-rate measurement is also
 still required before closing #915.
+## Reproducible boundary preflight (#872)
+
+`scripts/engine_b_boundary_quality.py` audits **closed offline SQLite copies**
+from the Phase 0 collector. Restore the canonical S3 DB archives and verify
+checksums first using the archive procedure above. Do not point this tool at the
+live data directory or remove WAL/SHM files to make a live DB pass its guard.
+
+```bash
+python3 scripts/engine_b_boundary_quality.py \
+  --data-dir /tmp/engine-b-offline \
+  --calendar configs/engine-b/trading_calendar.json \
+  --start 2026-09-08 --end 2026-09-09 \
+  --symbols SKHYNIXUSD SNDK SOXL NVDA EWY USDKRW \
+  --output /tmp/engine-b-boundary-quality.json
+```
+
+The required symbols are explicit. The example is an input set to inspect, not
+a primary-symbol/model freeze. Rerun candidate comparisons with the alternative
+KR/US inputs and preserve each report. The frozen calendar supplies t0 (KRX
+open), t1 (KRX close), and t2 (US cash open), including DST and delayed opens.
+Closed days are `market_closed`, never valid observations. Missing calendar days
+or malformed inputs fail the command with exit 2. A completed report exits 0
+even when boundaries fail: inspect the per-day/per-symbol status and reasons.
+
+Each boundary selects the latest stored complete snapshot **at or before** the
+boundary with receive age at most 30 seconds. It does not fill holes with later
+prices or fall back to an older good snapshot when the latest is malformed.
+It reports nonce presence, locked/crossed/missing-sided/zero-size/nonfinite book
+errors, contiguous level order, Decimal mid/spread/top-five depth, and available
+receive-minus-server timestamp diagnostics. Missing sequence numbers fail the
+preflight; their presence does not prove complete sequence continuity.
+
+The legacy `lighter_mainnet_context` and current `lighter` aliases are accepted
+only when `collector_manifest.config_json` identifies HTTPS/WSS mainnet
+endpoints and the event's symbol/market ID. Conflicting IDs or non-mainnet
+endpoints are rejected. Robinhood rows never substitute for missing mainnet
+inputs. Equal-time candidates from both aliases are ambiguous and fail.
+
+Provide hourly partitions covering each boundary plus/minus 15 minutes; t0
+requires the preceding day's final hour. Missing files fail the preflight and
+are listed explicitly. Connection/order-book `data_gap` and
+`sealed_gap_interval` rows in these partitions are checked for overlap with the
+whole boundary window, including gaps after the selected quote. Recovery rows
+stored **outside** these loaded partitions are not scanned by this preflight.
+The report does not sum missing durations or treat a file's presence as proof
+of continuous collection. Missing gap tables are reported as missing evidence.
+
+Every report includes the SHA-256 and size of each loaded DB, missing input
+names, calendar/code hashes, parameters and an `analysis_hash`. The analyzer
+opens DBs read-only with `immutable=1`, rejects WAL/SHM companions, and rehashes
+inputs after analysis to detect source mutation. Keep its input directory
+immutable for the entire run; there is no live-backup or repair functionality.
+Reports are atomically replaced after a successful analysis.
+
+`boundary_preflight_pass` is a necessary-input check only. **G0-2 remains
+`not_evaluated` in every report.** This tool does not determine full-session
+connection/sequence coverage, clock synchronization, freshness throughout the
+window, late recovery evidence in other partitions, eligibility, arrival-time
+execution VWAP, funding/fees, model selection, or Phase 0A/0B acceptance. A
+boundary passing this check must not be counted as a valid statistical session.
+Those remaining #872 checks need separate daily analysis over the complete
+archive and recovery evidence.
