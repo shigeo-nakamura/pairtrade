@@ -93,6 +93,7 @@ visibly so*, never free.
 from __future__ import annotations
 
 import argparse
+import codecs
 import glob
 import json
 import math
@@ -331,29 +332,34 @@ def read_jsonl(path: Path, tolerate_torn_tail: bool = True) -> Iterable[dict]:
     (Codex, PR #297).
     """
     raw = path.read_bytes()
+    # An incremental decoder separates the two failures exactly, which
+    # neither of the earlier attempts did: replacement-decoding the final
+    # line let a bad byte through as a real record (round 44), and
+    # dropping any final line that fails to decode silently discarded a
+    # *complete* record that merely lacked a trailing newline (round 45).
+    # `final=False` raises only on a genuinely invalid byte; a multibyte
+    # sequence truncated at EOF is buffered and raises only on the
+    # closing `final=True` (Codex, PR #297).
+    decoder = codecs.getincrementaldecoder("utf-8")()
     try:
-        text = raw.decode("utf-8")
+        text = decoder.decode(raw, final=False)
     except UnicodeDecodeError as error:
-        if not tolerate_torn_tail or (raw and raw.endswith(b"\n")):
+        raise SubsidyLedgerError(
+            f"{path}: invalid UTF-8 at byte {error.start}; this is not an incomplete "
+            "character at the end of the file, so it is not a torn trailing write, "
+            "and a substituted character can parse as valid JSON and silently become "
+            "a different key") from error
+    try:
+        text += decoder.decode(b"", final=True)
+    except UnicodeDecodeError as error:
+        # A character cut in half by the write that is still in flight.
+        # The bytes are simply absent; the truncated line then fails to
+        # parse and the torn-tail path drops it.
+        if not tolerate_torn_tail:
             raise SubsidyLedgerError(
-                f"{path}: invalid UTF-8 at byte {error.start} in a complete record; "
-                "a substituted character can parse as valid JSON and silently "
-                "become a different key") from error
-        # The undecodable bytes must be in the unterminated final line,
-        # or this is interior corruption wearing a torn tail's clothes.
-        head, _, _tail = raw.rpartition(b"\n")
-        try:
-            text = head.decode("utf-8") + "\n" if head else ""
-        except UnicodeDecodeError as inner:
-            raise SubsidyLedgerError(
-                f"{path}: invalid UTF-8 at byte {inner.start}, before the final "
-                "line; this is not a torn trailing write") from inner
-        # The torn line is *dropped*, not replacement-decoded. Replacing
-        # its bytes can leave syntactically complete JSON -- a final
-        # leg_fill ending `"variant":"fr\xffeq"}` with no newline yielded
-        # the `fr\ufffdeq` arm and exited 0, which is the exact split the
-        # strict decode exists to prevent. A line we cannot decode is a
-        # line we do not have (Codex, PR #297).
+                f"{path}: the file ends mid-character; nothing appends to this file, "
+                "so that is a damaged export rather than a write in progress"
+            ) from error
     lines = text.splitlines()
     tail_may_be_torn = tolerate_torn_tail and bool(text) and not text.endswith("\n")
     for number, line in enumerate(lines, start=1):
@@ -1834,6 +1840,7 @@ def main(argv: list[str] | None = None) -> int:
     known_arms |= {spec.partition("=")[0] for spec in args.equity}
     pnl = load_pnl(pnl_paths, known_arms)
     equity_costs: dict[str, dict[str, float]] = {}
+    equity_sources: dict[tuple, str] = {}
     for spec in args.equity:
         arm, sep, path = spec.partition("=")
         # Both sides, not just the path: `--equity =PATH` used to load the
@@ -1857,6 +1864,19 @@ def main(argv: list[str] | None = None) -> int:
                 "(the daily deltas are computed across the series, so two files "
                 "cannot simply be merged)"
             )
+        # And one history may not stand in for two arms. An
+        # equity_history is an account-level series, so attributing its
+        # daily deltas to two arms doubles the total cost and fabricates
+        # a per-arm cost for each -- with a 0 exit. By filesystem
+        # identity, so an alias cannot get around it (Codex, PR #297).
+        history_key = _path_key(Path(path))
+        if history_key in equity_sources:
+            parser.error(
+                f"--equity {arm}={path} names the same history already given for "
+                f"{equity_sources[history_key]!r}; an equity series is account-level, "
+                "so attributing its deltas to two arms would double the cost"
+            )
+        equity_sources[history_key] = arm
         equity_costs[arm] = equity_daily_costs(read_jsonl(Path(path)))
 
     rows = build_rows(execution, pnl, equity_costs, points)

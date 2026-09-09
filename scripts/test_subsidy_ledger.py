@@ -1634,19 +1634,24 @@ def test_invalid_utf8_inside_a_complete_record_is_refused():
             b'{"event": "leg_fill", "variant": "fr\xe3' % (TS * 1000))
         assert load_execution([torn])[("2026-09-08", "freq")].fills == 1
 
-        # But a torn line is *dropped*, never replacement-decoded: with
-        # the bad byte mid-line the remaining JSON is syntactically
-        # complete, so replacing it yielded a `fr\ufffdeq` arm and exited
-        # 0 -- the exact split strict decoding exists to prevent
+        # A *complete* final record that merely lacks a trailing newline
+        # is not a torn write, whatever byte is in it. Round 44
+        # replacement-decoded it into a real `fr\ufffdeq` arm; round 45
+        # then dropped it silently, understating volume. Both exited 0.
+        # Only a character cut in half at EOF gets the tolerance
         # (Codex, PR #297).
         torn_complete = Path(tmp) / "execution-freq.jsonl"
         torn_complete.write_bytes(
             b'{"event": "leg_fill", "ts_ms": %d, "variant": "freq", "fill_value": 1}\n'
             b'{"event": "leg_fill", "ts_ms": %d, "variant": "fr\xffeq", "fill_value": 9}'
             % (TS * 1000, TS * 1000))
-        loaded = load_execution([torn_complete])
-        assert sorted(k[1] for k in loaded) == ["freq"], sorted(loaded)
-        assert loaded[("2026-09-08", "freq")].volume_usd == 1.0, loaded
+        try:
+            load_execution([torn_complete])
+        except SubsidyLedgerError as error:
+            assert "invalid UTF-8" in str(error), error
+            assert "not a torn trailing write" in str(error), error
+        else:
+            raise AssertionError("a bad byte in a complete final record must be refused")
 
 
 def test_an_integer_too_large_for_a_float_is_unreadable_not_a_crash():
@@ -1756,6 +1761,42 @@ def test_hard_linked_ledgers_are_read_once():
         both = expand([str(root / "execution-b-*.jsonl")])
         assert len(both) == 2, both
         assert load_execution(both)[("2026-09-08", "b")].volume_usd == 12.0
+
+
+def test_one_equity_history_may_not_cost_two_arms():
+    """An equity_history is an account-level series.
+
+    Attributing its daily deltas to two arms doubles the total cost and
+    fabricates a per-arm cost for each, exit 0. The round-29 check only
+    stopped two histories for one arm (Codex, PR #297).
+    """
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        execution = write(root / "execution-freq.jsonl",
+                          [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                            "fill_value": 1.0}])
+        history = write(root / "equity_history.jsonl",
+                        [{"ts": 1788825600_000, "equity": 1000.0}])
+        alias = root / "alias.jsonl"
+        os.symlink(history, alias)
+        hardlink = root / "hard.jsonl"
+        os.link(history, hardlink)
+
+        for second in (history, alias, hardlink):
+            try:
+                ledger_main(["--exec-glob", str(execution),
+                             "--equity", f"a={history}", "--equity", f"b={second}"])
+            except SystemExit as exit_code:
+                assert exit_code.code == 2, (second, exit_code.code)
+            else:
+                raise AssertionError(f"--equity b={second} must be refused")
+
+        # Two genuinely different histories are the supported case.
+        other = write(root / "equity_history_b.jsonl",
+                      [{"ts": 1788825600_000, "equity": 500.0}])
+        assert ledger_main(["--exec-glob", str(execution),
+                            "--equity", f"a={history}", "--equity", f"b={other}"]) == 0
 
 
 def test_out_may_not_name_an_input_ledger():
