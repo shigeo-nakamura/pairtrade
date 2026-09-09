@@ -2083,6 +2083,51 @@ impl EngineBLiveEngine {
             // PnL -- and then linger as a duplicate claim after that
             // adopted position closed (pairtrade#300 Codex review).
             if p.symbol == self.cfg.us_primary_symbol {
+                // The managed slot may be held by a record that is
+                // itself foreign now (B was configured, A was parked,
+                // and us_primary just went back to A). Parking B first
+                // frees the slot for A's own record, basis and partial
+                // PnL included -- otherwise A was discarded here and
+                // then re-adopted from the exchange a moment later
+                // without any of it (pairtrade#300 Codex review).
+                let occupied_by_foreign = self
+                    .state
+                    .open_position
+                    .as_ref()
+                    .is_some_and(|q| q.symbol != self.cfg.us_primary_symbol);
+                if occupied_by_foreign {
+                    let displaced = self.state.open_position.take().expect("checked");
+                    let live = exchange_position_for(positions, &displaced.symbol);
+                    log::warn!(
+                        "[RECONCILE] parking the {} record to make room for {}, which is \
+                         us_primary again",
+                        displaced.symbol,
+                        p.symbol
+                    );
+                    match live {
+                        Some(live) => {
+                            if side_from_str(&displaced.side) != Some(live.side) {
+                                self.book_orphaned_partial_pnl(
+                                    &displaced,
+                                    "the venue reports the opposite side on the symbol \
+                                     being parked",
+                                );
+                            }
+                            let mid = self
+                                .exit_accounting_price(&displaced.symbol)
+                                .map(|(mid, _)| mid);
+                            kept.push(refreshed_unmanaged(displaced, &live, mid));
+                        }
+                        None => {
+                            // Gone from the venue: nothing left to park,
+                            // but what it realized is still money.
+                            self.book_orphaned_partial_pnl(
+                                &displaced,
+                                "it is flat on the venue and its record is being retired",
+                            );
+                        }
+                    }
+                }
                 if self.state.open_position.is_none() {
                     log::warn!(
                         "[RECONCILE] us_primary is {} again -- taking the parked {} record \
@@ -2094,8 +2139,9 @@ impl EngineBLiveEngine {
                     self.state.open_position = Some(p);
                     self.state_write_pending = true;
                 } else {
-                    // A managed record already exists for this symbol;
-                    // two claims on one symbol cannot both be resumed.
+                    // A managed record for this same symbol already
+                    // exists; two claims on one symbol cannot both be
+                    // resumed.
                     self.book_orphaned_partial_pnl(
                         &p,
                         "a managed record already exists for the same symbol",
@@ -4204,6 +4250,25 @@ impl EngineBLiveEngine {
             }],
             None => vec![],
         };
+        // A saved claim this process has not yet reconciled -- the
+        // account could not be read at startup, say -- is not evidence
+        // of a flat account either. `positions_ready` is false while
+        // that is true, but a consumer reading the position fields
+        // alone would see nothing at all during a venue outage
+        // (pairtrade#300 Codex review).
+        if self.position.is_none() {
+            if let Some(p) = self.state.open_position.as_ref() {
+                positions.push(DashboardPosition {
+                    symbol: p.symbol.clone(),
+                    side: match side_from_str(&p.side) {
+                        Some(dex_connector::OrderSide::Short) => "short",
+                        _ => "long",
+                    },
+                    size: p.open_size.to_string(),
+                    entry_price: p.entry_price.to_string(),
+                });
+            }
+        }
         // An exposure this engine cannot send orders for is still an
         // exposure the account holds. Omitting it reported
         // `has_position=false` on a dashboard while the position was
@@ -6977,6 +7042,70 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 11: coming back to a parked
+    /// symbol must not lose its record to the one now occupying the slot.
+    #[tokio::test]
+    async fn returning_to_a_parked_symbol_keeps_its_saved_basis() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // A was parked while B was traded; both are still open, and
+        // us_primary has just gone back to A (SNDK).
+        let mut parked = persisted_long(0.057, TODAY); // SNDK, basis 1756.92
+        parked.realized_partial_pnl = 0.42;
+        h.engine.state.unmanaged_positions = vec![parked];
+        let mut managed = persisted_long(0.020, TODAY);
+        managed.symbol = "BBB".to_string();
+        h.engine.state.open_position = Some(managed);
+        {
+            let mut positions = h.connector.positions.lock().unwrap();
+            // The venue gives no entry price for SNDK, so a blind
+            // adoption would price it at the mid or not at all.
+            positions.push(snap("SNDK", "0.057", 1, None));
+            positions.push(snap("BBB", "0.020", 1, Some("20.0")));
+        }
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        let resumed = h.engine.position.clone().expect("resumed under management");
+        assert!(
+            (resumed.entry_price - 1756.92).abs() < 1e-9,
+            "the saved basis must survive the swap of slots, got {}",
+            resumed.entry_price
+        );
+        assert!((resumed.realized_partial_pnl - 0.42).abs() < 1e-12);
+        assert_eq!(
+            unmanaged_symbols(&h.engine.state),
+            vec!["BBB".to_string()],
+            "and the displaced record is parked, not dropped"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 11: a saved claim this process
+    /// has not reconciled is not an empty account.
+    #[tokio::test]
+    async fn status_shows_a_claim_that_reconciliation_has_not_confirmed() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.connector
+            .fail_get_positions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            !h.engine.reconciled,
+            "the read failed, so it is still unresolved"
+        );
+
+        h.engine.last_status_write_us = 0;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(status["has_position"], serde_json::json!(true));
+        assert_eq!(status["positions"][0]["symbol"], serde_json::json!("SNDK"));
+        assert_eq!(status["positions_ready"], serde_json::json!(false));
     }
 
     /// pairtrade#300 Codex review round 10: the record is parked through
