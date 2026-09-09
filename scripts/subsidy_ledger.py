@@ -231,10 +231,12 @@ def quantity_moved(record: dict) -> bool:
         value = record.get(key)
         if value is None:
             continue
-        try:
-            quantity = abs(float(value))
-        except (TypeError, ValueError):
+        if is_not_a_number(value):
+            # Including a boolean: read as `0.0` it would claim the fill
+            # moved nothing, quietly excusing a missing notional
+            # (Codex, PR #297).
             return True
+        quantity = abs(float(value))
         # A non-finite quantity is not "no movement": read as zero it
         # leaves an unvalued fill counted as nothing at all, so the day's
         # denominator looks complete while this fill's volume is unknown
@@ -289,11 +291,10 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                 if quantity_moved(record):
                     day.fills_without_value += 1
             else:
-                try:
-                    value = abs(float(notional))
-                except (TypeError, ValueError):
+                if is_not_a_number(notional):
                     day.fills_without_value += 1
                 else:
+                    value = abs(float(notional))
                     # Zero notional on a fill that moved quantity is the
                     # same gap as no notional at all: the volume happened
                     # and its value is missing. Counting it as a valued
@@ -314,10 +315,7 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                         day.fills += 1
             slip = record.get("slippage_usd_vs_decision")
             if slip is not None:
-                try:
-                    slip_value = float(slip)
-                except (TypeError, ValueError):
-                    slip_value = None
+                slip_value = None if is_not_a_number(slip) else float(slip)
                 # Same finite test as the notional: a NaN here is only a
                 # diagnostic, but it still leaves `--out` holding a token
                 # no strict JSON reader will accept.
@@ -432,12 +430,14 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 day.incomplete = True
                 day.incomplete_reasons.add(defect)
                 continue
-            try:
-                pnl = float(record["pnl"])
-            except (TypeError, ValueError):
+            # `is_not_a_number` first: `float(False)` is `0.0`, so
+            # `"pnl": false` was counted as a cycle with a verified zero
+            # cost and left the day complete (Codex, PR #297).
+            if is_not_a_number(record.get("pnl")):
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_pnl")
                 continue
+            pnl = float(record["pnl"])
             # "NaN" and "Infinity" parse. Neither is a cost: a NaN
             # spreads through every total and out of `--out` as
             # non-standard JSON, and an infinity swamps the day.
@@ -459,12 +459,13 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                     day.incomplete = True
                     day.incomplete_reasons.add("funding_gap")
                 continue
-            try:
-                carry = float(funding)
-            except (TypeError, ValueError):
+            # Same trap on the funding side: a boolean carry is not a
+            # zero carry (Codex, PR #297).
+            if is_not_a_number(funding):
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_funding")
                 continue
+            carry = float(funding)
             if not math.isfinite(carry):
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_funding")
@@ -541,6 +542,26 @@ def funding_ticks_seen(record: dict) -> bool:
     if not math.isfinite(count) or count < 0:
         return True
     return count > 0
+
+
+def is_not_a_number(value: object) -> bool:
+    """Is this field something `float()` would silently misread?
+
+    `float(False)` is `0.0` and `float(True)` is `1.0`, so a boolean in a
+    money or count field parsed cleanly and was published as a verified
+    zero -- a malformed row becoming evidence rather than a gap. `None`
+    is not a number either, and neither is a value `float()` refuses.
+    Non-finiteness is deliberately *not* tested here: several callers
+    distinguish "unreadable" from "infinite" in their own way, and the
+    ones that do not test it themselves right after (Codex, PR #297).
+    """
+    if value is None or isinstance(value, bool):
+        return True
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return True
+    return False
 
 
 def funding_ticks_are_zero(record: dict) -> bool:
@@ -668,11 +689,10 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
         if equity is None:
             invalid_days.add(day)
             continue
-        try:
-            stamp, value = float(ts), float(equity)
-        except (TypeError, ValueError):
+        if is_not_a_number(ts) or is_not_a_number(equity):
             invalid_days.add(day)
         else:
+            stamp, value = float(ts), float(equity)
             # "NaN"/"Infinity" parse but are not a close: the next
             # consecutive-day delta would be non-finite and accepted as a
             # known `equity_delta` cost.
@@ -713,11 +733,10 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
             # per point without saying so.
             raise SubsidyLedgerError(
                 f"{path}: a points row needs date, arm and points; got {record!r}")
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError) as error:
+        if is_not_a_number(value):
             raise SubsidyLedgerError(
-                f"{path}: unreadable points value {value!r} for {date}/{arm}") from error
+                f"{path}: unreadable points value {value!r} for {date}/{arm}")
+        parsed = float(value)
         # A negative or non-finite count is a typo in a hand-written
         # file, and a silent one: the row's cost is excluded from
         # `cost_per_point` (the numerator requires points > 0) while its
@@ -1117,6 +1136,19 @@ def main(argv: list[str] | None = None) -> int:
             "--exec-glob matched no files: "
             + ", ".join(repr(pattern) for pattern in unmatched)
             + "; a missing export cannot be told apart from an empty period"
+        )
+    # `--pnl-glob` is optional -- a run with no PnL ledger is supported,
+    # and falls back to `equity_delta`. But a pattern the operator *did*
+    # supply that matches nothing is the same mistake as above, and its
+    # silent effect is worse: the costs it would have carried reappear as
+    # an equity delta or as uncovered days, and the command still exits 0
+    # (Codex, PR #297).
+    unmatched_pnl = [pattern for pattern in args.pnl_glob if not expand([pattern])]
+    if unmatched_pnl:
+        parser.error(
+            "--pnl-glob matched no files: "
+            + ", ".join(repr(pattern) for pattern in unmatched_pnl)
+            + "; omit the option entirely to run without a PnL ledger"
         )
     execution = load_execution(expand(args.exec_glob))
     pnl = load_pnl(expand(args.pnl_glob))

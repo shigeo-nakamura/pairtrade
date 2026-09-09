@@ -23,6 +23,7 @@ from subsidy_ledger import (  # noqa: E402
     render_table,
     funding_ticks_are_zero,
     funding_ticks_seen,
+    is_not_a_number,
     opening_date,
     spans_a_funding_interval,
     expand,
@@ -1214,6 +1215,63 @@ def test_a_string_zero_tick_count_is_still_a_gap():
         row = build_rows({}, {("2026-09-08", "freq"): day})[0]
         assert row.funding_usd is None
         assert row.cost_source != "pnl_ledger"
+
+
+def test_a_boolean_is_never_a_number_anywhere_in_the_ledger():
+    """`float(False)` is `0.0`, so a boolean parsed as a verified zero.
+
+    Applied at every money- or count-bearing field rather than only the
+    one reported: a malformed row must become a gap, never evidence
+    (Codex, PR #297).
+    """
+    assert is_not_a_number(False) and is_not_a_number(True)
+    assert is_not_a_number(None) and is_not_a_number("n/a")
+    assert not is_not_a_number(0) and not is_not_a_number("0") and not is_not_a_number(-1.5)
+
+    inside_the_hour = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        # A boolean realized PnL is a gap, not a zero-cost cycle.
+        bad_pnl = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": False,
+              "hold_secs": 600}],
+        )
+        day = load_pnl([bad_pnl])[("2026-09-08", "freq")]
+        assert day.incomplete and "unreadable_pnl" in day.incomplete_reasons
+        assert day.cycles == 0, "a malformed row is not a counted cycle"
+
+        # And so is a boolean funding carry.
+        bad_carry = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 600, "funding_carry_usd": False}],
+            arm="b",
+        )
+        carry_day = load_pnl([bad_carry])[("2026-09-08", "b")]
+        assert carry_day.incomplete
+        assert "unreadable_funding" in carry_day.incomplete_reasons
+        assert round(carry_day.funding_usd, 6) == 0.0, "nothing was booked from it"
+
+
+def test_a_supplied_pnl_glob_that_matches_nothing_is_refused():
+    """Omitting `--pnl-glob` is supported; mistyping it is not.
+
+    A pattern that matches nothing silently moved the arm's costs to
+    `equity_delta` or to uncovered days, and still exited 0
+    (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        execution = Path(tmp) / "execution-freq.jsonl"
+        execution.write_text("")
+        missing = str(Path(tmp) / "no-such-pnl-*.jsonl")
+        try:
+            ledger_main(["--exec-glob", str(execution), "--pnl-glob", missing])
+        except SystemExit as exit_code:
+            assert exit_code.code == 2, exit_code.code
+        else:
+            raise AssertionError("a supplied pnl pattern matching nothing must be refused")
+        # Omitting it entirely is still fine.
+        assert ledger_main(["--exec-glob", str(execution)]) == 0
 
 
 def test_one_mistyped_exec_glob_among_several_is_refused():
