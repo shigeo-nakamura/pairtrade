@@ -3548,27 +3548,7 @@ impl ArcusSpotRuntime {
     /// "already handled", or its window is skipped entirely (Codex P1,
     /// pairtrade#309). Records that predate fingerprints match by id alone.
     fn handled_record_for(&self, event: &ArcusSpotCorporateActionEvent) -> Option<HandledMatch> {
-        let fingerprint = event.fingerprint();
-        if self
-            .state
-            .handled_corporate_action_fingerprints
-            .iter()
-            .any(|handled| *handled == fingerprint)
-        {
-            return Some(HandledMatch::Same);
-        }
-        let index = self
-            .state
-            .handled_corporate_action_ids
-            .iter()
-            .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))?;
-        match self.state.handled_corporate_action_fingerprints.get(index) {
-            // Absent, or the empty padding a later resume wrote beside it.
-            None => Some(HandledMatch::LegacyById),
-            Some(recorded) if recorded.is_empty() => Some(HandledMatch::LegacyById),
-            Some(recorded) if *recorded == fingerprint => Some(HandledMatch::Same),
-            Some(_) => Some(HandledMatch::ReusedId),
-        }
+        handled_corporate_action_record(&self.state, event)
     }
 
     /// Compares each affected symbol's contract and decimals against what
@@ -3615,9 +3595,38 @@ impl ArcusSpotRuntime {
     }
 }
 
-/// See `ArcusSpotRuntime::handled_record_for`.
+/// How a declaration relates to the handled record. The one implementation
+/// of the rule: the checkpoint store applies it too, so "already handled"
+/// means the same thing at load time as it does inside a tick (Codex P1,
+/// pairtrade#309).
+pub(crate) fn handled_corporate_action_record(
+    state: &ArcusSpotRuntimeState,
+    event: &ArcusSpotCorporateActionEvent,
+) -> Option<HandledMatch> {
+    let fingerprint = event.fingerprint();
+    if state
+        .handled_corporate_action_fingerprints
+        .iter()
+        .any(|handled| *handled == fingerprint)
+    {
+        return Some(HandledMatch::Same);
+    }
+    let index = state
+        .handled_corporate_action_ids
+        .iter()
+        .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))?;
+    match state.handled_corporate_action_fingerprints.get(index) {
+        // Absent, or the empty padding a later resume wrote beside it.
+        None => Some(HandledMatch::LegacyById),
+        Some(recorded) if recorded.is_empty() => Some(HandledMatch::LegacyById),
+        Some(recorded) if *recorded == fingerprint => Some(HandledMatch::Same),
+        Some(_) => Some(HandledMatch::ReusedId),
+    }
+}
+
+/// See `handled_corporate_action_record`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandledMatch {
+pub(crate) enum HandledMatch {
     /// This exact declaration (by fingerprint) was handled.
     Same,
     /// Handled by id on a record written before fingerprints existed.

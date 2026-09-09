@@ -8,10 +8,12 @@
 //! maintained copies of it.
 
 use super::{
+    runtime::{handled_corporate_action_record, HandledMatch},
     ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime,
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use dex_connector::ArcusSpotPair;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -428,6 +430,20 @@ impl ArcusSpotRuntimeCheckpointStore {
     /// turn a missing checkpoint into a successful first-run state: absence
     /// is precisely the reset condition those checks are meant to detect.
     pub fn load_existing(&self, config: &ArcusSpotRuntimeConfig) -> Result<ArcusSpotRuntime> {
+        self.load_existing_at(config, Utc::now())
+    }
+
+    /// `load_existing` with the clock supplied. Window liveness is judged
+    /// against *now*, not against the checkpoint's own watermark: the
+    /// watermark does not advance while the bot is down, so a process that
+    /// was stopped before `entry_block_at` and started after it would
+    /// otherwise accept a config that dropped an already-open window (Codex
+    /// P1, pairtrade#309).
+    pub fn load_existing_at(
+        &self,
+        config: &ArcusSpotRuntimeConfig,
+        now: DateTime<Utc>,
+    ) -> Result<ArcusSpotRuntime> {
         if !self.path.exists() {
             bail!(
                 "Arcus runtime checkpoint {} does not exist",
@@ -448,29 +464,35 @@ impl ArcusSpotRuntimeCheckpointStore {
         // or a stale-unit exit straight through the cutoff. Retiring a
         // declaration whose window had not opened by the last observation is
         // still ordinary housekeeping (Codex P1, pairtrade#309).
-        if let Some(observed_at) = checkpoint.state.last_observation_at {
-            if let Some(dropped) = checkpoint.config.corporate_actions.iter().find(|stored| {
-                observed_at >= stored.entry_block_at
-                    && !checkpoint
-                        .state
-                        .handled_corporate_action_ids
-                        .iter()
-                        .any(|handled| handled.eq_ignore_ascii_case(&stored.event_id))
-                    && !config
-                        .corporate_actions
-                        .iter()
-                        .any(|event| event.fingerprint() == stored.fingerprint())
-            }) {
-                bail!(
-                    "Arcus runtime checkpoint {} was written under a config declaring corporate \
-                     action {} (window open since {}, not yet handled), which the supplied \
-                     config does not declare. Removing a live window drops the guard it exists \
-                     to be; restore the declaration, or resolve the window first",
-                    self.path.display(),
-                    dropped.event_id,
-                    dropped.entry_block_at.to_rfc3339(),
-                );
-            }
+        let live_by = checkpoint
+            .state
+            .last_observation_at
+            .map(|observed_at| observed_at.max(now))
+            .unwrap_or(now);
+        if let Some(dropped) = checkpoint.config.corporate_actions.iter().find(|stored| {
+            live_by >= stored.entry_block_at
+                // "Handled" by the same rule a tick applies: an id whose
+                // recorded fingerprint belongs to a *different* event is a
+                // reused label, not a completed window, and dropping it
+                // would remove a guard that was never resolved.
+                && !matches!(
+                    handled_corporate_action_record(&checkpoint.state, stored),
+                    Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
+                )
+                && !config
+                    .corporate_actions
+                    .iter()
+                    .any(|event| event.fingerprint() == stored.fingerprint())
+        }) {
+            bail!(
+                "Arcus runtime checkpoint {} was written under a config declaring corporate \
+                 action {} (window open since {}, not yet handled), which the supplied config \
+                 does not declare. Removing a live window drops the guard it exists to be; \
+                 restore the declaration, or resolve the window first",
+                self.path.display(),
+                dropped.event_id,
+                dropped.entry_block_at.to_rfc3339(),
+            );
         }
         let drift = classify_config_drift(&checkpoint.config, config);
         if !drift.state_invalidating.is_empty() {
@@ -817,7 +839,8 @@ mod tests {
 
         let mut dropped = declared.clone();
         dropped.corporate_actions.clear();
-        let error = match store.load_existing(&dropped) {
+        let inside = anchor + chrono::Duration::minutes(2);
+        let error = match store.load_existing_at(&dropped, inside) {
             Ok(_) => panic!("expected the dropped window to be refused"),
             Err(error) => error.to_string(),
         };
@@ -826,15 +849,49 @@ mod tests {
         // Renaming it is not removing it: same fingerprint, still declared.
         let mut renamed = declared.clone();
         renamed.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
-        assert!(store.load_existing(&renamed).is_ok());
+        assert!(store.load_existing_at(&renamed, inside).is_ok());
 
-        // And retiring a window that had not opened is ordinary housekeeping.
+        // Downtime does not make a window un-live: the watermark stays before
+        // `entry_block_at` while the clock moves past it.
         let mut early_state = state.clone();
         early_state.last_observation_at = Some(anchor - chrono::Duration::hours(1));
         store
-            .persist(&ArcusSpotRuntime::from_state(declared.clone(), early_state).unwrap())
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), early_state.clone()).unwrap())
             .unwrap();
-        assert!(store.load_existing(&dropped).is_ok());
+        let error = match store.load_existing_at(&dropped, inside) {
+            Ok(_) => panic!("a window open by the clock is live even after downtime"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Retiring one that has not opened by either clock is housekeeping.
+        assert!(store
+            .load_existing_at(&dropped, anchor - chrono::Duration::minutes(1))
+            .is_ok());
+
+        // A reused id is not "handled": the recorded fingerprint is another
+        // event's, so the declaration is still an unresolved window.
+        let mut reused_state = state.clone();
+        reused_state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        reused_state.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), reused_state).unwrap())
+            .unwrap();
+        let error = match store.load_existing_at(&dropped, inside) {
+            Ok(_) => panic!("a reused id must not read as handled"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Genuinely handled (same fingerprint): removal is fine.
+        let mut handled_state = state.clone();
+        handled_state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        handled_state.handled_corporate_action_fingerprints =
+            vec![declared.corporate_actions[0].fingerprint()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), handled_state).unwrap())
+            .unwrap();
+        assert!(store.load_existing_at(&dropped, inside).is_ok());
     }
 
     #[test]
