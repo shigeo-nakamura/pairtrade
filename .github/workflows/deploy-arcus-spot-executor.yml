@@ -9,6 +9,14 @@ on:
       - master
     paths:
       - ".github/workflows/deploy-arcus-spot-executor.yml"
+      # bot-strategy#973: the test job lives in a reusable workflow now, and
+      # this workflow is its only release-profile caller. Without this entry
+      # a change to the shared file would be exercised by ci.yml in debug
+      # only, and a release-only mistake in it would stay green until the
+      # next executor source change hit it -- blocking that deploy instead
+      # of the one that introduced it.
+      - ".github/workflows/_test-arcus-spot-live.yml"
+      - ".github/workflows/_resolve-dex-connector-ref.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
