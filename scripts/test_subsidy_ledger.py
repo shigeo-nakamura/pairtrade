@@ -891,7 +891,9 @@ def test_the_cross_day_marker_does_not_touch_an_equity_costed_day():
             ],
         )
         day = load_pnl([path])[("2026-09-08", "freq")]
-        assert day.cross_day_cycles == 1 and day.incomplete
+        # 2: the overnight close, plus the placeholder whose own hold is
+        # unreadable, which the fail-safe also counts as a crossing.
+        assert day.cross_day_cycles == 2 and day.incomplete
 
         row = build_rows(
             {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
@@ -1014,6 +1016,74 @@ def test_an_entry_marker_alone_does_not_cost_a_day_at_zero():
         assert opening.cost_source is None
         arm = summarize(rows)["arms"][0]
         assert arm["uncosted_volume_usd"] == 500_000.0
+
+
+def test_the_opening_day_is_marked_even_when_the_close_cannot_be_costed():
+    """The entry leg is in the execution ledger whatever the PnL says.
+
+    An overnight close with an unreadable PnL still leaves its entry
+    notional on the previous day, so that day's own rates are over a
+    denominator that is too big -- and the marker used to be created
+    only after every PnL rejection.
+    """
+    close = 1788868800 + 3600
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_fill", "pnl": "NaN",
+              "hold_secs": 20 * 3600}],
+        )
+        days = load_pnl([path])
+        assert days[("2026-09-08", "freq")].incomplete
+        assert days[("2026-09-07", "freq")].cross_day_entries == 1
+
+    # A simulated close moved no real quantity, so it marks nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_dry_run", "pnl": -5.0,
+              "hold_secs": 20 * 3600}],
+            arm="b",
+        )
+        days = load_pnl([path])
+        assert ("2026-09-07", "b") not in days
+
+
+def test_an_unreadable_opening_date_suppresses_the_rates():
+    """`None` from `opening_date` is not "it did not cross"."""
+    close = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_fill", "pnl": -100.0,
+              "hold_secs": -600, "funding_carry_usd": 0.0}],
+        )
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.cross_day_cycles == 1, "an unknowable crossing is treated as one"
+        row = build_rows(
+            {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+            {("2026-09-08", "freq"): day},
+        )[0]
+        assert row.cost_usd == 100.0
+        assert row.cost_per_musd_volume is None
+
+
+def test_a_row_without_a_timestamp_is_always_fatal():
+    """Even with no `pnl`: the days it might belong to cannot be cleared."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [
+                {"ts": TS, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600},
+                {"source": "recovery_no_pnl", "pnl_available": False},
+            ],
+        )
+        try:
+            load_pnl([path])
+        except SubsidyLedgerError as error:
+            assert "no `ts`" in str(error), error
+        else:
+            raise AssertionError("a row with no ts must raise even without a pnl")
 
 
 def main() -> int:

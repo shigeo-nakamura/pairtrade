@@ -366,19 +366,38 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
             ts = record.get("ts")
             if ts is None:
                 # Not attributable to any day, so it cannot be counted and
-                # cannot be blamed on a day either. A row carrying a PnL
-                # without a timestamp is a broken writer, not a gap.
-                if record.get("pnl") is not None:
-                    raise SubsidyLedgerError(
-                        f"{path}: a PnL row has no `ts`, so the day it belongs to "
-                        "cannot be determined")
-                continue
+                # cannot be blamed on a day either -- which also means the
+                # days it might belong to cannot be shown to be complete.
+                # Every archived row carries `ts`, so this is a broken
+                # writer whatever else the row holds, and it is fatal
+                # regardless of whether a `pnl` came with it
+                # (Codex, PR #297).
+                raise SubsidyLedgerError(
+                    f"{path}: a PnL row has no `ts`, so the day it belongs to "
+                    f"cannot be determined: {record!r}")
             try:
                 key = (utc_date(float(ts)), arm)
             except (TypeError, ValueError) as error:
                 raise SubsidyLedgerError(f"{path}: unreadable `ts` {ts!r}") from error
             day = days[key]
             defect = pnl_row_defect(record)
+            # Derived *before* any rejection below: the entry leg of an
+            # overnight cycle sits in the execution ledger whatever this
+            # row's PnL turned out to be, so the opening day's denominator
+            # is contaminated even when this close cannot be costed. A
+            # simulated close is the one kind that moved no real quantity
+            # (Codex, PR #297).
+            if str(record.get("source")) != "exit_dry_run":
+                opened_on = opening_date(record)
+                if opened_on is None:
+                    # Whether it crossed midnight is unknowable, so the
+                    # fail-safe is to treat this day's denominator as
+                    # spanning two -- the same direction every other
+                    # unreadable input takes.
+                    day.cross_day_cycles += 1
+                elif opened_on != key[0]:
+                    day.cross_day_cycles += 1
+                    days[(opened_on, arm)].cross_day_entries += 1
             if defect is not None:
                 day.incomplete = True
                 day.incomplete_reasons.add(defect)
@@ -398,16 +417,6 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             day.realized_pnl_usd += pnl
             day.cycles += 1
-            opened_on = opening_date(record)
-            if opened_on is not None and opened_on != key[0]:
-                day.cross_day_cycles += 1
-                # And the day the entry landed on: its execution volume
-                # holds that leg while none of this cost does, so its own
-                # rates are over a denominator that is too big. The entry
-                # date may have no PnL rows of its own, so this can create
-                # the day -- `build_rows` costs a day from this ledger
-                # only when it actually holds a realized cycle.
-                days[(opened_on, arm)].cross_day_entries += 1
             funding = record.get("funding_carry_usd")
             if funding is None:
                 # A positive `funding_ticks_observed` is the row's own
@@ -440,6 +449,11 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
 
 def opening_date(record: dict) -> str | None:
     """The UTC date this cycle opened on, or `None` when it cannot be read.
+
+    `None` is not "it did not cross": the caller treats an unknown
+    opening date as a crossing, because a row whose own opening date is
+    unreadable cannot be shown to be aligned with its day (Codex,
+    PR #297).
 
     The two ledgers are keyed differently: `load_execution` files a fill
     under the date it happened, `load_pnl` files a whole realized cycle
