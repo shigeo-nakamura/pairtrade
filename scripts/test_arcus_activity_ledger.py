@@ -816,6 +816,37 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, history, since=orphan_at + timedelta(minutes=1))
         self.assertIn(20, report["ledger_swaps_outside_window"])
 
+    def test_an_unmatched_leg_inside_the_stream_withholds_the_verdict(self):
+        """Pairing runs over the whole stream, so such a leg is not harmless.
+
+        An unmatched exit before `--since` still reduced the position, so
+        a later in-window exit cannot pair the rotation: it looks open,
+        its loss and volume leave the totals, and coverage said complete.
+        """
+        events, history = baseline_round_trip()
+        orphan_at = ENTRY_AT + timedelta(minutes=5)
+        history.append(attempt(20, orphan_at, sell="NVDA", buy="AMD",
+                               sell_quantity="0.1", buy_quantity="0.2"))
+        report = report_for(events, history, since=orphan_at + timedelta(minutes=1))
+
+        # Still produced -- refusing outright was the round-5 complaint.
+        self.assertEqual(report["coverage"]["unmatched_legs_in_stream"], [20])
+        self.assertIn(20, report["ledger_swaps_outside_window"])
+        # But not with a clean verdict over pairing that may be short a leg.
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+        self.assertIn("pairing may be short a leg",
+                      ledger_tool.render_markdown(report))
+
+    def test_an_unmatched_attempt_outside_the_stream_is_still_harmless(self):
+        """It cannot take part in pairing, so it is only reported."""
+        events, history = baseline_round_trip()
+        old = attempt(5, ENTRY_AT - timedelta(days=30), sell="NVDA", buy="AMD",
+                      sell_quantity="0.1", buy_quantity="0.2")
+        report = report_for(events, [old] + history)
+        self.assertEqual(report["coverage"]["unmatched_legs_in_stream"], [])
+        self.assertTrue(report["coverage"]["complete"])
+
     def test_a_gas_top_up_across_a_swap_is_not_a_negative_cost(self):
         """A wallet inflow between the two snapshots is not cheaper gas.
 
@@ -866,7 +897,9 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, history, until=cutoff)
         self.assertEqual(
             report["window"]["to"], cutoff.isoformat().replace("+00:00", "Z"))
-        self.assertLessEqual(report["window"]["from"], report["window"]["to"])
+        # One-sided, so the open start is reported as open rather than as
+        # a derived instant after the cutoff.
+        self.assertIsNone(report["window"]["from"])
         self.assertEqual(report["days"], [])
 
     def test_a_one_sided_bound_stays_open_on_the_side_the_caller_left_open(self):
@@ -909,9 +942,13 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, history,
                             since=datetime(2026, 9, 5, tzinfo=timezone.utc))
 
-        self.assertLessEqual(report["window"]["from"], report["window"]["to"])
-        # And it covers the row it emitted, rather than ending before it.
-        self.assertGreaterEqual(report["window"]["to"], "2026-09-05T00:00:01Z")
+        self.assertIsNone(report["window"]["to"], "an open end is reported as open")
+        self.assertEqual(
+            report["window"]["from"],
+            datetime(2026, 9, 5, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"))
+        # And it covers the row it emitted: an open end cannot end before
+        # it, which is what the inverted interval used to do.
+        self.assertEqual(report["days"][0]["date"], "2026-09-05")
 
     def test_the_freshness_bound_truncates_the_way_the_runtime_does(self):
         """A swap the runtime accepted must not become unmatchable here.

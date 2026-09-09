@@ -514,7 +514,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                      since: datetime | None = None,
                      until: datetime | None = None,
                      max_plan_age_secs: int = HARD_MAX_PLAN_AGE_SECS,
-                     ) -> tuple[list[Swap], list[tuple[int, datetime]]]:
+                     ) -> tuple[list[Swap], list[tuple[int, datetime]], list[int]]:
     """Price every reconciled swap the event window actually covers.
 
     Coverage is decided by the *pricing event*, not by the dispatch clock.
@@ -535,21 +535,27 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     start, end = window
     swaps: list[Swap] = []
     out_of_window: list[tuple[int, datetime]] = []
+    unmatched_in_stream: list[int] = []
     for attempt in reconciled_attempts(ledger):
         dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
         event = find_event(attempt, index, max_plan_age_secs)
         if event is None:
-            # Inside the stream *and* inside what the caller asked about.
-            # A stream can span more than the requested report, and a
-            # manual or offline attempt outside the requested bounds is
-            # something the CLI promises to ignore -- raising on it
-            # refused to produce a report the caller can legitimately ask
-            # for (PR #298 Codex review).
-            if start <= dispatched_at <= end and within(dispatched_at, since, until):
+            inside_stream = start <= dispatched_at <= end
+            if inside_stream and within(dispatched_at, since, until):
                 raise ActivityLedgerError(
                     f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or "
                     f"before {attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- "
                     "the event window probably does not cover this swap")
+            if inside_stream:
+                # Inside the priced history but outside the caller's
+                # bounds. Not fatal -- a report the caller can ask for
+                # must still be produced -- but not harmless either:
+                # pairing runs over the whole stream, so a leg missing
+                # from it can leave a rotation that really closed looking
+                # open, taking its loss and volume out of the totals
+                # while coverage says complete. It is a coverage hole
+                # (PR #298 Codex review, rounds 5 and 11).
+                unmatched_in_stream.append(int(attempt["sequence"]))
             out_of_window.append((int(attempt["sequence"]), dispatched_at))
             continue
         swap = swap_from_attempt(attempt, event)
@@ -561,7 +567,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     # The dispatch time rides along so the caller can tell an unpriceable
     # swap it was asked about from one it was not: the first is a hole in
     # the answer, the second is simply outside the question.
-    return swaps, sorted(out_of_window)
+    return swaps, sorted(out_of_window), sorted(unmatched_in_stream)
 
 
 def pair_round_trips(swaps: Sequence[Swap]) -> tuple[list[RoundTrip], list[Swap]]:
@@ -728,7 +734,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # belongs to the day the caller named.
     if since is not None and until is not None and since > until:
         raise ActivityLedgerError("--since is after --until")
-    swaps, out_of_window = reconciled_swaps(
+    swaps, out_of_window, unmatched_in_stream = reconciled_swaps(
         ledger, index, stream, since, until, max_plan_age_secs)
     # Pair over everything the stream priced, so a rotation that spans a
     # requested bound is still recognised as one rotation.
@@ -786,6 +792,16 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     if since is None:
         window_from = min(window_from, window_to)
     report_window = (window_from, window_to)
+    # A one-sided request is answered over an *open* interval -- that is
+    # what the coverage tests do -- so reporting a derived instant on the
+    # open side made the metadata contradict the verdict: a hole after
+    # `window.to` could be listed as requested-but-unpriceable. The open
+    # side is reported as null instead. With no bounds at all, both ends
+    # are the export's own span, which is the question in that case
+    # (PR #298 Codex review).
+    one_sided = (since is None) != (until is None)
+    reported_from = None if one_sided and since is None else window_from
+    reported_to = None if one_sided and until is None else window_to
 
     # Two ways this window can be short a rotation, and both make the stop
     # verdict undecidable. The report still says what it can measure, but it
@@ -883,12 +899,26 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # after the last observation could not have been priced by this
     # export anyway (PR #298 Codex review).
     pending_outside = [pending_row] if pending is not None and not in_window else []
-    complete = not orphaned and not unpriceable and not unmeasured_gas and not unresolved
+    complete = (
+        not orphaned
+        and not unpriceable
+        and not unmeasured_gas
+        and not unresolved
+        and not unmatched_in_stream
+    )
     return {
         "schema_version": 1,
         "window": {
-            "from": report_window[0].isoformat().replace("+00:00", "Z"),
-            "to": report_window[1].isoformat().replace("+00:00", "Z"),
+            "from": (
+                reported_from.isoformat().replace("+00:00", "Z")
+                if reported_from is not None
+                else None
+            ),
+            "to": (
+                reported_to.isoformat().replace("+00:00", "Z")
+                if reported_to is not None
+                else None
+            ),
         },
         "event_stream": {
             "from": stream[0].isoformat().replace("+00:00", "Z"),
@@ -937,6 +967,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "requested_but_unpriceable": unpriceable,
             "gas_unmeasurable": unmeasured_gas,
             "unresolved_attempts": unresolved,
+            "unmatched_legs_in_stream": unmatched_in_stream,
             "pending_outside_window": pending_outside,
         },
         "stop_rule": {
@@ -984,6 +1015,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             reasons.append(
                 "covers swaps the event stream cannot price at all (ledger sequences "
                 + ", ".join(str(s) for s in coverage["requested_but_unpriceable"]) + ")")
+        if coverage.get("unmatched_legs_in_stream"):
+            reasons.append(
+                "holds swaps inside the priced history that no event matches, so pairing may "
+                "be short a leg (ledger sequences "
+                + ", ".join(str(s) for s in coverage["unmatched_legs_in_stream"]) + ")")
         if coverage.get("unresolved_attempts"):
             reasons.append(
                 "holds an attempt that may be on chain but is not reconciled ("
