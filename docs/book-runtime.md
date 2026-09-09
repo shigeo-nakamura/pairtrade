@@ -64,10 +64,10 @@ sizing:
   rebalance_deadband_usd: 5       # diffs below this are not traded at all
 
 execution:
-  slippage_bps: 50                # IOC price cap **against the mid** (converted to the venue's touch-relative cap at send); also the pre-send drift guard vs the sizing mid
+  slippage_bps: 50                # IOC price cap **against the mid**, sent as the absolute limit `mid * (1 +/- bps)`; also the pre-send drift guard vs the sizing mid
   max_attempts: 3                 # per intent, on partial fill
   fill_confirm_timeout_secs: 15   # venue position must reflect the fill within this
-  allow_venue_protection_fallback: false  # keep false: Lighter has a capped IOC since v4.7.22 (#918); true = ±20% venue protection
+  allow_venue_protection_fallback: false  # keep false: Lighter has an absolute-limit IOC since v4.7.24 (#978); true = ±20% venue protection
   paper_slippage_bps: 5           # dry_run fill = mid +/- this
   paper_fee_bps: 0
 
@@ -240,21 +240,31 @@ reduce_only }`.
   `slippage_bps` of the intent's sizing price in the adverse direction,
   otherwise the intent errors out unsent and the residual is re-planned
   next tick. `slippage_bps` is a bound **against the mid** on every path
-  (paper fill, drift guard, live cap). The venue's IOC crosses the
-  *touch* by the bps it is handed, so the executor converts the bound
-  with the half-spread of the last WS update (`bound − half-spread`,
-  multiplicatively, floored) and sends `create_order_taker_ioc(symbol,
-  qty, side, converted_bps, reduce_only)`; on a 90/110 book a 50 bps
-  bound is therefore a refusal, not a cap at 110.55 (bot-strategy#971).
-  When the half-spread alone exceeds the bound, or no WS touch was seen
-  for the symbol (a ticker-priced adopted leg), an **entry is not sent**
-  — reported as a pre-send abort, no attempt spent, re-planned next tick
-  — while a **reduce-only order still goes out**: at the touch (1 bp) on
-  a torn book, or with the configured bps against the venue's own touch
-  when no book was observed, because a position left inside a tear is
-  the worse outcome. Lighter has had a price-capped IOC
-  since dex-connector **v4.7.22** (bot-strategy#918), so this is the
-  normal path there. On a venue that still lacks one, the order is sent
+  (paper fill, drift guard, live cap), so the executor sends the bound
+  itself: `create_order_taker_ioc_at(symbol, qty, side, mid * (1 ±
+  slippage_bps), reduce_only)`, priced off the same WS snapshot the
+  drift guard judged (dex-connector **v4.7.24**, bot-strategy#978). The
+  venue rounds that price inward to its tick and never re-anchors it, so
+  a spread that widens between the snapshot and the submit cannot move
+  the cap — which is what the earlier mid-to-touch bps conversion could
+  not prevent and recorded as a residual (bot-strategy#971). On a 90/110
+  book a 50 bps bound is a refusal, not a cap at 110.55.
+  When the bounded price would not reach the touch, or no WS touch was
+  seen for the symbol (a ticker-priced adopted leg, or a crossed book),
+  an **entry is not sent** — reported as a pre-send abort, no attempt
+  spent, re-planned next tick — while a **reduce-only order still goes
+  out**: at the opposing touch on a torn book, or, with no book of our
+  own to price against, with the configured bps against the venue's own
+  touch (`create_order_taker_ioc`, the one remaining percentage path),
+  because a position left inside a tear is the worse outcome. The
+  absolute-limit path carries **no staleness gate inside the connector**
+  (there is no reference price there to age-check), so freshness is the
+  runtime's own: the quote must be a WS update under
+  `WS_PRICE_MAX_AGE_SECS` (30 s) or the entry is refused, and it is the
+  same snapshot the drift guard judges. Lighter
+  has had a price-capped IOC since dex-connector **v4.7.22**
+  (bot-strategy#918) and the absolute-limit one since **v4.7.24**, so
+  this is the normal path there. On a venue that still lacks one, the order is sent
   as `create_order(price=None)` with the venue's ±20 % protection price
   **only if** `execution.allow_venue_protection_fallback` is true, else
   it is not sent — and that refusal is reported as a pre-send abort, so
@@ -448,9 +458,9 @@ bar date, and it is ticked there, with that date's closes.
   Hyperliquid instance (even DRY_RUN) needs a build with
   `hyperliquid-sdk`.
 - Live execution is **Lighter-only** for now: orders go out as
-  `create_order_taker_ioc`, a LIMIT + `TIF_IOC` bounded by the configured
-  `slippage_bps` converted from the mid to the touch (§6, bot-strategy#971;
-  dex-connector **v4.7.22**, bot-strategy#918). Up to
+  `create_order_taker_ioc_at`, a LIMIT + `TIF_IOC` at the configured
+  `slippage_bps` from the observed mid (§6, bot-strategy#978;
+  dex-connector **v4.7.24**). Up to
   v4.7.21 Lighter had no price-capped IOC and live meant
   `create_order(price=None)` with the venue's ±20 % protection price —
   see `allow_venue_protection_fallback`, which no longer needs to be

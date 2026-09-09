@@ -87,24 +87,27 @@ pub struct SizingConfig {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
     /// Price bound for a live send, **against the mid** -- the same basis
-    /// as `paper_slippage_bps` and the pre-send drift guard. The venue's
-    /// `create_order_taker_ioc` crosses the touch by what it is handed, so
-    /// the executor converts this with the observed half-spread before
-    /// sending (bot-strategy#971): on a book whose half-spread alone
-    /// exceeds it, an entry is not sent (no attempt spent) and a
-    /// reduce-only order crosses at the touch.
+    /// as `paper_slippage_bps` and the pre-send drift guard. The executor
+    /// sends it as the absolute limit `mid * (1 +/- slippage_bps)` off
+    /// the snapshot the drift guard judged, which the venue rounds inward
+    /// and never re-anchors (`create_order_taker_ioc_at`,
+    /// bot-strategy#978). On a book whose touch lies outside it, an entry
+    /// is not sent (no attempt spent) and a reduce-only order crosses at
+    /// the touch.
     pub slippage_bps: u32,
     pub max_attempts: u32,
     pub fill_confirm_timeout_secs: i64,
-    /// When a venue has no price-capped IOC (`create_order_taker_ioc`
+    /// When a venue has no price-capped IOC (`create_order_taker_ioc_at`,
+    /// or `create_order_taker_ioc` on the no-book reduce-only path,
     /// answers `Permanent`), a live order falls back to
     /// `create_order(price = None)` -- the venue's own ±20 % protection
     /// price instead of `slippage_bps` -- but only if this is true.
     /// Default false = fail closed (the order is not sent).
     ///
     /// Lighter needed it up to dex-connector v4.7.21 and does **not**
-    /// since v4.7.22 (bot-strategy#918), so on Lighter there is no
-    /// longer any reason to turn this on.
+    /// since v4.7.22 (bot-strategy#918) / v4.7.24 (bot-strategy#978), so
+    /// on Lighter there is no longer any reason to turn this on. The
+    /// runtime refuses live on any other venue anyway (`book_runtime.rs`).
     #[serde(default)]
     pub allow_venue_protection_fallback: bool,
     pub paper_slippage_bps: f64,
@@ -365,13 +368,13 @@ impl BookConfig {
         if ex.paper_slippage_bps >= 10_000.0 {
             bail!("execution.paper_slippage_bps must be < 10000 (100%)");
         }
-        // The live budget is handed to the venue's price-capped IOC, whose
-        // `slippage_bps` is `1..=1000` (dex-connector `create_order_taker_ioc`),
-        // after the mid-to-touch conversion (bot-strategy#971) -- which
-        // only ever shrinks it and clamps at 1000. A wider configured value
-        // would therefore mean one thing on a tight book (clamped) and
-        // another on the no-touch reduce-only path (passed through and
-        // refused by the connector), so it is rejected here instead.
+        // The live budget goes out as an absolute limit price
+        // (bot-strategy#978), which has no bps range of its own -- but the
+        // reduce-only path with no observed book still hands the figure
+        // straight to `create_order_taker_ioc`, whose `slippage_bps` is
+        // `1..=1000`. A wider configured value would mean a 10 % bound on
+        // every ordinary send and a connector refusal on exactly the send
+        // that must not be refused, so it is rejected here instead.
         if !(1..=1000).contains(&ex.slippage_bps) {
             bail!(
                 "execution.slippage_bps must be within 1..=1000 (the connector's IOC cap range), got {}",
@@ -953,9 +956,10 @@ mod tests {
 
     #[test]
     fn rejects_live_slippage_outside_the_connector_ioc_range() {
-        // The venue IOC takes 1..=1000 and the mid-to-touch conversion
-        // clamps there (bot-strategy#971): a wider value would silently
-        // mean 1000 on one send path and be refused on another.
+        // The absolute-limit send has no range of its own, but the
+        // no-book reduce-only fallback still passes this straight to the
+        // venue IOC, which takes 1..=1000 (bot-strategy#978): a wider
+        // value would be refused on exactly the send that must go out.
         let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
         for ok in [1, 50, 1000] {
             c.execution.slippage_bps = ok;

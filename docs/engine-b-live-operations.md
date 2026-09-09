@@ -114,19 +114,31 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
-- **Both legs are bounded taker IOCs** (bot-strategy#918, dex-connector
-  v4.7.22): `submit_order` sends `create_order_taker_ioc` at a marketable
-  limit `ENGINE_B_LIVE_SLIPPAGE_BPS` (default **50**) from the touch,
-  tick-rounded inward, remainder cancelled. This replaces
-  `create_order(price = None)`, whose ±20 % protection price bounded a
-  $100 lot at $20 per leg. The value is validated at startup against the
-  connector's accepted `1..=1000`: the process refuses to start outside
-  it rather than losing a session day to a rejected send (only one entry
-  `sendTx` is allowed per day, G-4). Two consequences at the first live
-  cycle: a book the connector considers stale now **fails the send**
-  instead of pricing off a stale ticker, and a size that truncates to
-  zero at the market's size decimals is rejected instead of being forced
-  up to one size tick. If a live send is ever rejected for crossing the
+- **Both legs are bounded taker IOCs** (bot-strategy#918, #978;
+  dex-connector v4.7.24): `submit_order` sends
+  `create_order_taker_ioc_at` at the marketable limit
+  `mid * (1 ± ENGINE_B_LIVE_SLIPPAGE_BPS)` (default **50**) computed from
+  this process's own observation, tick-rounded inward by the connector,
+  remainder cancelled. `ENGINE_B_LIVE_SLIPPAGE_BPS` is therefore a bound
+  against the **mid** and the venue does not re-anchor it on its own
+  touch at submit time (which the earlier touch-relative bps send could,
+  #918's residual). This replaces `create_order(price = None)`, whose
+  ±20 % protection price bounded a $100 lot at $20 per leg. The value is
+  still validated at startup against the connector's accepted `1..=1000`,
+  because the one path left without a book of its own to price against --
+  a reduce-only exit with no observed quote -- still sends it as a
+  percentage: the process refuses to start outside it rather than losing
+  a session day to a rejected send (only one entry `sendTx` is allowed
+  per day, G-4). Two consequences at the first live
+  cycle: a size that truncates to zero at the market's size decimals is
+  rejected instead of being forced up to one size tick, and **freshness
+  is now entirely this process's job** — the absolute-limit path
+  deliberately carries no staleness gate of its own (there is no
+  reference price in the connector to age-check), where the older
+  percentage path failed the send on a book the connector considered
+  stale. The engine's own gates are what stand in for it: an entry needs
+  a usable observation (`max_staleness_secs`, same feed generation) and
+  the price it is bounded against is that same observation. If a live send is ever rejected for crossing the
   bound, widen `ENGINE_B_LIVE_SLIPPAGE_BPS` deliberately with the
   observed book in hand — never back to an unbounded market order.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,

@@ -505,6 +505,35 @@ impl DexConnector for DexConnectorBox {
         result
     }
 
+    // bot-strategy#978: explicit forward, same rule as the slippage
+    // variant above -- the trait has no default, so a missing forward is a
+    // compile error rather than a silent degradation, but the rate-limit
+    // reporting only happens here.
+    async fn create_order_taker_ioc_at(
+        &self,
+        symbol: &str,
+        size: Decimal,
+        side: OrderSide,
+        limit_price: Decimal,
+        reduce_only: bool,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let result = self
+            .inner
+            .create_order_taker_ioc_at(symbol, size, side, limit_price, reduce_only)
+            .await;
+        if let Err(ref err) = result {
+            self.report_rate_limit(
+                "create_order_taker_ioc_at",
+                &format!(
+                    "{} | side={:?} size={} limit_price={}",
+                    symbol, side, size, limit_price
+                ),
+                err,
+            );
+        }
+        result
+    }
+
     // bot-strategy#471: explicit forward so the amend path reaches the
     // connector impl instead of silently degrading to the trait default
     // (`DexError::Permanent`). Per feedback_dex_connector_box_forward.md.
