@@ -67,7 +67,7 @@ execution:
   slippage_bps: 50                # IOC price cap; also a pre-send drift guard vs the sizing mid
   max_attempts: 3                 # per intent, on partial fill
   fill_confirm_timeout_secs: 15   # venue position must reflect the fill within this
-  allow_venue_protection_fallback: false  # Lighter has no capped IOC (#918): true = send with the venue's ±20% protection instead
+  allow_venue_protection_fallback: false  # keep false: Lighter has a capped IOC since v4.7.22 (#918); true = ±20% venue protection
   paper_slippage_bps: 5           # dry_run fill = mid +/- this
   paper_fee_bps: 0
 
@@ -240,9 +240,10 @@ reduce_only }`.
   `slippage_bps` of the intent's sizing price in the adverse direction,
   otherwise the intent errors out unsent and the residual is re-planned
   next tick. The order goes out as `create_order_taker_ioc(symbol, qty,
-  side, slippage_bps, reduce_only)`; on a venue without a price-capped IOC
-  (Lighter in dex-connector v4.7.20, bot-strategy#918) it is sent as
-  `create_order(price=None)` with the venue's ±20 % protection price
+  side, slippage_bps, reduce_only)`. Lighter has had a price-capped IOC
+  since dex-connector **v4.7.22** (bot-strategy#918), so this is the
+  normal path there. On a venue that still lacks one, the order is sent
+  as `create_order(price=None)` with the venue's ±20 % protection price
   **only if** `execution.allow_venue_protection_fallback` is true, else
   it is not sent — and that refusal is reported as a pre-send abort, so
   it costs no attempt and the target is still retried once the flag is
@@ -435,9 +436,12 @@ bar date, and it is ticked there, with that date's closes.
   Hyperliquid instance (even DRY_RUN) needs a build with
   `hyperliquid-sdk`.
 - Live execution is **Lighter-only** for now: orders go out as
-  `create_order(price=None)` (venue-native market/IOC with Lighter's 20 %
-  protection price — bot-strategy#918 tracks a price-constrained IOC).
-  dex-connector v4.7.20's Hyperliquid `create_order_taker_ioc` is
+  `create_order_taker_ioc`, a LIMIT + `TIF_IOC` bounded by the configured
+  `slippage_bps` (dex-connector **v4.7.22**, bot-strategy#918). Up to
+  v4.7.21 Lighter had no price-capped IOC and live meant
+  `create_order(price=None)` with the venue's ±20 % protection price —
+  see `allow_venue_protection_fallback`, which no longer needs to be
+  enabled for Lighter. Hyperliquid's `create_order_taker_ioc` is
   spot-only, so `venue: hyperliquid` is DRY_RUN-only until a perp IOC path
   exists there; the runtime refuses `dry_run: false` on any other venue.
 - SIGTERM does **not** reduce-only close the book (same as `engine_b_live`);
