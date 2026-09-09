@@ -476,7 +476,7 @@ impl ArcusSpotRuntimeCheckpointStore {
                 // reused label, not a completed window, and dropping it
                 // would remove a guard that was never resolved.
                 && !matches!(
-                    handled_corporate_action_record(&checkpoint.state, stored),
+                    handled_corporate_action_record(&checkpoint.state, stored, live_by),
                     Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
                 )
                 && !config

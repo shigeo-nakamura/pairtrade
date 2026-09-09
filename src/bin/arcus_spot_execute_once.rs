@@ -3871,6 +3871,28 @@ fn require_corporate_action_progress_transition(
         }
         return Ok(());
     }
+    // A discard stamp may only sit at or after the cutoff it claims to mark
+    // and no later than the observation that produced it. Applied wherever a
+    // stamp can appear -- a window opening already stamped counts (Codex P1,
+    // pairtrade#309).
+    let stamp_within_bounds = |progress: &ArcusSpotCorporateActionProgress,
+                               stamped_at: DateTime<Utc>| {
+        let cutoff = progress.effective_at.or_else(|| {
+            config
+                .corporate_actions
+                .iter()
+                .find(|event| {
+                    (!progress.fingerprint.is_empty()
+                        && progress.fingerprint == event.fingerprint())
+                        || event.event_id.eq_ignore_ascii_case(&progress.event_id)
+                })
+                .map(|event| event.effective_at)
+        });
+        cutoff.is_some_and(|cutoff| stamped_at >= cutoff)
+            && current
+                .last_observation_at
+                .is_some_and(|observed_at| stamped_at <= observed_at)
+    };
     match (&baseline.corporate_action, &current.corporate_action) {
         (None, None) => {}
         (Some(_), None) => {
@@ -3922,6 +3944,15 @@ fn require_corporate_action_progress_transition(
                     opened.event_id
                 );
             }
+            if let Some(stamped_at) = opened.history_invalidated_at {
+                if !stamp_within_bounds(opened, stamped_at) {
+                    bail!(
+                        "Arcus corporate action {} opened with a discard stamp no observation \
+                         produces",
+                        opened.event_id
+                    );
+                }
+            }
         }
         (Some(before), Some(after)) => {
             let same_event = after.fingerprint == before.fingerprint
@@ -3937,23 +3968,7 @@ fn require_corporate_action_progress_transition(
                 (Some(was), Some(now)) => was == now,
                 (None, None) => true,
                 (Some(_), None) => false,
-                (None, Some(stamped_at)) => {
-                    let cutoff = after.effective_at.or_else(|| {
-                        config
-                            .corporate_actions
-                            .iter()
-                            .find(|event| {
-                                (!after.fingerprint.is_empty()
-                                    && after.fingerprint == event.fingerprint())
-                                    || event.event_id.eq_ignore_ascii_case(&after.event_id)
-                            })
-                            .map(|event| event.effective_at)
-                    });
-                    cutoff.is_some_and(|cutoff| stamped_at >= cutoff)
-                        && current
-                            .last_observation_at
-                            .is_some_and(|observed_at| stamped_at <= observed_at)
-                }
+                (None, Some(stamped_at)) => stamp_within_bounds(after, stamped_at),
             };
             if !same_event
                 || !stamp_ok
@@ -10653,6 +10668,54 @@ runtime:
             .unwrap_err()
             .to_string();
         assert!(error.contains("cleared without a resume"), "{error}");
+    }
+
+    #[test]
+    fn an_opened_window_may_not_arrive_already_stamped_early() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let event = fixture_event();
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        let opened = |stamp: Option<&str>| {
+            let mut current = continuity_state(8, ("1", "1"));
+            current.relative_log_price_history.clear();
+            current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+                event_id: event.event_id.clone(),
+                blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+                pre_event_token_a: Some(observed.clone()),
+                pre_event_token_b: None,
+                history_invalidated_at: stamp.map(|at| at.parse().unwrap()),
+                fingerprint: event.fingerprint(),
+                effective_at: Some(event.effective_at),
+                symbols: event.symbols.clone(),
+            });
+            current
+        };
+        // Unstamped, and stamped at the cutoff: both are transitions.
+        corporate_action_continuity(&config, &baseline, &opened(None), 1).unwrap();
+        corporate_action_continuity(&config, &baseline, &opened(Some("2026-08-16T02:00:01Z")), 1)
+            .unwrap();
+
+        // Stamped before the cutoff: after a restore this would suppress
+        // halts and refuse exits before effective_at ever arrived.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened(Some("2026-08-16T00:30:00Z")),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("discard stamp no observation produces"),
+            "{error}"
+        );
     }
 
     #[test]

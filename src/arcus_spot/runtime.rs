@@ -2958,7 +2958,9 @@ impl ArcusSpotRuntime {
             .config
             .corporate_actions
             .iter()
-            .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
+            .find(|event| {
+                self.handled_record_for(event, evaluation_time) == Some(HandledMatch::ReusedId)
+            })
             .cloned()
         {
             gate.block_entry.get_or_insert_with(|| {
@@ -3032,7 +3034,8 @@ impl ArcusSpotRuntime {
                     .iter()
                     .find(|event| {
                         Self::progress_matches(&progress, event)
-                            && self.handled_record_for(event) == Some(HandledMatch::ReusedId)
+                            && self.handled_record_for(event, evaluation_time)
+                                == Some(HandledMatch::ReusedId)
                     })
                     .cloned()
                 {
@@ -3366,7 +3369,7 @@ impl ArcusSpotRuntime {
         // planned before the cutoff and dispatched after it (Codex P1,
         // pairtrade#309).
         self.config.corporate_actions.iter().any(|event| {
-            self.handled_record_for(event) == Some(HandledMatch::ReusedId)
+            self.handled_record_for(event, evaluation_time) == Some(HandledMatch::ReusedId)
                 && evaluation_time >= event.effective_at
         })
     }
@@ -3382,7 +3385,7 @@ impl ArcusSpotRuntime {
         self.config
             .corporate_actions
             .iter()
-            .filter(|event| !self.corporate_action_is_handled(event))
+            .filter(|event| !self.corporate_action_is_handled(event, evaluation_time))
             .find(|event| evaluation_time >= event.entry_block_at)
     }
 
@@ -3555,7 +3558,7 @@ impl ArcusSpotRuntime {
             .iter()
             .filter(|event| {
                 !matches!(
-                    self.handled_record_for(event),
+                    self.handled_record_for(event, at),
                     Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
                 )
             })
@@ -3584,7 +3587,7 @@ impl ArcusSpotRuntime {
         self.config
             .corporate_actions
             .iter()
-            .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
+            .find(|event| self.handled_record_for(event, at) == Some(HandledMatch::ReusedId))
             .map(|event| {
                 format!(
                     "corporate action {} reuses the id of an already handled event",
@@ -3596,8 +3599,12 @@ impl ArcusSpotRuntime {
     /// Anything with a handled record is excluded from becoming active --
     /// including a reused id, which is refused by the gate's overlay rather
     /// than allowed to open a window under an old name.
-    fn corporate_action_is_handled(&self, event: &ArcusSpotCorporateActionEvent) -> bool {
-        self.handled_record_for(event).is_some()
+    fn corporate_action_is_handled(
+        &self,
+        event: &ArcusSpotCorporateActionEvent,
+        at: DateTime<Utc>,
+    ) -> bool {
+        self.handled_record_for(event, at).is_some()
     }
 
     /// How `event` relates to the handled record, if at all. The id and the
@@ -3606,8 +3613,12 @@ impl ArcusSpotRuntime {
     /// distinct action declared under an old name -- and must not be read as
     /// "already handled", or its window is skipped entirely (Codex P1,
     /// pairtrade#309). Records that predate fingerprints match by id alone.
-    fn handled_record_for(&self, event: &ArcusSpotCorporateActionEvent) -> Option<HandledMatch> {
-        handled_corporate_action_record(&self.state, event)
+    fn handled_record_for(
+        &self,
+        event: &ArcusSpotCorporateActionEvent,
+        at: DateTime<Utc>,
+    ) -> Option<HandledMatch> {
+        handled_corporate_action_record(&self.state, event, at)
     }
 
     /// Compares each affected symbol's contract and decimals against what
@@ -3661,6 +3672,7 @@ impl ArcusSpotRuntime {
 pub(crate) fn handled_corporate_action_record(
     state: &ArcusSpotRuntimeState,
     event: &ArcusSpotCorporateActionEvent,
+    at: DateTime<Utc>,
 ) -> Option<HandledMatch> {
     let fingerprint = event.fingerprint();
     if state
@@ -3674,10 +3686,22 @@ pub(crate) fn handled_corporate_action_record(
         .handled_corporate_action_ids
         .iter()
         .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))?;
+    // Absent, or the empty padding a later resume wrote beside it: the
+    // record predates fingerprints and can only be matched by label. A
+    // record is only ever written by a resume, so a declaration that has
+    // not reached its own `resume_not_before` cannot be the one it was
+    // written for -- it is a reused label. Without this a new action
+    // inherits "handled" from a legacy record, is excluded from
+    // `active_corporate_action`, misses the reused-id overlay, and the
+    // runtime trades straight through its window (Codex P1, pairtrade#309).
+    let legacy = if event.resume_not_before > at {
+        HandledMatch::ReusedId
+    } else {
+        HandledMatch::LegacyById
+    };
     match state.handled_corporate_action_fingerprints.get(index) {
-        // Absent, or the empty padding a later resume wrote beside it.
-        None => Some(HandledMatch::LegacyById),
-        Some(recorded) if recorded.is_empty() => Some(HandledMatch::LegacyById),
+        None => Some(legacy),
+        Some(recorded) if recorded.is_empty() => Some(legacy),
         Some(recorded) if *recorded == fingerprint => Some(HandledMatch::Same),
         Some(_) => Some(HandledMatch::ReusedId),
     }
@@ -7668,12 +7692,12 @@ mod tests {
             ],
         );
         assert_eq!(
-            runtime.handled_record_for(&legacy),
+            runtime.handled_record_for(&legacy, resumed_at),
             Some(HandledMatch::LegacyById),
             "the padded legacy id is still legacy, not a reused id",
         );
         assert_eq!(
-            runtime.handled_record_for(&runtime.config.corporate_actions[1]),
+            runtime.handled_record_for(&runtime.config.corporate_actions[1], resumed_at),
             Some(HandledMatch::Same),
         );
         // And nothing blocks: no overlay from a phantom reuse.
@@ -7908,7 +7932,10 @@ mod tests {
         reused.post_event_inventory = None;
         runtime.config.corporate_actions = vec![reused];
         assert_eq!(
-            runtime.handled_record_for(&runtime.config.corporate_actions[0]),
+            runtime.handled_record_for(
+                &runtime.config.corporate_actions[0],
+                anchor + Duration::seconds(10)
+            ),
             Some(HandledMatch::ReusedId)
         );
         seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
@@ -7994,6 +8021,51 @@ mod tests {
             runtime.state.relative_log_price_history.len(),
             samples_before,
             "no post-event prints"
+        );
+    }
+
+    #[test]
+    fn a_future_action_reusing_a_legacy_id_is_not_handled() {
+        // The checkpoint predates fingerprints: an id, no fingerprint. A
+        // later, distinct action declared under that id must not inherit
+        // "handled" from it.
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
+        runtime.state.handled_corporate_action_fingerprints.clear();
+        // The declaration has not reached its own resume time, so no resume
+        // can have written that record for it.
+        let inside = anchor + Duration::seconds(2);
+        assert_eq!(
+            runtime.handled_record_for(&runtime.config.corporate_actions[0], inside),
+            Some(HandledMatch::ReusedId),
+        );
+
+        let outcome = runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionBlock);
+                assert!(hold.detail.contains("reuses the id"), "{}", hold.detail);
+            }
+            other => panic!("a legacy id must not license a new action, got {other:?}"),
+        }
+        assert!(
+            runtime.state.corporate_action.is_some(),
+            "the window is recorded"
+        );
+
+        // A legacy record for a window that has passed its resume time is
+        // the event it was written for, and stays handled.
+        let mut past = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        past.state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
+        past.state.handled_corporate_action_fingerprints.clear();
+        assert_eq!(
+            past.handled_record_for(
+                &past.config.corporate_actions[0],
+                anchor + Duration::seconds(13)
+            ),
+            Some(HandledMatch::LegacyById),
         );
     }
 
