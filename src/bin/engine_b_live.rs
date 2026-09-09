@@ -3119,6 +3119,36 @@ impl EngineBLiveEngine {
     }
 }
 
+/// Whether this instance may run with no working notification channel
+/// (bot-strategy#968). Under DRY_RUN it may -- nothing is at risk of going
+/// unnoticed but a simulated trade. A live run may not: entry, exit and
+/// session-halt notifications are the only push path this service has, and
+/// `EmailClient::send()` drops them with a single `WARN` when the
+/// credentials are absent, which is how `engine-b-live` ran from
+/// 2026-09-01 to 2026-09-08 notifying nobody of anything. An operator who
+/// genuinely wants to run live without them says so explicitly, and the
+/// refusal below turns into a logged `Some(reason)` instead.
+///
+/// `Ok(None)` = configured, `Ok(Some(reason))` = missing but allowed,
+/// `Err(reason)` = missing and not allowed.
+fn notification_gate(
+    dry_run: bool,
+    configured: bool,
+    opt_out: bool,
+) -> Result<Option<String>, String> {
+    if configured {
+        return Ok(None);
+    }
+    let reason = "no e-mail credentials (GMAIL_USER + GMAIL_TO/TO_ADDRESS + GMAIL_APP_PASSWORD): \
+                  every ENTRY / EXIT / SESSION HALT notification is dropped"
+        .to_string();
+    if dry_run || opt_out {
+        Ok(Some(reason))
+    } else {
+        Err(reason)
+    }
+}
+
 /// Fire-and-forget notification via `debot::email_client::EmailClient`
 /// (`src/email_client.rs`, `pub mod` in `src/lib.rs`). `EmailClient::new()`
 /// reads `GMAIL_USER`/`GMAIL_TO` (or legacy `TO_ADDRESS`)/`GMAIL_APP_PASSWORD`
@@ -3172,6 +3202,24 @@ async fn main() -> Result<()> {
             "ENGINE_B_LIVE_DRY_RUN=false requires ENGINE_B_LIVE_CONFIRM_LIVE=yes-i-mean-it as well \
              (deliberate double confirmation before real orders go out, bot-strategy#866)"
         );
+    }
+
+    // The only push alert path this service has (bot-strategy#968).
+    match notification_gate(
+        cfg.dry_run,
+        debot::email_client::EmailClient::is_configured(),
+        std::env::var("ENGINE_B_LIVE_ALLOW_NO_NOTIFICATIONS").as_deref() == Ok("yes-i-know"),
+    ) {
+        Ok(None) => log::info!("[NOTIFY] e-mail notifications configured"),
+        Ok(Some(reason)) => log::error!(
+            "[NOTIFY] {reason} -- running anyway (DRY_RUN or explicit opt-out); journalctl and \
+             status.json are the only ways to see what this instance does"
+        ),
+        Err(reason) => anyhow::bail!(
+            "{reason}. Provision them in /etc/engine-b-live/live-secrets.env (see \
+             docs/engine-b-live-operations.md), or set \
+             ENGINE_B_LIVE_ALLOW_NO_NOTIFICATIONS=yes-i-know to run live without any alert path"
+        ),
     }
 
     // direction_multiplier only ever means "same as epsilon's sign" (1.0)
@@ -5153,5 +5201,35 @@ mod tests {
             debug.contains("SKHY=190.0000@0.0s/gen0[ok]"),
             "unexpected: {debug}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Notification channel gate (bot-strategy#968)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_configured_channel_passes_the_gate_in_both_modes() {
+        assert_eq!(notification_gate(true, true, false), Ok(None));
+        assert_eq!(notification_gate(false, true, false), Ok(None));
+    }
+
+    #[test]
+    fn dry_run_may_run_without_notifications_but_says_so() {
+        let allowed = notification_gate(true, false, false).expect("DRY_RUN is allowed");
+        let reason = allowed.expect("and it reports why");
+        assert!(reason.contains("GMAIL_USER"), "unexpected: {reason}");
+    }
+
+    #[test]
+    fn a_live_run_refuses_to_start_with_no_alert_path() {
+        let refused = notification_gate(false, false, false).expect_err("live must refuse");
+        assert!(refused.contains("SESSION HALT"), "unexpected: {refused}");
+    }
+
+    #[test]
+    fn a_live_run_may_opt_out_explicitly_and_it_is_on_the_record() {
+        let allowed =
+            notification_gate(false, false, true).expect("an explicit opt-out is allowed");
+        assert!(allowed.is_some(), "the reason is still reported");
     }
 }
