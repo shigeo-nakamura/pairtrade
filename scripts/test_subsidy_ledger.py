@@ -24,6 +24,7 @@ from subsidy_ledger import (  # noqa: E402
     funding_ticks_are_zero,
     funding_tick_claim,
     funding_ticks_seen,
+    is_canonical_date,
     is_not_a_number,
     opening_date,
     pnl_row_defect,
@@ -32,6 +33,7 @@ from subsidy_ledger import (  # noqa: E402
     main as ledger_main,
     render_table,
     summarize,
+    utc_date,
 )
 
 # 2026-09-08 12:30 UTC. Mid-hour on purpose: the short holds below are
@@ -1344,18 +1346,33 @@ def test_a_points_date_must_be_canonical():
     rate could not be produced -- with a 0 exit (Codex, PR #297).
     """
     with tempfile.TemporaryDirectory() as tmp:
-        for bad in ("2026-9-08", "2026-09-08 ", " 2026-09-08", "20260908", "2026-09-8"):
+        # Wrong shape, and -- the round-31 addition -- right shape but
+        # not a day. `2026-02-31` matches \d{4}-\d{2}-\d{2} and can never
+        # be produced by `utc_date`, so it would have keyed a separate
+        # points-only row (Codex, PR #297).
+        for bad in ("2026-9-08", "2026-09-08 ", " 2026-09-08", "20260908", "2026-09-8",
+                    "2026-02-31", "2026-13-01", "2026-00-10", "2026-09-00",
+                    "2025-02-29", "not-a-date", 20260908, None):
             path = write(Path(tmp) / "points.jsonl",
                          [{"date": bad, "arm": "freq", "points": 1000}])
             try:
                 load_points(path)
             except SubsidyLedgerError as error:
-                assert "YYYY-MM-DD" in str(error), error
+                # `None` is caught a line earlier by the missing-field
+                # guard; everything else by the date check itself.
+                assert "YYYY-MM-DD" in str(error) or "needs date" in str(error), error
             else:
                 raise AssertionError(f"points date {bad!r} must be refused")
         canonical = write(Path(tmp) / "points.jsonl",
                           [{"date": "2026-09-08", "arm": "freq", "points": 1000}])
         assert load_points(canonical) == {("2026-09-08", "freq"): 1000.0}
+        # A real leap day is a real date and must not be collateral.
+        leap = write(Path(tmp) / "points.jsonl",
+                     [{"date": "2024-02-29", "arm": "freq", "points": 5}])
+        assert load_points(leap) == {("2024-02-29", "freq"): 5.0}
+        # And every date `utc_date` actually produces round-trips.
+        for ts in (0, 1788825600, 1788825600 + 86_399, 2_000_000_000):
+            assert is_canonical_date(utc_date(ts)), ts
 
 
 def test_an_availability_flag_that_is_not_true_does_not_establish_availability():

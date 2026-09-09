@@ -96,7 +96,6 @@ import argparse
 import glob
 import json
 import math
-import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -105,9 +104,27 @@ from pathlib import Path
 from typing import Iterable
 
 
-# The join key every loader produces via `utc_date`, so anything read
-# from a hand-written file has to match it exactly (Codex, PR #297).
-CANONICAL_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+def is_canonical_date(value: object) -> bool:
+    """Is this exactly a date `utc_date` could have produced?
+
+    A round-trip rather than a shape test, because the two failures are
+    different and both matter. `strptime` rejects an impossible date --
+    `2026-02-31` matches `\\d{4}-\\d{2}-\\d{2}` but is not a day, and
+    `utc_date` can never emit it (Codex, PR #297). Re-formatting then
+    rejects a real date spelled differently -- `2026-9-08` parses, but
+    is not the key the other loaders build.
+
+    It matters because this is a *join key*: a value that misses either
+    way silently becomes a separate points-only row, leaving the day the
+    operator meant to price without points and its rate unproducible.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%d") == value
 
 
 def utc_date(ts_seconds: float) -> str:
@@ -826,9 +843,9 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
         # separate points-only row instead, so the day the operator meant
         # to price reports no points and its rate cannot be produced, with
         # a 0 exit (Codex, PR #297).
-        if not CANONICAL_DATE.fullmatch(str(date)):
+        if not is_canonical_date(date):
             raise SubsidyLedgerError(
-                f"{path}: a points row needs a YYYY-MM-DD date; got {date!r}")
+                f"{path}: a points row needs a real YYYY-MM-DD date; got {date!r}")
         if is_not_a_number(value):
             raise SubsidyLedgerError(
                 f"{path}: unreadable points value {value!r} for {date}/{arm}")
