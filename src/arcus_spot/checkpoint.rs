@@ -8,7 +8,10 @@
 //! maintained copies of it.
 
 use super::{
-    runtime::{handled_corporate_action_record, HandledMatch},
+    runtime::{
+        backfill_handled_corporate_action_fingerprints, handled_corporate_action_record,
+        HandledMatch,
+    },
     ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime,
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
@@ -464,6 +467,11 @@ impl ArcusSpotRuntimeCheckpointStore {
         // or a stale-unit exit straight through the cutoff. Retiring a
         // declaration whose window had not opened by the last observation is
         // still ordinary housekeeping (Codex P1, pairtrade#309).
+        // The handled record is resolved the same way `from_state` will
+        // resolve it, so "already handled" reads identically here and in the
+        // runtime this load is about to build.
+        let mut resolved = checkpoint.state.clone();
+        backfill_handled_corporate_action_fingerprints(&mut resolved, &checkpoint.config);
         let live_by = checkpoint
             .state
             .last_observation_at
@@ -476,8 +484,8 @@ impl ArcusSpotRuntimeCheckpointStore {
                 // reused label, not a completed window, and dropping it
                 // would remove a guard that was never resolved.
                 && !matches!(
-                    handled_corporate_action_record(&checkpoint.state, stored, live_by),
-                    Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
+                    handled_corporate_action_record(&resolved, stored),
+                    Some(HandledMatch::Same)
                 )
                 && !config
                     .corporate_actions
