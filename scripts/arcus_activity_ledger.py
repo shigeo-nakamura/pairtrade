@@ -712,7 +712,18 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # A swap whose gas could not be read is a hole of the same kind: its
     # cost is understated by an unknown amount, so no definitive stop
     # verdict is given for a window containing one.
-    unmeasured_gas = sorted(swap.sequence for swap in swaps if swap.gas_unmeasurable)
+    #
+    # Every leg the report *charges for*, not only the in-window ones: a
+    # rotation that closes inside the window carries its entry (and any
+    # earlier partial exit) in with it, and those legs were filtered out
+    # of `swaps` before this scan. Their zeroed gas is still in the
+    # retained trip's cost, so missing them published `complete: true`
+    # over a cost understated by an unknown amount (PR #298 Codex
+    # review).
+    priced_legs = list(swaps)
+    priced_legs.extend(leg for trip in round_trips for leg in (trip.entry, *trip.exits))
+    unmeasured_gas = sorted(
+        {leg.sequence for leg in priced_legs if leg.gas_unmeasurable})
     complete = not orphaned and not unpriceable and not unmeasured_gas
     return {
         "schema_version": 1,

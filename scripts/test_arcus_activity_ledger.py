@@ -615,6 +615,28 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertGreaterEqual(report["totals"]["gas_usd"], 0)
         self.assertIn("topped up across them", ledger_tool.render_markdown(report))
 
+    def test_a_carry_in_leg_with_unreadable_gas_still_withholds_the_verdict(self):
+        """A rotation carries its entry in even when `--since` excludes it.
+
+        The entry leg is filtered out of `swaps` but stays in the
+        retained round trip, so its zeroed gas is in the cost the report
+        publishes -- and the scan that withholds the verdict has to see
+        it too.
+        """
+        events, history = baseline_round_trip()
+        # The entry's wallet gains a native token; `--since` then starts
+        # after that entry, so only the close is an in-window swap.
+        history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
+                             sell_quantity="0.347094", buy_quantity="0.323269",
+                             gas_after=str(int(WEI) + 10**18))
+        report = report_for(events, history, since=ENTRY_AT + timedelta(hours=1))
+
+        self.assertEqual(report["totals"]["round_trips"], 1,
+                         "the rotation still closes inside the window")
+        self.assertEqual(report["coverage"]["gas_unmeasurable"], [8])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+
     def test_an_explicit_until_is_never_moved_forward(self):
         """`--until` before the stream must not be reported as after it."""
         events, history = baseline_round_trip()
