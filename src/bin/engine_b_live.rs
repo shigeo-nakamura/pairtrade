@@ -1972,15 +1972,10 @@ impl EngineBLiveEngine {
                 // otherwise the session PnL and the drawdown it drives
                 // stay permanently short of money that was measured
                 // (pairtrade#300 Codex review).
-                if p.realized_partial_pnl != 0.0 {
-                    log::error!(
-                        "[RECONCILE] booking ${:.2} of partial PnL realized before the record \
-                         was lost; only the final remainder is unbooked",
-                        p.realized_partial_pnl
-                    );
-                    self.state.realized_pnl_session += p.realized_partial_pnl;
-                    self.state.pnl_today += p.realized_partial_pnl;
-                }
+                self.book_orphaned_partial_pnl(
+                    &p,
+                    "the exchange is flat, so only its final remainder is unbooked",
+                );
                 // Both fields in one write. Clearing the record first and
                 // halting second leaves a crash window in which disk says
                 // "flat, nothing to reconcile" while the close this
@@ -2024,6 +2019,9 @@ impl EngineBLiveEngine {
         );
         self.state.realized_pnl_session += record.realized_partial_pnl;
         self.state.pnl_today += record.realized_partial_pnl;
+        // Same accounting a close runs: this moves the number the
+        // session-loss halt is measured against.
+        self.reprice_equity_and_drawdown();
         self.state_write_pending = true;
     }
 
@@ -2165,9 +2163,16 @@ impl EngineBLiveEngine {
             p.symbol == self.cfg.us_primary_symbol && side_from_str(&p.side) == Some(live.side)
         });
         let carried_partial_pnl = carried.map(|p| p.realized_partial_pnl).unwrap_or(0.0);
+        // The persisted basis describes the quantity that was already
+        // there. It carries onto a *reduction* unchanged, but applying it
+        // to quantity added while the process was down would price the
+        // added part at the original entry -- `on_exit` multiplies the
+        // basis by the whole `open_size`. Growth blends the added part in
+        // at whatever price is available, and admits an unknown basis
+        // when there is none (pairtrade#300 Codex review).
         let carried_basis = carried
             .filter(|p| !p.entry_price_unknown)
-            .map(|p| (p.entry_price, p.entry_price_estimated));
+            .map(|p| (p.entry_price, p.entry_price_estimated, p.open_size));
         if carried_partial_pnl != 0.0 {
             log::warn!(
                 "[RECONCILE] carrying ${carried_partial_pnl:.2} of already-booked partial PnL \
@@ -2212,9 +2217,31 @@ impl EngineBLiveEngine {
                 // The record's own basis beats a current mid when it
                 // describes this same position: it is what the carried
                 // partial PnL was booked against.
-                (None, _) if carried_basis.is_some() => {
-                    let (price, estimated) = carried_basis.expect("checked");
-                    (price, estimated, false)
+                (None, ws) if carried_basis.is_some() => {
+                    let (price, estimated, tracked_size) = carried_basis.expect("checked");
+                    let grown = live.size - tracked_size;
+                    if grown <= 1e-12 {
+                        // A reduction (or the same size): the basis still
+                        // describes every unit that is left.
+                        (price, estimated, false)
+                    } else if let Some(mid) = ws.filter(|m| *m > 0.0) {
+                        let blended = (price * tracked_size + mid * grown) / live.size;
+                        log::warn!(
+                            "[RECONCILE] the position grew by {grown:.6} while this process was \
+                             down and the exchange reports no entry price -- blending the added \
+                             quantity in at the current mid {mid:.4}: basis {price:.4} -> \
+                             {blended:.4}"
+                        );
+                        (blended, true, false)
+                    } else {
+                        log::error!(
+                            "[RECONCILE] the position grew by {grown:.6} while this process was \
+                             down, with neither an exchange entry price nor a mid to value the \
+                             added quantity -- adopting with NO known basis rather than \
+                             pricing it at the old entry"
+                        );
+                        (0.0, true, true)
+                    }
                 }
                 (None, Some(w)) => (w, true, false),
                 // No cost basis of any kind. Still adopt -- getting flat
@@ -3242,6 +3269,45 @@ impl EngineBLiveEngine {
         }
     }
 
+    /// Re-derive equity, the peak and the drawdown from
+    /// `realized_pnl_session`, engaging the session-loss halt if the
+    /// threshold is crossed.
+    ///
+    /// Every path that changes realized PnL runs this, not just
+    /// `on_exit`: booking an orphaned record's realized reductions moves
+    /// the same number the halt is measured against, and skipping it
+    /// left a loss able to pass the threshold unnoticed -- and a gain
+    /// unable to advance the peak, which understates every later
+    /// drawdown (pairtrade#300 Codex review).
+    fn reprice_equity_and_drawdown(&mut self) {
+        let current_equity = self.state.session_start_equity + self.state.realized_pnl_session;
+        if current_equity > self.state.peak_equity {
+            self.state.peak_equity = current_equity;
+        }
+        let dd_usd = self.state.peak_equity - current_equity;
+        if dd_usd > self.state.max_dd_usd {
+            self.state.max_dd_usd = dd_usd;
+        }
+        let dd_bps = if self.state.peak_equity > 0.0 {
+            dd_usd / self.state.peak_equity * 10_000.0
+        } else {
+            0.0
+        };
+        if dd_bps > self.state.max_dd_bps {
+            self.state.max_dd_bps = dd_bps;
+        }
+        if dd_bps >= self.cfg.max_session_loss_bps && !self.state.session_halted {
+            self.state.session_halted = true;
+            self.state.session_halt_reason = Some(format!("session_dd_{dd_bps:.0}bps"));
+            log::warn!(
+                "[SESSION_DD] halt engaged: dd={:.0}bps >= {:.0}bps threshold -- clear via RISK_ACK at {}",
+                dd_bps,
+                self.cfg.max_session_loss_bps,
+                self.cfg.risk_ack_path.display()
+            );
+        }
+    }
+
     /// Sticky session halt (same on-disk RISK_ACK contract as the drawdown
     /// halt in `on_exit`): blocks new entries until the operator creates
     /// `risk_ack_path`. Exits keep running.
@@ -4012,32 +4078,7 @@ impl EngineBLiveEngine {
         if pnl > 0.0 {
             self.state.total_wins += 1;
         }
-        let current_equity = self.state.session_start_equity + self.state.realized_pnl_session;
-        if current_equity > self.state.peak_equity {
-            self.state.peak_equity = current_equity;
-        }
-        let dd_usd = self.state.peak_equity - current_equity;
-        if dd_usd > self.state.max_dd_usd {
-            self.state.max_dd_usd = dd_usd;
-        }
-        let dd_bps = if self.state.peak_equity > 0.0 {
-            dd_usd / self.state.peak_equity * 10_000.0
-        } else {
-            0.0
-        };
-        if dd_bps > self.state.max_dd_bps {
-            self.state.max_dd_bps = dd_bps;
-        }
-        if dd_bps >= self.cfg.max_session_loss_bps && !self.state.session_halted {
-            self.state.session_halted = true;
-            self.state.session_halt_reason = Some(format!("session_dd_{dd_bps:.0}bps"));
-            log::warn!(
-                "[SESSION_DD] halt engaged: dd={:.0}bps >= {:.0}bps threshold -- clear via RISK_ACK at {}",
-                dd_bps,
-                self.cfg.max_session_loss_bps,
-                self.cfg.risk_ack_path.display()
-            );
-        }
+        self.reprice_equity_and_drawdown();
         self.day.exited = true;
         self.mark_day_acted(self.day.skip_reason.clone());
 
@@ -4474,21 +4515,34 @@ async fn main() -> Result<()> {
         .context("failed to install the SIGTERM handler")?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .context("failed to install the SIGINT handler")?;
+    // The tick is deliberately **not** awaited inside the `select!`. A
+    // signal arriving while `tick()` is inside `submit_order` would drop
+    // that future mid-request: the order may already be at the exchange,
+    // but `PendingConfirm::Entry` was never installed, so shutdown would
+    // report an account with nothing open. The select only decides what
+    // to do next; the tick then runs to completion, and a signal that
+    // arrives during it is delivered on the next `recv()`
+    // (pairtrade#300 Codex review).
+    enum Wake {
+        Tick,
+        Signal(&'static str),
+    }
     loop {
-        tokio::select! {
-            _ = tick_interval.tick() => {
+        let wake = tokio::select! {
+            _ = tick_interval.tick() => Wake::Tick,
+            _ = sigterm.recv() => Wake::Signal("SIGTERM"),
+            _ = sigint.recv() => Wake::Signal("SIGINT"),
+        };
+        match wake {
+            Wake::Tick => {
                 if feed_closed.load(std::sync::atomic::Ordering::SeqCst) {
                     log::error!("[WS] price feed closed, exiting");
                     break;
                 }
                 engine.tick().await;
             }
-            _ = sigterm.recv() => {
-                let _ = engine.note_shutdown_signal("SIGTERM");
-                break;
-            }
-            _ = sigint.recv() => {
-                let _ = engine.note_shutdown_signal("SIGINT");
+            Wake::Signal(signal) => {
+                let _ = engine.note_shutdown_signal(signal);
                 break;
             }
         }
@@ -6883,6 +6937,87 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 9, P1: booking an orphaned
+    /// record's PnL moves the number the session-loss halt measures.
+    #[tokio::test]
+    async fn booking_orphaned_pnl_runs_the_drawdown_accounting() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.session_start_equity = 1_000.0;
+        h.engine.state.peak_equity = 1_000.0;
+        h.engine.cfg.max_session_loss_bps = 50.0; // $5 on $1,000
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.realized_partial_pnl = -20.0; // a 200bps session loss
+        h.engine.state.open_position = Some(saved);
+        // The exchange is flat: `Vanished`, so the record is booked out.
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!((h.engine.state.realized_pnl_session + 20.0).abs() < 1e-12);
+        assert!(
+            h.engine.state.max_dd_usd >= 20.0,
+            "the drawdown must see it, got {}",
+            h.engine.state.max_dd_usd
+        );
+        assert!(h.engine.state.max_dd_bps >= 50.0);
+        assert!(h.engine.state.session_halted);
+    }
+
+    /// pairtrade#300 Codex review round 9, P2: a position that grew while
+    /// the process was down must not price the added quantity at the old
+    /// entry.
+    #[tokio::test]
+    async fn adopting_a_grown_position_does_not_apply_the_old_basis_to_new_quantity() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.050, TODAY)); // basis 1756.92
+        h.observe_at("SNDK", 1800.0, T1_US, 0);
+        // Same symbol and side, larger, and the exchange gives no basis.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.100", 1, None));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        let adopted = h.engine.position.clone().expect("adopted");
+        let mid = h
+            .engine
+            .exit_accounting_price("SNDK")
+            .expect("the harness feeds a mid")
+            .0;
+        let expected = (1756.92 * 0.050 + mid * 0.050) / 0.100;
+        assert!(
+            (adopted.entry_price - expected).abs() < 1e-6,
+            "expected the blended basis {expected}, got {}",
+            adopted.entry_price
+        );
+        assert!(adopted.entry_price_estimated);
+        assert!(!adopted.entry_price_unknown);
+
+        // With no price of any kind for the added quantity, the basis is
+        // unknown rather than the old entry applied to all of it.
+        let mut bare = harness();
+        bare.engine.reconciled = false;
+        bare.engine.state.open_position = Some(persisted_long(0.050, TODAY));
+        {
+            let mut feed = bare.engine.feed.lock().unwrap();
+            feed.latest.clear();
+            feed.last_raw_mid.clear();
+        }
+        bare.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.100", 1, None));
+        bare.set_now(T1_US);
+        bare.engine.tick().await;
+        let blind = bare.engine.position.clone().expect("adopted");
+        assert!(
+            blind.entry_price_unknown,
+            "no price to value the growth with"
+        );
     }
 
     /// pairtrade#300 Codex review round 8: a parked record is what the
