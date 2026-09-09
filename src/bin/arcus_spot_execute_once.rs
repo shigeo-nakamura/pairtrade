@@ -2708,9 +2708,18 @@ fn corporate_action_units_are_stale(
     // declines to engage a halt there. Without the same case here, a valid
     // checkpoint from that phase is rejected for "omitting" the halt (Codex
     // P2, pairtrade#309).
-    if let Some(observed_at) = current.last_observation_at {
+    // Judged on the price clock, like the progress-record path: on the tick
+    // that first crosses the cutoff the runtime may have engaged a genuine
+    // halt from pre-cutoff prices, and classifying the units stale from the
+    // later observation watermark would let that halt be removed and still
+    // verify (Codex P1, pairtrade#309). A checkpoint predating the field
+    // keeps the observation watermark.
+    let priced_at = current
+        .last_reference_price_at
+        .or(current.last_observation_at);
+    if let Some(priced_at) = priced_at {
         let reused_and_effective = config.corporate_actions.iter().any(|event| {
-            observed_at >= event.effective_at
+            priced_at >= event.effective_at
                 && current
                     .handled_corporate_action_ids
                     .iter()
@@ -11464,6 +11473,48 @@ runtime:
         current.last_equity_usd = Some(Decimal::from(290));
         current.corporate_action = Some(stale_unit_progress());
         baseline.corporate_action = current.corporate_action.clone();
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Prices from before the cutoff (02:00Z): the halt is still owed.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T01:59:00Z".parse().unwrap());
+        }
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Prices from after it: the runtime suppressed, and so does this.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T02:01:00Z".parse().unwrap());
+        }
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_reused_ids_stale_phase_is_judged_on_the_price_clock() {
+        // Same rule as the progress-record path: on the tick that first
+        // crosses the cutoff a pre-cutoff mark may have engaged a genuine
+        // halt, so the exemption cannot come from the observation watermark.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = None;
+        for state in [&mut baseline, &mut current] {
+            state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+            state.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        }
         let none = ArcusSpotCorporateActionContinuity::default();
 
         // Prices from before the cutoff (02:00Z): the halt is still owed.

@@ -3032,6 +3032,20 @@ impl ArcusSpotRuntime {
                 gate.suppress_exits = true;
             }
         }
+        // A window that opens within the settlement margin blocks entries at
+        // dispatch, so the planner must not produce a plan its own dispatch
+        // will refuse: `live-tick` would persist pending-plan evidence for
+        // it, and `ReplaySimulation` -- which never runs the live validator
+        // -- would record a fill production will not send (Codex P2,
+        // pairtrade#309).
+        if gate.block_entry.is_none() {
+            if let Some(reason) = self.corporate_action_blocks_entries(evaluation_time) {
+                gate.block_entry = Some(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::CorporateActionBlock,
+                    format!("entries are already blocked at dispatch: {reason}"),
+                ));
+            }
+        }
         gate
     }
 
@@ -7491,6 +7505,44 @@ mod tests {
     }
 
     #[test]
+    fn planning_blocks_entries_inside_the_pre_window_margin() {
+        // The planner and the dispatch validator must agree, or live-tick
+        // writes a plan its own dispatch refuses and replay records a fill
+        // production would not send.
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor + Duration::seconds(10));
+        cfg.corporate_action_settlement_margin_secs = 1;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+
+        // entry_block_at is +10s; at +8s the 1s margin has not reached it.
+        let early = anchor + Duration::seconds(8);
+        assert!(matches!(
+            runtime
+                .step_at(&snapshot_with_valid_row(early), early)
+                .decision,
+            ArcusSpotDecision::SimulatedFill { .. }
+        ));
+
+        let mut inside =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(10))).unwrap();
+        inside.config.corporate_action_settlement_margin_secs = 1;
+        seed_entry_signal_history(&mut inside);
+        let at = anchor + Duration::seconds(9);
+        match inside.step_at(&snapshot_with_valid_row(at), at).decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionBlock);
+                assert!(
+                    hold.detail.contains("already blocked at dispatch"),
+                    "{}",
+                    hold.detail
+                );
+            }
+            other => panic!("no entry may be planned once dispatch would refuse it, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_unpinned_identity_refuses_the_forced_exit() {
         // The window was declared after it opened, so no pre-event identity
         // was ever observed. The drift check has nothing to compare, which
@@ -8020,6 +8072,26 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("no longer quotes"), "{error}");
         assert!(runtime.state.risk_halt.is_some());
+    }
+
+    #[test]
+    fn a_restored_runtime_may_hold_more_than_the_declared_funding() {
+        // A completed split raised the holding to 40 and its declaration was
+        // retired; a floor of 5 is then perfectly reachable, and the config
+        // alone cannot tell -- only the restored state can.
+        let mut cfg = config();
+        cfg.inventory_floors.token_a = Decimal::from(5);
+        cfg.validate().unwrap();
+        let mut state = ArcusSpotRuntime::new(config()).unwrap().state().clone();
+        state.inventory.token_a = Decimal::from(40);
+        state.initial_baseline_inventory = Some(state.inventory);
+        state.daily_baseline_inventory = Some(state.inventory);
+        ArcusSpotRuntime::from_state(cfg.clone(), state.clone()).unwrap();
+
+        // A restored holding that does not reach the floor is still refused.
+        let mut short = state;
+        short.inventory.token_a = Decimal::new(4, 0);
+        assert!(ArcusSpotRuntime::from_state(cfg, short).is_err());
     }
 
     #[test]
