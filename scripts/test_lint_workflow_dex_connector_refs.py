@@ -257,6 +257,45 @@ class OutputAndScopePrecedence(LintTestCase):
         self.assertClean()
 
 
+class ResolverInvocation(LintTestCase):
+    """Codex round 4, pairtrade#314: the resolver call and its output are wiring too."""
+
+    def test_a_literal_input_ref_on_the_resolver_call_is_rejected(self) -> None:
+        # The resolver lets a non-empty `input-ref` beat Cargo.lock, so this
+        # reinstates the static pin for every consumer at once.
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n",
+             "  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n"
+             "    with:\n      input-ref: v4.7.20\n"),
+        ))
+        self.assertFlags("caller.yml", "overrides Cargo.lock")
+
+    def test_a_dispatch_input_passed_through_to_the_resolver_is_accepted(self) -> None:
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n",
+             "  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n"
+             "    with:\n      input-ref: ${{ inputs.dex_connector_ref || '' }}\n"),
+        ))
+        self.assertClean()
+
+    def test_a_resolver_that_renames_its_output_is_rejected(self) -> None:
+        self.write("_resolve-dex-connector-ref.yml", self.variant(
+            RESOLVER_WORKFLOW,
+            ("    outputs:\n      ref:\n", "    outputs:\n      tag:\n"),
+        ))
+        self.assertFlags("_resolve-dex-connector-ref.yml", "does not declare a `ref`")
+
+    def test_a_resolver_output_mapped_to_a_missing_job_output_is_rejected(self) -> None:
+        self.write("_resolve-dex-connector-ref.yml", self.variant(
+            RESOLVER_WORKFLOW,
+            ("        value: ${{ jobs.resolve.outputs.ref }}",
+             "        value: ${{ jobs.resolve.outputs.tag }}"),
+        ))
+        self.assertFlags("_resolve-dex-connector-ref.yml", "does not publish `tag`")
+
+
 class CheckoutWiring(LintTestCase):
     """Codex round 2, pairtrade#314: the ref match must belong to *this* checkout."""
 

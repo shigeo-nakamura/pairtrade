@@ -105,6 +105,79 @@ def _is_resolver_job(job: dict) -> bool:
     return isinstance(job.get("uses"), str) and job["uses"].strip() == RESOLVER
 
 
+def _resolver_input_ref_problem(job: dict) -> str | None:
+    """Reject a resolver call that pins the ref through its own input.
+
+    The resolver treats a non-empty `input-ref` as a deliberate draft/test
+    pin and lets it beat Cargo.lock, so `input-ref: v4.7.20` reinstates
+    exactly the drift this lint exists to stop -- and it does it upstream of
+    every `needs.<resolver>.outputs.ref` consumer at once (Codex,
+    pairtrade#314). A pass-through of the workflow's own dispatch input is
+    the shape that is meant to be allowed.
+    """
+    with_block = job.get("with")
+    if not isinstance(with_block, dict) or "input-ref" not in with_block:
+        return None
+    value = with_block["input-ref"]
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "${{" in text and re.search(r"\binputs\.", text):
+        return None
+    return (
+        f"calls the resolver with `input-ref: {text}`, which overrides "
+        "Cargo.lock for every consumer of its output"
+    )
+
+
+def _check_resolver_publishes_its_output(workflows_dir: Path, findings: Findings) -> None:
+    """The consumers' `outputs.ref` is only real if the resolver still declares it.
+
+    Renaming, dropping, or rewiring that output to a job output that does not
+    exist leaves every consumer interpolating the empty string -- and a
+    checkout with an empty `ref` silently takes the repository's default
+    branch (Codex, pairtrade#314).
+    """
+    path = workflows_dir / Path(RESOLVER).name
+    if not path.is_file():
+        findings.add(str(workflows_dir), f"{RESOLVER} is missing (bot-strategy#899).")
+        return
+    workflow = _load(path)
+    call = _on(workflow).get("workflow_call")
+    outputs = call.get("outputs") if isinstance(call, dict) else None
+    declared = outputs.get(RESOLVER_OUTPUT) if isinstance(outputs, dict) else None
+    if not isinstance(declared, dict):
+        findings.add(
+            str(path),
+            f"does not declare a `{RESOLVER_OUTPUT}` workflow_call output, which every "
+            "caller reads (bot-strategy#899/#973).",
+        )
+        return
+    value = str(declared.get("value", "")).strip()
+    match = re.match(
+        r"^\$\{\{\s*jobs\.(?P<job>[A-Za-z0-9_-]+)\.outputs\.(?P<output>[A-Za-z0-9_-]+)\s*\}\}$",
+        value,
+    )
+    if not match:
+        findings.add(
+            str(path),
+            f"maps its `{RESOLVER_OUTPUT}` output to `{value or '(missing)'}`, which is not "
+            "one of its own job outputs (bot-strategy#899/#973).",
+        )
+        return
+    producer = _jobs(workflow).get(match.group("job"))
+    produced = producer.get("outputs") if isinstance(producer, dict) else None
+    if not isinstance(produced, dict) or match.group("output") not in produced:
+        findings.add(
+            str(path),
+            f"maps its `{RESOLVER_OUTPUT}` output to `{value}`, but job "
+            f"`{match.group('job')}` does not publish `{match.group('output')}` "
+            "(bot-strategy#899/#973).",
+        )
+
+
 def _local_reusable_path(uses: str, workflows_dir: Path) -> Path | None:
     """Map a `uses:` value to the local reusable workflow file it names.
 
@@ -199,6 +272,9 @@ def _resolve_ref_source(
                 "bad",
                 f"ref comes from job `{producer_name}`, which does not call {RESOLVER}",
             )
+        problem = _resolver_input_ref_problem(producer)
+        if problem is not None:
+            return "bad", f"ref comes from job `{producer_name}`, which {problem}"
         if output_name != RESOLVER_OUTPUT:
             return (
                 "bad",
@@ -297,6 +373,7 @@ def _check_reusable_calls(
 
 def lint_workflows(workflows_dir: Path) -> Findings:
     findings = Findings()
+    _check_resolver_publishes_its_output(workflows_dir, findings)
     for path in sorted(workflows_dir.glob("*.yml")):
         try:
             workflow = _load(path)
