@@ -1119,7 +1119,15 @@ impl ArcusSpotRuntime {
         // blocked and the exit forced throughout this window regardless, so
         // nothing accumulates exposure while the limits are unenforceable
         // (Codex, PR #309).
-        if !self.corporate_action_units_are_stale(evaluation_time) {
+        //
+        // Judged at `price.observed_at`, not at the processing clock: the
+        // question is whether *this mark* mixes units, and the mark is made
+        // of the prices and identities that observation carries. A snapshot
+        // taken before the cutoff and processed after it is a valid
+        // pre-event mark, and suppressing it would drop a genuine breach for
+        // good -- every later mark is stale, and the resume re-anchors both
+        // baskets (Codex P2, pairtrade#309).
+        if !self.corporate_action_units_are_stale(price.observed_at) {
             self.engage_risk_halt(evaluation_time, risk_before);
         }
         self.update_risk_baselines(evaluation_time, equity_before, inventory_before);
@@ -7629,6 +7637,43 @@ mod tests {
                 hold.detail
             );
         }
+    }
+
+    #[test]
+    fn a_pre_cutoff_observation_processed_late_still_halts() {
+        // The overview was received before `effective_at`, so the mark is
+        // made of pre-event prices against pre-event inventory -- a genuine
+        // breach. Suppressing it because the tick happens to be processed
+        // after the cutoff would lose it permanently: every later mark is
+        // stale, and the resume re-anchors both baskets.
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        // 0.02 NVDA short: $4.00 at the pre-event price, over the $2 limit.
+        runtime.state.inventory.token_a = Decimal::new(98, 2);
+
+        // effective_at is anchor + 4s. Observed at +3s, processed at +5s.
+        let observed_at = anchor + Duration::seconds(3);
+        let evaluated_at = anchor + Duration::seconds(5);
+        runtime.step_at(
+            &snapshot_with_overview_received_at(observed_at, observed_at),
+            evaluated_at,
+        );
+        assert!(
+            runtime.state.risk_halt.is_some(),
+            "a pre-cutoff mark is measured in the units the venue was quoting",
+        );
+
+        // A mark whose observation is itself past the cutoff stays suppressed.
+        let mut later = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut later);
+        later.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        later.state.inventory.token_a = Decimal::new(98, 2);
+        let post = anchor + Duration::seconds(5);
+        later.step_at(&snapshot_with_overview_received_at(post, post), post);
+        assert_eq!(later.state.risk_halt, None);
     }
 
     #[test]
