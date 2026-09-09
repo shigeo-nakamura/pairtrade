@@ -26,6 +26,7 @@ from subsidy_ledger import (  # noqa: E402
     funding_ticks_seen,
     is_not_a_number,
     opening_date,
+    pnl_row_defect,
     spans_a_funding_interval,
     expand,
     main as ledger_main,
@@ -187,7 +188,7 @@ def test_a_day_holding_any_non_realized_row_is_not_costed_from_the_pnl_ledger():
         assert day.cycles == 1
         assert day.realized_pnl_usd == -5.0
         assert day.incomplete
-        assert day.incomplete_reasons == {"pnl_available_false"}
+        assert day.incomplete_reasons == {"pnl_available_not_true"}
 
         # The day therefore takes the equity delta, not the partial sum.
         rows = build_rows(
@@ -1306,6 +1307,79 @@ def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
         assert not fine.incomplete, fine.incomplete_reasons
 
 
+def test_an_earlier_bad_equity_sample_is_settled_by_a_later_good_close():
+    """Asymmetry with the tie handling, and only in the wrong direction.
+
+    A missing-equity sample at 10:00 followed by a valid 23:00 close
+    leaves the day's close perfectly well known, but the day was
+    invalidated permanently -- discarding that day's delta *and* the
+    next day's (Codex, PR #297).
+    """
+    day_one = 1788825600_000            # 2026-09-08 00:00 UTC, ms
+    day_two = day_one + 86_400_000
+    good_one = {"ts": day_one + 82_800_000, "equity": 1000.0}   # 23:00
+    good_two = {"ts": day_two + 82_800_000, "equity": 900.0}
+    for bad in ({"ts": day_one + 36_000_000},                    # 10:00, no equity
+                {"ts": day_one + 36_000_000, "equity": "n/a"},
+                {"ts": day_one + 36_000_000, "equity": float("nan")}):
+        costs = equity_daily_costs([bad, good_one, good_two])
+        assert costs.get("2026-09-09") == 100.0, (bad, costs)
+
+    # A bad sample *after* the day's best close still spoils it: the
+    # close is then not known to be the close.
+    late_bad = {"ts": day_one + 84_000_000, "equity": None}
+    spoiled = equity_daily_costs([good_one, late_bad, good_two])
+    assert "2026-09-09" not in spoiled, spoiled
+
+    # And a day with no readable sample at all has nothing to settle it.
+    only_bad = equity_daily_costs([{"ts": day_one + 100, "equity": None}, good_two])
+    assert "2026-09-09" not in only_bad, only_bad
+
+
+def test_a_points_date_must_be_canonical():
+    """The date is a join key against dates produced by `utc_date`.
+
+    A truthy but noncanonical spelling keyed a separate points-only row,
+    so the day the operator meant to price reported no points and its
+    rate could not be produced -- with a 0 exit (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for bad in ("2026-9-08", "2026-09-08 ", " 2026-09-08", "20260908", "2026-09-8"):
+            path = write(Path(tmp) / "points.jsonl",
+                         [{"date": bad, "arm": "freq", "points": 1000}])
+            try:
+                load_points(path)
+            except SubsidyLedgerError as error:
+                assert "YYYY-MM-DD" in str(error), error
+            else:
+                raise AssertionError(f"points date {bad!r} must be refused")
+        canonical = write(Path(tmp) / "points.jsonl",
+                          [{"date": "2026-09-08", "arm": "freq", "points": 1000}])
+        assert load_points(canonical) == {("2026-09-08", "freq"): 1000.0}
+
+
+def test_an_availability_flag_that_is_not_true_does_not_establish_availability():
+    """`is False` caught only the shape a correct writer emits.
+
+    The field claims the PnL is real, so anything present that is not
+    exactly `true` fails to establish it. Absent is different and stays
+    fine -- most rows do not carry it (Codex, PR #297).
+    """
+    base = {"ts": TS, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}
+    assert pnl_row_defect(base) is None, "absent stays fine"
+    assert pnl_row_defect({**base, "pnl_available": True}) is None
+    for bad in (False, 0, 1, None, "false", "true", "", []):
+        assert pnl_row_defect({**base, "pnl_available": bad}) == "pnl_available_not_true", bad
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(Path(tmp), [{**base, "pnl_available": 0}])
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.incomplete and day.cycles == 0
+        assert day.incomplete_reasons == {"pnl_available_not_true"}
+        row = build_rows({}, {("2026-09-08", "freq"): day})[0]
+        assert row.cost_source != "pnl_ledger"
+
+
 def test_two_equity_closes_at_the_same_instant_settle_nothing():
     """`>=` made export order decide the day's close.
 
@@ -1316,7 +1390,7 @@ def test_two_equity_closes_at_the_same_instant_settle_nothing():
     def history(rows):
         return equity_daily_costs(rows)
 
-    day_one = 1788868800_000          # 2026-09-08 00:00 UTC, ms
+    day_one = 1788825600_000          # 2026-09-08 00:00 UTC, ms
     day_two = day_one + 86_400_000
     tie_a = {"ts": day_one + 100, "equity": 1000.0}
     tie_b = {"ts": day_one + 100, "equity": 1200.0}

@@ -96,12 +96,18 @@ import argparse
 import glob
 import json
 import math
+import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+
+# The join key every loader produces via `utc_date`, so anything read
+# from a hand-written file has to match it exactly (Codex, PR #297).
+CANONICAL_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def utc_date(ts_seconds: float) -> str:
@@ -369,8 +375,13 @@ FUNDING_INTERVAL_SECS = 3600
 
 def pnl_row_defect(record: dict) -> str | None:
     """Why this row cannot stand as a realized live close, or None."""
-    if record.get("pnl_available") is False:
-        return "pnl_available_false"
+    # `is False` caught only the one shape a correct writer emits. The
+    # field is a *claim that the PnL is real*, so anything present that
+    # is not exactly `true` fails to establish it -- `0`, `null`,
+    # `"false"`, `"true"` as a string. Absent is different and stays
+    # fine: most rows do not carry the field at all (Codex, PR #297).
+    if "pnl_available" in record and record["pnl_available"] is not True:
+        return "pnl_available_not_true"
     source = record.get("source")
     if source is None:
         return "missing_source"
@@ -726,6 +737,14 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     # strictly greater sample settles the day and clears the tie
     # (Codex, PR #297).
     tied_closes: set[str] = set()
+    # The latest instant at which a day had an unreadable sample. A day is
+    # only spoiled if that instant is at or after its best readable close:
+    # a missing equity at 10:00 followed by a good 23:00 close leaves the
+    # day's close perfectly well known, and marking it invalid discarded
+    # that day's delta *and* the next day's for nothing. Same rule the
+    # tie handling already follows -- a strictly later valid sample
+    # settles it (Codex, PR #297).
+    last_invalid_us: dict[str, float] = {}
     for row in rows:
         ts = row.get("ts")
         if ts is None:
@@ -736,14 +755,13 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
         day = None if is_not_a_number(ts) else utc_date_or_none(float(ts) / 1000.0)
         if day is None:
             raise SubsidyLedgerError(f"unreadable `ts` {ts!r} in an equity_history row")
+        stamp = float(ts)
         equity = row.get("equity")
-        if equity is None:
-            invalid_days.add(day)
+        if equity is None or is_not_a_number(equity):
+            last_invalid_us[day] = max(last_invalid_us.get(day, stamp), stamp)
             continue
-        if is_not_a_number(ts) or is_not_a_number(equity):
-            invalid_days.add(day)
         else:
-            stamp, value = float(ts), float(equity)
+            value = float(equity)
             # "NaN"/"Infinity" parse but are not a close: the next
             # consecutive-day delta would be non-finite and accepted as a
             # known `equity_delta` cost.
@@ -762,7 +780,14 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
                     # close (Codex, PR #297).
                     tied_closes.add(day)
             else:
-                invalid_days.add(day)
+                last_invalid_us[day] = max(last_invalid_us.get(day, stamp), stamp)
+    # A day is spoiled only when its unreadable sample is at or after the
+    # best close it does have: anything earlier is settled by that close.
+    # With no readable close at all the day has nothing to be settled by.
+    for day, bad_us in last_invalid_us.items():
+        seen = last_by_day.get(day)
+        if seen is None or bad_us >= seen[0]:
+            invalid_days.add(day)
     invalid_days |= tied_closes
     costs: dict[str, float] = {}
     previous_day: str | None = None
@@ -795,6 +820,15 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
             # per point without saying so.
             raise SubsidyLedgerError(
                 f"{path}: a points row needs date, arm and points; got {record!r}")
+        # The date is a *join key* against the execution and PnL ledgers,
+        # both of which produce it from `utc_date`. A noncanonical but
+        # truthy spelling -- "2026-9-08", or a trailing space -- keys a
+        # separate points-only row instead, so the day the operator meant
+        # to price reports no points and its rate cannot be produced, with
+        # a 0 exit (Codex, PR #297).
+        if not CANONICAL_DATE.fullmatch(str(date)):
+            raise SubsidyLedgerError(
+                f"{path}: a points row needs a YYYY-MM-DD date; got {date!r}")
         if is_not_a_number(value):
             raise SubsidyLedgerError(
                 f"{path}: unreadable points value {value!r} for {date}/{arm}")
