@@ -471,7 +471,7 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             day.funding_usd += carry
             day.funding_seen = True
-            if record.get("funding_ticks_observed") == 0 and spans_a_funding_interval(record):
+            if funding_ticks_are_zero(record) and spans_a_funding_interval(record):
                 day.incomplete = True
                 day.incomplete_reasons.add("funding_gap")
     return dict(days)
@@ -534,6 +534,32 @@ def funding_ticks_seen(record: dict) -> bool:
     if not math.isfinite(count) or count < 0:
         return True
     return count > 0
+
+
+def funding_ticks_are_zero(record: dict) -> bool:
+    """Does the row *readably* claim that no funding tick landed?
+
+    An exact `== 0` let an export that writes its numbers as strings
+    through: `"0"` is not `0`, so a row spanning an hourly boundary with a
+    zero carry was accepted as a complete day and its zero went into the
+    cost -- while the identical row written with a numeric `0` correctly
+    produced a `funding_gap` (Codex, PR #297).
+
+    Only a value that is present and parses to exactly zero counts.
+    Missing means the row makes no claim (the caller's other branch
+    handles a missing carry), and unreadable, negative or non-finite is
+    not evidence of zero either -- the same doctrine as
+    `funding_ticks_seen`, which this deliberately mirrors rather than
+    negates: both must answer "no" for a count that cannot be read.
+    """
+    ticks = record.get("funding_ticks_observed")
+    if ticks is None or isinstance(ticks, bool):
+        return False
+    try:
+        count = float(ticks)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(count) and count == 0.0
 
 
 def spans_a_funding_interval(record: dict) -> bool:
@@ -1069,19 +1095,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="write the rows as JSONL")
     args = parser.parse_args(argv)
 
-    exec_paths = expand(args.exec_glob)
     # `--exec-glob` is required, so matching nothing is a mistyped pattern
     # or a missing export -- not an empty period. Left alone the command
     # exited 0, wrote an empty `--out`, and printed no arm-level warning,
-    # making a missing ledger indistinguishable from a real empty report
-    # (Codex, PR #297).
-    if not exec_paths:
+    # making a missing ledger indistinguishable from a real empty report.
+    #
+    # Checked *per pattern*, not on the combined expansion: the option
+    # repeats, and one good pattern beside a mistyped one still leaves
+    # `exec_paths` non-empty while a whole arm or date silently drops out
+    # of the execution denominator (Codex, PR #297).
+    unmatched = [pattern for pattern in args.exec_glob if not expand([pattern])]
+    if unmatched:
         parser.error(
-            "--exec-glob matched no files ("
-            + ", ".join(repr(p) for p in args.exec_glob)
-            + "); an empty report cannot be told apart from a missing export"
+            "--exec-glob matched no files: "
+            + ", ".join(repr(pattern) for pattern in unmatched)
+            + "; a missing export cannot be told apart from an empty period"
         )
-    execution = load_execution(exec_paths)
+    execution = load_execution(expand(args.exec_glob))
     pnl = load_pnl(expand(args.pnl_glob))
     equity_costs: dict[str, dict[str, float]] = {}
     for spec in args.equity:

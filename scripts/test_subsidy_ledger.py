@@ -21,6 +21,7 @@ from subsidy_ledger import (  # noqa: E402
     load_pnl,
     load_points,
     render_table,
+    funding_ticks_are_zero,
     funding_ticks_seen,
     opening_date,
     spans_a_funding_interval,
@@ -1164,6 +1165,58 @@ def test_exec_globs_that_match_nothing_are_refused():
             assert exit_code.code == 2, exit_code.code
         else:
             raise AssertionError("a required glob that matches nothing must be refused")
+
+
+def test_a_string_zero_tick_count_is_still_a_gap():
+    """`"0"` is not `0`, and an exact comparison let it through.
+
+    An export that writes its numbers as strings then had a row spanning
+    an hourly boundary accepted as a complete day, with its zero carry in
+    the cost -- while the identical row written numerically produced a
+    `funding_gap` (Codex, PR #297).
+    """
+    on_the_hour = 1788868800 + 1800
+    assert funding_ticks_are_zero({"funding_ticks_observed": 0})
+    assert funding_ticks_are_zero({"funding_ticks_observed": "0"})
+    assert funding_ticks_are_zero({"funding_ticks_observed": 0.0})
+    # No claim, or a claim that cannot be read, is not a claim of zero.
+    assert not funding_ticks_are_zero({})
+    assert not funding_ticks_are_zero({"funding_ticks_observed": "n/a"})
+    assert not funding_ticks_are_zero({"funding_ticks_observed": 2})
+    assert not funding_ticks_are_zero({"funding_ticks_observed": "NaN"})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        as_text = pnl_file(
+            Path(tmp),
+            [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 20 * 3600, "funding_carry_usd": 0.0,
+              "funding_ticks_observed": "0"}],
+        )
+        day = load_pnl([as_text])[("2026-09-08", "freq")]
+        assert day.incomplete, "a string zero must be read as a real zero claim"
+        assert "funding_gap" in day.incomplete_reasons
+        row = build_rows({}, {("2026-09-08", "freq"): day})[0]
+        assert row.funding_usd is None
+        assert row.cost_source != "pnl_ledger"
+
+
+def test_one_mistyped_exec_glob_among_several_is_refused():
+    """The option repeats, so a collective check is not enough.
+
+    One good pattern beside a mistyped one keeps the expansion non-empty
+    while a whole arm or date drops out of the execution denominator
+    (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        good = Path(tmp) / "execution-freq.jsonl"
+        good.write_text("")
+        missing = str(Path(tmp) / "no-such-export-*.jsonl")
+        try:
+            ledger_main(["--exec-glob", str(good), "--exec-glob", missing])
+        except SystemExit as exit_code:
+            assert exit_code.code == 2, exit_code.code
+        else:
+            raise AssertionError("the unmatched pattern must still be refused")
 
 
 def test_a_partially_covered_day_does_not_publish_its_known_funding_subtotal():
