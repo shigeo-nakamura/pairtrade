@@ -1036,7 +1036,8 @@ impl ArcusSpotRuntime {
         // re-anchors its risk baskets on; and before the z-score is read, so
         // a window that discards the signal history has already done it by
         // the time the score is taken from it.
-        let corporate_action = self.corporate_action_gate(evaluation_time, &price);
+        let corporate_action =
+            self.corporate_action_gate(evaluation_time, snapshot.collection_finished_at, &price);
         self.state.last_token_a_identity = Some(observed_token_a_identity);
         self.state.last_token_b_identity = Some(observed_token_b_identity);
         self.state.last_token_identity_at = Some(snapshot.collection_finished_at);
@@ -2777,16 +2778,48 @@ impl ArcusSpotRuntime {
     fn corporate_action_gate(
         &mut self,
         evaluation_time: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
         price: &PriceContext,
     ) -> CorporateActionGate {
         // Cheapest possible path for the overwhelmingly common case: an
         // empty calendar cannot change any decision, and must not cost one.
-        if self.config.corporate_actions.is_empty() {
-            self.state.corporate_action = None;
+        // Only when there is no open window to resolve, though -- emptying
+        // the calendar is one of the ways an operator can delete a live
+        // declaration, and this path used to erase its progress and return
+        // an unrestricted gate.
+        if self.config.corporate_actions.is_empty() && self.state.corporate_action.is_none() {
             return CorporateActionGate::default();
         }
 
         let Some(event) = self.active_corporate_action(evaluation_time) else {
+            // Retiring a declaration whose window never opened is ordinary
+            // housekeeping: nothing was pinned, nothing was discarded,
+            // nothing needs resolving. Once a window *has* opened, its
+            // progress record is the only thing that remembers the
+            // pre-event identity and the discarded signal window, and past
+            // `effective_at` the tracked inventory is denominated in units
+            // the venue no longer quotes. Dropping the record because the
+            // declaration disappeared would resume sampling -- and
+            // eventually trading -- on that inventory, with the event never
+            // reconciled and never marked handled. Deleting or renaming a
+            // live entry is not a way to cancel a window (Codex P1,
+            // pairtrade#309).
+            if let Some(progress) = self.state.corporate_action.clone() {
+                return CorporateActionGate {
+                    block_entry: Some(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::CorporateActionBlock,
+                        format!(
+                            "corporate action {} opened at {} and is no longer declared in the \
+                             approved config; restore the declaration and its reconciled \
+                             post_event_inventory to resume -- the tracked inventory is still \
+                             the pre-event holding",
+                            progress.event_id, progress.blocked_at,
+                        ),
+                    )),
+                    force_exit: self.state.regime != ArcusSpotRegime::Neutral,
+                    suppress_history: true,
+                };
+            }
             self.state.corporate_action = None;
             return CorporateActionGate::default();
         };
@@ -2842,16 +2875,38 @@ impl ArcusSpotRuntime {
             }
         }
 
-        if evaluation_time < event.resume_not_before {
+        // The evaluation clock reaching `resume_not_before` is not enough.
+        // The resume values the reconciled holding at *this* observation's
+        // prices and seeds the emptied window with their ratio, so the
+        // observation itself must come from after the cutoff. A snapshot
+        // collected shortly before it and still inside `max_quote_age_secs`
+        // describes exactly the interval the calendar declares
+        // untrustworthy -- the same prints the discard at `effective_at`
+        // threw away (Codex P1, pairtrade#309).
+        let observation_is_post_cutoff = observed_at >= event.resume_not_before;
+        if evaluation_time < event.resume_not_before || !observation_is_post_cutoff {
             let hold = ArcusSpotHold::new(
                 ArcusSpotHoldCode::CorporateActionBlock,
-                format!(
-                    "corporate action {} ({}) blocks entries until {}; source: {}",
-                    event.event_id,
-                    event.symbols.join("+"),
-                    event.resume_not_before,
-                    event.source,
-                ),
+                if observation_is_post_cutoff {
+                    format!(
+                        "corporate action {} ({}) blocks entries until {}; source: {}",
+                        event.event_id,
+                        event.symbols.join("+"),
+                        event.resume_not_before,
+                        event.source,
+                    )
+                } else {
+                    format!(
+                        "corporate action {} ({}) reached its resume time, but the latest \
+                         observation was collected at {}, before {}; the resume waits for an \
+                         observation taken after the event. source: {}",
+                        event.event_id,
+                        event.symbols.join("+"),
+                        observed_at,
+                        event.resume_not_before,
+                        event.source,
+                    )
+                },
             );
             return CorporateActionGate {
                 block_entry: Some(hold),
@@ -2968,6 +3023,20 @@ impl ArcusSpotRuntime {
     /// has not unwound). Any equity derived from `state.inventory` is
     /// meaningless until the reconciled holding replaces it.
     fn corporate_action_units_are_stale(&self, evaluation_time: DateTime<Utc>) -> bool {
+        // The stamp is the durable half: it is written at `effective_at`
+        // and cleared only by the resume, so it survives a restart and an
+        // operator deleting the declaration out from under an open window.
+        if self
+            .state
+            .corporate_action
+            .as_ref()
+            .is_some_and(|progress| progress.history_invalidated_at.is_some())
+        {
+            return true;
+        }
+        // ... and the calendar covers the tick that first crosses
+        // `effective_at`, where the halt is evaluated before the gate has
+        // had a chance to write the stamp.
         self.active_corporate_action(evaluation_time)
             .is_some_and(|event| evaluation_time >= event.effective_at)
     }
@@ -6495,6 +6564,132 @@ mod tests {
             }
             other => panic!("expected warm-up after the resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_resume_waits_for_an_observation_taken_after_the_cutoff() {
+        // The evaluation clock is not the evidence. A snapshot collected
+        // just before `resume_not_before` is still fresh enough to be
+        // evaluated after it, but its prints come from the interval the
+        // calendar declares untrustworthy -- and the resume would value the
+        // reconciled holding at those prices and seed the emptied window
+        // with their ratio.
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        let reconciled = ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        };
+        event.post_event_inventory = Some(reconciled);
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+
+        // resume_not_before is anchor + 12s. Collected at +11s, evaluated
+        // at +13s: past the cutoff by the clock, before it by the data.
+        let collected_before = anchor + Duration::seconds(11);
+        let evaluated_after = anchor + Duration::seconds(13);
+        let held = runtime.step_at(&snapshot_with_valid_row(collected_before), evaluated_after);
+        match held.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionBlock);
+                assert!(
+                    hold.detail.contains("before"),
+                    "the hold must say why: {}",
+                    hold.detail
+                );
+            }
+            other => panic!("expected the resume to wait, got {other:?}"),
+        }
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+        assert_ne!(runtime.state.inventory, reconciled);
+        assert!(runtime.state.relative_log_price_history.is_empty());
+
+        // An observation from after the cutoff resumes.
+        let post_cutoff = anchor + Duration::seconds(14);
+        runtime.step_at(&snapshot_with_valid_row(post_cutoff), post_cutoff);
+        assert_eq!(runtime.state.inventory, reconciled);
+        assert_eq!(
+            runtime.state.handled_corporate_action_ids,
+            vec!["NVDA-2026-10-4FOR1".to_string()],
+        );
+    }
+
+    #[test]
+    fn deleting_a_live_declaration_does_not_cancel_its_window() {
+        // The progress record is the only thing that remembers the
+        // pre-event identity and the discarded window, and past
+        // `effective_at` the tracked inventory is in units the venue no
+        // longer quotes. Dropping it because the operator removed the entry
+        // would resume sampling -- and eventually trading -- on that
+        // inventory, with the event never reconciled and never handled.
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        });
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let inventory_before = runtime.state.inventory;
+
+        // Open the window and cross `effective_at` (anchor + 4s).
+        let during = anchor + Duration::seconds(6);
+        runtime.step_at(&snapshot_with_valid_row(during), during);
+        assert!(runtime.state.corporate_action.is_some());
+
+        // The operator removes (or renames) the entry.
+        runtime.config.corporate_actions.clear();
+        let later = anchor + Duration::seconds(20);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+
+        assert!(
+            matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
+            "the window stays fail-closed: {:?}",
+            outcome.decision,
+        );
+        // The distinguishing evidence, and what dropping the record would
+        // undo: the progress survives and the window is still suppressed,
+        // so no post-event print rebuilds the contamination the discard
+        // removed. (The surfaced hold is `Warmup` here, as it is for any
+        // suppressed window -- there is no signal left for the gate's own
+        // hold to outrank.)
+        let even_later = anchor + Duration::seconds(40);
+        runtime.step_at(&snapshot_with_valid_row(even_later), even_later);
+        assert!(runtime.state.corporate_action.is_some(), "progress is kept");
+        assert!(runtime.state.relative_log_price_history.is_empty());
+        assert_eq!(runtime.state.inventory, inventory_before);
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+        // Still stale units, so still no halt derived from them.
+        assert!(runtime.corporate_action_units_are_stale(even_later));
+    }
+
+    #[test]
+    fn retiring_a_declaration_whose_window_never_opened_is_ordinary() {
+        let anchor = event_time();
+        let mut cfg = config();
+        cfg.corporate_actions = vec![corporate_action_event(anchor + Duration::days(30))];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert_eq!(runtime.state.corporate_action, None);
+
+        runtime.config.corporate_actions.clear();
+        let later = anchor + Duration::seconds(5);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        assert!(
+            !matches!(
+                outcome.decision,
+                ArcusSpotDecision::Observe { ref hold }
+                    if hold.code == ArcusSpotHoldCode::CorporateActionBlock
+            ),
+            "nothing was pinned or discarded, so there is nothing to resolve",
+        );
+        assert_eq!(runtime.state.corporate_action, None);
     }
 
     #[test]

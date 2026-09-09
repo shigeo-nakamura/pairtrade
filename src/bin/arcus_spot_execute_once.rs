@@ -2637,6 +2637,45 @@ fn require_corporate_action_rebase_marks(
     Ok(equity)
 }
 
+/// True when the checkpoint sits inside a declared corporate action's
+/// stale-unit phase: past its `effective_at`, resume not yet committed.
+///
+/// The runtime deliberately declines to engage a loss halt there -- the
+/// venue quotes the post-event instrument while the tracked inventory and
+/// its buy-and-hold basket are still in pre-event units, so the gap between
+/// them is priced in the wrong denomination and a reverse split multiplies
+/// an otherwise sub-limit shortfall (see `corporate_action_units_are_stale`
+/// in the runtime). This verifier re-derives that same loss, so without the
+/// matching exception it demands a halt the runtime was right not to engage
+/// and rejects every valid backup spanning such a tick.
+///
+/// The stamp alone is not enough to earn the exception: the progress record
+/// must name an event the *approved config* declares and that the runtime
+/// has not yet handled, so a checkpoint cannot mint the exemption for
+/// itself (bot-strategy#853).
+fn corporate_action_units_are_stale(
+    config: &ArcusSpotRuntimeConfig,
+    current: &ArcusSpotRuntimeState,
+) -> bool {
+    let Some(progress) = current.corporate_action.as_ref() else {
+        return false;
+    };
+    if progress.history_invalidated_at.is_none() {
+        return false;
+    }
+    if current
+        .handled_corporate_action_ids
+        .iter()
+        .any(|handled| handled.eq_ignore_ascii_case(&progress.event_id))
+    {
+        return false;
+    }
+    config
+        .corporate_actions
+        .iter()
+        .any(|event| event.event_id.eq_ignore_ascii_case(&progress.event_id))
+}
+
 fn require_risk_state_continuity(
     config: &ArcusSpotRuntimeConfig,
     baseline: &ArcusSpotRuntimeState,
@@ -2777,7 +2816,16 @@ fn require_risk_state_continuity(
                 bail!("Arcus runtime engaged an unexpected risk halt across restart/rollback")
             }
             (Some(_), None) => {
-                bail!("Arcus runtime omitted a newly triggered loss halt across restart/rollback")
+                // The one phase in which the runtime is *supposed* to omit
+                // it. Scoped to that phase only: an unexpected halt is
+                // still rejected above, and once the resume commits the
+                // baskets are re-anchored and the ordinary expectation
+                // applies again (Codex P1, pairtrade#309).
+                if !corporate_action_units_are_stale(config, current) {
+                    bail!(
+                        "Arcus runtime omitted a newly triggered loss halt across restart/rollback"
+                    )
+                }
             }
             (Some((kind, loss, limit)), Some(halt)) => {
                 let current_day = current_daily
@@ -10214,6 +10262,117 @@ runtime:
             &ArcusSpotCorporateActionContinuity::default(),
         )
         .unwrap_err();
+    }
+
+    fn stale_unit_progress() -> ArcusSpotCorporateActionProgress {
+        ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn the_stale_unit_phase_does_not_demand_a_halt() {
+        // The runtime declines to engage a halt between `effective_at` and
+        // the resume, because the wallet-vs-basket gap is priced in units
+        // the venue no longer quotes. This verifier re-derives that same
+        // loss, so without the matching exception every valid backup
+        // spanning such a tick is rejected for "omitting" a halt the
+        // runtime was right not to engage.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        // A $10 daily loss against the $2 limit -- measured in pre-event
+        // units at post-event prices.
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = Some(stale_unit_progress());
+        let none = ArcusSpotCorporateActionContinuity::default();
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+
+        // An ordinary tick with the same loss still has to have halted.
+        let mut ordinary = continuity_state(8, ("1", "1"));
+        ordinary.last_equity_usd = Some(Decimal::from(290));
+        let error = require_risk_state_continuity(
+            &config, &baseline, &ordinary, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // And the exemption is not something a checkpoint can mint for
+        // itself: the progress must name an event the approved config
+        // declares, and one the runtime has not already handled.
+        let mut undeclared = config.clone();
+        undeclared.corporate_actions.clear();
+        let error = require_risk_state_continuity(
+            &undeclared,
+            &baseline,
+            &current,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        let mut handled = current.clone();
+        handled.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        let error = require_risk_state_continuity(
+            &config, &baseline, &handled, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_stale_unit_phase_still_rejects_an_unexpected_halt() {
+        // Only the omission is excused. A halt that appeared without a
+        // derivable loss is still an unexplained change.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.corporate_action = Some(stale_unit_progress());
+        current.risk_halt = Some(ArcusSpotRiskHalt {
+            kind: ArcusSpotRiskHaltKind::DailyLoss,
+            engaged_at: "2026-08-16T12:00:00Z".parse().unwrap(),
+            equity_usd: Decimal::from(300),
+            loss_usd: Decimal::from(5),
+            limit_usd: Decimal::from(2),
+        });
+        let error = require_risk_state_continuity(
+            &config,
+            &baseline,
+            &current,
+            1,
+            not_before,
+            not_after,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unexpected risk halt"), "{error}");
     }
 
     #[test]
