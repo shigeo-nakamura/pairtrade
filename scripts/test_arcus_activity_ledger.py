@@ -603,7 +603,7 @@ class ActivityLedgerTests(unittest.TestCase):
         coverage flag and a definitive stop result.
         """
         events, history = baseline_round_trip()
-        pending = attempt(11, EXIT_AT + timedelta(minutes=1), sell="SPY", buy="QQQ",
+        pending = attempt(11, ENTRY_AT + timedelta(minutes=1), sell="SPY", buy="QQQ",
                           sell_quantity="0.1", buy_quantity="0.2", phase="confirmed")
         report = report_for(events, history, active=pending)
 
@@ -614,11 +614,38 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertIn("may be on chain but is not reconciled",
                       ledger_tool.render_markdown(report))
 
-        # A phase that sent nothing is not a hole.
-        prepared = dict(pending, phase="prepared")
-        clean = report_for(events, history, active=prepared)
-        self.assertEqual(clean["coverage"]["unresolved_attempts"], [])
-        self.assertTrue(clean["coverage"]["complete"])
+        # `failed` counts too: the ledger's own recovery contract says it
+        # can hold a dispatched-but-unconfirmed transaction.
+        failed = report_for(events, history, active=dict(pending, phase="failed"))
+        self.assertEqual(failed["coverage"]["unresolved_attempts"],
+                         [{"sequence": 11, "phase": "failed"}])
+
+        # A phase that sent nothing is not a hole. `rejected` is the
+        # router refusing before any transaction went out.
+        for phase in ("prepared", "rejected", "operator_hold"):
+            clean = report_for(events, history, active=dict(pending, phase=phase))
+            self.assertEqual(clean["coverage"]["unresolved_attempts"], [], phase)
+            self.assertTrue(clean["coverage"]["complete"], phase)
+
+    def test_a_pending_attempt_outside_the_window_is_named_not_fatal(self):
+        """A historical export must not be spoiled by activity after it.
+
+        An attempt dispatched after the last observation could not have
+        been priced by this export, so it belongs to the next report --
+        but the operator is still told the ledger holds one.
+        """
+        events, history = baseline_round_trip()
+        pending = attempt(11, EXIT_AT + timedelta(days=1), sell="SPY", buy="QQQ",
+                          sell_quantity="0.1", buy_quantity="0.2", phase="confirmed")
+        report = report_for(events, history, active=pending)
+
+        self.assertEqual(report["coverage"]["unresolved_attempts"], [])
+        self.assertEqual(report["coverage"]["pending_outside_window"],
+                         [{"sequence": 11, "phase": "confirmed"}])
+        self.assertTrue(report["coverage"]["complete"])
+        self.assertFalse(report["stop_rule"]["undecidable"])
+        self.assertIn("unfinished attempt outside this window",
+                      ledger_tool.render_markdown(report))
 
     def test_plan_freshness_is_measured_from_the_quote_not_the_observation(self):
         """`validate_plan_age` measures from `plan.quote_received_at`.
@@ -640,6 +667,24 @@ class ActivityLedgerTests(unittest.TestCase):
         stale["quote_received_at"] = stamp(ENTRY_AT - timedelta(seconds=1))
         report = report_for(events, history)
         self.assertEqual(report["totals"]["round_trips"], 1)
+
+    def test_plan_freshness_is_measured_at_dispatch(self):
+        """The runtime re-validates the plan immediately before dispatch.
+
+        A quote inside the bound at preparation but outside it by the
+        time the attempt was dispatched was refused by the runtime, so an
+        event carrying it cannot be the one that produced this swap.
+        """
+        events, history = baseline_round_trip()
+        plan = events[0]["decision"]["plan"]
+        plan["quote_received_at"] = stamp(ENTRY_AT - timedelta(seconds=30))
+        # Prepared while the quote was 30s old (inside the bound), then
+        # dispatched much later, by which time it was not.
+        history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
+                             sell_quantity="0.347094", buy_quantity="0.323269",
+                             dispatched=ENTRY_AT + timedelta(minutes=5))
+        with self.assertRaises(ledger_tool.ActivityLedgerError):
+            report_for(events, history)
 
     def test_an_unmatched_attempt_outside_the_requested_bounds_is_not_fatal(self):
         """A stream can span more than the report the caller asked for.

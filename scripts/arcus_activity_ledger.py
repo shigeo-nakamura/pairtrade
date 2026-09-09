@@ -302,7 +302,15 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
         intent.get("buy_symbol"),
         intent.get("sell_amount_raw"),
     )
-    prepared_at = event_stream.parse_timestamp(attempt["prepared_at"])
+    # The runtime re-runs `validate_plan_age` immediately before
+    # `mark_dispatching` and cancels the prepared attempt if it fails, so
+    # the constraint that actually governed this submission is the quote
+    # against the *dispatch* time, not against preparation. A quote 60.4s
+    # old when prepared but 61s old when dispatched was refused by the
+    # runtime, and matching on `prepared_at` would still select it
+    # (PR #298 Codex review).
+    prepared_at = event_stream.parse_timestamp(
+        attempt.get("dispatched_at") or attempt["prepared_at"])
     candidates = []
     for event in index.get(key, []):
         plan = event["decision"]["plan"]
@@ -460,10 +468,15 @@ def reconciled_attempts(ledger: dict[str, Any]) -> list[dict[str, Any]]:
 # Phases in which a transaction may already exist on chain while the
 # attempt has not been reconciled: the runtime persists `Confirmed`
 # *before* it starts reconciliation, and a crash or provider failure in
-# between leaves it here. `Prepared` has sent nothing; `Rejected`,
-# `Failed` and `OperatorHold` are terminal without a swap
-# (src/arcus_spot/execution_ledger.rs).
-UNRESOLVED_PHASES = frozenset({"dispatching", "submitted", "confirmed", "unknown"})
+# between leaves it here. `Failed` and `Unknown` belong for the reason
+# the ledger's own recovery contract gives -- they "can involve a
+# dispatched-but-unconfirmed transaction and need the heavier
+# repair-report/manual-reconcile review", unlike `Rejected`, which the
+# router refused before any transaction went out
+# (src/arcus_spot/execution_ledger.rs). `Prepared` has sent nothing and
+# `OperatorHold` is a deliberate stop.
+UNRESOLVED_PHASES = frozenset(
+    {"dispatching", "submitted", "confirmed", "failed", "unknown"})
 
 
 def unresolved_attempt(ledger: dict[str, Any]) -> tuple[int, datetime, str] | None:
@@ -816,12 +829,18 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # decide, so a report about a past window is not spoiled by an
     # attempt that is in flight now.
     pending = unresolved_attempt(ledger)
-    asked_about_pending = pending is not None and (
-        (since is None and until is None) or within(pending[1], since, until)
+    pending_row = (
+        {"sequence": pending[0], "phase": pending[2]} if pending is not None else None
     )
-    unresolved = (
-        [{"sequence": pending[0], "phase": pending[2]}] if asked_about_pending else []
-    )
+    in_window = pending is not None and within(pending[1], *asked)
+    unresolved = [pending_row] if in_window else []
+    # Outside the reported window it is still worth naming -- the ledger
+    # holds an unfinished attempt right now -- but it does not spoil a
+    # verdict about a period it is not in. A no-bounds report over a
+    # historical export is the case that matters: an attempt dispatched
+    # after the last observation could not have been priced by this
+    # export anyway (PR #298 Codex review).
+    pending_outside = [pending_row] if pending is not None and not in_window else []
     complete = not orphaned and not unpriceable and not unmeasured_gas and not unresolved
     return {
         "schema_version": 1,
@@ -876,6 +895,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "requested_but_unpriceable": unpriceable,
             "gas_unmeasurable": unmeasured_gas,
             "unresolved_attempts": unresolved,
+            "pending_outside_window": pending_outside,
         },
         "stop_rule": {
             "consecutive_days_required": STOP_RULE_CONSECUTIVE_DAYS,
@@ -936,6 +956,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             "⚠️ This window " + " and ".join(reasons)
             + ", so their cost is in none of the figures above and no stop verdict is given. "
               "Re-run with the missing event segment included.")
+    outside = report["coverage"].get("pending_outside_window")
+    if outside:
+        lines.append("")
+        lines.append(
+            "Note: the ledger holds an unfinished attempt outside this window ("
+            + ", ".join(f"sequence {a['sequence']} in {a['phase']}" for a in outside)
+            + "). It is not part of this report's verdict, and the next report over a "
+              "window that covers it will treat it as a coverage hole until it reconciles.")
     open_gas = report["totals"]["open_leg_gas_usd"]
     if open_gas:
         lines.append("")
