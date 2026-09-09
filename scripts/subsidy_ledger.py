@@ -43,8 +43,25 @@ so the fills cannot be tied back and re-attributed from what is written
 today; both days are marked instead -- the close day (`cross_day_cycles`)
 and the day the entry landed on (`cross_day_entries`), whose own volume
 holds that leg while none of the cost does -- and their rates are
-suppressed, the same treatment an unvalued fill gets. Closing it properly
-needs the bot to stamp a cycle id on both ledgers.
+suppressed, the same treatment an unvalued fill gets.
+
+Those two are the cases a *realized close* can reveal: its own hold names
+the day it opened on. An entry with no realized close in the report at
+all -- still open when the window ends, or closed in a PnL file the
+caller did not pass -- names nothing, and the PnL rows carry no size or
+notional (checked against the archived ledgers: `ts`, prices, `pnl`,
+`hold_secs`, funding), so there is no way to tell that a day's fills
+include such a leg. Its notional therefore sits in the denominator with
+no cost beside it, and the rate for that day reads cheaper than the truth
+by however much of it was unpaired.
+
+All three are one missing link: a `leg_fill` cannot be tied to the cycle
+it belongs to. Closing it needs the bot to stamp a cycle id on both
+ledgers -- at which point the volume denominator can be built from the
+cycles that actually closed, and none of these three cases exists.
+Estimating it instead (pairing by symbol and time, or assuming two legs
+per cycle) would put a constructed number where a measured one is
+supposed to be, which is the failure this KPI exists to avoid.
 
 `cost_per_musd_volume` needs no points at all and is the KPI to steer by
 in the meantime: points programs are volume-weighted, so the conversion
