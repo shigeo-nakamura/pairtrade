@@ -240,18 +240,16 @@ Not a checklist to execute now; recorded so the path is explicit:
 2. Set `dry_run: false` in `configs/book/xsmom-695.yaml` **and**
    `Environment=BOOK_CONFIRM_LIVE=yes-i-mean-it` in a unit drop-in; either
    alone refuses to start.
-3. In the same reviewed config change, set
-   `execution.allow_venue_protection_fallback: true`. **Without it no
-   Lighter order can be sent at all**: dex-connector v4.7.20 has no
-   price-capped IOC for Lighter, so `send_capped` refuses rather than
-   silently widening the cap, and the default is false precisely so that
-   choice is made deliberately. Accepting it means orders go out with
-   Lighter's own ±20 % protection price instead of the configured
-   `slippage_bps`, so the pre-send drift guard (which still uses
-   `slippage_bps` against the sizing mid) and the per-symbol/gross/net
-   caps are what actually bound a bad fill. Revisit when
-   bot-strategy#918 lands a price-constrained IOC; at that point this
-   flag should go back to false.
+3. Leave `execution.allow_venue_protection_fallback` at its default
+   **false**. This step used to require setting it to `true`, because
+   dex-connector had no price-capped IOC for Lighter and `send_capped`
+   refused rather than silently widening the cap. As of **v4.7.22**
+   (bot-strategy#918) `create_order_taker_ioc` is implemented for
+   Lighter — LIMIT + `TIF_IOC` bounded by the configured `slippage_bps`
+   — so the fallback is no longer a prerequisite for anything, and
+   turning it on now only authorizes a ±20 % order for some future
+   "not supported" error path. Fail closed instead: an order that cannot
+   be sent under the configured cap should not be sent.
 4. Restart before a decision window with the book flat (the paper book
    does not carry over: delete `state.json` positions or let the venue
    reconcile adopt whatever is there — it starts flat on a new account).
