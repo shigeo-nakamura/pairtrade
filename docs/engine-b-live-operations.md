@@ -114,6 +114,54 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
+- **Venue equity is published, never traded on** (bot-strategy#919).
+  `status.json`'s `han_bridge` block carries `venue_equity_usd`
+  (`total_asset_value`), `venue_available_usd` (`available_balance`),
+  `venue_equity_age_secs` and `unrealized_pnl_usd_mid_estimate`,
+  refreshed every `ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS` (default
+  60). Read them as operator visibility only:
+  - **Nothing gates on them.** Sizing and the session-loss halt still run
+    off `ENGINE_B_LIVE_EQUITY_USD_REFERENCE`, a config constant, so a
+    reference that does not match the funded account makes the halt
+    threshold mean something other than it appears to. Reconcile the two
+    by hand; this feature reports the gap, it does not close it.
+  - **The age is part of the reading.** A failed refresh keeps the last
+    value and lets its age grow rather than blanking it or restamping it;
+    only the ok -> failed and failed -> ok edges are logged (`[EQUITY]`),
+    so a venue that is down for an hour does not WARN sixty times about a
+    number nothing trades on. Treat a large `venue_equity_age_secs` as
+    "unknown", not as "unchanged".
+  - **`unrealized_pnl_usd_mid_estimate` is a mid mark, not a settled
+    figure**: no fees, no funding, computed against the recorded entry
+    price (itself an estimate whenever `entry_price_estimated` is set),
+    and only for the position this engine manages -- `unmanaged_positions`
+    have no cost basis here. It is `null` when flat, when the basis is
+    unknown, or when no fresh US primary price is available, because a
+    dashboard can render `null` as "-" but cannot tell a real zero from a
+    fabricated one. The settled ledger is #919's remaining work.
+  - On the wire this is at most one REST call per five minutes:
+    dex-connector's Lighter `get_balance` caches for 300 s and a WS fill
+    invalidates that cache, so the reading refreshes promptly right after
+    an entry or exit without adding steady-state load to a Standard-tier
+    60 req/min account.
+  - debot-dashboard renders these in the Han Bridge panel even though
+    Engine B is an `alpha_candidate` whose performance fields are
+    blinded. Solvency is not performance -- it answers "can this place
+    its next order", the class of question the halt pills are already
+    exempt for. See debot-dashboard `deploy/alpha-gate.md`.
+- **Both legs are bounded taker IOCs** (bot-strategy#918, dex-connector
+  v4.7.22): `submit_order` sends `create_order_taker_ioc` at a marketable
+  limit `ENGINE_B_LIVE_SLIPPAGE_BPS` (default **50**) from the touch,
+  tick-rounded inward, remainder cancelled. This replaces
+  `create_order(price = None)`, whose ±20 % protection price bounded a
+  $100 lot at $20 per leg. The value is validated at startup against the
+  connector's accepted `1..=1000`: the process refuses to start outside
+  it rather than losing a session day to a rejected send (only one entry
+  `sendTx` is allowed per day, G-4). Two consequences at the first live
+  cycle: a book the connector considers stale now **fails the send**
+  instead of pricing off a stale ticker, and a size that truncates to
+  zero at the market's size decimals is rejected instead of being forced
+  up to one size tick. If a live send is ever rejected for crossing the
 - **Both legs are bounded taker IOCs** (bot-strategy#918, #978;
   dex-connector v4.7.24): `submit_order` sends
   `create_order_taker_ioc_at` at the marketable limit

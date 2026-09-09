@@ -358,6 +358,15 @@ struct EngineBLiveConfig {
     min_daily_volume_usd: f64,
     equity_usd_reference: f64,
     max_session_loss_bps: f64,
+    /// How often (seconds) the venue's own account equity is re-read for
+    /// `status.json` (bot-strategy#919). This is an operator-visibility
+    /// read, never an input to a trading decision: nothing gates on it,
+    /// so a failed or stale read can only blank a dashboard row, never
+    /// block or allow an order. `dex-connector`'s Lighter connector
+    /// already caches `get_balance` for 300 s and invalidates that cache
+    /// on a WS fill, so a refresh more often than that costs nothing on
+    /// the wire and still updates promptly right after an entry or exit.
+    venue_equity_refresh_secs: i64,
     trading_calendar_path: PathBuf,
     kill_switch_path: PathBuf,
     risk_ack_path: PathBuf,
@@ -459,6 +468,7 @@ impl EngineBLiveConfig {
             min_daily_volume_usd: env_f64("ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD", 100_000.0),
             equity_usd_reference: env_f64("ENGINE_B_LIVE_EQUITY_USD_REFERENCE", 1000.0),
             max_session_loss_bps: env_f64("ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS", 500.0),
+            venue_equity_refresh_secs: env_i64("ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS", 60),
             trading_calendar_path: PathBuf::from(env_string(
                 "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
                 &format!("{code_dir}/trading_calendar.json"),
@@ -1626,6 +1636,30 @@ struct EngineStatusExtra {
     calendar_version: String,
 }
 
+/// The venue's own view of the account, as of `fetched_at_us`
+/// (bot-strategy#919). Read-only operator visibility: `engine_b_live`
+/// sizes and halts off `equity_usd_reference`, a config constant, and
+/// nothing here feeds a trading decision -- so a stale or missing
+/// reading blanks a dashboard row and never changes what the engine
+/// does.
+///
+/// Kept with its own timestamp rather than as a bare number because a
+/// number with no age cannot be told apart from a number that stopped
+/// updating an hour ago; `HanBridgeStatus` publishes the age alongside
+/// the value so a reader can apply their own bound (same reasoning as
+/// `stale_or_missing_symbols`, bot-strategy#916).
+#[derive(Clone, Copy, Debug)]
+struct VenueEquity {
+    /// `total_asset_value` -- the whole account, collateral plus the
+    /// mark value of open positions.
+    equity_usd: f64,
+    /// `available_balance` -- what is free of margin. Falling toward
+    /// zero while equity holds is the shape of an account that cannot
+    /// open the next lot.
+    available_usd: f64,
+    fetched_at_us: i64,
+}
+
 /// Engine-B-specific dashboard block, nested under a named `han_bridge`
 /// key (same pattern as `hype-accumulator`'s `accumulator` block in
 /// debot-dashboard's `StatusData`) rather than flattened alongside
@@ -1659,6 +1693,38 @@ struct HanBridgeStatus {
     /// Current price-feed generation; increments on every broadcast
     /// `Lagged` (dropped updates).
     price_feed_generation: u64,
+    /// The venue's own total account value in USD, and the age of that
+    /// reading (bot-strategy#919). `None` until the first successful
+    /// `get_balance`, and the age is what makes a frozen reading
+    /// visible rather than silently authoritative.
+    ///
+    /// These live in the `han_bridge` block, not in `DashboardStatus`,
+    /// on purpose. debot-dashboard blinds the generic trading view's
+    /// equity headline and PnL rows for `alpha_candidate` targets --
+    /// running performance is peeking on a pre-registered study. Account
+    /// solvency is not performance: it answers "can this thing still
+    /// place its next order", the same class of question as the halt
+    /// pills that blinding already exempts. Publishing it here lets the
+    /// dashboard render solvency without reopening the performance
+    /// fields (see debot-dashboard `deploy/alpha-gate.md`).
+    venue_equity_usd: Option<f64>,
+    venue_available_usd: Option<f64>,
+    venue_equity_age_secs: Option<i64>,
+    /// Mark-to-mid PnL of the position this engine manages, or `None`
+    /// when flat, when the cost basis was never known
+    /// (`entry_price_unknown`), or when no fresh US primary price is
+    /// available. Deliberately `None` rather than a stale figure: the
+    /// same fail-closed rule the entry path uses for boundary prices
+    /// (bot-strategy#916).
+    ///
+    /// The name says `mid_estimate` because that is exactly what it is
+    /// -- a WS mid against the recorded entry, with no fees and no
+    /// funding. It is not the exchange's unrealized PnL and must not be
+    /// reconciled against an account statement; the settled ledger is
+    /// bot-strategy#919's remaining work. `unmanaged_positions` are
+    /// excluded: this engine has no cost basis for exposure it did not
+    /// open.
+    unrealized_pnl_usd_mid_estimate: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -1718,6 +1784,21 @@ struct EngineBLiveEngine {
     state_writes: u64,
     last_status_write_us: i64,
     status_s3_mirror: Option<Arc<S3Mirror>>,
+    /// Last successful venue equity reading (bot-strategy#919). Kept
+    /// across a failed refresh so the dashboard can show the last known
+    /// figure *with its age* rather than dropping to "-" on one
+    /// transient REST error; the age is what stops a frozen reading
+    /// from passing as current.
+    venue_equity: Option<VenueEquity>,
+    /// When the last refresh was *attempted*, successful or not, so a
+    /// failing venue cannot turn into a retry-every-tick REST loop
+    /// against a 60 req/min account.
+    last_venue_equity_attempt_us: i64,
+    /// True while the most recent attempt failed. Only the ok -> failed
+    /// and failed -> ok transitions are logged; a venue that is down for
+    /// an hour would otherwise WARN once a minute for an hour about a
+    /// value nothing trades on.
+    venue_equity_failing: bool,
 }
 
 impl EngineBLiveEngine {
@@ -4840,7 +4921,113 @@ impl EngineBLiveEngine {
         // persisting it itself (bot-strategy#917); a no-op when nothing
         // changed.
         self.persist_position();
+        // Observational only (bot-strategy#919): refreshed before the
+        // status write so a fresh reading lands in the same document,
+        // and after every trading decision so it can never delay one.
+        self.refresh_venue_equity(now).await;
         self.write_status_if_due(now);
+    }
+
+    /// Re-read the venue's own account equity for `status.json`
+    /// (bot-strategy#919), at most once per
+    /// `cfg.venue_equity_refresh_secs`.
+    ///
+    /// Purely observational. No caller gates on the result, so this
+    /// deliberately has no failure path that touches trading state: a
+    /// venue that stops answering leaves the previous reading in place
+    /// and lets its published age grow, which is the honest rendering
+    /// of "we last saw $X, N seconds ago". Replacing it with `None` on
+    /// the first error would throw away a good reading over one blip;
+    /// replacing it with a fresh timestamp would be a lie.
+    ///
+    /// `get_balance(None)` returns account-level USD on the Lighter
+    /// connector (`equity` = `total_asset_value`, `balance` =
+    /// `available_balance`), served from a 300 s cache that a WS fill
+    /// invalidates eagerly -- so this is at most one REST call per five
+    /// minutes in the steady state, and refreshes promptly right after
+    /// an entry or exit fill.
+    async fn refresh_venue_equity(&mut self, now_us: i64) {
+        let interval_us = self
+            .cfg
+            .venue_equity_refresh_secs
+            .max(1)
+            .saturating_mul(1_000_000);
+        if self.last_venue_equity_attempt_us != 0
+            && now_us - self.last_venue_equity_attempt_us < interval_us
+        {
+            return;
+        }
+        self.last_venue_equity_attempt_us = now_us;
+        match self.connector.get_balance(None).await {
+            Ok(balance) => {
+                // A venue that answers with an unrepresentable number is
+                // not a venue that answered. Treat it as a failure
+                // rather than publishing 0.0 as if the account were
+                // empty -- an equity row reading $0.00 is exactly the
+                // alarm an operator must be able to trust.
+                let (Some(equity_usd), Some(available_usd)) =
+                    (balance.equity.to_f64(), balance.balance.to_f64())
+                else {
+                    self.note_venue_equity_failure("balance was not representable as f64");
+                    return;
+                };
+                if self.venue_equity_failing {
+                    log::info!(
+                        "[EQUITY] venue equity readable again: equity=${equity_usd:.2} \
+                         available=${available_usd:.2}"
+                    );
+                    self.venue_equity_failing = false;
+                }
+                self.venue_equity = Some(VenueEquity {
+                    equity_usd,
+                    available_usd,
+                    fetched_at_us: now_us,
+                });
+            }
+            Err(e) => self.note_venue_equity_failure(&format!("{e:?}")),
+        }
+    }
+
+    /// WARN once on the ok -> failed edge, then stay quiet. The previous
+    /// reading and its growing age are what a reader should be looking
+    /// at; repeating the same line every minute would only bury the
+    /// lines that matter.
+    fn note_venue_equity_failure(&mut self, why: &str) {
+        if !self.venue_equity_failing {
+            log::warn!(
+                "[EQUITY] venue equity unreadable ({why}); status.json keeps the last reading \
+                 and its age. Nothing gates on this value."
+            );
+            self.venue_equity_failing = true;
+        }
+    }
+
+    /// Mark-to-mid PnL of the position this engine manages, or `None`
+    /// when there is nothing trustworthy to compute it from
+    /// (bot-strategy#919).
+    ///
+    /// `None` rather than `0.0` in every degenerate case: flat, no cost
+    /// basis (`entry_price_unknown`), or no US primary price fresh
+    /// enough to mark against. A dashboard can render "-" for `None`;
+    /// it cannot tell a real zero from a fabricated one.
+    ///
+    /// This is a WS mid against the recorded entry price -- no fees, no
+    /// funding, and `entry_price` is itself an estimate whenever
+    /// `entry_price_estimated` is set. It exists so an operator can see
+    /// roughly where an open position stands, not so anyone can book it.
+    fn unrealized_pnl_mid_estimate(&self, now_us: i64) -> Option<f64> {
+        let pos = self.position.as_ref()?;
+        if pos.entry_price_unknown {
+            return None;
+        }
+        let mid = *self
+            .usable_prices(now_us)
+            .get(&self.cfg.us_primary_symbol)?;
+        let direction = match pos.side {
+            OrderSide::Long => 1.0,
+            OrderSide::Short => -1.0,
+        };
+        Some((mid - pos.entry_price) * pos.open_size * direction)
     }
 
     fn write_status_if_due(&mut self, now_us: i64) {
@@ -4958,6 +5145,12 @@ impl EngineBLiveEngine {
             skip_reason: self.day.skip_reason.clone(),
             stale_or_missing_symbols,
             price_feed_generation: self.feed_generation(),
+            venue_equity_usd: self.venue_equity.map(|v| v.equity_usd),
+            venue_available_usd: self.venue_equity.map(|v| v.available_usd),
+            venue_equity_age_secs: self
+                .venue_equity
+                .map(|v| (now_us - v.fetched_at_us) / 1_000_000),
+            unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -5204,6 +5397,9 @@ async fn main() -> Result<()> {
         state_writes: 0,
         last_status_write_us: 0,
         status_s3_mirror: S3Mirror::from_env(),
+        venue_equity: None,
+        last_venue_equity_attempt_us: 0,
+        venue_equity_failing: false,
     };
     if let Some(p) = engine.state.open_position.as_ref() {
         log::warn!(
@@ -5364,6 +5560,7 @@ mod tests {
             lighter_rest_url: "https://mainnet.zklighter.elliot.ai".to_string(),
             min_daily_volume_usd: 100_000.0,
             equity_usd_reference: 1000.0,
+            venue_equity_refresh_secs: 60,
             max_session_loss_bps: 500.0,
             trading_calendar_path: PathBuf::from("/nonexistent"),
             kill_switch_path: PathBuf::from("/nonexistent/KILL_SWITCH"),
@@ -5821,6 +6018,10 @@ mod tests {
                 skip_reason: None,
                 stale_or_missing_symbols: Vec::new(),
                 price_feed_generation: 0,
+                venue_equity_usd: None,
+                venue_available_usd: None,
+                venue_equity_age_secs: None,
+                unrealized_pnl_usd_mid_estimate: None,
             },
         }
     }
@@ -6223,6 +6424,13 @@ mod tests {
         /// Makes `get_positions` fail, standing in for an account this
         /// process cannot read at startup (bot-strategy#917).
         fail_get_positions: std::sync::atomic::AtomicBool,
+        /// How many times `get_balance` was called, so the refresh
+        /// throttle is asserted against the call itself rather than
+        /// against a timestamp field (bot-strategy#919).
+        balance_calls: std::sync::atomic::AtomicUsize,
+        /// `(equity, available)` the stub reports, and whether the call
+        /// fails instead.
+        balance: std::sync::Mutex<Option<(Decimal, Decimal)>>,
     }
 
     impl StubConnector {
@@ -6245,6 +6453,21 @@ mod tests {
                 .iter()
                 .map(|d| d.to_f64().unwrap())
                 .collect()
+        }
+
+        fn balance_call_count(&self) -> usize {
+            self.balance_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_balance(&self, equity: &str, available: &str) {
+            *self.balance.lock().unwrap() = Some((
+                Decimal::from_str(equity).unwrap(),
+                Decimal::from_str(available).unwrap(),
+            ));
+        }
+
+        fn fail_balance(&self) {
+            *self.balance.lock().unwrap() = None;
         }
     }
 
@@ -6295,7 +6518,19 @@ mod tests {
             &self,
             _symbol: Option<&str>,
         ) -> Result<dex_connector::BalanceResponse, dex_connector::DexError> {
-            unimplemented!("engine_b_live does not call get_balance")
+            self.balance_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match *self.balance.lock().unwrap() {
+                Some((equity, balance)) => Ok(dex_connector::BalanceResponse {
+                    equity,
+                    balance,
+                    position_entry_price: None,
+                    position_sign: None,
+                }),
+                None => Err(dex_connector::DexError::Transient(
+                    "stub balance unavailable".to_string(),
+                )),
+            }
         }
         async fn get_combined_balance(
             &self,
@@ -6573,6 +6808,9 @@ mod tests {
             state_writes: 0,
             last_status_write_us: 0,
             status_s3_mirror: None,
+            venue_equity: None,
+            last_venue_equity_attempt_us: 0,
+            venue_equity_failing: false,
         };
         Harness {
             engine,
@@ -7970,6 +8208,142 @@ mod tests {
         let resumed = h.engine.position.clone().expect("resumed");
         assert!(!resumed.flatten_asap, "resumed on schedule, not flattened");
         assert!(!h.engine.state.session_halted);
+    }
+
+    // -------------------------------------------------------------
+    // Venue equity / unrealized visibility (bot-strategy#919).
+    //
+    // Everything here is observational: the assertions are about what
+    // reaches `status.json`, and each test also pins that no order was
+    // sent, because a visibility feature that can move the trading path
+    // is a bug, not a feature.
+    // -------------------------------------------------------------
+
+    fn read_status(h: &Harness) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn venue_equity_reaches_status_with_its_age() {
+        let mut h = harness();
+        h.connector.set_balance("5000.5", "4900.25");
+        h.engine.refresh_venue_equity(T1_US).await;
+        // 30 s later the value has not been re-read (the throttle), so
+        // the published age must have grown rather than reset.
+        h.engine.write_status_if_due(T1_US + 30_000_000);
+        let status = read_status(&h);
+        assert_eq!(
+            status["han_bridge"]["venue_equity_usd"],
+            serde_json::json!(5000.5)
+        );
+        assert_eq!(
+            status["han_bridge"]["venue_available_usd"],
+            serde_json::json!(4900.25)
+        );
+        assert_eq!(
+            status["han_bridge"]["venue_equity_age_secs"],
+            serde_json::json!(30),
+            "an equity figure with no age cannot be told apart from a frozen one"
+        );
+        assert_eq!(h.connector.order_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn venue_equity_is_null_until_the_first_successful_read() {
+        let mut h = harness();
+        h.connector.fail_balance();
+        h.engine.refresh_venue_equity(T1_US).await;
+        h.engine.write_status_if_due(T1_US);
+        let status = read_status(&h);
+        assert_eq!(
+            status["han_bridge"]["venue_equity_usd"],
+            serde_json::json!(null),
+            "never publish 0.0 for an account that was never read"
+        );
+        assert!(h.engine.venue_equity_failing);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_reading_and_lets_its_age_grow() {
+        let mut h = harness();
+        h.connector.set_balance("5000", "5000");
+        h.engine.refresh_venue_equity(T1_US).await;
+        h.connector.fail_balance();
+        h.engine.refresh_venue_equity(T1_US + 600_000_000).await;
+        h.engine.write_status_if_due(T1_US + 600_000_000);
+        let status = read_status(&h);
+        assert_eq!(
+            status["han_bridge"]["venue_equity_usd"],
+            serde_json::json!(5000.0),
+            "one transient error must not discard a good reading"
+        );
+        assert_eq!(
+            status["han_bridge"]["venue_equity_age_secs"],
+            serde_json::json!(600),
+            "but it must be visibly 10 minutes old"
+        );
+        assert!(h.engine.venue_equity_failing);
+    }
+
+    #[tokio::test]
+    async fn venue_equity_refresh_is_throttled_to_its_interval() {
+        let mut h = harness();
+        h.connector.set_balance("5000", "5000");
+        h.engine.cfg.venue_equity_refresh_secs = 60;
+        h.engine.refresh_venue_equity(T1_US).await;
+        h.engine.refresh_venue_equity(T1_US + 59_000_000).await;
+        assert_eq!(
+            h.connector.balance_call_count(),
+            1,
+            "a 5 s tick must not turn into a 12/min REST loop"
+        );
+        h.engine.refresh_venue_equity(T1_US + 60_000_000).await;
+        assert_eq!(h.connector.balance_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn unrealized_is_signed_by_side_and_null_without_a_trustworthy_mark() {
+        let mut h = harness();
+        h.observe_all(T1_US, 1000.0, 1750.0);
+        assert_eq!(
+            h.engine.unrealized_pnl_mid_estimate(T1_US),
+            None,
+            "flat is not a zero unrealized"
+        );
+
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        let long = h.engine.unrealized_pnl_mid_estimate(T1_US).unwrap();
+        assert!((long - 2.5).abs() < 1e-9, "long: {long}");
+
+        h.engine.position.as_mut().unwrap().side = OrderSide::Short;
+        let short = h.engine.unrealized_pnl_mid_estimate(T1_US).unwrap();
+        assert!((short + 2.5).abs() < 1e-9, "short: {short}");
+
+        // No cost basis at all -- an adopted position of unknown origin.
+        h.engine.position.as_mut().unwrap().entry_price_unknown = true;
+        assert_eq!(h.engine.unrealized_pnl_mid_estimate(T1_US), None);
+        h.engine.position.as_mut().unwrap().entry_price_unknown = false;
+
+        // The mark went stale: fail closed to `None` rather than mark
+        // against a price the entry path would itself refuse.
+        let stale_now = T1_US + 31_000_000;
+        assert_eq!(
+            h.engine.unrealized_pnl_mid_estimate(stale_now),
+            None,
+            "a stale mark must blank the row, not quietly age into it"
+        );
+        assert_eq!(h.connector.order_count(), 0);
     }
 
     /// pairtrade#300 Codex review, P1: a `us_primary` change must not
