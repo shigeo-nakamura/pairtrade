@@ -440,6 +440,38 @@ impl ArcusSpotRuntimeCheckpointStore {
         if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
             bail!("unsupported Arcus runtime checkpoint schema");
         }
+        // `corporate_actions` drift is state-preserving, but *removing* a
+        // window the stored config declared is not a tuning change: it drops
+        // a live guard. Before any tick has written progress there is
+        // nothing else for the runtime to fail closed on, so an older but
+        // still-validly-signed config could be loaded and dispatch an entry
+        // or a stale-unit exit straight through the cutoff. Retiring a
+        // declaration whose window had not opened by the last observation is
+        // still ordinary housekeeping (Codex P1, pairtrade#309).
+        if let Some(observed_at) = checkpoint.state.last_observation_at {
+            if let Some(dropped) = checkpoint.config.corporate_actions.iter().find(|stored| {
+                observed_at >= stored.entry_block_at
+                    && !checkpoint
+                        .state
+                        .handled_corporate_action_ids
+                        .iter()
+                        .any(|handled| handled.eq_ignore_ascii_case(&stored.event_id))
+                    && !config
+                        .corporate_actions
+                        .iter()
+                        .any(|event| event.fingerprint() == stored.fingerprint())
+            }) {
+                bail!(
+                    "Arcus runtime checkpoint {} was written under a config declaring corporate \
+                     action {} (window open since {}, not yet handled), which the supplied \
+                     config does not declare. Removing a live window drops the guard it exists \
+                     to be; restore the declaration, or resolve the window first",
+                    self.path.display(),
+                    dropped.event_id,
+                    dropped.entry_block_at.to_rfc3339(),
+                );
+            }
+        }
         let drift = classify_config_drift(&checkpoint.config, config);
         if !drift.state_invalidating.is_empty() {
             bail!(
@@ -753,6 +785,56 @@ mod tests {
         assert!(drift
             .state_preserving
             .contains(&"corporate_action_settlement_margin_secs"));
+    }
+
+    #[test]
+    fn load_refuses_a_config_that_dropped_a_live_window() {
+        use super::super::ArcusSpotCorporateActionEvent;
+        let dir = tempdir().unwrap();
+        let store = ArcusSpotRuntimeCheckpointStore::new(dir.path().join("runtime.json"));
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-08-16T00:00:00Z".parse().unwrap();
+        let mut declared = live_runtime_config();
+        declared.corporate_actions = vec![ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec![declared.pair.sell_symbol.clone()],
+            entry_block_at: anchor,
+            reduce_exit_at: anchor + chrono::Duration::hours(1),
+            effective_at: anchor + chrono::Duration::hours(2),
+            resume_not_before: anchor + chrono::Duration::hours(3),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        }];
+        // The window has opened as of the last observation, and no tick has
+        // written progress yet -- the exact gap this guard closes.
+        let mut state = ArcusSpotRuntime::new(declared.clone())
+            .unwrap()
+            .state()
+            .clone();
+        state.last_observation_at = Some(anchor + chrono::Duration::minutes(1));
+        assert!(state.corporate_action.is_none());
+        let runtime = ArcusSpotRuntime::from_state(declared.clone(), state.clone()).unwrap();
+        store.persist(&runtime).unwrap();
+
+        let mut dropped = declared.clone();
+        dropped.corporate_actions.clear();
+        let error = match store.load_existing(&dropped) {
+            Ok(_) => panic!("expected the dropped window to be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Renaming it is not removing it: same fingerprint, still declared.
+        let mut renamed = declared.clone();
+        renamed.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
+        assert!(store.load_existing(&renamed).is_ok());
+
+        // And retiring a window that had not opened is ordinary housekeeping.
+        let mut early_state = state.clone();
+        early_state.last_observation_at = Some(anchor - chrono::Duration::hours(1));
+        store
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), early_state).unwrap())
+            .unwrap();
+        assert!(store.load_existing(&dropped).is_ok());
     }
 
     #[test]
