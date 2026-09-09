@@ -86,6 +86,13 @@ pub struct SizingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
+    /// Price bound for a live send, **against the mid** -- the same basis
+    /// as `paper_slippage_bps` and the pre-send drift guard. The venue's
+    /// `create_order_taker_ioc` crosses the touch by what it is handed, so
+    /// the executor converts this with the observed half-spread before
+    /// sending (bot-strategy#971): on a book whose half-spread alone
+    /// exceeds it, an entry is not sent (no attempt spent) and a
+    /// reduce-only order crosses at the touch.
     pub slippage_bps: u32,
     pub max_attempts: u32,
     pub fill_confirm_timeout_secs: i64,

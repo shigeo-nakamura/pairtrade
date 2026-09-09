@@ -461,10 +461,26 @@ async fn main() -> Result<()> {
         tokio::select! {
             update = price_rx.recv() => {
                 match update {
-                    Ok(PriceUpdate { symbol, mid_price, .. }) => {
+                    Ok(PriceUpdate {
+                        symbol,
+                        mid_price,
+                        best_bid,
+                        best_ask,
+                        ..
+                    }) => {
                         if let Some(px) = mid_price.to_f64() {
-                            if let Some(p) = &paper { p.set_price(&symbol, px).await; }
-                            if let Some(l) = &live { l.set_price(&symbol, px).await; }
+                            if let Some(p) = &paper {
+                                p.set_price(&symbol, px).await;
+                            }
+                            if let Some(l) = &live {
+                                // The touch is what bounds a live send
+                                // against the mid (bot-strategy#971); an
+                                // update without one still refreshes the mid.
+                                match (best_bid.to_f64(), best_ask.to_f64()) {
+                                    (Some(b), Some(a)) => l.set_quote(&symbol, px, b, a).await,
+                                    _ => l.set_price(&symbol, px).await,
+                                }
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
