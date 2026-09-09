@@ -1266,6 +1266,10 @@ def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
     `0` correctly produced a gap (Codex, PR #297).
     """
     assert funding_tick_claim({}) == "absent"
+    # An explicit null is *present* and is not a count. Absent means the
+    # row makes no claim, which marks no gap -- so collapsing the two
+    # here, and only here, loses safety (Codex, PR #297).
+    assert funding_tick_claim({"funding_ticks_observed": None}) == "malformed"
     assert funding_tick_claim({"funding_ticks_observed": 0}) == "none"
     assert funding_tick_claim({"funding_ticks_observed": "0"}) == "none"
     assert funding_tick_claim({"funding_ticks_observed": 3}) == "some"
@@ -1282,7 +1286,8 @@ def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
 
     on_the_hour = 1788868800 + 1800
     with tempfile.TemporaryDirectory() as tmp:
-        for arm, ticks in (("freq", -1), ("b", "NaN"), ("c", False), ("e", 0.5)):
+        for arm, ticks in (("freq", -1), ("b", "NaN"), ("c", False), ("e", 0.5),
+                           ("f", None)):
             path = pnl_file(
                 Path(tmp),
                 [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
@@ -1296,6 +1301,20 @@ def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
             row = build_rows({}, {("2026-09-08", arm): day})[0]
             assert row.funding_usd is None
             assert row.cost_source != "pnl_ledger"
+
+        # The comment on `funding_tick_claim` claims this is the only
+        # field where absent is the permissive answer. Back it up: a
+        # present-null *carry* still takes the conservative branch, so it
+        # needs no such distinction.
+        null_carry = pnl_file(
+            Path(tmp),
+            [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 20 * 3600, "funding_carry_usd": None}],
+            arm="g",
+        )
+        carry_day = load_pnl([null_carry])[("2026-09-08", "g")]
+        assert carry_day.incomplete, "a spanning row with no carry is a gap either way"
+        assert "funding_gap" in carry_day.incomplete_reasons
 
         # A readable positive count with a carry is the normal case and
         # stays complete.

@@ -624,15 +624,20 @@ def funding_tick_claim(record: dict) -> str:
     deliberately distinct from `none`, because a row that cannot say how
     many ticks it saw is not a row saying it saw none.
     """
-    ticks = record.get("funding_ticks_observed")
-    if ticks is None:
+    # `in`, not `.get()`: an explicit `null` is a *present* value that is
+    # not a count, and collapsing it into `absent` is the one direction
+    # that loses safety here. For every other field a missing value takes
+    # the conservative branch anyway -- a missing `funding_carry_usd`
+    # runs the tick/interval fail-safe, a missing `pnl` or `source` is a
+    # defect -- but a missing tick count is the row making *no claim*,
+    # which marks no gap. So this is the only field where present-null
+    # and absent must differ (Codex, PR #297).
+    if "funding_ticks_observed" not in record:
         return FUNDING_TICKS_ABSENT
-    if is_not_a_number(ticks):
+    if is_not_a_number(record["funding_ticks_observed"]):
         return FUNDING_TICKS_MALFORMED
+    ticks = record["funding_ticks_observed"]
     count = float(ticks)
-    # Finite is not the same as possible: a tick count cannot be
-    # negative, and reading one as "no ticks" would make a malformed row
-    # into evidence that no funding occurred (Codex, PR #297).
     # Finite is not the same as possible, and neither is non-negative: a
     # tick count is how many hourly funding charges landed, so it is a
     # whole number. `0.5` is not "some ticks" any more than `-1` is "no
