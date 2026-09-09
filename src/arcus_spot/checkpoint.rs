@@ -61,6 +61,9 @@ pub struct ArcusSpotCheckpointSummary {
     /// the window again (Codex P1, pairtrade#309).
     pub handled_corporate_action_ids: Vec<String>,
     pub handled_corporate_action_fingerprints: Vec<String>,
+    /// The corporate-action window the state is currently inside, if any.
+    /// `reset-window` refuses to discard it (Codex P1, pairtrade#309).
+    pub corporate_action_event_id: Option<String>,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -359,6 +362,11 @@ impl ArcusSpotRuntimeCheckpointStore {
                 .handled_corporate_action_fingerprints
                 .clone(),
             inventory: checkpoint.state.inventory,
+            corporate_action_event_id: checkpoint
+                .state
+                .corporate_action
+                .as_ref()
+                .map(|progress| progress.event_id.clone()),
         }))
     }
 

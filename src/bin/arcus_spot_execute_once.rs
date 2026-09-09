@@ -2204,6 +2204,22 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
     // tick and resume it again -- clearing the new window and replacing the
     // newly declared initial_inventory with the old post_event_inventory
     // (Codex P1, pairtrade#309).
+    // An open corporate-action window is state this reset would silently
+    // discard: the fresh runtime has no progress record, so the next tick
+    // trades without the fail-closed guard while the inventory may still be
+    // in pre-event units. Refused -- unless the change *is* the instrument
+    // being replaced (`pair`), which is the documented recovery for a
+    // relisted ticker and makes the old window moot (Codex P1, pairtrade#309).
+    if let Some(event_id) = &previous.corporate_action_event_id {
+        if !changed.contains(&"pair") {
+            bail!(
+                "Arcus runtime checkpoint is inside corporate action {event_id}'s window; a \
+                 reset would discard that progress and the next tick would trade without the \
+                 guard. Resolve the window first (restore its declaration and let it resume, \
+                 or reconcile per the runbook), or replace the instrument by changing `pair`",
+            );
+        }
+    }
     let runtime =
         ArcusSpotRuntime::new_continuing_event_sequence(config.runtime.clone(), tail_sequence)
             .map_err(anyhow::Error::msg)
@@ -4917,7 +4933,9 @@ async fn main() -> Result<()> {
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = executor
-                .execute_plan_once(&plan, &plan_config_digest)
+                .execute_plan_once(&plan, &plan_config_digest, &|at| {
+                    runtime.validate_plan_consistent_with_state(&plan, at)
+                })
                 .await?;
             let attempt = finalize_reconciled_attempt(
                 &config,
@@ -4964,7 +4982,9 @@ async fn main() -> Result<()> {
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = executor
-                .execute_plan_once(&plan, &plan_config_digest)
+                .execute_plan_once(&plan, &plan_config_digest, &|at| {
+                    runtime.validate_plan_consistent_with_state(&plan, at)
+                })
                 .await?;
             let attempt = finalize_reconciled_attempt(
                 &config,
@@ -5236,7 +5256,12 @@ async fn main() -> Result<()> {
                 .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
-            let attempt = match executor.execute_plan_once(&plan, &plan_config_digest).await {
+            let attempt = match executor
+                .execute_plan_once(&plan, &plan_config_digest, &|at| {
+                    runtime.validate_plan_consistent_with_state(&plan, at)
+                })
+                .await
+            {
                 Ok(attempt) => attempt,
                 // The venue could not quote and said so before this dispatch
                 // touched anything (bot-strategy#967). Like an unsupported
@@ -9883,6 +9908,44 @@ runtime:
             fresh.state().handled_corporate_action_fingerprints,
             vec!["fp-split".to_string()],
         );
+    }
+
+    #[test]
+    fn reset_window_refuses_to_drop_an_open_corporate_action_window() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.corporate_action = Some(stale_unit_progress());
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+
+        // An unrelated state-invalidating change: refused.
+        let mut unrelated = reset_window_config(dir.path());
+        unrelated.runtime.signal_window_samples += 1;
+        let error = commit_runtime_window_reset(&unrelated)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inside corporate action NVDA-2026-08-SPLIT"),
+            "{error}"
+        );
+
+        // Replacing the instrument is the documented recovery for a relisted
+        // ticker, and makes the old window moot.
+        let mut replaced = reset_window_config(dir.path());
+        replaced.runtime.pair.sell_symbol = "NVDB".to_string();
+        commit_runtime_window_reset(&replaced).unwrap();
+        let fresh = ArcusSpotRuntimeCheckpointStore::new(replaced.runtime_state_path.clone())
+            .load_existing(&replaced.runtime)
+            .unwrap();
+        assert_eq!(fresh.state().corporate_action, None);
     }
 
     #[test]
