@@ -387,13 +387,19 @@ def within_plan_age(observed_at: datetime, prepared_at: datetime,
 def observed_before(observed_at: datetime, prepared_at: datetime) -> bool:
     """Could this event have produced an attempt prepared then?
 
-    To the second, for the same reason `within_plan_age` truncates: the
-    two stamps are written by different code paths on the same host, and
-    holding the comparison to whole seconds keeps a same-second event --
-    which the commit ordering guarantees is the real one -- from being
-    rejected on sub-second serialization noise (PR #298 Codex review).
+    Exactly, *not* to the second. `within_plan_age` truncates because it
+    is mirroring a bound the runtime itself applies with
+    `num_seconds()`; there is no such bound here -- this is program
+    order, and the runtime commits the event before it calls
+    `execute_plan_once`, so the real event's `observed_at` is always at
+    or before `prepared_at` and equality is already safe. Truncating
+    instead admitted a tick observed up to a whole second *after*
+    preparation (`int(-0.5) == 0`), which is precisely the causally
+    impossible candidate this test exists to reject. The stream parser
+    keeps microseconds, so the exact comparison is available
+    (PR #298 Codex review).
     """
-    return int((prepared_at - observed_at).total_seconds()) >= 0
+    return observed_at <= prepared_at
 
 
 def token_addresses_match(intent: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -563,6 +569,17 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     unmatched_in_stream: list[int] = []
     for attempt in reconciled_attempts(ledger):
         dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
+        # Past an explicit `--until` there is nothing to match *for*. The
+        # report keeps swaps by dispatch time, so this one is filtered out
+        # downstream whatever is found here, and a rotation it would have
+        # closed is dropped with its round trip and reported open anyway.
+        # Matching it regardless meant an ambiguous pair of same-shaped
+        # events after the cutoff could raise and take the whole
+        # historical report with it -- the same premise as the unmatched
+        # leg below, applied one step earlier (PR #298 Codex review).
+        if until is not None and dispatched_at > until:
+            out_of_window.append((int(attempt["sequence"]), dispatched_at))
+            continue
         event = find_event(attempt, index, max_plan_age_secs)
         if event is None:
             inside_stream = start <= dispatched_at <= end
@@ -571,7 +588,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                     f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or "
                     f"before {attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- "
                     "the event window probably does not cover this swap")
-            if inside_stream and not (until is not None and dispatched_at > until):
+            if inside_stream:
                 # Inside the priced history but outside the caller's
                 # bounds. Not fatal -- a report the caller can ask for
                 # must still be produced -- but not harmless either:
@@ -581,12 +598,11 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                 # while coverage says complete. It is a coverage hole
                 # (PR #298 Codex review, rounds 5 and 11).
                 #
-                # Only on the `--since` side, though. A leg dispatched
-                # after `--until` is in the future of every rotation this
-                # report can close, so it cannot have unwound one of
-                # them; counting it made an otherwise sound historical
-                # report undecidable purely because the ledger kept
-                # going (PR #298 Codex review, round 12).
+                # Only reachable on the `--since` side now: an attempt
+                # after `--until` never gets this far, because it is in
+                # the future of every rotation this report can close and
+                # so cannot have unwound one (PR #298 Codex review,
+                # rounds 12 and 13).
                 unmatched_in_stream.append(int(attempt["sequence"]))
             out_of_window.append((int(attempt["sequence"]), dispatched_at))
             continue

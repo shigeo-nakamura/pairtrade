@@ -25,6 +25,10 @@ def stamp(when):
     return when.isoformat().replace("+00:00", "Z")
 
 
+def event_stream_parse(text):
+    return ledger_tool.event_stream.parse_timestamp(text)
+
+
 def raw(quantity, decimals=18):
     return str(int(Decimal(quantity) * (Decimal(10) ** decimals)))
 
@@ -908,6 +912,63 @@ class ActivityLedgerTests(unittest.TestCase):
         # than pricing the swap at its marks.
         decoy_only = ledger_tool.would_rotate_index([events[0], future])
         self.assertIsNone(ledger_tool.find_event(history[1], decoy_only))
+
+    def test_an_ambiguous_attempt_after_the_cutoff_does_not_break_the_report(self):
+        """Matching is skipped past `--until`, not just its coverage hole.
+
+        `find_event` raises on ambiguity, and that raise happened before
+        the post-cutoff exclusion could run -- so two same-shaped events
+        after the cutoff took the whole historical report with them
+        (PR #298 Codex review, round 13).
+        """
+        events, history = baseline_round_trip()
+        events.append(observe_event(3, EXIT_AT + timedelta(hours=4)))
+        after = EXIT_AT + timedelta(hours=2)
+        # Two identical would-rotate events after the cutoff, and an
+        # attempt that matches both.
+        for seq, offset in ((4, 0), (5, 30)):
+            events.append(would_rotate_event(
+                seq, after + timedelta(seconds=offset), trigger="entry_signal",
+                sell="QQQ", buy="SPY", sell_quantity="0.5", buy_quantity="0.4",
+                spy_mark="780.00", qqq_mark="700.00"))
+        history.append(attempt(20, after + timedelta(seconds=45), sell="QQQ", buy="SPY",
+                               sell_quantity="0.5", buy_quantity="0.4"))
+        cutoff = EXIT_AT + timedelta(hours=1)
+
+        # Without the cutoff the ambiguity is still refused.
+        with self.assertRaises(ledger_tool.ActivityLedgerError):
+            report_for(events, history)
+
+        report = report_for(events, history, until=cutoff)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+        self.assertIn(20, report["ledger_swaps_outside_window"])
+        self.assertEqual(report["coverage"]["unmatched_legs_in_stream"], [])
+        self.assertTrue(report["coverage"]["complete"])
+
+    def test_causality_is_compared_exactly_not_to_the_second(self):
+        """`int(-0.5) == 0` let a tick observed after preparation through.
+
+        Nothing here mirrors a runtime bound -- this is program order, and
+        the event is committed before `execute_plan_once` -- so the
+        comparison is exact (PR #298 Codex review, round 13).
+        """
+        events, history = baseline_round_trip()
+        prepared_at = event_stream_parse(history[1]["prepared_at"])
+        # Half a second after preparation: truncation used to accept it.
+        decoy = would_rotate_event(
+            3, prepared_at + timedelta(milliseconds=500),
+            trigger="mean_reversion_exit", sell="SPY", buy="QQQ",
+            sell_quantity="0.323269", buy_quantity="0.346345",
+            spy_mark="999.00", qqq_mark="111.00")
+        decoy["decision"]["plan"]["quote_received_at"] = stamp(
+            EXIT_AT - timedelta(seconds=5))
+
+        index = ledger_tool.would_rotate_index([events[0], decoy])
+        self.assertIsNone(ledger_tool.find_event(history[1], index),
+                          "a tick observed after preparation cannot have caused it")
+        # The real event, observed at exactly `prepared_at`, still matches.
+        exact = ledger_tool.would_rotate_index([events[0], events[1]])
+        self.assertEqual(ledger_tool.find_event(history[1], exact)["sequence"], 2)
 
     def test_an_unmatched_attempt_outside_the_stream_is_still_harmless(self):
         """It cannot take part in pairing, so it is only reported."""
