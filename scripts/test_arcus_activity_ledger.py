@@ -594,6 +594,32 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertEqual(asked["coverage"]["requested_but_unpriceable"], [5])
         self.assertTrue(asked["stop_rule"]["undecidable"])
 
+    def test_an_unreconciled_active_attempt_withholds_the_verdict(self):
+        """`Confirmed` is persisted before reconciliation starts.
+
+        A crash or provider failure in between leaves a transaction that
+        may already be on chain in that phase; ignoring it left its leg
+        out of every figure while the report still published a clean
+        coverage flag and a definitive stop result.
+        """
+        events, history = baseline_round_trip()
+        pending = attempt(11, EXIT_AT + timedelta(minutes=1), sell="SPY", buy="QQQ",
+                          sell_quantity="0.1", buy_quantity="0.2", phase="confirmed")
+        report = report_for(events, history, active=pending)
+
+        self.assertEqual(report["coverage"]["unresolved_attempts"],
+                         [{"sequence": 11, "phase": "confirmed"}])
+        self.assertFalse(report["coverage"]["complete"])
+        self.assertTrue(report["stop_rule"]["undecidable"])
+        self.assertIn("may be on chain but is not reconciled",
+                      ledger_tool.render_markdown(report))
+
+        # A phase that sent nothing is not a hole.
+        prepared = dict(pending, phase="prepared")
+        clean = report_for(events, history, active=prepared)
+        self.assertEqual(clean["coverage"]["unresolved_attempts"], [])
+        self.assertTrue(clean["coverage"]["complete"])
+
     def test_plan_freshness_is_measured_from_the_quote_not_the_observation(self):
         """`validate_plan_age` measures from `plan.quote_received_at`.
 

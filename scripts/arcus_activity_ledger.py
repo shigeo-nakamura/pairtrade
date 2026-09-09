@@ -37,6 +37,18 @@ persisting `amount_out` from the `SwapExecuted` event it already verifies
 follow-up the runtime's own comment tracks under bot-strategy#880. Until
 then every figure below inherits that exposure, in the direction of
 looking cheaper than it was.
+
+The gas delta has the same shape and the same answer. A *negative* one
+is self-evidently not a transaction cost (the wallet gained native
+tokens), so that case is caught and reported as unmeasurable; a positive
+one is indistinguishable from real gas, because an unrelated native-token
+payment in the same window looks exactly like a larger fee. Separating
+them needs the receipt's own `gasUsed * effectiveGasPrice`, which is not
+recorded either. Marking *all* snapshot-based gas unmeasurable would
+withhold every verdict this report exists to give, so the positive case
+is accepted as gas and named here instead -- error direction: cost can
+look higher than it was, so a stop signal can be triggered by spend that
+was not the bot's.
 """
 
 from __future__ import annotations
@@ -445,6 +457,34 @@ def reconciled_attempts(ledger: dict[str, Any]) -> list[dict[str, Any]]:
     return [attempt for attempt in attempts if attempt.get("phase") == "reconciled"]
 
 
+# Phases in which a transaction may already exist on chain while the
+# attempt has not been reconciled: the runtime persists `Confirmed`
+# *before* it starts reconciliation, and a crash or provider failure in
+# between leaves it here. `Prepared` has sent nothing; `Rejected`,
+# `Failed` and `OperatorHold` are terminal without a swap
+# (src/arcus_spot/execution_ledger.rs).
+UNRESOLVED_PHASES = frozenset({"dispatching", "submitted", "confirmed", "unknown"})
+
+
+def unresolved_attempt(ledger: dict[str, Any]) -> tuple[int, datetime, str] | None:
+    """The active attempt that may be on chain but is not priced, if any.
+
+    Ignoring it left its leg out of every figure while the report still
+    published `coverage.complete: true` and a definitive stop verdict
+    (PR #298 Codex review).
+    """
+    active = ledger.get("active")
+    if not isinstance(active, dict):
+        return None
+    phase = str(active.get("phase", "")).lower()
+    if phase not in UNRESOLVED_PHASES:
+        return None
+    stamp = active.get("dispatched_at") or active.get("prepared_at")
+    if not stamp:
+        return None
+    return int(active["sequence"]), event_stream.parse_timestamp(stamp), phase
+
+
 def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, Any]]],
                      window: tuple[datetime, datetime],
                      since: datetime | None = None,
@@ -765,7 +805,24 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     priced_legs.extend(leg for trip in round_trips for leg in (trip.entry, *trip.exits))
     unmeasured_gas = sorted(
         {leg.sequence for leg in priced_legs if leg.gas_unmeasurable})
-    complete = not orphaned and not unpriceable and not unmeasured_gas
+    # And an attempt that may already be on chain but has not been
+    # reconciled: its leg is in none of the figures above.
+    #
+    # The active slot holds at most one attempt and it is the *current*
+    # one, so with no bounds given -- the routine invocation -- it is
+    # part of the question whatever its timestamp: a pending attempt is
+    # typically dispatched after the last observation the export holds,
+    # which is exactly the case worth flagging. Explicit bounds still
+    # decide, so a report about a past window is not spoiled by an
+    # attempt that is in flight now.
+    pending = unresolved_attempt(ledger)
+    asked_about_pending = pending is not None and (
+        (since is None and until is None) or within(pending[1], since, until)
+    )
+    unresolved = (
+        [{"sequence": pending[0], "phase": pending[2]}] if asked_about_pending else []
+    )
+    complete = not orphaned and not unpriceable and not unmeasured_gas and not unresolved
     return {
         "schema_version": 1,
         "window": {
@@ -818,6 +875,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "exits_without_entry": orphaned,
             "requested_but_unpriceable": unpriceable,
             "gas_unmeasurable": unmeasured_gas,
+            "unresolved_attempts": unresolved,
         },
         "stop_rule": {
             "consecutive_days_required": STOP_RULE_CONSECUTIVE_DAYS,
@@ -864,6 +922,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             reasons.append(
                 "covers swaps the event stream cannot price at all (ledger sequences "
                 + ", ".join(str(s) for s in coverage["requested_but_unpriceable"]) + ")")
+        if coverage.get("unresolved_attempts"):
+            reasons.append(
+                "holds an attempt that may be on chain but is not reconciled ("
+                + ", ".join(f"sequence {a['sequence']} in {a['phase']}"
+                            for a in coverage["unresolved_attempts"]) + ")")
         if coverage.get("gas_unmeasurable"):
             reasons.append(
                 "holds swaps whose gas cannot be read because the wallet was topped up across "
