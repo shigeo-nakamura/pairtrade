@@ -41,14 +41,6 @@ permissions:
 env:
   AWS_REGION: eu-central-1
   INSTALL_DIR: /opt/debot-bull-holder
-  # Fallback only, used when debot/Cargo.lock has no dex-connector entry
-  # (should not happen in practice) -- resolve-ref below resolves against
-  # Cargo.lock's own pinned dex-connector version, same as ci.yml
-  # (bot-strategy#892 / PR #259), so a dex-connector tag bump never needs a
-  # matching manual edit here the way it does for
-  # deploy-hyperliquid-observer.yml / deploy-arcus-spot-executor.yml's
-  # static pins (bot-strategy#865 lesson).
-  DEX_CONNECTOR_REF: v4.7.19
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
   RUST_TOOLCHAIN: 1.94.1
@@ -62,75 +54,18 @@ env:
 
 jobs:
   resolve-ref:
-    runs-on: ubuntu-latest
-    outputs:
-      dex_connector_ref: ${{ steps.resolve.outputs.dex_connector_ref }}
-    steps:
-      - name: Checkout debot
-        uses: actions/checkout@v5
-        with:
-          path: debot
-          sparse-checkout: |
-            Cargo.lock
-          sparse-checkout-cone-mode: false
-
-      - name: Resolve dex-connector ref
-        id: resolve
-        env:
-          DEFAULT_REF: ${{ env.DEX_CONNECTOR_REF }}
-          INPUT_REF: ${{ github.event.inputs.dex_connector_ref }}
-        run: |
-          python3 - <<'PY'
-          import os, re
-
-          default_ref = os.environ.get("DEFAULT_REF", "").strip()
-          input_ref = (os.environ.get("INPUT_REF") or "").strip()
-
-          # An explicit workflow_dispatch input is a deliberate draft/test
-          # pin and always wins.
-          #
-          # Otherwise, resolve against debot/Cargo.lock's own pinned
-          # dex-connector version -- NOT the latest published dex-connector
-          # tag (same fix as ci.yml's resolve-ref, bot-strategy#892 / PR
-          # #259: a dex-connector tag push used to make this job check out a
-          # newer dex-connector than Cargo.lock's pin, and the build's
-          # `cargo build --release --locked` would then fail with a
-          # `--locked` violation that gave no hint the real cause was a
-          # stale Cargo.lock relative to a tag nobody had bumped to yet).
-          # Pinning to Cargo.lock makes a new dex-connector tag a no-op here
-          # until someone deliberately runs `cargo update -p dex-connector`
-          # (scripts/bump.sh's documented step) to pick it up.
-          ref = input_ref
-          if not ref:
-              with open("debot/Cargo.lock") as f:
-                  lockfile = f.read()
-              m = re.search(
-                  r'name = "dex-connector"\nversion = "([^"]+)"', lockfile
-              )
-              if m:
-                  ref = f"v{m.group(1)}"
-              elif default_ref:
-                  print(
-                      "resolve-ref: no dex-connector entry found in "
-                      f"debot/Cargo.lock, falling back to DEX_CONNECTOR_REF={default_ref}"
-                  )
-                  ref = default_ref
-              else:
-                  raise SystemExit(
-                      "resolve-ref: no dex-connector entry in debot/Cargo.lock "
-                      "and no DEX_CONNECTOR_REF default to fall back to"
-                  )
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"dex_connector_ref={ref}\n")
-          PY
+    # bot-strategy#899: shared with ci.yml / ci-robinhood-dipgrid.yml /
+    # deploy-arcus-spot-executor.yml.
+    uses: ./.github/workflows/_resolve-dex-connector-ref.yml
+    with:
+      input-ref: ${{ inputs.dex_connector_ref || '' }}
 
   test:
     name: Test bull-holder (x86_64)
     needs: resolve-ref
     runs-on: ubuntu-latest
     env:
-      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}
       LIGHTER_GO_PATH: ${{ github.workspace }}/lighter-go
       LD_LIBRARY_PATH: ${{ github.workspace }}/lighter-go
     defaults:
@@ -198,7 +133,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.target == 'build-only' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     timeout-minutes: 60
     env:
-      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.dex_connector_ref }}
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}
     outputs:
       binary_sha256: ${{ steps.package.outputs.binary_sha256 }}
       libsigner_sha256: ${{ steps.package.outputs.libsigner_sha256 }}
@@ -225,38 +160,16 @@ jobs:
 
       - name: Resolve build image
         id: build_image
-        run: |
-          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
-          AL2023_IMAGE_RESOLVED=$(docker image inspect --format="{{index .RepoDigests 0}}" "${AL2023_IMAGE}")
-          echo "AL2023_IMAGE_RESOLVED=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_ENV}"
-          BUILD_IMAGE_CACHE_KEY=$(printf "%s" "${AL2023_IMAGE_RESOLVED}" | sha256sum)
-          echo "cache_key=${BUILD_IMAGE_CACHE_KEY%% *}" >> "${GITHUB_OUTPUT}"
-
-      - name: Cache libsigner (native arm64)
-        id: cache_libsigner
-        uses: actions/cache@v5
+        uses: ./debot/.github/actions/al2023-build-image
         with:
-          path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
+          image: ${{ env.AL2023_IMAGE }}
 
       - name: Build libsigner in AL2023 (native arm64)
-        if: steps.cache_libsigner.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p lighter-go/build
-          docker run --rm --platform linux/arm64 \
-            -v "${{ github.workspace }}/lighter-go:/go/src/sdk" \
-            -w /go/src/sdk \
-            -e HOST_UID="$(id -u)" \
-            -e HOST_GID="$(id -g)" \
-            ${AL2023_IMAGE_RESOLVED} \
-            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install golang gcc; CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib; chown -R \${HOST_UID}:\${HOST_GID} /go/src/sdk/build"
-
-      - name: Save libsigner cache (native arm64)
-        if: steps.cache_libsigner.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
+        uses: ./debot/.github/actions/build-libsigner-al2023
         with:
-          path: lighter-go/build/libsigner.so
-          key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ env.LIGHTER_GO_REF }}-${{ steps.build_image.outputs.cache_key }}-${{ hashFiles('lighter-go/go.sum') }}
+          image-ref: ${{ steps.build_image.outputs.image_ref }}
+          image-cache-key: ${{ steps.build_image.outputs.cache_key }}
+          lighter-go-ref: ${{ env.LIGHTER_GO_REF }}
 
       - name: Cache cargo (native arm64, bull-holder feature set)
         id: cache_cargo

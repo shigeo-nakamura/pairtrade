@@ -639,8 +639,10 @@ binary contains the `live-tick` subcommand, so a deploy covers both the approved
 one-shot flow and the timer-invoked probe flow without deploying a second
 executable.
 
-The workflow is accepted only from `master`/`main`. It checks out the pinned
-`DEX_CONNECTOR_REF` (or the explicitly supplied manual-dispatch override), uses
+The workflow is accepted only from `master`/`main`. It resolves the
+dex-connector ref from `Cargo.lock` through the shared
+`.github/workflows/_resolve-dex-connector-ref.yml` (or uses the explicitly
+supplied manual-dispatch override), uses
 `Cargo.lock`, runs the Arcus live library and binary tests inside an arm64
 Amazon Linux 2023 container, and records the exact pairtrade commit,
 dex-connector commit, Rust toolchain, resolved container image, lockfile hash,

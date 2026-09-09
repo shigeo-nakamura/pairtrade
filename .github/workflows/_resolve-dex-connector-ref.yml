@@ -1,0 +1,97 @@
+name: Resolve dex-connector ref
+
+# Reusable workflow (bot-strategy#899). Single source of truth for the
+# dex-connector ref every build in this repo checks out.
+#
+# It used to be a copy-pasted `resolve-ref` job in ci.yml,
+# ci-robinhood-dipgrid.yml and deploy-bull-holder.yml, plus a *static*
+# `DEX_CONNECTOR_REF:` pin in deploy-arcus-spot-executor.yml. The copies
+# drifted: bot-strategy#892's fix (resolve against Cargo.lock, not the latest
+# published tag) was written in ci.yml and had to be re-applied by hand in
+# each new deploy workflow, and the static pins silently shipped binaries
+# built against a dex-connector older than Cargo.lock's (the "bump three
+# files" trap documented in CLAUDE.md). Callers now have no ref of their own
+# to keep in sync.
+
+on:
+  workflow_call:
+    inputs:
+      input-ref:
+        description: >
+          An explicit workflow_dispatch ref/tag. When non-empty it always
+          wins: it is a deliberate draft/test pin.
+        required: false
+        type: string
+        default: ""
+    outputs:
+      ref:
+        description: The dex-connector ref callers must check out.
+        value: ${{ jobs.resolve.outputs.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Checkout Cargo.lock
+        uses: actions/checkout@v5
+        with:
+          path: debot
+          sparse-checkout: |
+            Cargo.lock
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve dex-connector ref
+        id: resolve
+        env:
+          INPUT_REF: ${{ inputs.input-ref }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+
+          input_ref = (os.environ.get("INPUT_REF") or "").strip()
+
+          # An explicit workflow_dispatch input is a deliberate draft/test pin
+          # and always wins.
+          #
+          # Otherwise, resolve against Cargo.lock's own pinned dex-connector
+          # version -- NOT the latest published dex-connector tag. The two
+          # used to diverge silently: any dex-connector tag push (even for
+          # unrelated work) made this job check out a newer dex-connector than
+          # Cargo.lock's pin, and `cargo check --all-targets --locked` would
+          # then fail with a generic "cannot update the lock file ... --locked
+          # was passed" error that gave no hint the real cause was a stale
+          # Cargo.lock relative to a tag nobody here had bumped to yet
+          # (bot-strategy#892 -- three dex-connector tags landed within about
+          # an hour on 2026-09-03 and broke build-test on multiple unrelated
+          # PRs before that fix). Pinning to Cargo.lock makes a new
+          # dex-connector tag a no-op for CI until someone deliberately runs
+          # `cargo update -p dex-connector` (scripts/bump.sh's documented
+          # step) to pick it up.
+          #
+          # There is deliberately no hardcoded fallback ref here. The previous
+          # per-workflow `DEX_CONNECTOR_REF:` defaults were the drift source:
+          # they were only reachable when Cargo.lock had no dex-connector
+          # entry, which cannot happen in a tree that builds, yet they had to
+          # be remembered on every bump and were already inconsistent
+          # (deploy-bull-holder.yml sat on v4.7.19 while the rest said
+          # v4.7.20). A missing entry is now a loud failure instead.
+          ref = input_ref
+          if not ref:
+              with open("debot/Cargo.lock") as f:
+                  lockfile = f.read()
+              m = re.search(r'name = "dex-connector"\nversion = "([^"]+)"', lockfile)
+              if not m:
+                  raise SystemExit(
+                      "resolve-ref: no dex-connector entry in debot/Cargo.lock"
+                  )
+              ref = f"v{m.group(1)}"
+
+          print(f"resolve-ref: dex_connector_ref={ref}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"ref={ref}\n")
+          PY
