@@ -1,7 +1,7 @@
 use super::{
     ArcusSpotCorporateActionEvent, ArcusSpotInventory, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use dex_connector::{
     ArcusSpotCapture, ArcusSpotOverviewEntry, ArcusSpotRecorderSnapshot, ArcusSpotRoundTripRecord,
     ArcusSpotRouteObservation, ArcusSpotToken,
@@ -825,6 +825,19 @@ impl ArcusSpotRuntime {
                          tracked open quantity is in units the venue no longer quotes"
                             .to_string(),
                     );
+                }
+                // Submission is not execution. An order sent just before the
+                // cutoff can be mined after it, and no in-process re-check
+                // can cover the venue round trip -- so exits stop a margin
+                // early instead (Codex P1, pairtrade#309).
+                if let Some(event) = self.corporate_action_within_settlement_margin(dispatched_at) {
+                    return Err(format!(
+                        "cannot dispatch an exit plan within {}s of corporate action {}'s \
+                         effective time {}: it could settle after the venue changes units",
+                        self.config.corporate_action_settlement_margin_secs,
+                        event.event_id,
+                        event.effective_at,
+                    ));
                 }
                 let open = self
                     .state
@@ -3391,6 +3404,27 @@ impl ArcusSpotRuntime {
     /// past window whose `entry_block_at` is long gone would become active
     /// again on the next tick, clear the live signal history and re-apply
     /// its `post_event_inventory` over every trade made since.
+    /// A declared window whose `effective_at` is inside the settlement
+    /// margin (or already past it, with the units not yet observed as
+    /// stale). Reused-id declarations count too: they never become active,
+    /// but their cutoff is as real as any other.
+    fn corporate_action_within_settlement_margin(
+        &self,
+        at: DateTime<Utc>,
+    ) -> Option<&ArcusSpotCorporateActionEvent> {
+        let margin = Duration::seconds(self.config.corporate_action_settlement_margin_secs);
+        self.config
+            .corporate_actions
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    self.handled_record_for(event),
+                    Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
+                )
+            })
+            .find(|event| at + margin >= event.effective_at)
+    }
+
     /// Every reason the planning gate would refuse to open a rotation right
     /// now, for the dispatch validator to refuse the same plan: a declared
     /// window that has opened, a persisted progress record whose declaration
@@ -3854,6 +3888,7 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
             corporate_actions: Vec::new(),
+            corporate_action_settlement_margin_secs: 300,
         }
     }
 
@@ -6476,6 +6511,8 @@ mod tests {
         let anchor = event_time();
         let mut cfg = cfg_with_window_at(anchor);
         cfg.mode = ArcusSpotRuntimeMode::Live;
+        // The settlement margin has its own test; isolate the cutoff rule.
+        cfg.corporate_action_settlement_margin_secs = 0;
         let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
         seed_open_rotation(&mut runtime, anchor);
         let planned_at = anchor + Duration::seconds(3);
@@ -7591,10 +7628,47 @@ mod tests {
 
     #[cfg(feature = "arcus-spot-live")]
     #[test]
+    fn an_exit_plan_is_refused_inside_the_settlement_margin() {
+        // Submission is not execution: an exit sent seconds before the
+        // cutoff can be mined after it. The margin stops exits early.
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor);
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        cfg.corporate_action_settlement_margin_secs = 2;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
+        let planned_at = anchor + Duration::seconds(1);
+        let plan = runtime
+            .build_plan(
+                &context(planned_at - Duration::seconds(1), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::CorporateActionExit,
+                planned_at,
+                runtime.state.inventory,
+            )
+            .unwrap();
+        // effective_at is anchor + 4s; at +1s the margin (2s) has not bitten.
+        runtime
+            .validate_plan_consistent_with_state(&plan, planned_at)
+            .unwrap();
+        // At +2s it has: 2s + 2s margin reaches the cutoff.
+        let error = runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(2))
+            .unwrap_err();
+        assert!(
+            error.contains("settle after the venue changes units"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
     fn an_exit_plan_is_refused_at_dispatch_past_a_reused_ids_cutoff() {
         let anchor = event_time();
         let mut cfg = cfg_with_window_at(anchor);
         cfg.mode = ArcusSpotRuntimeMode::Live;
+        // The settlement margin has its own test; isolate the cutoff rule.
+        cfg.corporate_action_settlement_margin_secs = 0;
         let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
         // The first action is handled; a distinct later one reuses its id,
         // with effective_at at +17s.

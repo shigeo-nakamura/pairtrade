@@ -2701,6 +2701,30 @@ fn corporate_action_units_are_stale(
     config: &ArcusSpotRuntimeConfig,
     current: &ArcusSpotRuntimeState,
 ) -> bool {
+    // A distinct later action reusing a handled id never gets a progress
+    // record, yet the runtime treats its units as stale from its cutoff and
+    // declines to engage a halt there. Without the same case here, a valid
+    // checkpoint from that phase is rejected for "omitting" the halt (Codex
+    // P2, pairtrade#309).
+    if let Some(observed_at) = current.last_observation_at {
+        let reused_and_effective = config.corporate_actions.iter().any(|event| {
+            observed_at >= event.effective_at
+                && current
+                    .handled_corporate_action_ids
+                    .iter()
+                    .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))
+                    .and_then(|index| {
+                        current
+                            .handled_corporate_action_fingerprints
+                            .get(index)
+                            .filter(|recorded| !recorded.is_empty())
+                    })
+                    .is_some_and(|recorded| *recorded != event.fingerprint())
+        });
+        if reused_and_effective {
+            return true;
+        }
+    }
     let Some(progress) = current.corporate_action.as_ref() else {
         return false;
     };
@@ -3732,10 +3756,19 @@ fn corporate_action_continuity(
             if sequence_advance != 1 {
                 bail!("Arcus corporate action {event_id} resumed without a single new observation");
             }
+            // By id, or by the fingerprint recorded beside it: a completed
+            // entry the operator renamed afterwards is the same event, which
+            // is the whole point of the fingerprint (Codex P2,
+            // pairtrade#309).
+            let resumed_fingerprint = resumed_fingerprints.first().filter(|it| !it.is_empty());
             let event = config
                 .corporate_actions
                 .iter()
-                .find(|event| event.event_id.eq_ignore_ascii_case(event_id))
+                .find(|event| {
+                    event.event_id.eq_ignore_ascii_case(event_id)
+                        || resumed_fingerprint
+                            .is_some_and(|recorded| *recorded == event.fingerprint())
+                })
                 .with_context(|| {
                     format!("Arcus runtime resumed corporate action {event_id}, which the approved config does not declare")
                 })?;
@@ -10642,6 +10675,25 @@ runtime:
     }
 
     #[test]
+    fn a_renamed_completed_event_is_matched_by_fingerprint() {
+        // The backup predates the resume; afterwards the operator renamed
+        // the completed entry. Same fingerprint, new id.
+        let mut config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, current) = resume_pair();
+        config.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
+        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        assert!(authorized.resumed_inventory.is_some());
+
+        // A genuinely undeclared resume is still refused.
+        let mut gone = config.clone();
+        gone.corporate_actions.clear();
+        let error = corporate_action_continuity(&gone, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not declare"), "{error}");
+    }
+
+    #[test]
     fn a_resume_after_a_legacy_record_pads_before_appending() {
         let config = config_with_corporate_action(Some(("4", "1")));
         let (mut baseline, mut current) = resume_pair();
@@ -10864,6 +10916,48 @@ runtime:
         handled.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
         let error = require_risk_state_continuity(
             &config, &baseline, &handled, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_reused_ids_stale_phase_does_not_demand_a_halt_either() {
+        // A distinct later action under a handled id never gets a progress
+        // record, but the runtime treats its units as stale from its cutoff
+        // and declines to engage a halt. The verifier must agree, or every
+        // backup from that phase is rejected for "omitting" the halt.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = None;
+        // The id is handled, but under a different fingerprint: the config
+        // entry is a new action wearing the old label.
+        current.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        current.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        let mut baseline = baseline;
+        baseline.handled_corporate_action_ids = current.handled_corporate_action_ids.clone();
+        baseline.handled_corporate_action_fingerprints =
+            current.handled_corporate_action_fingerprints.clone();
+        // last_observation_at (12:00Z) is past the fixture's effective_at.
+        let none = ArcusSpotCorporateActionContinuity::default();
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+
+        // Before that cutoff the halt is still demanded.
+        let mut early = current.clone();
+        early.last_observation_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
+        let error = require_risk_state_continuity(
+            &config, &baseline, &early, 1, not_before, not_after, &none,
         )
         .unwrap_err()
         .to_string();

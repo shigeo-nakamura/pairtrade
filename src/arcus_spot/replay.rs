@@ -105,6 +105,7 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(100),
             cumulative_loss_limit_usd: Decimal::from(100),
             corporate_actions: Vec::new(),
+            corporate_action_settlement_margin_secs: 300,
         }
     }
 

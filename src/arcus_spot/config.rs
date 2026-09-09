@@ -164,6 +164,22 @@ pub struct ArcusSpotRuntimeConfig {
     /// deployment deserializes to -- leaves behaviour exactly as it was.
     #[serde(default)]
     pub corporate_actions: Vec<ArcusSpotCorporateActionEvent>,
+    /// How long before a declared `effective_at` the runtime stops
+    /// submitting exits.
+    ///
+    /// Submission is not execution: an order sent seconds before the cutoff
+    /// can still be mined after it, selling the pre-event `rotated_quantity`
+    /// at the post-event denomination. No amount of re-checking closes that
+    /// -- the window is the venue round trip, outside this process -- so the
+    /// guard is a margin instead: exits stop this many seconds early and the
+    /// reduce phase is expected to be sized accordingly (Codex P1,
+    /// pairtrade#309). Defaults to 300s; deployments deserialize without it.
+    #[serde(default = "default_corporate_action_settlement_margin_secs")]
+    pub corporate_action_settlement_margin_secs: i64,
+}
+
+fn default_corporate_action_settlement_margin_secs() -> i64 {
+    300
 }
 
 impl ArcusSpotRuntimeConfig {
@@ -234,6 +250,9 @@ impl ArcusSpotRuntimeConfig {
             || self.exit_z_score >= self.entry_z_score
         {
             return Err("exit_z_score must be finite and in [0, entry_z_score)".to_string());
+        }
+        if self.corporate_action_settlement_margin_secs < 0 {
+            return Err("corporate_action_settlement_margin_secs must not be negative".to_string());
         }
         if self.max_quote_age_secs <= 0 || self.max_hold_secs <= 0 {
             return Err("quote age and hold limits must be positive".to_string());
@@ -414,6 +433,8 @@ mod tests {
             exit_z_score: 0.25,
             max_quote_age_secs: 30,
             max_hold_secs: 86_400,
+            corporate_action_settlement_margin_secs:
+                default_corporate_action_settlement_margin_secs(),
             max_all_in_round_trip_cost_bps: Decimal::from(100),
             gas_buffer_bps: Decimal::from(5),
             settlement_buffer_bps: Decimal::from(5),

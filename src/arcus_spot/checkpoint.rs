@@ -134,6 +134,7 @@ fn classify_config_drift(
         daily_loss_limit_usd: stored_daily_loss_limit_usd,
         cumulative_loss_limit_usd: stored_cumulative_loss_limit_usd,
         corporate_actions: stored_corporate_actions,
+        corporate_action_settlement_margin_secs: stored_corporate_action_settlement_margin_secs,
     } = stored;
     let ArcusSpotRuntimeConfig {
         mode: current_mode,
@@ -156,6 +157,7 @@ fn classify_config_drift(
         daily_loss_limit_usd: current_daily_loss_limit_usd,
         cumulative_loss_limit_usd: current_cumulative_loss_limit_usd,
         corporate_actions: current_corporate_actions,
+        corporate_action_settlement_margin_secs: current_corporate_action_settlement_margin_secs,
     } = current;
 
     let mut drift = ArcusSpotCheckpointConfigDrift::default();
@@ -268,6 +270,16 @@ fn classify_config_drift(
     // reset here would instead discard it at config-install time, which is
     // the wrong moment and would also drop the regime and risk baselines
     // that the forced exit still needs.
+    // How early exits stop before a declared cutoff. A pure forward-looking
+    // guard: it re-aims the next dispatch decision and reinterprets nothing
+    // that is stored.
+    if stored_corporate_action_settlement_margin_secs
+        != current_corporate_action_settlement_margin_secs
+    {
+        drift
+            .state_preserving
+            .push("corporate_action_settlement_margin_secs");
+    }
     if stored_corporate_actions != current_corporate_actions {
         drift.state_preserving.push("corporate_actions");
     }
@@ -572,6 +584,7 @@ mod tests {
                 source: "issuer notice".to_string(),
                 post_event_inventory: None,
             }],
+            corporate_action_settlement_margin_secs: 42,
         }
     }
 
@@ -606,6 +619,7 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
             corporate_actions: Vec::new(),
+            corporate_action_settlement_margin_secs: 300,
         }
     }
 
@@ -736,6 +750,9 @@ mod tests {
             ],
         );
         assert!(drift.state_preserving.contains(&"corporate_actions"));
+        assert!(drift
+            .state_preserving
+            .contains(&"corporate_action_settlement_margin_secs"));
     }
 
     #[test]
