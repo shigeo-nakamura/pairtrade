@@ -10781,6 +10781,10 @@ runtime:
         // units at post-event prices.
         current.last_equity_usd = Some(Decimal::from(290));
         current.corporate_action = Some(stale_unit_progress());
+        // The transition rules are covered elsewhere; here the window is
+        // open on both sides so only the halt expectation is under test.
+        let mut baseline = baseline;
+        baseline.corporate_action = current.corporate_action.clone();
         let none = ArcusSpotCorporateActionContinuity::default();
         require_risk_state_continuity(
             &config, &baseline, &current, 1, not_before, not_after, &none,
