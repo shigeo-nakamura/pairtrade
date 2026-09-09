@@ -254,6 +254,13 @@ pub struct ArcusSpotCorporateActionProgress {
     /// pairtrade#309). `None` on records that predate the field.
     #[serde(default)]
     pub effective_at: Option<DateTime<Utc>>,
+    /// The declaration's affected symbols, copied at window open, so that
+    /// what the window is *about* survives the declaration being deleted:
+    /// `reset-window` may only discard an open window when the new `pair`
+    /// no longer names any of them (Codex P1, pairtrade#309). Empty on
+    /// records that predate the field, which the reset treats as unknown.
+    #[serde(default)]
+    pub symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -540,7 +547,26 @@ impl ArcusSpotRuntime {
         if state.inventory.token_a < config.inventory_floors.token_a
             || state.inventory.token_b < config.inventory_floors.token_b
         {
-            return Err("restored Arcus inventory is below a configured floor".to_string());
+            // Unless the state is inside a declared window whose reconciled
+            // holding *does* satisfy the floors: the operator raised a floor
+            // past the stale pre-event quantity and below the post-event
+            // one (1 -> 5 across a 4 -> 40 split), and the resume that
+            // applies it can only run if this load succeeds. Refusing here
+            // made the advertised resume-time check unreachable (Codex P2,
+            // pairtrade#309). Trading stays blocked by the window itself.
+            let pending_reconciliation_satisfies_floors =
+                state.corporate_action.as_ref().is_some_and(|progress| {
+                    config.corporate_actions.iter().any(|event| {
+                        Self::progress_matches(progress, event)
+                            && event.post_event_inventory.is_some_and(|reconciled| {
+                                reconciled.token_a >= config.inventory_floors.token_a
+                                    && reconciled.token_b >= config.inventory_floors.token_b
+                            })
+                    })
+                });
+            if !pending_reconciliation_satisfies_floors {
+                return Err("restored Arcus inventory is below a configured floor".to_string());
+            }
         }
         if state
             .relative_log_price_history
@@ -671,6 +697,25 @@ impl ArcusSpotRuntime {
     /// promptly if the rest of the budget goes too. It unfreezes at the next
     /// rollover, now that no halt stands on it.
     pub fn clear_risk_halt(&mut self) -> Result<ArcusSpotRiskHalt, String> {
+        // The "condition still holds" check below reads `last_risk_mark`,
+        // and while a corporate action is effective that mark values
+        // pre-event quantities at post-event prices -- meaningless in both
+        // directions. After a forward split it can shrink a genuine loss
+        // below the limit and let a halt engaged *before* the event be
+        // cleared through it; the resume then re-anchors the baselines and
+        // the halt never returns. Decide it after the resume, on marks that
+        // mean something (Codex P2, pairtrade#309).
+        let clock = self
+            .state
+            .last_observation_at
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        if self.corporate_action_units_are_stale(clock) {
+            return Err(
+                "refusing to clear the risk halt while a corporate action is effective and the \
+                 tracked inventory is in units the venue no longer quotes; resume first"
+                    .to_string(),
+            );
+        }
         let halt = self
             .state
             .risk_halt
@@ -2988,6 +3033,7 @@ impl ArcusSpotRuntime {
                 history_invalidated_at: None,
                 fingerprint: event.fingerprint(),
                 effective_at: Some(event.effective_at),
+                symbols: event.symbols.clone(),
             });
         }
 
@@ -7409,6 +7455,65 @@ mod tests {
                 hold.detail
             );
         }
+    }
+
+    #[test]
+    fn a_halt_is_not_cleared_on_stale_unit_marks() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        // A real $4 shortfall, halted before the event.
+        runtime.state.inventory.token_a = Decimal::new(98, 2);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert!(runtime.state.risk_halt.is_some());
+        // Past effective_at at a post-split price that shrinks the mark.
+        let effective = anchor + Duration::seconds(6);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(effective, "50", "100"),
+            effective,
+        );
+        let error = runtime.clear_risk_halt().unwrap_err();
+        assert!(error.contains("no longer quotes"), "{error}");
+        assert!(runtime.state.risk_halt.is_some());
+    }
+
+    #[test]
+    fn a_raised_floor_defers_to_a_pending_reconciliation_that_satisfies_it() {
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor);
+        cfg.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(40),
+            token_b: Decimal::ONE,
+        });
+        let mut runtime = ArcusSpotRuntime::new(cfg.clone()).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        // Prior rotations left the wallet below the declared figure.
+        runtime.state.inventory.token_a = Decimal::new(5, 1);
+        let inside = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        assert!(runtime.state.corporate_action.is_some());
+        let state = runtime.state.clone();
+
+        // The floor is raised past the stale holding (0.5) -- still within
+        // initial_inventory (1), so the config is valid and the change is
+        // state-preserving -- but below the reconciled one (40): the load
+        // must succeed so the resume can run.
+        let mut raised = cfg.clone();
+        raised.inventory_floors.token_a = Decimal::new(8, 1);
+        ArcusSpotRuntime::from_state(raised.clone(), state.clone()).unwrap();
+
+        // Without a satisfying reconciliation the floor still refuses.
+        let mut unsatisfied = raised.clone();
+        unsatisfied.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::new(6, 1),
+            token_b: Decimal::ONE,
+        });
+        assert!(ArcusSpotRuntime::from_state(unsatisfied, state.clone()).is_err());
+        let mut no_window = state.clone();
+        no_window.corporate_action = None;
+        assert!(ArcusSpotRuntime::from_state(raised, no_window).is_err());
     }
 
     #[test]

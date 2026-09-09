@@ -64,6 +64,9 @@ pub struct ArcusSpotCheckpointSummary {
     /// The corporate-action window the state is currently inside, if any.
     /// `reset-window` refuses to discard it (Codex P1, pairtrade#309).
     pub corporate_action_event_id: Option<String>,
+    /// The symbols that window is about (empty when the record predates
+    /// the field).
+    pub corporate_action_symbols: Vec<String>,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -367,6 +370,12 @@ impl ArcusSpotRuntimeCheckpointStore {
                 .corporate_action
                 .as_ref()
                 .map(|progress| progress.event_id.clone()),
+            corporate_action_symbols: checkpoint
+                .state
+                .corporate_action
+                .as_ref()
+                .map(|progress| progress.symbols.clone())
+                .unwrap_or_default(),
         }))
     }
 
