@@ -160,6 +160,22 @@ pub struct ArcusSpotSettlementReceiptExpectation {
     pub venue_router: String,
 }
 
+/// A reconciliation read whose confirmed transaction was additionally
+/// proven to carry the canonical SwapShell's own `SwapExecuted` event, and
+/// the exact settled buy amount that event reported.
+///
+/// The balances and the settled amount come from two structurally different
+/// sources: `balances` is a `latest` snapshot read after confirmation (so it
+/// reflects everything that has touched the wallet since, not only this
+/// swap), while `settled_buy_amount_raw` is a field of the swap's own log
+/// entry and can never include anything else. Reconciliation requires them
+/// to agree exactly (bot-strategy#883).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcusSpotSettlementRead {
+    pub balances: ArcusSpotBalanceSnapshot,
+    pub settled_buy_amount_raw: String,
+}
+
 #[derive(Clone, Copy)]
 struct ValidatedSettlementReceiptExpectation {
     taker: Address,
@@ -312,11 +328,17 @@ fn redact_rpc_url(rpc_url: &str) -> String {
     }
 }
 
+/// Returns the event's own `amount_out` -- the exact settled buy amount,
+/// reported atomically inside the same transaction as the swap. The caller
+/// carries it through to reconciliation, which requires the balance-derived
+/// buy delta to equal it exactly (bot-strategy#883); a `latest` balance
+/// snapshot taken any distance in time after confirmation cannot show that
+/// on its own.
 fn validate_settlement_receipt(
     receipt: &TransactionReceipt,
     confirmed_tx_hash: H256,
     expected: ValidatedSettlementReceiptExpectation,
-) -> Result<()> {
+) -> Result<U256> {
     if receipt.transaction_hash != confirmed_tx_hash {
         bail!("Arcus Spot receipt transaction hash does not match confirmed transaction");
     }
@@ -371,7 +393,7 @@ fn validate_settlement_receipt(
     {
         bail!("Arcus Spot SwapExecuted output is below the signed minimum");
     }
-    Ok(())
+    Ok(event.amount_out)
 }
 
 impl ArcusSpotChainClient {
@@ -758,6 +780,7 @@ impl ArcusSpotChainClient {
     ) -> Result<ArcusSpotBalanceSnapshot> {
         self.balances_requiring_receipt(taker, sell_token, buy_token, confirmed_tx_hash, None)
             .await
+            .map(|(balances, _)| balances)
     }
 
     /// Reconciliation read that additionally requires one exact
@@ -767,16 +790,29 @@ impl ArcusSpotChainClient {
         &self,
         expectation: &ArcusSpotSettlementReceiptExpectation,
         confirmed_tx_hash: H256,
-    ) -> Result<ArcusSpotBalanceSnapshot> {
+    ) -> Result<ArcusSpotSettlementRead> {
         let expected = expectation.validate()?;
-        self.balances_requiring_receipt(
-            expected.taker,
-            expected.sell_token,
-            expected.buy_token,
-            confirmed_tx_hash,
-            Some(expected),
-        )
-        .await
+        let (balances, settled_buy_amount) = self
+            .balances_requiring_receipt(
+                expected.taker,
+                expected.sell_token,
+                expected.buy_token,
+                confirmed_tx_hash,
+                Some(expected),
+            )
+            .await?;
+        // `Some` by construction: a settlement expectation was passed in, so
+        // the read either validated exactly one matching `SwapExecuted`
+        // event and carried its `amount_out` back, or failed before
+        // returning at all. Refusing here rather than defaulting keeps that
+        // an assertion instead of a silently skipped check if the
+        // relationship ever changes.
+        let settled_buy_amount =
+            settled_buy_amount.context("Arcus settlement read returned no settled buy amount")?;
+        Ok(ArcusSpotSettlementRead {
+            balances,
+            settled_buy_amount_raw: settled_buy_amount.to_string(),
+        })
     }
 
     async fn balances_requiring_receipt(
@@ -786,7 +822,7 @@ impl ArcusSpotChainClient {
         buy_token: Address,
         confirmed_tx_hash: H256,
         settlement: Option<ValidatedSettlementReceiptExpectation>,
-    ) -> Result<ArcusSpotBalanceSnapshot> {
+    ) -> Result<(ArcusSpotBalanceSnapshot, Option<U256>)> {
         if taker == Address::zero()
             || sell_token == Address::zero()
             || buy_token == Address::zero()
@@ -795,7 +831,7 @@ impl ArcusSpotChainClient {
             bail!("invalid Arcus balance request addresses");
         }
         let chain_id = self.config.chain_id;
-        let (raw, _provider) = self
+        let ((raw, settled_buy_amount), _provider) = self
             .try_providers(|provider| async move {
                 // Neither read depends on the other's *result* (only on
                 // each having answered before the freshness check below),
@@ -813,10 +849,13 @@ impl ArcusSpotChainClient {
                         "Arcus provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}"
                     )));
                 };
-                if let Some(expected) = settlement {
-                    validate_settlement_receipt(&receipt, confirmed_tx_hash, expected)
-                        .map_err(ProviderAttemptError::Fatal)?;
-                }
+                let settled_buy_amount = match settlement {
+                    Some(expected) => Some(
+                        validate_settlement_receipt(&receipt, confirmed_tx_hash, expected)
+                            .map_err(ProviderAttemptError::Fatal)?,
+                    ),
+                    None => None,
+                };
                 // bot-strategy#880: this used to pin the balance reads to
                 // the receipt's own block hash via EIP-1898
                 // requireCanonical=true, so a stale/reorged backend would
@@ -875,17 +914,28 @@ impl ArcusSpotChainClient {
                          to confirmed tx's block {receipt_block_number}"
                     )));
                 }
-                read_latest_balances_from_provider(provider, chain_id, taker, sell_token, buy_token)
-                    .await
+                let raw = read_latest_balances_from_provider(
+                    provider, chain_id, taker, sell_token, buy_token,
+                )
+                .await?;
+                // Pairing the settled amount with the balances *this same
+                // provider attempt* returned matters: try_providers can fall
+                // through to a later provider, and the two must always
+                // describe the same read for the exact-match check
+                // downstream to mean anything.
+                Ok((raw, settled_buy_amount))
             })
             .await?;
-        Ok(balance_snapshot(
-            taker,
-            sell_token,
-            buy_token,
-            raw.sell_balance,
-            raw.buy_balance,
-            raw.gas_balance,
+        Ok((
+            balance_snapshot(
+                taker,
+                sell_token,
+                buy_token,
+                raw.sell_balance,
+                raw.buy_balance,
+                raw.gas_balance,
+            ),
+            settled_buy_amount,
         ))
     }
 }
@@ -1403,6 +1453,68 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("below the signed minimum"));
+    }
+
+    /// bot-strategy#883: the settled output is what reconciliation compares
+    /// the wallet delta against, so it has to be the event's own
+    /// `amount_out` -- not the signed minimum it clears, and not the quote
+    /// it was expected to fill at.
+    #[test]
+    fn settlement_validation_returns_the_events_own_settled_output() {
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let expectation = settlement_expectation("rialto", rialto_router)
+            .validate()
+            .unwrap();
+        let receipt = settlement_receipt("RIALTO", rialto_router, true, 985);
+
+        let settled =
+            validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
+                .unwrap();
+
+        assert_eq!(settled, U256::from(985));
+        // The fixture's signed minimum and quoted output, neither of which
+        // is the settled amount.
+        assert_ne!(settled, U256::from(980));
+        assert_ne!(settled, U256::from(990));
+    }
+
+    /// The settled amount has to survive from inside `try_providers`'
+    /// per-provider closure out to the caller, paired with the balances
+    /// that same attempt returned (bot-strategy#883).
+    #[tokio::test]
+    async fn a_settlement_read_carries_the_settled_output_with_its_balances() {
+        let (_taker, sell_token, buy_token) = test_addresses();
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let tx_hash = H256::from_low_u64_be(0x818);
+        let block_hash = H256::from_low_u64_be(0x22);
+        let mut receipt = settlement_receipt("RIALTO", rialto_router, true, 985);
+        receipt.block_hash = Some(block_hash);
+        receipt.block_number = Some(U64::from(TEST_RECEIPT_BLOCK_NUMBER));
+        let receipt_value = serde_json::to_value(receipt).unwrap();
+        let server = spawn_rpc_server(move |request| {
+            if request["method"] == "eth_getTransactionReceipt" {
+                return RpcReply::Result(receipt_value.clone());
+            }
+            successful_reconciliation_reply(
+                request, block_hash, sell_token, buy_token, 1_499, 500, 100,
+            )
+        })
+        .await;
+        let client = ArcusSpotChainClient::new(rpc_config(vec![server.url.clone()])).unwrap();
+
+        let read = client
+            .balances_requiring_settlement_receipt(
+                &settlement_expectation("rialto", rialto_router),
+                tx_hash,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(read.settled_buy_amount_raw, "985");
+        assert_eq!(read.balances.buy_balance_raw, "500");
+        assert_eq!(read.balances.sell_balance_raw, "1499");
     }
 
     #[test]

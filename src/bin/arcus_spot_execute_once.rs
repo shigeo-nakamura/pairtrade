@@ -5619,6 +5619,10 @@ runtime:
             tx_hash: Some(format!("0x{sequence:064x}")),
             router_status: Some("confirmed".to_string()),
             detail: None,
+            // The buy-balance delta above, as the settlement receipt's own
+            // `SwapExecuted.amount_out` would have reported it
+            // (bot-strategy#883).
+            settled_buy_amount_raw: Some("50000000000000000".to_string()),
         }
     }
 
@@ -8257,6 +8261,7 @@ runtime:
             tx_hash: Some(format!("0x{:064x}", 7)),
             router_status: Some("submitted".to_string()),
             detail: None,
+            settled_buy_amount_raw: None,
         }
     }
 
