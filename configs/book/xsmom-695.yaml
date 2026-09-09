@@ -115,6 +115,10 @@ execution:
   # +/-20% protection price; v4.7.22 (bot-strategy#918) implements
   # create_order_taker_ioc for Lighter, so slippage_bps below is what
   # actually bounds a fill and the fallback would only widen it.
+  # slippage_bps is a bound against the mid, same as paper_slippage_bps;
+  # the runtime nets out the half-spread before handing it to the venue
+  # (bot-strategy#971), so a torn book refuses an entry instead of
+  # widening the cap.
   slippage_bps: 50
   max_attempts: 3
   fill_confirm_timeout_secs: 15

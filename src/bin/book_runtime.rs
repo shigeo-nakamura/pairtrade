@@ -454,27 +454,60 @@ async fn main() -> Result<()> {
             .map(|r| (&r.key, r.outcome))
     );
 
+    // Drain the price feed on its own task. The select! loop below awaits
+    // `engine.tick()`, which can hold it for the fill-confirm timeout plus
+    // venue calls; updates that queue up meanwhile would otherwise be
+    // stamped with the moment the loop drained them, so a touch observed
+    // before a 20 s confirm would look fresh for another 30 s and the
+    // mid-relative bound (bot-strategy#971) would be derived from a
+    // narrower book than the venue is about to apply it to. Stamping on
+    // arrival keeps `WS_PRICE_MAX_AGE_SECS` an age of the observation.
+    let feed_paper = paper.clone();
+    let feed_live = live.clone();
+    let mut feed = tokio::spawn(async move {
+        loop {
+            match price_rx.recv().await {
+                Ok(PriceUpdate {
+                    symbol,
+                    mid_price,
+                    best_bid,
+                    best_ask,
+                    ..
+                }) => {
+                    if let Some(px) = mid_price.to_f64() {
+                        if let Some(p) = &feed_paper {
+                            p.set_price(&symbol, px).await;
+                        }
+                        if let Some(l) = &feed_live {
+                            // The touch is what bounds a live send against
+                            // the mid (bot-strategy#971); an update without
+                            // one still refreshes the mid.
+                            match (best_bid.to_f64(), best_ask.to_f64()) {
+                                (Some(b), Some(a)) => l.set_quote(&symbol, px, b, a).await,
+                                _ => l.set_price(&symbol, px).await,
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("[WS] price feed lagged, dropped {n} updates");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     let mut lot_retry = tokio::time::interval(Duration::from_secs(600));
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
-            update = price_rx.recv() => {
-                match update {
-                    Ok(PriceUpdate { symbol, mid_price, .. }) => {
-                        if let Some(px) = mid_price.to_f64() {
-                            if let Some(p) = &paper { p.set_price(&symbol, px).await; }
-                            if let Some(l) = &live { l.set_price(&symbol, px).await; }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("[WS] price feed lagged, dropped {n} updates");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::error!("[WS] price feed closed, exiting");
-                        break;
-                    }
-                }
+            // The feed is drained by its own task (see `feed` above) so a
+            // quote is stamped when it arrives, not when this loop gets
+            // back from a long tick; this arm only notices the feed dying.
+            _ = &mut feed => {
+                log::error!("[WS] price feed closed, exiting");
+                break;
             }
             _ = tick.tick() => {
                 if let Err(e) = engine.tick(now_secs()).await {

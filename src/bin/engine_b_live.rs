@@ -150,6 +150,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
+use debot::trade::execution::slippage::mid_relative_slippage_bps;
 use dex_connector::{DexConnector, OrderSide, PositionSnapshot, PriceUpdate};
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
@@ -1289,76 +1290,6 @@ struct PriceFeed {
     /// usable for entry: after a drop, what we hold may be arbitrarily
     /// behind the book, and only a fresh update per symbol clears that.
     generation: u64,
-}
-
-/// Convert a *mid-relative* price bound into the touch-relative
-/// `slippage_bps` that `create_order_taker_ioc` takes, so the resulting
-/// limit price is at most `bound_bps` from the mid (bot-strategy#918
-/// Codex review).
-///
-/// The connector crosses the **touch** by `slippage_bps`, while the
-/// requirements doc (§6.3) states the bound against the *mid*. Those
-/// agree only on a tight book: on a 90/110 book, handing the connector
-/// the full 50 bps caps a buy near 110.55 -- 10.5% above the 100 mid,
-/// i.e. no bound at all in exactly the torn-book tail the bound exists
-/// for.
-///
-/// The conversion is **multiplicative and side-aware**, not a
-/// subtraction. The connector applies its collar to the touch, so for a
-/// buy the adverse move against the mid is `(1+h)(1+s) - 1 = h + s +
-/// h*s`, not `h + s`; subtracting the half-spread in bps leaves the
-/// cross term. With `h` the half-spread and `b` the budget, both as
-/// fractions:
-///
-/// - buy:  `s = (1 + b) / (1 + h) - 1`
-/// - sell: `s = 1 - (1 - b) / (1 - h)`
-///
-/// `None` means the half-spread alone already exceeds the budget, so no
-/// marketable price inside the bound exists. That is a refusal for an
-/// entry; the exit path treats it separately, because a position that
-/// cannot be closed is worse than one closed at the touch.
-///
-/// Rounded **down** to a whole bp (the connector takes `u32`), so the
-/// conversion can only tighten, never widen -- the same direction as the
-/// connector's own inward tick rounding.
-///
-/// Not modelled: the connector crosses by one tick *before* applying the
-/// collar, so the realised cap is up to one tick wider than `bound_bps`
-/// from the mid. On SNDK near 1700 with 2 price decimals that is
-/// 0.01/1700 ≈ 0.06 bps. Modelling it would need the market's
-/// `price_decimals`, which lives in the connector, not here.
-fn mid_relative_slippage_bps(
-    bound_bps: u32,
-    best_bid: f64,
-    best_ask: f64,
-    side: OrderSide,
-) -> Option<u32> {
-    if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask < best_bid {
-        return None;
-    }
-    let mid = (best_bid + best_ask) / 2.0;
-    if mid <= 0.0 {
-        return None;
-    }
-    let budget = f64::from(bound_bps) / 10_000.0;
-    let half_spread = (best_ask - best_bid) / 2.0 / mid;
-    // `best_bid > 0` and `best_ask >= best_bid` bound `half_spread` to
-    // `[0, 1)`, so the sell denominator cannot be zero or negative.
-    let allowance = match side {
-        OrderSide::Long => (1.0 + budget) / (1.0 + half_spread) - 1.0,
-        OrderSide::Short => 1.0 - (1.0 - budget) / (1.0 - half_spread),
-    };
-    // The nano-bp tolerance is for f64 representation error, not slack in
-    // the rule: `100.01 - 99.99` is 0.020000000000010232, which would
-    // otherwise cost a whole basis point to the floor below.
-    let allowance_bps = allowance * 10_000.0 + 1e-9;
-    if allowance_bps < 1.0 {
-        return None;
-    }
-    // `validate` already rejected a configured bound outside the
-    // connector's 1..=1000, and the conversion only ever shrinks one; the
-    // clamp is here so a future caller cannot smuggle a wider one through.
-    Some((allowance_bps.floor() as u32).min(1000))
 }
 
 impl PriceFeed {

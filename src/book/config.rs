@@ -86,6 +86,13 @@ pub struct SizingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
+    /// Price bound for a live send, **against the mid** -- the same basis
+    /// as `paper_slippage_bps` and the pre-send drift guard. The venue's
+    /// `create_order_taker_ioc` crosses the touch by what it is handed, so
+    /// the executor converts this with the observed half-spread before
+    /// sending (bot-strategy#971): on a book whose half-spread alone
+    /// exceeds it, an entry is not sent (no attempt spent) and a
+    /// reduce-only order crosses at the touch.
     pub slippage_bps: u32,
     pub max_attempts: u32,
     pub fill_confirm_timeout_secs: i64,
@@ -358,13 +365,18 @@ impl BookConfig {
         if ex.paper_slippage_bps >= 10_000.0 {
             bail!("execution.paper_slippage_bps must be < 10000 (100%)");
         }
-        // The live budget guards the same adverse-price direction as the
-        // paper one (LiveExecutor's within_slippage / send_capped price
-        // cap): at 100% or more it stops meaningfully bounding a sell
-        // (any positive mid passes), so a live order could clear far
-        // outside its sizing reference instead of being rejected.
-        if ex.slippage_bps >= 10_000 {
-            bail!("execution.slippage_bps must be < 10000 (100%)");
+        // The live budget is handed to the venue's price-capped IOC, whose
+        // `slippage_bps` is `1..=1000` (dex-connector `create_order_taker_ioc`),
+        // after the mid-to-touch conversion (bot-strategy#971) -- which
+        // only ever shrinks it and clamps at 1000. A wider configured value
+        // would therefore mean one thing on a tight book (clamped) and
+        // another on the no-touch reduce-only path (passed through and
+        // refused by the connector), so it is rejected here instead.
+        if !(1..=1000).contains(&ex.slippage_bps) {
+            bail!(
+                "execution.slippage_bps must be within 1..=1000 (the connector's IOC cap range), got {}",
+                ex.slippage_bps
+            );
         }
         // paths.state itself must not be a symlink: its atomic persist
         // (rename a temp file onto this exact pathname) replaces whatever
@@ -940,13 +952,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_live_slippage_of_a_hundred_percent_or_more() {
+    fn rejects_live_slippage_outside_the_connector_ioc_range() {
+        // The venue IOC takes 1..=1000 and the mid-to-touch conversion
+        // clamps there (bot-strategy#971): a wider value would silently
+        // mean 1000 on one send path and be refused on another.
         let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
-        c.execution.slippage_bps = 9_999;
-        assert!(c.validate().is_ok());
-        c.execution.slippage_bps = 10_000;
-        let e = c.validate().unwrap_err().to_string();
-        assert!(e.contains("execution.slippage_bps"), "{e}");
+        for ok in [1, 50, 1000] {
+            c.execution.slippage_bps = ok;
+            assert!(c.validate().is_ok(), "{ok}");
+        }
+        for bad in [0, 1001, 2000, 9_999, 10_000] {
+            c.execution.slippage_bps = bad;
+            let e = c.validate().unwrap_err().to_string();
+            assert!(
+                e.contains("execution.slippage_bps") && e.contains("1..=1000"),
+                "{bad}: {e}"
+            );
+        }
     }
 
     #[test]
