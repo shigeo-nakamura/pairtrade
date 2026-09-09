@@ -108,6 +108,22 @@ def utc_date(ts_seconds: float) -> str:
     return datetime.fromtimestamp(ts_seconds, timezone.utc).strftime("%Y-%m-%d")
 
 
+def utc_date_or_none(ts_seconds: float) -> str | None:
+    """`utc_date`, or `None` when the epoch is outside what it can render.
+
+    `float()` accepts numbers `datetime.fromtimestamp` cannot: a finite
+    but enormous value raises `OverflowError` or `OSError` depending on
+    the platform. Every caller here has to handle that -- the loaders by
+    refusing the row, `opening_date` by taking its documented fail-safe --
+    so the conversion is expressed once, and a new call site cannot
+    forget it (Codex, PR #297).
+    """
+    try:
+        return utc_date(ts_seconds)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 @dataclass
 class ExecDay:
     fills: int = 0
@@ -271,12 +287,12 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                 raise SubsidyLedgerError(
                     f"{path}: a leg_fill has no {'ts_ms' if ts_ms is None else 'variant'}, "
                     "so the day and arm it belongs to cannot be determined")
-            if is_not_a_number(ts_ms):
+            day_key = (
+                None if is_not_a_number(ts_ms) else utc_date_or_none(float(ts_ms) / 1000.0)
+            )
+            if day_key is None:
                 raise SubsidyLedgerError(f"{path}: unreadable `ts_ms` {ts_ms!r}")
-            try:
-                key = (utc_date(float(ts_ms) / 1000.0), str(arm))
-            except (TypeError, ValueError, OverflowError, OSError) as error:
-                raise SubsidyLedgerError(f"{path}: unreadable `ts_ms` {ts_ms!r}") from error
+            key = (day_key, str(arm))
             day = days[key]
             # `fill_value` is the field the bot actually writes (175/175
             # leg_fill rows in the archived ledgers carry it, and none
@@ -409,12 +425,10 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
             # so a boolean `ts` attributed the row to 1970-01-01 and
             # published a complete realized cost there instead of taking
             # the fatal unreadable-timestamp path (Codex, PR #297).
-            if is_not_a_number(ts):
+            day_key = None if is_not_a_number(ts) else utc_date_or_none(float(ts))
+            if day_key is None:
                 raise SubsidyLedgerError(f"{path}: unreadable `ts` {ts!r}")
-            try:
-                key = (utc_date(float(ts)), arm)
-            except (TypeError, ValueError, OverflowError, OSError) as error:
-                raise SubsidyLedgerError(f"{path}: unreadable `ts` {ts!r}") from error
+            key = (day_key, arm)
             day = days[key]
             defect = pnl_row_defect(record)
             # Derived *before* any rejection below: the entry leg of an
@@ -526,7 +540,12 @@ def opening_date(record: dict) -> str | None:
     opened = close_secs - hold_secs
     if not math.isfinite(opened):
         return None
-    return utc_date(opened)
+    # Finite is still not renderable: a normal close with `hold_secs:
+    # 1e300` derives an epoch `datetime.fromtimestamp` refuses, and this
+    # call sits outside the loaders' handlers -- so it came out of the
+    # CLI as a traceback instead of this function's documented fail-safe
+    # (Codex, PR #297).
+    return utc_date_or_none(opened)
 
 
 def funding_ticks_seen(record: dict) -> bool:
@@ -689,14 +708,10 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
             raise SubsidyLedgerError(
                 "an equity_history row has no `ts`, so the day it belongs to "
                 f"cannot be determined: {row!r}")
-        if is_not_a_number(ts):
+        # equity_history stamps milliseconds.
+        day = None if is_not_a_number(ts) else utc_date_or_none(float(ts) / 1000.0)
+        if day is None:
             raise SubsidyLedgerError(f"unreadable `ts` {ts!r} in an equity_history row")
-        try:
-            # equity_history stamps milliseconds.
-            day = utc_date(float(ts) / 1000.0)
-        except (TypeError, ValueError, OverflowError, OSError) as error:
-            raise SubsidyLedgerError(
-                f"unreadable `ts` {ts!r} in an equity_history row") from error
         equity = row.get("equity")
         if equity is None:
             invalid_days.add(day)

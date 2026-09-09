@@ -1253,6 +1253,43 @@ def test_a_boolean_is_never_a_number_anywhere_in_the_ledger():
         assert round(carry_day.funding_usd, 6) == 0.0, "nothing was booked from it"
 
 
+def test_an_epoch_too_large_to_render_is_a_gap_not_a_traceback():
+    """Finite is not the same as renderable.
+
+    A normal close with `hold_secs: 1e300` derives an opening epoch
+    `datetime.fromtimestamp` refuses with `OverflowError`/`OSError`, and
+    `opening_date`'s call sits outside the loaders' handlers -- so it
+    came out of the CLI as a traceback instead of the documented
+    fail-safe (Codex, PR #297).
+    """
+    huge = {"ts": 1788868800 + 1800, "hold_secs": 1e300}
+    assert opening_date(huge) is None, "unknowable, not a crash"
+    # The fail-safe is the same one an unreadable hold takes: treated as a
+    # crossing, so the day's rates are suppressed rather than published.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": 1788868800 + 1800, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 1e300}],
+        )
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.cross_day_cycles == 1, "an unknowable opening date counts as a crossing"
+
+    # And a timestamp the loaders cannot render is refused rather than
+    # raising something a caller has to guess at.
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = pnl_file(
+            Path(tmp),
+            [{"ts": 1e300, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}],
+        )
+        try:
+            load_pnl([bad])
+        except SubsidyLedgerError as error:
+            assert "unreadable `ts`" in str(error), error
+        else:
+            raise AssertionError("an unrenderable ts must be refused")
+
+
 def test_a_boolean_timestamp_or_hold_never_reads_as_a_real_value():
     """The remaining `float()` sites: timestamps and hold durations.
 
