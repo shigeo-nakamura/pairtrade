@@ -21,6 +21,7 @@ from subsidy_ledger import (  # noqa: E402
     load_execution,
     load_pnl,
     load_points,
+    matching_pnl_arms,
     render_table,
     funding_ticks_are_zero,
     funding_tick_claim,
@@ -1931,12 +1932,25 @@ def test_a_padded_arm_in_a_pnl_filename_is_not_an_arm():
         path = write(Path(tmp) / production,
                      [{"ts": TS, "source": "exit_fill", "pnl": -1.0, "hold_secs": 600}])
         try:
-            load_pnl([path], {"freq", "lighter-freq"})
+            load_pnl([path], {"freq", "lighter-freq", "pair"})
         except SubsidyLedgerError as error:
             assert "not decidable" in str(error), error
             assert "'lighter-freq'" in str(error), error
+            # And only the arms that could actually be it. `pair` occurs
+            # inside the *service* -- listing it sent the operator to
+            # rename an arm that was never in the running. The message
+            # and the decision use one predicate now (Codex, PR #297).
+            assert "'pair'" not in str(error), error
         else:
             raise AssertionError("an ambiguous arm must be refused")
+
+    # That predicate, directly: the decision and the diagnostic cannot
+    # disagree because there is only one of them.
+    assert matching_pnl_arms(production, {"freq", "lighter-freq", "pair"}) == [
+        "freq", "lighter-freq"]
+    assert matching_pnl_arms(production, {"freq"}) == ["freq"]
+    assert matching_pnl_arms(production, {"pair"}) == []
+    assert matching_pnl_arms("not-a-pnl-name.jsonl", {"freq"}) == []
 
 
 def test_a_total_that_overflows_is_a_gap_not_an_infinity():

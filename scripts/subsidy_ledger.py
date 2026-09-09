@@ -566,8 +566,7 @@ def load_pnl(paths: Iterable[Path],
             # in it and still exited 0 -- the report then says no PnL
             # source covers those days, which is a different claim from
             # "one was supplied and could not be read" (Codex, PR #297).
-            ambiguous = sorted(candidate for candidate in known_arms
-                               if f"-{candidate}-" in f"-{path.name}")
+            ambiguous = matching_pnl_arms(path.name, known_arms)
             detail = ""
             if len(ambiguous) > 1:
                 detail = (
@@ -879,6 +878,35 @@ def spans_a_funding_interval(record: dict) -> bool:
     return (close_secs // FUNDING_INTERVAL_SECS) != (opened // FUNDING_INTERVAL_SECS)
 
 
+def matching_pnl_arms(name: str, known_arms: Iterable[str] = ()) -> list[str]:
+    """Every known arm the filename could be naming, sorted.
+
+    One predicate, used by `arm_from_pnl_filename` to decide and by the
+    refusal message to explain. They were written separately -- the
+    message used a substring test -- so with arms `{freq, lighter-freq,
+    pair}` it listed `pair` as a candidate for
+    `pnl-debot-pair-robinhood-lighter-freq-...`, sending the operator to
+    rename an arm that was never in the running. Two predicates for one
+    question is the defect, not the wording (Codex, PR #297).
+    """
+    stem = _pnl_service_and_arm(name)
+    if stem is None:
+        return []
+    return sorted({candidate for candidate in known_arms
+                   if stem.endswith(f"-{candidate}")})
+
+
+def _pnl_service_and_arm(name: str) -> str | None:
+    """The `<service>-<arm>` part of `pnl-<service>-<arm>-<date>.jsonl`."""
+    if not name.startswith("pnl-") or not name.endswith(".jsonl"):
+        return None
+    stem = name[len("pnl-") : -len(".jsonl")]
+    service_and_arm, _, date = stem.rpartition("-")
+    if not service_and_arm or not date.isdigit():
+        return None
+    return service_and_arm
+
+
 def arm_from_pnl_filename(name: str, known_arms: Iterable[str] = ()) -> str | None:
     """`pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl` -> `freq`.
 
@@ -906,15 +934,10 @@ def arm_from_pnl_filename(name: str, known_arms: Iterable[str] = ()) -> str | No
     the same thing this module does with every other ambiguity rather
     than guessing (Codex, PR #297).
     """
-    if not name.startswith("pnl-") or not name.endswith(".jsonl"):
+    service_and_arm = _pnl_service_and_arm(name)
+    if service_and_arm is None:
         return None
-    stem = name[len("pnl-") : -len(".jsonl")]
-    parts = stem.rsplit("-", 1)
-    if len(parts) != 2 or not parts[1].isdigit():
-        return None
-    service_and_arm = parts[0]
-    matches = sorted({candidate for candidate in known_arms
-                      if service_and_arm.endswith(f"-{candidate}")})
+    matches = matching_pnl_arms(name, known_arms)
     if len(matches) > 1:
         return None
     if matches:
