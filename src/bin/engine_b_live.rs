@@ -1655,6 +1655,13 @@ struct EngineBLiveEngine {
     /// `tick`'s backstop retries until one succeeds (pairtrade#300 Codex
     /// review).
     state_write_pending: bool,
+    /// This process wrote the current `entry_in_flight` marker (rather
+    /// than finding it on disk at startup). Only such a marker is
+    /// cleared when the tick's confirmation resolves; a restored one is
+    /// resolved by reconciliation or by seeing the exposure, never by a
+    /// tick that simply has nothing pending (pairtrade#300 Codex
+    /// review).
+    entry_marker_owned: bool,
     /// Successful `state_path` writes, so a test can assert that a change
     /// which must be atomic really did land in **one** write rather than
     /// in two with a crash window between them (pairtrade#300 Codex
@@ -1966,6 +1973,15 @@ impl EngineBLiveEngine {
                 // wrong instrument. Whatever it created has to be handled
                 // as an unmanaged exposure (pairtrade#300 Codex review).
                 let live = exchange_position_for(&positions, &sent_for);
+                // Only a *sighting* resolves this. A read that shows
+                // nothing proves nothing this soon after a send, so the
+                // marker is put back and `poll_foreign_in_flight` keeps
+                // looking every tick -- otherwise one flat snapshot
+                // retired the claim and nothing ever watched that symbol
+                // again (pairtrade#300 Codex review).
+                if live.is_none() {
+                    self.state.entry_in_flight = Some(sent_for.clone());
+                }
                 let reason = format!(
                     "entry_in_flight_on_a_former_symbol: an entry order for {sent_for} was sent \
                      and never confirmed, and us_primary is now {symbol}. This engine cannot \
@@ -2174,6 +2190,51 @@ impl EngineBLiveEngine {
         // session-loss halt is measured against.
         self.reprice_equity_and_drawdown();
         self.state_write_pending = true;
+    }
+
+    /// Keep looking for an exposure created by an order sent for a symbol
+    /// `us_primary` no longer names. `try_adopt_unconfirmed` cannot do
+    /// it -- that polls the configured symbol -- and startup
+    /// reconciliation runs once, so without this a single flat snapshot
+    /// would end the search (pairtrade#300 Codex review).
+    async fn poll_foreign_in_flight(&mut self, now_us: i64) {
+        let Some(sent_for) = self
+            .state
+            .entry_in_flight
+            .clone()
+            .filter(|s| *s != self.cfg.us_primary_symbol)
+        else {
+            return;
+        };
+        let positions = match self.connector.get_positions().await {
+            Ok(positions) => positions,
+            Err(e) => {
+                log::warn!("[RECONCILE] get_positions failed while watching {sent_for} ({e:?})");
+                return;
+            }
+        };
+        let Some(live) = exchange_position_for(&positions, &sent_for) else {
+            return;
+        };
+        log::error!(
+            "[RECONCILE] the unconfirmed {sent_for} order did create a position ({} size={:.6}); \
+             recording it as an unmanaged exposure -- this engine cannot close it, flatten it \
+             by hand",
+            live.side,
+            live.size
+        );
+        let mid = self.exit_accounting_price(&sent_for).map(|(mid, _)| mid);
+        let today = self.current_date.map(|d| d.to_string()).unwrap_or_default();
+        let record = unmanaged_from_live(&sent_for, &live, mid, &today);
+        self.state
+            .unmanaged_positions
+            .retain(|q| q.symbol != record.symbol);
+        self.state.unmanaged_positions.push(record);
+        // Resolved: the exposure now has a record that every start
+        // re-checks, and the session is already halted.
+        self.state.entry_in_flight = None;
+        self.state_write_pending = true;
+        let _ = now_us;
     }
 
     /// Check the exposure this engine cannot manage against the exchange
@@ -3201,7 +3262,7 @@ impl EngineBLiveEngine {
                                 // (pairtrade#275 Codex review).
                                 self.reconcile_side_flip_if_any(
                                     &remaining,
-                                    exit_price,
+                                    Some(exit_price),
                                     "exit confirm",
                                 );
                                 if expired {
@@ -3405,7 +3466,13 @@ impl EngineBLiveEngine {
     fn reconcile_side_flip_if_any(
         &mut self,
         live: &ExchangePosition,
-        ws_price: f64,
+        // `None` when no market price exists. It used to be a bare
+        // `f64`, and `maybe_exit` passes the tracked position's own
+        // entry price when the feed has nothing -- installing *that* as
+        // the replacement leg's basis, and clearing the unknown flag,
+        // prices the new leg against the old one's entry
+        // (pairtrade#300 Codex review).
+        market_price: Option<f64>,
         context: &str,
     ) {
         let Some(pos) = self.position.as_ref() else {
@@ -3433,35 +3500,48 @@ impl EngineBLiveEngine {
             // `(ws_price - 0.0) * size` would book the flipped-away
             // leg's whole notional as realized (pairtrade#300 Codex
             // review).
-            let old_leg_pnl = if p.entry_price_unknown {
-                log::error!(
-                    "[EXIT] the flipped-away {} leg had NO known cost basis -- booking $0.00 for \
-                     it; its PnL is not measurable from what this process saw",
-                    p.side
-                );
-                0.0
-            } else {
-                old_sign * (ws_price - p.entry_price) * p.open_size
+            let old_leg_pnl = match market_price.filter(|m| *m > 0.0) {
+                _ if p.entry_price_unknown => {
+                    log::error!(
+                        "[EXIT] the flipped-away {} leg had NO known cost basis -- booking \
+                         $0.00 for it; its PnL is not measurable from what this process saw",
+                        p.side
+                    );
+                    0.0
+                }
+                Some(mid) => old_sign * (mid - p.entry_price) * p.open_size,
+                None => {
+                    log::error!(
+                        "[EXIT] the flipped-away {} leg cannot be valued: no market price of \
+                         any kind -- booking $0.00 for it",
+                        p.side
+                    );
+                    0.0
+                }
             };
             p.realized_partial_pnl += old_leg_pnl;
             log::error!(
-                "[EXIT] booked the flipped-away {} leg: size={:.6} entry={:.4} at mid {ws_price:.4} \
+                "[EXIT] booked the flipped-away {} leg: size={:.6} entry={:.4} at mid {:?} \
                  pnl=${old_leg_pnl:.2}; realized_so_far=${:.2}",
                 p.side,
                 p.open_size,
                 p.entry_price,
+                market_price,
                 p.realized_partial_pnl
             );
             p.side = live.side;
             p.size = live.size;
             p.open_size = live.size;
-            p.entry_price_estimated = live.entry_price.is_none();
-            p.entry_price = live.entry_price.unwrap_or(ws_price);
             // The replacement leg has a basis of its own, so the flag
             // must not survive onto it -- leaving it set would suppress
-            // the *new* leg's PnL at exit. It only stays set when there
-            // is still no price to install.
-            p.entry_price_unknown = live.entry_price.is_none() && !(ws_price > 0.0);
+            // the *new* leg's PnL at exit. But only the venue's own
+            // price, or an actual market observation, may become that
+            // basis: with neither, the leg is adopted as unknown rather
+            // than valued at the leg it replaced.
+            let market = market_price.filter(|m| *m > 0.0);
+            p.entry_price_estimated = live.entry_price.is_none();
+            p.entry_price = live.entry_price.or(market).unwrap_or(0.0);
+            p.entry_price_unknown = live.entry_price.is_none() && market.is_none();
         }
         // Durable before the caller does anything else. The old leg's
         // PnL and the replacement leg exist only in `self.position` at
@@ -3990,6 +4070,7 @@ impl EngineBLiveEngine {
         // order may exist even though nothing is persisted about a
         // position yet (pairtrade#300 Codex review).
         self.state.entry_in_flight = Some(self.cfg.us_primary_symbol.clone());
+        self.entry_marker_owned = true;
         if let Err(e) = atomic_write_json_checked(&self.cfg.state_path, &self.state) {
             // No durable marker, no order: sending now would make the
             // at-most-one guarantee depend on this process surviving.
@@ -3999,6 +4080,7 @@ impl EngineBLiveEngine {
                 self.cfg.state_path.display()
             );
             self.state.entry_in_flight = None;
+            self.entry_marker_owned = false;
             return;
         }
         let submit = self.submit_order(side, size, false).await;
@@ -4169,7 +4251,15 @@ impl EngineBLiveEngine {
                         // entry price so the PnL we book is at least the
                         // exchange's, and halt new entries (pairtrade#275
                         // review findings 2 and 5).
-                        self.reconcile_side_flip_if_any(&live, price, "exit_side_mismatch");
+                        // `price` is only a market price when the feed
+                        // gave one; the fallback above is the position's
+                        // own entry, which must not become the
+                        // replacement leg's basis.
+                        self.reconcile_side_flip_if_any(
+                            &live,
+                            (price_source != "entry_price_pnl_unknown").then_some(price),
+                            "exit_side_mismatch",
+                        );
                         (opposite(live.side), live.size)
                     } else {
                         let tracked_open = pos.open_size;
@@ -4350,6 +4440,7 @@ impl EngineBLiveEngine {
         if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
             self.try_adopt_unconfirmed(now).await;
         }
+        self.poll_foreign_in_flight(now).await;
         if self.pending.is_some() {
             // One exchange read per tick until the in-flight entry/exit is
             // confirmed or its window ends; no new decisions meanwhile.
@@ -4360,8 +4451,9 @@ impl EngineBLiveEngine {
         }
         // The confirmation has resolved (or was never installed), so the
         // durable in-flight marker is no longer owed to a restart.
-        if self.pending.is_none() && self.state.entry_in_flight.is_some() {
+        if self.pending.is_none() && self.entry_marker_owned {
             self.state.entry_in_flight = None;
+            self.entry_marker_owned = false;
             self.state_write_pending = true;
         }
         // Backstop for any path above that changed the position without
@@ -4509,6 +4601,7 @@ impl EngineBLiveEngine {
                 // the in-memory list (pairtrade#275 Codex review).
                 positions_ready: !(!self.reconciled
                     || self.state.position_unconfirmed
+                    || self.state.entry_in_flight.is_some()
                     || self.pending.is_some()),
                 positions,
                 pnl_total: self.state.realized_pnl_session,
@@ -4725,6 +4818,7 @@ async fn main() -> Result<()> {
         // is allowed (bot-strategy#917).
         reconciled: false,
         state_write_pending: false,
+        entry_marker_owned: false,
         state_writes: 0,
         last_status_write_us: 0,
         status_s3_mirror: S3Mirror::from_env(),
@@ -6038,6 +6132,7 @@ mod tests {
             // this back to false.
             reconciled: true,
             state_write_pending: false,
+            entry_marker_owned: false,
             state_writes: 0,
             last_status_write_us: 0,
             status_s3_mirror: None,
@@ -7282,6 +7377,86 @@ mod tests {
         assert_eq!(status["positions"][0]["symbol"], serde_json::json!("SNDK"));
     }
 
+    /// pairtrade#300 Codex review round 14, P1: one flat snapshot must
+    /// not retire the claim for a former symbol.
+    #[tokio::test]
+    async fn a_former_symbol_claim_is_polled_until_the_exposure_is_seen() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        // The first read shows nothing -- which proves nothing.
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert_eq!(
+            h.engine.state.entry_in_flight.as_deref(),
+            Some("SNDK"),
+            "the claim survives a read that has not seen the fill yet"
+        );
+        assert!(h.engine.state.session_halted);
+        assert!(h.engine.state.unmanaged_positions.is_empty());
+        // The status must not read as a trustworthy empty account.
+        h.engine.last_status_write_us = 0;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(status["positions_ready"], serde_json::json!(false));
+
+        // The fill lands late; the next tick finds and parks it.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.engine.tick().await;
+        assert_eq!(unmanaged_symbols(&h.engine.state), vec!["SNDK".to_string()]);
+        assert!(
+            h.engine.state.entry_in_flight.is_none(),
+            "a sighting resolves the claim into a record"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 14, P2: only a real market price
+    /// may become the replacement leg's basis.
+    #[tokio::test]
+    async fn a_side_flip_without_a_market_price_adopts_an_unknown_basis() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        });
+        // The venue gives no entry price and there is no market price:
+        // `maybe_exit` would have passed the position's own entry here.
+        h.engine.reconcile_side_flip_if_any(
+            &ExchangePosition {
+                side: OrderSide::Short,
+                size: 0.030,
+                entry_price: None,
+            },
+            None,
+            "test",
+        );
+        let pos = h.engine.position.clone().expect("tracked");
+        assert_eq!(pos.side, OrderSide::Short);
+        assert!(
+            pos.entry_price_unknown,
+            "the old leg's entry price is not the new leg's basis"
+        );
+        assert_eq!(
+            pos.realized_partial_pnl, 0.0,
+            "and the flipped-away leg cannot be valued either"
+        );
+    }
+
     /// pairtrade#300 Codex review round 13, P1: parking a live displaced
     /// position halts, even if the earlier halt was already acknowledged.
     #[tokio::test]
@@ -7769,7 +7944,7 @@ mod tests {
                 size: 0.030,
                 entry_price: Some(1750.0),
             },
-            1760.0,
+            Some(1760.0),
             "test",
         );
         // Disk must already carry the flipped record, not the pre-flip one.
@@ -7866,7 +8041,7 @@ mod tests {
                 size: 0.030,
                 entry_price: Some(1750.0),
             },
-            1756.92,
+            Some(1756.92),
             "test",
         );
         let pos = h.engine.position.clone().expect("still tracked");
