@@ -1265,14 +1265,20 @@ def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
     assert funding_tick_claim({"funding_ticks_observed": 0}) == "none"
     assert funding_tick_claim({"funding_ticks_observed": "0"}) == "none"
     assert funding_tick_claim({"funding_ticks_observed": 3}) == "some"
-    for bad in (-1, float("nan"), float("inf"), False, True, "n/a"):
+    # Every value a count cannot be: unparseable, boolean, non-finite,
+    # negative, or fractional. A tick count is how many hourly charges
+    # landed, so 0.5 is no more a count than -1 is (Codex, PR #297).
+    for bad in (-1, -0.5, 0.5, 1.5, "0.5", float("nan"), float("inf"),
+                float("-inf"), False, True, "n/a", ""):
         claim = funding_tick_claim({"funding_ticks_observed": bad})
-        expected = "malformed" if bad is not True else "malformed"
-        assert claim == expected, (bad, claim)
+        assert claim == "malformed", (bad, claim)
+    # Integral values written as floats or strings are still counts.
+    for good, expected in ((0.0, "none"), ("0.0", "none"), (2.0, "some"), ("2", "some")):
+        assert funding_tick_claim({"funding_ticks_observed": good}) == expected, good
 
     on_the_hour = 1788868800 + 1800
     with tempfile.TemporaryDirectory() as tmp:
-        for arm, ticks in (("freq", -1), ("b", "NaN"), ("c", False)):
+        for arm, ticks in (("freq", -1), ("b", "NaN"), ("c", False), ("e", 0.5)):
             path = pnl_file(
                 Path(tmp),
                 [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,

@@ -587,7 +587,12 @@ def funding_tick_claim(record: dict) -> str:
     # Finite is not the same as possible: a tick count cannot be
     # negative, and reading one as "no ticks" would make a malformed row
     # into evidence that no funding occurred (Codex, PR #297).
-    if not math.isfinite(count) or count < 0:
+    # Finite is not the same as possible, and neither is non-negative: a
+    # tick count is how many hourly funding charges landed, so it is a
+    # whole number. `0.5` is not "some ticks" any more than `-1` is "no
+    # ticks" -- both are rows that cannot say what they saw
+    # (Codex, PR #297).
+    if not math.isfinite(count) or count < 0 or count != int(count):
         return FUNDING_TICKS_MALFORMED
     return FUNDING_TICKS_NONE if count == 0.0 else FUNDING_TICKS_SOME
 
