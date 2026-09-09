@@ -104,6 +104,19 @@ from pathlib import Path
 from typing import Iterable
 
 
+def overflows(total: float, addend: float) -> bool:
+    """Would adding this to a finite running total make it non-finite?
+
+    Every individual value is checked for finiteness before it is added,
+    for a stated reason: a non-finite number spreads through the totals
+    and reaches `--out` as the non-standard JSON token `Infinity`, and an
+    infinite denominator reports a real cost as `$0.00` per $1M. A *sum*
+    of finite values can overflow to the same thing, so the guarantee
+    only holds if the running total is checked too (Codex, PR #297).
+    """
+    return not math.isfinite(total + addend)
+
+
 def is_bare_arm(value: object) -> bool:
     """Is this exactly an arm name the other loaders could have produced?
 
@@ -118,6 +131,10 @@ def is_bare_arm(value: object) -> bool:
     Deliberately *not* a check that the arm exists elsewhere: points and
     equity may legitimately be supplied for an arm whose ledger has not
     been exported yet, which `uncosted_points` reports.
+
+    `arm_from_pnl_filename` uses it too. A filename is operator-supplied,
+    so the only genuinely machine-written arm is the execution ledger's
+    `variant` (Codex, PR #297).
     """
     return isinstance(value, str) and bool(value) and value == value.strip()
 
@@ -369,6 +386,11 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                         day.fills_without_value += 1
                     elif value == 0.0 and quantity_moved(record):
                         day.fills_without_value += 1
+                    elif overflows(day.volume_usd, value):
+                        # Real volume whose value cannot be carried in the
+                        # running total: the same gap as an unvalued fill,
+                        # and the denominator is a lower bound either way.
+                        day.fills_without_value += 1
                     else:
                         day.volume_usd += value
                         day.fills += 1
@@ -379,7 +401,10 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                 # diagnostic, but it still leaves `--out` holding a token
                 # no strict JSON reader will accept.
                 if slip_value is not None and math.isfinite(slip_value):
-                    day.slippage_usd += slip_value
+                    if overflows(day.slippage_usd, slip_value):
+                        day.slippage_unreadable += 1
+                    else:
+                        day.slippage_usd += slip_value
                 else:
                     day.slippage_unreadable += 1
     return dict(days)
@@ -513,6 +538,10 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_pnl")
                 continue
+            if overflows(day.realized_pnl_usd, pnl):
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_pnl")
+                continue
             day.realized_pnl_usd += pnl
             day.cycles += 1
             funding = record.get("funding_carry_usd")
@@ -535,6 +564,10 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             carry = float(funding)
             if not math.isfinite(carry):
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_funding")
+                continue
+            if overflows(day.funding_usd, carry):
                 day.incomplete = True
                 day.incomplete_reasons.add("unreadable_funding")
                 continue
@@ -738,7 +771,11 @@ def arm_from_pnl_filename(name: str) -> str | None:
         return None
     service_and_arm = parts[0]
     arm = service_and_arm.rsplit("-", 1)[-1]
-    return arm or None
+    # A filename is operator-supplied, so this is not the machine source
+    # the round-33 comment took it for: `pnl-service-freq -20260908.jsonl`
+    # parses to `"freq "`, which keys separately from the execution and
+    # points rows for `freq` (Codex, PR #297).
+    return arm if is_bare_arm(arm) else None
 
 
 def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:

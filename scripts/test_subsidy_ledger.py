@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -1465,6 +1466,59 @@ def test_two_equity_closes_at_the_same_instant_settle_nothing():
     # And an exactly repeated sample is not a conflict.
     repeated = history([tie_a, dict(tie_a), close_two])
     assert repeated.get("2026-09-09") == 100.0, repeated
+
+
+def test_a_padded_arm_in_a_pnl_filename_is_not_an_arm():
+    """A filename is operator-supplied, not a machine source.
+
+    Round 33's comment took `arm_from_pnl_filename` for a machine source
+    that could not emit a padded value; it parses a filename, and a
+    filename can contain a space (Codex, PR #297).
+    """
+    assert arm_from_pnl_filename(
+        "pnl-debot-pair-robinhood-lighter-freq-20260908.jsonl") == "freq"
+    assert arm_from_pnl_filename("pnl-service-freq -20260908.jsonl") is None
+    assert arm_from_pnl_filename("pnl-service- freq-20260908.jsonl") is None
+
+
+def test_a_total_that_overflows_is_a_gap_not_an_infinity():
+    """Finite inputs can sum to one that is not.
+
+    Each value is already refused when it is non-finite, because such a
+    number reaches `--out` as the non-standard token `Infinity` and makes
+    a real cost divide to `$0.00` per $1M. The sum needs the same guard
+    or the guarantee does not hold (Codex, PR #297).
+    """
+    huge = 1e308
+    with tempfile.TemporaryDirectory() as tmp:
+        volume = write(
+            Path(tmp) / "execution-freq.jsonl",
+            [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+              "fill_value": huge, "filled_qty": 1.0},
+             {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+              "fill_value": huge, "filled_qty": 1.0}],
+        )
+        day = load_execution([volume])[("2026-09-08", "freq")]
+        assert math.isfinite(day.volume_usd), day.volume_usd
+        assert day.fills == 1 and day.fills_without_value == 1
+
+        pnl_overflow = pnl_file(
+            Path(tmp),
+            [{"ts": TS, "source": "exit_fill", "pnl": -huge, "hold_secs": 600},
+             {"ts": TS, "source": "exit_fill", "pnl": -huge, "hold_secs": 600}],
+        )
+        pday = load_pnl([pnl_overflow])[("2026-09-08", "freq")]
+        assert math.isfinite(pday.realized_pnl_usd), pday.realized_pnl_usd
+        assert pday.incomplete and "unreadable_pnl" in pday.incomplete_reasons
+
+    # Nothing non-finite can reach `--out`, which is the property all of
+    # this exists for.
+    rows = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=1e308)},
+                      {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-5.0)})
+    for row in rows:
+        for value in (row.volume_usd, row.realized_pnl_usd, row.funding_usd,
+                      row.cost_usd, row.slippage_usd):
+            assert value is None or math.isfinite(value), (row, value)
 
 
 def test_an_epoch_too_large_to_render_is_a_gap_not_a_traceback():
