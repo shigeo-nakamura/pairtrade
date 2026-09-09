@@ -240,10 +240,30 @@ impl ArcusSpotRuntimeConfig {
         }
         validate_inventory("initial_inventory", self.initial_inventory)?;
         validate_inventory("inventory_floors", self.inventory_floors)?;
-        if self.inventory_floors.token_a > self.initial_inventory.token_a
-            || self.inventory_floors.token_b > self.initial_inventory.token_b
+        // Against the largest holding this config declares, not just the
+        // funding baseline: a completed forward split reconciles 1 into 40,
+        // and a floor of 5 is then perfectly reachable -- but comparing it
+        // with `initial_inventory` alone made that increase impossible
+        // without also changing `initial_inventory`, which is a
+        // state-invalidating reset (Codex P2, pairtrade#309). Raising a
+        // floor is the conservative direction, so widening the baseline to
+        // include declared reconciliations loosens nothing that matters;
+        // what the check is for is a floor no holding this config describes
+        // could ever satisfy.
+        let mut floor_baseline = self.initial_inventory;
+        for event in &self.corporate_actions {
+            if let Some(reconciled) = event.post_event_inventory {
+                floor_baseline.token_a = floor_baseline.token_a.max(reconciled.token_a);
+                floor_baseline.token_b = floor_baseline.token_b.max(reconciled.token_b);
+            }
+        }
+        if self.inventory_floors.token_a > floor_baseline.token_a
+            || self.inventory_floors.token_b > floor_baseline.token_b
         {
-            return Err("inventory floors cannot exceed initial inventory".to_string());
+            return Err(
+                "inventory floors cannot exceed initial inventory (or the largest reconciled                  post_event_inventory this config declares)"
+                    .to_string(),
+            );
         }
         if self.max_rotation_fraction <= Decimal::ZERO || self.max_rotation_fraction > Decimal::ONE
         {
@@ -494,6 +514,26 @@ mod tests {
     fn rejects_floor_above_inventory() {
         let mut config = valid_config();
         config.inventory_floors.token_a = Decimal::from(2);
+        assert!(config.validate().unwrap_err().contains("floors"));
+    }
+
+    #[test]
+    fn a_declared_reconciliation_widens_the_floor_baseline() {
+        // A completed forward split reconciled 1 into 40; raising the floor
+        // to 5 afterwards must not require a state-invalidating change to
+        // initial_inventory.
+        let mut config = valid_config();
+        let mut event = split_event("NVDA-2026-08-SPLIT", anchor());
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(40),
+            token_b: Decimal::ONE,
+        });
+        config.corporate_actions = vec![event];
+        config.inventory_floors.token_a = Decimal::from(5);
+        config.validate().unwrap();
+
+        // Still bounded: above every declared holding is refused.
+        config.inventory_floors.token_a = Decimal::from(41);
         assert!(config.validate().unwrap_err().contains("floors"));
     }
 

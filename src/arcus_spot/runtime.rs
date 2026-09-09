@@ -439,6 +439,13 @@ struct PriceContext {
     /// separately and validated on its own `received_at`, and can predate
     /// the collection that later wrapped it (Codex P1, pairtrade#309).
     observed_at: DateTime<Utc>,
+    /// When the *prices* in this context were received. `observed_at` is the
+    /// earliest instant anything here describes, which is the right question
+    /// for the resume and the identity pins; a decision made purely of
+    /// prices has to ask when the prices arrived, or a collection that
+    /// started before a cutoff would license a mark built from prices
+    /// received after it (Codex P2, pairtrade#309).
+    priced_at: DateTime<Utc>,
 }
 
 /// Which leg of `SnapshotContext::row` an exit executes, and therefore how
@@ -1120,14 +1127,17 @@ impl ArcusSpotRuntime {
         // nothing accumulates exposure while the limits are unenforceable
         // (Codex, PR #309).
         //
-        // Judged at `price.observed_at`, not at the processing clock: the
-        // question is whether *this mark* mixes units, and the mark is made
-        // of the prices and identities that observation carries. A snapshot
-        // taken before the cutoff and processed after it is a valid
-        // pre-event mark, and suppressing it would drop a genuine breach for
-        // good -- every later mark is stale, and the resume re-anchors both
-        // baskets (Codex P2, pairtrade#309).
-        if !self.corporate_action_units_are_stale(price.observed_at) {
+        // Judged at `price.priced_at`, not at the processing clock and not
+        // at the composite `observed_at`: the question is whether *this
+        // mark* mixes units, and the mark is made of prices alone. A
+        // snapshot whose prices arrived before the cutoff and was processed
+        // after it is a valid pre-event mark, and suppressing it would drop
+        // a genuine breach for good -- every later mark is stale, and the
+        // resume re-anchors both baskets. Symmetrically, a collection that
+        // *started* before the cutoff but whose prices arrived after it is
+        // already a post-event mark and must stay suppressed (Codex P2 x2,
+        // pairtrade#309).
+        if !self.corporate_action_units_are_stale(price.priced_at) {
             self.engage_risk_halt(evaluation_time, risk_before);
         }
         self.update_risk_baselines(evaluation_time, equity_before, inventory_before);
@@ -1527,6 +1537,7 @@ impl ArcusSpotRuntime {
             token_a_price_usd,
             token_b_price_usd,
             observed_at: overview.received_at.min(snapshot.collection_started_at),
+            priced_at: overview.received_at,
         })
     }
 
@@ -7687,6 +7698,24 @@ mod tests {
         assert!(
             runtime.state.risk_halt.is_some(),
             "a pre-cutoff mark is measured in the units the venue was quoting",
+        );
+
+        // Prices that arrived after the cutoff stay suppressed even when the
+        // collection that wrapped them started before it.
+        let mut straddling = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut straddling);
+        straddling.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        straddling.state.inventory.token_a = Decimal::new(98, 2);
+        straddling.step_at(
+            &snapshot_with_overview_received_at(
+                anchor + Duration::seconds(3),
+                anchor + Duration::seconds(5),
+            ),
+            anchor + Duration::seconds(6),
+        );
+        assert_eq!(
+            straddling.state.risk_halt, None,
+            "the prices are post-event even though the collection started before the cutoff",
         );
 
         // A mark whose observation is itself past the cutoff stays suppressed.
