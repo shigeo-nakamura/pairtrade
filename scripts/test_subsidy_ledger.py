@@ -1120,6 +1120,37 @@ def test_a_complete_day_with_no_funding_ticks_reports_a_known_zero():
         assert gap_row.funding_usd is None
 
 
+def test_a_partially_covered_day_does_not_publish_its_known_funding_subtotal():
+    """One good carry does not make the day's funding total known.
+
+    `funding_seen` goes true on the first readable carry, so a day with
+    one good close and one whose carry is missing used to serialize the
+    subtotal into `funding_usd` -- a number a consumer reads as the day's
+    total, next to the contract that `null` means unknown (Codex, PR #297).
+    """
+    inside_the_hour = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        mixed = pnl_file(
+            Path(tmp),
+            [
+                # Readable carry: funding_seen goes true here.
+                {"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+                 "hold_secs": 600, "funding_carry_usd": -0.03},
+                # Held across a funding interval with no carry at all.
+                {"ts": inside_the_hour + 60, "source": "exit_fill", "pnl": -4.0,
+                 "hold_secs": 20 * 3600},
+            ],
+        )
+        day = load_pnl([mixed])[("2026-09-08", "freq")]
+        assert day.funding_seen and day.incomplete
+        assert "funding_gap" in day.incomplete_reasons
+        row = build_rows({}, {("2026-09-08", "freq"): day})[0]
+        assert row.funding_usd is None, row.funding_usd
+        # And the day is not costed from the ledger either, so the two
+        # agree about what is unknown.
+        assert row.cost_source != "pnl_ledger"
+
+
 def test_a_pnl_file_whose_arm_cannot_be_read_is_refused():
     """Skipping it dropped every realized cost in it and still exited 0."""
     with tempfile.TemporaryDirectory() as tmp:

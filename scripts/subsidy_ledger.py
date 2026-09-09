@@ -128,6 +128,11 @@ class PnlDay:
     cycles: int = 0
     realized_pnl_usd: float = 0.0
     funding_usd: float = 0.0
+    # At least one close carried a readable `funding_carry_usd`. A
+    # diagnostic only: it deliberately does not gate `funding_usd`'s
+    # serialization, because it goes true on the *first* good carry and
+    # would publish a partial sum for a day whose coverage is incomplete
+    # (Codex, PR #297).
     funding_seen: bool = False
     # Set by any row that is not a realized, live-money close. A day with
     # this set is never costed from the PnL ledger, however many good rows
@@ -754,9 +759,19 @@ def build_rows(
             # JSON consumer unable to tell a verified zero from a gap --
             # and the gap case is exactly what `incomplete` marks
             # (Codex, PR #297).
+            #
+            # `funding_seen` is deliberately *not* part of this test. It
+            # goes true on the first readable carry, so a day holding one
+            # good close and one whose carry is missing, unparseable or
+            # non-finite would have published the known subtotal as if it
+            # were the day's total. Every path that marks a day incomplete
+            # also skips that row's carry -- `unreadable_pnl` and the
+            # excluded-source defect both `continue` before funding is
+            # read -- so an incomplete day's sum is partial whatever the
+            # reason, and the honest value is `null` (Codex, PR #297).
             row.funding_usd = (
                 round(day.funding_usd, 6)
-                if day.funding_seen or (day.cycles > 0 and not day.incomplete)
+                if day.cycles > 0 and not day.incomplete
                 else None
             )
             # A day created only to carry a cross-day entry marker has no
