@@ -296,6 +296,14 @@ pub struct ArcusSpotRuntimeState {
     /// treated as a repeat.
     #[serde(default)]
     pub last_observation_at: Option<DateTime<Utc>>,
+    /// Set the first time a legacy handled record is resolved against the
+    /// calendar. The resolution uses the observation watermark, which keeps
+    /// advancing, so re-running it on a later load would eventually confirm
+    /// a *different* action that has since passed its own resume time --
+    /// permanently marking it handled. Resolving once and recording that it
+    /// happened is what freezes the answer (Codex P1, pairtrade#309).
+    #[serde(default)]
+    pub handled_corporate_actions_resolved: bool,
     pub last_rotation_at: Option<DateTime<Utc>>,
     /// Quantity of the currently-held (bought) token still open from the
     /// entry that produced the current non-Neutral `regime`, denominated in
@@ -394,6 +402,10 @@ impl ArcusSpotRuntimeState {
             last_token_a_reference_price_usd: None,
             last_token_b_reference_price_usd: None,
             last_observation_at: None,
+            // A fresh runtime has no handled records, so there is nothing
+            // for the legacy resolution to do -- and it must not run later
+            // against a watermark that has since advanced.
+            handled_corporate_actions_resolved: true,
             last_rotation_at: None,
             rotated_quantity: None,
             initial_equity_usd: None,
@@ -3679,7 +3691,21 @@ pub(crate) fn backfill_handled_corporate_action_fingerprints(
     state: &mut ArcusSpotRuntimeState,
     config: &ArcusSpotRuntimeConfig,
 ) {
-    let watermark = state.last_observation_at;
+    if state.handled_corporate_actions_resolved {
+        return;
+    }
+    resolve_handled_corporate_action_fingerprints(state, config, state.last_observation_at);
+    state.handled_corporate_actions_resolved = true;
+}
+
+/// The resolution itself, with the watermark supplied. Continuity
+/// verification runs it on both sides with the *baseline's* watermark, so
+/// the two are judged with the same information.
+pub fn resolve_handled_corporate_action_fingerprints(
+    state: &mut ArcusSpotRuntimeState,
+    config: &ArcusSpotRuntimeConfig,
+    watermark: Option<DateTime<Utc>>,
+) {
     let ids = state.handled_corporate_action_ids.clone();
     state
         .handled_corporate_action_fingerprints
@@ -7688,6 +7714,7 @@ mod tests {
             .state
             .handled_corporate_action_fingerprints
             .is_empty());
+        runtime.state.handled_corporate_actions_resolved = false;
         // Loaded the way production loads it: `from_state` resolves the
         // legacy id against the declaration whose window completed before
         // the last observation, so it is handled rather than ambiguous.
@@ -8085,6 +8112,7 @@ mod tests {
         seed_entry_signal_history(&mut runtime);
         runtime.state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
         runtime.state.handled_corporate_action_fingerprints.clear();
+        runtime.state.handled_corporate_actions_resolved = false;
         // The declaration has not reached its own resume time, so no resume
         // can have written that record for it.
         let inside = anchor + Duration::seconds(2);
@@ -8111,6 +8139,7 @@ mod tests {
         let mut past = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
         past.state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
         past.state.handled_corporate_action_fingerprints.clear();
+        past.state.handled_corporate_actions_resolved = false;
         past.state.last_observation_at = Some(anchor + Duration::seconds(13));
         let resolved =
             ArcusSpotRuntime::from_state(past.config.clone(), past.state.clone()).unwrap();
@@ -8125,12 +8154,47 @@ mod tests {
         let mut offline = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
         offline.state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
         offline.state.handled_corporate_action_fingerprints.clear();
+        offline.state.handled_corporate_actions_resolved = false;
         offline.state.last_observation_at = Some(anchor - Duration::seconds(1));
         let resolved =
             ArcusSpotRuntime::from_state(offline.config.clone(), offline.state.clone()).unwrap();
         assert_eq!(
             resolved.handled_record_for(&resolved.config.corporate_actions[0]),
             Some(HandledMatch::ReusedId),
+        );
+    }
+
+    #[test]
+    fn a_resolved_legacy_record_does_not_change_on_a_later_load() {
+        // The resolution uses the observation watermark, which keeps
+        // advancing. Re-running it on a later load would eventually confirm
+        // a *different* action that has since passed its own resume time,
+        // marking it handled for good -- so it runs once and is frozen.
+        let anchor = event_time();
+        let cfg = cfg_with_window_at(anchor);
+        let mut state = ArcusSpotRuntime::new(cfg.clone()).unwrap().state().clone();
+        state.handled_corporate_action_ids = vec!["NVDA-2026-10-4FOR1".to_string()];
+        state.handled_corporate_action_fingerprints.clear();
+        state.handled_corporate_actions_resolved = false;
+        // The declaration has not completed its window, so it cannot be
+        // confirmed as the event this record was written for.
+        state.last_observation_at = Some(anchor - Duration::seconds(1));
+
+        let first = ArcusSpotRuntime::from_state(cfg.clone(), state).unwrap();
+        assert!(first.state.handled_corporate_actions_resolved);
+        assert_eq!(
+            first.handled_record_for(&first.config.corporate_actions[0]),
+            Some(HandledMatch::ReusedId),
+        );
+
+        // Ticks carry the watermark past that declaration's resume time.
+        let mut later = first.state.clone();
+        later.last_observation_at = Some(anchor + Duration::seconds(60));
+        let second = ArcusSpotRuntime::from_state(cfg, later).unwrap();
+        assert_eq!(
+            second.handled_record_for(&second.config.corporate_actions[0]),
+            Some(HandledMatch::ReusedId),
+            "a frozen resolution must not be reconsidered",
         );
     }
 

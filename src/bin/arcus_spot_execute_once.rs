@@ -13,6 +13,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(test)]
 use debot::arcus_spot::event_record;
+use debot::arcus_spot::resolve_handled_corporate_action_fingerprints;
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, is_supported_live_route,
     manual_reconciled_runtime_fill_for_attempt, open_exit_fixed_sell_amount_row_for,
@@ -2713,13 +2714,16 @@ fn corporate_action_units_are_stale(
                     .handled_corporate_action_ids
                     .iter()
                     .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))
-                    .and_then(|index| {
+                    // An empty or missing slot is an unresolved legacy
+                    // record, which the runtime classifies as a reused label
+                    // -- so it must read the same way here (Codex P2,
+                    // pairtrade#309).
+                    .is_some_and(|index| {
                         current
                             .handled_corporate_action_fingerprints
                             .get(index)
-                            .filter(|recorded| !recorded.is_empty())
+                            .is_none_or(|recorded| *recorded != event.fingerprint())
                     })
-                    .is_some_and(|recorded| *recorded != event.fingerprint())
         });
         if reused_and_effective {
             return true;
@@ -3722,6 +3726,22 @@ fn corporate_action_continuity(
 ) -> Result<ArcusSpotCorporateActionContinuity> {
     let mut authorized = ArcusSpotCorporateActionContinuity::default();
 
+    // A legacy record is resolved once, at load, from the observation
+    // watermark. A backup taken before that resolution and the state after
+    // it therefore differ in slots neither side changed deliberately, so the
+    // append-only prefix -- and only that comparison -- is made on copies
+    // resolved with the *baseline's* watermark: the same information, one
+    // answer. Every other check below still reads what the runtime actually
+    // wrote (Codex P1, pairtrade#309).
+    let (resolved_baseline, resolved_current) = {
+        let mut resolved_baseline = baseline.clone();
+        let mut resolved_current = current.clone();
+        let watermark = baseline.last_observation_at;
+        resolve_handled_corporate_action_fingerprints(&mut resolved_baseline, config, watermark);
+        resolve_handled_corporate_action_fingerprints(&mut resolved_current, config, watermark);
+        (resolved_baseline, resolved_current)
+    };
+
     if current.handled_corporate_action_ids.len() < baseline.handled_corporate_action_ids.len()
         || current.handled_corporate_action_ids[..baseline.handled_corporate_action_ids.len()]
             != baseline.handled_corporate_action_ids[..]
@@ -3734,9 +3754,14 @@ fn corporate_action_continuity(
     // append-only in exactly the same way: dropping one would let a renamed
     // entry be applied again after a restore (Codex P1, pairtrade#309).
     let fingerprints_before = baseline.handled_corporate_action_fingerprints.len();
-    if current.handled_corporate_action_fingerprints.len() < fingerprints_before
-        || current.handled_corporate_action_fingerprints[..fingerprints_before]
-            != baseline.handled_corporate_action_fingerprints[..]
+    if resolved_current.handled_corporate_action_fingerprints.len()
+        < resolved_baseline
+            .handled_corporate_action_fingerprints
+            .len()
+        || resolved_current.handled_corporate_action_fingerprints[..resolved_baseline
+            .handled_corporate_action_fingerprints
+            .len()]
+            != resolved_baseline.handled_corporate_action_fingerprints[..]
     {
         bail!(
             "Arcus runtime lost or reordered its handled corporate-action fingerprints across \
@@ -11018,10 +11043,21 @@ runtime:
             vec![String::new(), fixture_event().fingerprint()];
         corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
 
-        // Appended without padding: the fingerprint sits beside OLDER.
+        // Appended without padding: the fingerprint sits beside OLDER, so
+        // the resolved prefix no longer matches the backup's.
         let mut misaligned = current.clone();
         misaligned.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
         let error = corporate_action_continuity(&config, &baseline, &misaligned, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+
+        // Padded correctly but the appended fingerprint is not the declared
+        // event's: that is what the alignment check is for.
+        let mut wrong = current.clone();
+        wrong.handled_corporate_action_fingerprints =
+            vec![String::new(), "not-the-declared-event".to_string()];
+        let error = corporate_action_continuity(&config, &baseline, &wrong, 1, verified_now())
             .unwrap_err()
             .to_string();
         assert!(error.contains("beside its id"), "{error}");
@@ -11231,8 +11267,13 @@ runtime:
         )
         .unwrap_err();
 
+        // A genuinely handled record -- resolved, with the declared event's
+        // fingerprint beside its id -- gets no exemption. (An id with no
+        // fingerprint is an unresolved legacy record, which the runtime and
+        // this verifier both read as a reused label.)
         let mut handled = current.clone();
         handled.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        handled.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
         let error = require_risk_state_continuity(
             &config, &baseline, &handled, 1, not_before, not_after, &none,
         )
@@ -11284,6 +11325,35 @@ runtime:
             error.contains("omitted a newly triggered loss halt"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn an_unresolved_legacy_record_reads_as_reused_in_the_stale_check() {
+        // The runtime classifies a handled id with no aligned fingerprint as
+        // a reused label, records progress and suppresses the halt after the
+        // cutoff. This verifier has to read it the same way, or a valid
+        // checkpoint from that phase is rejected for omitting the halt.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = None;
+        for state in [&mut baseline, &mut current] {
+            state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+            state.handled_corporate_action_fingerprints.clear();
+        }
+        require_risk_state_continuity(
+            &config,
+            &baseline,
+            &current,
+            1,
+            not_before,
+            not_after,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap();
     }
 
     #[test]
