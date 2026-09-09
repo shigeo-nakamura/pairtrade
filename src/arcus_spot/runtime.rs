@@ -3888,7 +3888,10 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
             corporate_actions: Vec::new(),
-            corporate_action_settlement_margin_secs: 300,
+            // The corporate-action fixtures use second-scale windows, so
+            // the 300s production default would leave no dispatchable reduce
+            // phase. Tests that exercise the margin set it explicitly.
+            corporate_action_settlement_margin_secs: 0,
         }
     }
 
@@ -7634,7 +7637,7 @@ mod tests {
         let anchor = event_time();
         let mut cfg = cfg_with_window_at(anchor);
         cfg.mode = ArcusSpotRuntimeMode::Live;
-        cfg.corporate_action_settlement_margin_secs = 2;
+        cfg.corporate_action_settlement_margin_secs = 1;
         let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
         seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
         let planned_at = anchor + Duration::seconds(1);
@@ -7647,13 +7650,13 @@ mod tests {
                 runtime.state.inventory,
             )
             .unwrap();
-        // effective_at is anchor + 4s; at +1s the margin (2s) has not bitten.
+        // effective_at is anchor + 4s; at +1s the margin (1s) has not bitten.
         runtime
             .validate_plan_consistent_with_state(&plan, planned_at)
             .unwrap();
-        // At +2s it has: 2s + 2s margin reaches the cutoff.
+        // At +3s it has: 3s + 1s margin reaches the cutoff.
         let error = runtime
-            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(2))
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(3))
             .unwrap_err();
         assert!(
             error.contains("settle after the venue changes units"),

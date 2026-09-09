@@ -366,7 +366,9 @@ It also stops early: exit dispatch is refused within
 before the cutoff can still be mined after it, selling the pre-event
 quantity at the post-event denomination, and no in-process check covers the
 venue round trip. Size `reduce_exit_at` to leave room for that margin as
-well as for the venue not quoting.
+well as for the venue not quoting -- `hash-config` refuses a window whose
+reduce phase begins inside the margin, since its forced unwind could never
+be submitted.
 
 **From `effective_at` the opposite holds: the runtime submits no exit at
 all** -- not the forced one, not max-hold, not mean-reversion. The venue is

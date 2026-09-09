@@ -367,6 +367,38 @@ impl ArcusSpotRuntimeConfig {
                     event.event_id
                 ));
             }
+            // The reduce phase must have a dispatchable interval. Exits are
+            // refused within `corporate_action_settlement_margin_secs` of
+            // `effective_at` (submission is not execution), so a window whose
+            // reduce phase starts inside that margin advertises a forced
+            // unwind that can never be submitted -- and an open rotation then
+            // reaches `effective_at` and is stranded on
+            // `corporate_action_unresolved` (Codex P1, pairtrade#309).
+            let margin = chrono::Duration::seconds(self.corporate_action_settlement_margin_secs);
+            let last_dispatchable =
+                event
+                    .reduce_exit_at
+                    .checked_add_signed(margin)
+                    .ok_or_else(|| {
+                        format!(
+                            "corporate action {}: reduce_exit_at plus the settlement margin \
+                         overflows the representable range",
+                            event.event_id
+                        )
+                    })?;
+            if last_dispatchable >= event.effective_at {
+                return Err(format!(
+                    "corporate action {} leaves no dispatchable reduce phase: reduce_exit_at \
+                     ({}) plus corporate_action_settlement_margin_secs ({}s) reaches \
+                     effective_at ({}), so a forced unwind could never be submitted and an \
+                     open rotation would be stranded. Move reduce_exit_at earlier or lower \
+                     the margin",
+                    event.event_id,
+                    event.reduce_exit_at.to_rfc3339(),
+                    self.corporate_action_settlement_margin_secs,
+                    event.effective_at.to_rfc3339(),
+                ));
+            }
             if let Some(previous) = previous {
                 if event.entry_block_at <= previous.entry_block_at {
                     return Err(format!(
@@ -589,6 +621,28 @@ corporate_action:
         .validate()
         .unwrap_err();
         assert!(error.contains("not unique"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_window_with_no_dispatchable_reduce_phase() {
+        // Exits are refused within the settlement margin of effective_at, so
+        // a reduce phase that starts inside it advertises a forced unwind
+        // that can never be submitted, stranding an open rotation.
+        let mut config = valid_config();
+        config.corporate_action_settlement_margin_secs = 3600;
+        config.corporate_actions = vec![split_event("NVDA-2026-08-SPLIT", anchor())];
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("no dispatchable reduce phase"), "{error}");
+
+        // An hour of reduce phase with a 30-minute margin is fine.
+        config.corporate_action_settlement_margin_secs = 1800;
+        config.validate().unwrap();
+
+        // A zero-length reduce phase is refused even with no margin.
+        config.corporate_action_settlement_margin_secs = 0;
+        config.corporate_actions[0].reduce_exit_at = config.corporate_actions[0].effective_at;
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("no dispatchable reduce phase"), "{error}");
     }
 
     #[test]
