@@ -1572,12 +1572,27 @@ def test_invalid_utf8_inside_a_complete_record_is_refused():
             raise AssertionError("invalid UTF-8 in a complete record must be refused")
 
         # An incomplete multi-byte sequence in an unterminated final line
-        # is a torn write and keeps its tolerance.
+        # is a torn write and keeps its tolerance -- the earlier lines
+        # still load.
         torn = Path(tmp) / "execution-freq.jsonl"
         torn.write_bytes(
             b'{"event": "leg_fill", "ts_ms": %d, "variant": "freq", "fill_value": 1}\n'
             b'{"event": "leg_fill", "variant": "fr\xe3' % (TS * 1000))
         assert load_execution([torn])[("2026-09-08", "freq")].fills == 1
+
+        # But a torn line is *dropped*, never replacement-decoded: with
+        # the bad byte mid-line the remaining JSON is syntactically
+        # complete, so replacing it yielded a `fr\ufffdeq` arm and exited
+        # 0 -- the exact split strict decoding exists to prevent
+        # (Codex, PR #297).
+        torn_complete = Path(tmp) / "execution-freq.jsonl"
+        torn_complete.write_bytes(
+            b'{"event": "leg_fill", "ts_ms": %d, "variant": "freq", "fill_value": 1}\n'
+            b'{"event": "leg_fill", "ts_ms": %d, "variant": "fr\xffeq", "fill_value": 9}'
+            % (TS * 1000, TS * 1000))
+        loaded = load_execution([torn_complete])
+        assert sorted(k[1] for k in loaded) == ["freq"], sorted(loaded)
+        assert loaded[("2026-09-08", "freq")].volume_usd == 1.0, loaded
 
 
 def test_an_integer_too_large_for_a_float_is_unreadable_not_a_crash():
@@ -1615,6 +1630,25 @@ def test_an_uncosted_arm_still_reports_a_points_file_that_skipped_it():
     # And with no points file there is nothing to report.
     plain = render_table(rows, summarize(rows, points_input=False))
     assert "points" not in plain.split("money up):")[1], plain
+
+
+def test_an_explicit_zero_points_row_is_not_an_omitted_arm():
+    """`points: 0` is a legal award of nothing.
+
+    Reading it through `uncosted_points`'s truthiness reported a
+    supplied zero as an omitted export, while the daily table showed
+    0.0 points on the same run (Codex, PR #297).
+    """
+    exec_days = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)}
+    zero = build_rows(exec_days, {}, None, {("2026-09-08", "freq"): 0.0})
+    printed = render_table(zero, summarize(zero, points_input=True))
+    assert "0.0 points were supplied" in printed, printed
+    assert "supplied none for this arm" not in printed, printed
+
+    # A genuinely omitted arm still says so.
+    omitted = build_rows(exec_days, {})
+    omitted_printed = render_table(omitted, summarize(omitted, points_input=True))
+    assert "supplied none for this arm" in omitted_printed, omitted_printed
 
 
 def test_a_run_without_points_says_nothing_about_points():

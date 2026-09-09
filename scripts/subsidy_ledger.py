@@ -332,14 +332,19 @@ def read_jsonl(path: Path, tolerate_torn_tail: bool = True) -> Iterable[dict]:
                 "become a different key") from error
         # The undecodable bytes must be in the unterminated final line,
         # or this is interior corruption wearing a torn tail's clothes.
-        head, _, tail = raw.rpartition(b"\n")
+        head, _, _tail = raw.rpartition(b"\n")
         try:
             text = head.decode("utf-8") + "\n" if head else ""
         except UnicodeDecodeError as inner:
             raise SubsidyLedgerError(
                 f"{path}: invalid UTF-8 at byte {inner.start}, before the final "
                 "line; this is not a torn trailing write") from inner
-        text += tail.decode("utf-8", errors="replace")
+        # The torn line is *dropped*, not replacement-decoded. Replacing
+        # its bytes can leave syntactically complete JSON -- a final
+        # leg_fill ending `"variant":"fr\xffeq"}` with no newline yielded
+        # the `fr\ufffdeq` arm and exited 0, which is the exact split the
+        # strict decode exists to prevent. A line we cannot decode is a
+        # line we do not have (Codex, PR #297).
     lines = text.splitlines()
     tail_may_be_torn = tolerate_torn_tail and bool(text) and not text.endswith("\n")
     for number, line in enumerate(lines, start=1):
@@ -1356,6 +1361,11 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
         arm["points_supplied"] = (
             bool(arm["points_seen"]) if points_input is None else points_input
         )
+        # And whether *this arm* had a row, which is not the same as its
+        # totals being non-zero: `points: 0` is a legal award of nothing,
+        # and reading it through `uncosted_points`'s truthiness reported
+        # a supplied zero as an omitted export (Codex, PR #297).
+        arm["points_for_this_arm"] = bool(arm["points_seen"])
         if not arm["points_seen"]:
             # `points` and `uncosted_points` are genuinely absent for
             # this arm, so `None` is the honest value. The *cost*
@@ -1437,7 +1447,7 @@ def render_table(rows: list[Row], summary: dict) -> str:
                     "         the points total could not be represented, so no price per "
                     "point can be computed"
                 )
-            elif arm["uncosted_points"]:
+            elif arm["points_for_this_arm"]:
                 out.append(
                     f"         {arm['uncosted_points']:,.1f} points were supplied for days with "
                     f"no usable cost, so no price per point can be computed"
@@ -1544,7 +1554,7 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"         no price per point: the day(s) that supplied points carry a "
                 f"cost earned against another day ({cross_day_reason(arm, 'points')})"
             )
-        elif arm["points"] is None:
+        elif not arm["points_for_this_arm"]:
             # A points file was given (or the section would have been
             # skipped) and it holds nothing for this arm. Saying nothing
             # would hide that the export omitted it (Codex, PR #297).
