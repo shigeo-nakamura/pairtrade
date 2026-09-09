@@ -20,6 +20,7 @@ from subsidy_ledger import (  # noqa: E402
     load_execution,
     load_pnl,
     load_points,
+    render_table,
     funding_ticks_seen,
     opened_on_an_earlier_day,
     spans_a_funding_interval,
@@ -927,6 +928,31 @@ def test_a_repeated_points_row_is_refused():
             {"date": "2026-09-08", "arm": "b", "points": 500.0},
         ])
         assert len(load_points(fine)) == 2
+
+
+def test_point_coverage_is_explained_even_when_no_rate_exists():
+    """No rate is when the reader most needs to know why.
+
+    Points on one day and cost on another is the ordinary cause, and the
+    diagnostics that say so were suppressed along with the rate -- so the
+    requested KPI was simply missing, unexplained.
+    """
+    rows = build_rows(
+        {},
+        {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-100.0, funding_seen=True)},
+        None,
+        {("2026-09-07", "freq"): 1000.0},
+    )
+    summary = summarize(rows)
+    arm = summary["arms"][0]
+    assert arm["cost_per_point"] is None
+    assert arm["uncosted_points"] == 1000.0
+    assert arm["cost_usd_without_points"] == 100.0
+
+    rendered = render_table(rows, summary)
+    assert "no price per point" in rendered, rendered
+    assert "1,000.0 points earned on days with no usable cost" in rendered, rendered
+    assert "$100.00 of cost fell on days with no points supplied" in rendered, rendered
 
 
 def main() -> int:

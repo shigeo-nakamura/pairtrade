@@ -875,16 +875,27 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"         ${arm['cost_usd_on_pointed_days']:,.2f} of it over "
                 f"{arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
             )
-            if arm["uncosted_points"]:
-                out.append(
-                    f"         {arm['uncosted_points']:,.1f} points earned on uncosted days "
-                    f"are excluded from that price"
-                )
-            if arm["cost_usd_without_points"]:
-                out.append(
-                    f"         ${arm['cost_usd_without_points']:,.2f} of cost fell on days with "
-                    f"no points supplied and is excluded from that price"
-                )
+        elif arm["points"] is not None:
+            # No rate is exactly when the reader most needs to be told
+            # why: points and cost landing on different days is the
+            # normal cause, and suppressing the diagnostics with the rate
+            # left the requested KPI missing with no explanation
+            # (Codex, PR #297).
+            out.append(
+                "         no price per point: no day supplied both a cost and points"
+            )
+        # These say which side was missing, and are worth printing
+        # whether or not a rate came out of what remained.
+        if arm["uncosted_points"]:
+            out.append(
+                f"         {arm['uncosted_points']:,.1f} points earned on days with no usable "
+                f"cost are excluded from that price"
+            )
+        if arm["cost_usd_without_points"]:
+            out.append(
+                f"         ${arm['cost_usd_without_points']:,.2f} of cost fell on days with "
+                f"no points supplied and is excluded from that price"
+            )
     return "\n".join(out)
 
 
@@ -932,6 +943,18 @@ def main(argv: list[str] | None = None) -> int:
         arm, _, path = spec.partition("=")
         if not path:
             parser.error(f"--equity expects ARM=PATH, got {spec!r}")
+        # `--equity` repeats, and a second file for the same arm replaced
+        # the first silently: costs the operator did supply would vanish,
+        # or turn into uncosted days. Merging two series is not safe
+        # either -- the deltas are computed between consecutive daily
+        # closes, so two partial exports do not concatenate into one
+        # history -- so it is refused (Codex, PR #297).
+        if arm in equity_costs:
+            parser.error(
+                f"--equity given twice for {arm!r}; pass one history file per arm "
+                "(the daily deltas are computed across the series, so two files "
+                "cannot simply be merged)"
+            )
         equity_costs[arm] = equity_daily_costs(read_jsonl(Path(path)))
 
     rows = build_rows(execution, pnl, equity_costs, load_points(args.points))
