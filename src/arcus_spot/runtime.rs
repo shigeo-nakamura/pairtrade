@@ -275,6 +275,14 @@ pub struct ArcusSpotRuntimeState {
     /// USD-notional sizing instead of trusting a pending plan's quantities.
     #[serde(default)]
     pub last_token_a_reference_price_usd: Option<Decimal>,
+    /// When those reference prices were received (`PriceContext::priced_at`).
+    /// The runtime decides stale-unit halt suppression from it, so the
+    /// verifier has to be able to re-derive that decision from the
+    /// checkpoint rather than infer it from the discard stamp, which the
+    /// gate writes with the later evaluation clock (Codex P1,
+    /// pairtrade#309).
+    #[serde(default)]
+    pub last_reference_price_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_token_b_reference_price_usd: Option<Decimal>,
     /// `collection_finished_at` of the last snapshot `step_at` genuinely
@@ -400,6 +408,7 @@ impl ArcusSpotRuntimeState {
             regime: ArcusSpotRegime::Neutral,
             relative_log_price_history: Vec::new(),
             last_token_a_reference_price_usd: None,
+            last_reference_price_at: None,
             last_token_b_reference_price_usd: None,
             last_observation_at: None,
             // A fresh runtime has no handled records, so there is nothing
@@ -1110,6 +1119,7 @@ impl ArcusSpotRuntime {
         // reason (e.g. RouteUnavailable) -- advance the watermark now,
         // not conditioned on anything past this point.
         self.state.last_observation_at = Some(snapshot.collection_finished_at);
+        self.state.last_reference_price_at = Some(price.priced_at);
         self.state.last_token_a_reference_price_usd = Some(price.token_a_price_usd);
         self.state.last_token_b_reference_price_usd = Some(price.token_b_price_usd);
         // Captured before the corporate-action gate runs, but *read* by it

@@ -2736,6 +2736,30 @@ fn corporate_action_units_are_stale(
     let Some(stamped_at) = progress.history_invalidated_at else {
         return false;
     };
+    // The stamp is written with the evaluation clock, but the runtime
+    // decides halt suppression from the *price* clock -- so on the tick that
+    // first crosses the cutoff a genuine halt may have engaged from
+    // pre-cutoff prices. Granting the exemption on the stamp alone would let
+    // that halt be removed and still verify. Re-derive the decision from the
+    // clock the runtime actually used (Codex P1, pairtrade#309); a
+    // checkpoint predating the field cannot say, and keeps the old
+    // stamp-only reading.
+    if let Some(priced_at) = current.last_reference_price_at {
+        let cutoff = progress.effective_at.or_else(|| {
+            config
+                .corporate_actions
+                .iter()
+                .find(|event| {
+                    (!progress.fingerprint.is_empty()
+                        && progress.fingerprint == event.fingerprint())
+                        || event.event_id.eq_ignore_ascii_case(&progress.event_id)
+                })
+                .map(|event| event.effective_at)
+        });
+        if cutoff.is_some_and(|cutoff| priced_at < cutoff) {
+            return false;
+        }
+    }
     if current
         .handled_corporate_action_ids
         .iter()
@@ -3907,6 +3931,11 @@ fn require_corporate_action_progress_transition(
             || current.last_token_identity_at != baseline.last_token_identity_at
         {
             bail!("Arcus cached token identities changed without a new observation");
+        }
+        // The price clock decides the stale-unit exemption, so it is
+        // forgeable evidence and gets the same treatment.
+        if current.last_reference_price_at != baseline.last_reference_price_at {
+            bail!("Arcus reference-price timestamp changed without a new observation");
         }
         return Ok(());
     }
@@ -6422,6 +6451,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             set_observed_token_identities(state, "2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
@@ -6507,6 +6537,7 @@ runtime:
             state["relative_log_price_history"] = json!(shifted_history);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("57.300959372038022");
             set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["initial_equity_usd"] = json!("79.16815349952608352");
@@ -6555,6 +6586,7 @@ runtime:
             state["relative_log_price_history"] = json!(unchanged_full_window);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
@@ -6864,6 +6896,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             set_observed_token_identities(state, "2026-08-16T00:00:01Z");
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -6921,6 +6954,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
             state["last_token_a_reference_price_usd"] = json!("600");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
             set_observed_token_identities(state, "2026-08-16T00:00:01Z");
             // The day and its equity mark roll, as they always did...
@@ -6979,6 +7013,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["daily_baseline_day"] = json!("2026-08-17");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
@@ -7061,6 +7096,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("600");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
             set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["last_equity_usd"] = json!("294.7197026481211824");
@@ -7125,6 +7161,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             // Inflated rather than deflated (it was "95" before #813): the
             // basket is genuinely worth 98.2399… at these marks, so a mark
@@ -7168,6 +7205,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.2]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("163.7461506155964");
             state["initial_equity_usd"] = json!("96.199384098495424");
             state["initial_baseline_inventory"] = state["inventory"].clone();
@@ -10804,6 +10842,15 @@ runtime:
             .unwrap_err()
             .to_string();
         assert!(error.contains("cached token identities"), "{error}");
+
+        // The price clock decides the stale-unit exemption, so it is
+        // forgeable evidence and gets the same treatment.
+        let mut repriced = baseline.clone();
+        repriced.last_reference_price_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
+        let error = corporate_action_continuity(&config, &baseline, &repriced, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reference-price timestamp"), "{error}");
     }
 
     #[test]
@@ -11399,6 +11446,46 @@ runtime:
             not_before,
             not_after,
             &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_pre_cutoff_priced_mark_still_owes_its_halt() {
+        // The tick that first crosses the cutoff stamps with the evaluation
+        // clock, but the runtime judged the halt on the price clock. If the
+        // prices predate the cutoff a genuine halt may have engaged, so the
+        // exemption must not be granted on the stamp alone.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = Some(stale_unit_progress());
+        baseline.corporate_action = current.corporate_action.clone();
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Prices from before the cutoff (02:00Z): the halt is still owed.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T01:59:00Z".parse().unwrap());
+        }
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Prices from after it: the runtime suppressed, and so does this.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T02:01:00Z".parse().unwrap());
+        }
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
         )
         .unwrap();
     }
