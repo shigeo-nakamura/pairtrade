@@ -20,6 +20,8 @@ from subsidy_ledger import (  # noqa: E402
     load_execution,
     load_pnl,
     load_points,
+    funding_ticks_seen,
+    opened_on_an_earlier_day,
     spans_a_funding_interval,
     expand,
     render_table,
@@ -851,7 +853,14 @@ def test_a_non_finite_number_never_reads_as_absence_of_movement():
         assert pnl_day.incomplete
         assert pnl_day.incomplete_reasons == {"funding_gap"}
 
-    # 3. A NaN hold or close is not a hold inside one funding hour.
+    # 3. An impossible value is not evidence either: a tick count cannot
+    # be negative, and a hold that ends before it starts says nothing
+    # about which day the cycle opened on.
+    assert funding_ticks_seen({"funding_ticks_observed": -1})
+    assert opened_on_an_earlier_day({"ts": inside_the_hour, "hold_secs": -600},
+                                    "2026-09-08")
+
+    # 4. A NaN hold or close is not a hold inside one funding hour.
     # (This one already came out right by NaN propagation through the
     # boundary comparison; the explicit guard is there so the behaviour
     # does not depend on that, and this asserts the behaviour itself.)

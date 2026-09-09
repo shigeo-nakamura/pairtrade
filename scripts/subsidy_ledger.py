@@ -429,9 +429,16 @@ def opened_on_an_earlier_day(record: dict, close_date: str) -> bool:
     if hold is None or ts is None:
         return True
     try:
-        opened = float(ts) - float(hold)
+        hold_secs, close_secs = float(hold), float(ts)
     except (TypeError, ValueError):
         return True
+    # A negative hold puts the open *after* the close, which usually
+    # lands on the same date and would clear the marker on a row whose
+    # real opening date is unknowable -- the same fail-safe
+    # `spans_a_funding_interval` already applies (Codex, PR #297).
+    if not math.isfinite(hold_secs) or not math.isfinite(close_secs) or hold_secs < 0:
+        return True
+    opened = close_secs - hold_secs
     if not math.isfinite(opened):
         return True
     return utc_date(opened) != close_date
@@ -447,7 +454,10 @@ def funding_ticks_seen(record: dict) -> bool:
     except (TypeError, ValueError):
         # An unreadable tick count is not evidence of zero either.
         return True
-    if not math.isfinite(count):
+    # Finite is not the same as possible: a tick count cannot be
+    # negative, and reading one as "no ticks" would make a malformed row
+    # into evidence that no funding occurred (Codex, PR #297).
+    if not math.isfinite(count) or count < 0:
         return True
     return count > 0
 
