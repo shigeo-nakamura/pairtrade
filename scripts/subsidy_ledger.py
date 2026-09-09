@@ -297,7 +297,7 @@ class SubsidyLedgerError(ValueError):
     """A ledger this script cannot read honestly."""
 
 
-def read_jsonl(path: Path) -> Iterable[dict]:
+def read_jsonl(path: Path, tolerate_torn_tail: bool = True) -> Iterable[dict]:
     """Tolerate a torn *final* line, and nothing else.
 
     These files are appended to by a running bot, so the last row can be
@@ -307,10 +307,41 @@ def read_jsonl(path: Path) -> Iterable[dict]:
     entirely: skipping it drops real fills or real closes while the
     report still presents the day as fully covered, which is the one
     outcome this KPI must never produce. Those are raised.
+
+    `tolerate_torn_tail=False` for a file no bot appends to. The points
+    export is written by hand for this report, so a truncated last line
+    is a damaged file, not a race, and letting it through drops that
+    day's points silently (Codex, PR #297).
+
+    Decoding is strict. `errors="replace"` turned invalid UTF-8 inside an
+    otherwise complete record into U+FFFD and handed on JSON that still
+    parses -- corruption inside an execution `variant` becomes a new arm
+    key, splitting its volume from its costs, with a 0 exit. A torn tail
+    can be an incomplete multi-byte sequence, so that one case is
+    retried leniently and only the last line is kept from it
+    (Codex, PR #297).
     """
-    text = path.read_text(encoding="utf-8", errors="replace")
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        if not tolerate_torn_tail or (raw and raw.endswith(b"\n")):
+            raise SubsidyLedgerError(
+                f"{path}: invalid UTF-8 at byte {error.start} in a complete record; "
+                "a substituted character can parse as valid JSON and silently "
+                "become a different key") from error
+        # The undecodable bytes must be in the unterminated final line,
+        # or this is interior corruption wearing a torn tail's clothes.
+        head, _, tail = raw.rpartition(b"\n")
+        try:
+            text = head.decode("utf-8") + "\n" if head else ""
+        except UnicodeDecodeError as inner:
+            raise SubsidyLedgerError(
+                f"{path}: invalid UTF-8 at byte {inner.start}, before the final "
+                "line; this is not a torn trailing write") from inner
+        text += tail.decode("utf-8", errors="replace")
     lines = text.splitlines()
-    tail_may_be_torn = bool(text) and not text.endswith("\n")
+    tail_may_be_torn = tolerate_torn_tail and bool(text) and not text.endswith("\n")
     for number, line in enumerate(lines, start=1):
         stripped = line.strip()
         if not stripped:
@@ -766,7 +797,12 @@ def is_not_a_number(value: object) -> bool:
         return True
     try:
         float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # `json.loads` keeps an integer literal at arbitrary precision,
+        # so a field like 10**400 survives parsing and then raises
+        # OverflowError here. Catching only TypeError/ValueError let that
+        # reach the caller as a traceback instead of the documented
+        # unreadable-value handling (Codex, PR #297).
         return True
     return False
 
@@ -943,7 +979,7 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
     if path is None:
         return {}
     points: dict[tuple[str, str], float] = {}
-    for record in read_jsonl(path):
+    for record in read_jsonl(path, tolerate_torn_tail=False):
         date, arm, value = record.get("date"), record.get("arm"), record.get("points")
         if not date or not arm or value is None:
             # This file is written by hand for exactly this report. A line
@@ -1405,6 +1441,15 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 out.append(
                     f"         {arm['uncosted_points']:,.1f} points were supplied for days with "
                     f"no usable cost, so no price per point can be computed"
+                )
+            elif arm["points_supplied"]:
+                # A points file was given and holds nothing for this arm.
+                # This branch returns before the diagnostic further down,
+                # so without it the omission is silent on exactly the
+                # arms that have no cost either (Codex, PR #297).
+                out.append(
+                    "         the points file supplied none for this arm, so no price "
+                    "per point can be computed"
                 )
             if arm["fills_without_value"]:
                 out.append(

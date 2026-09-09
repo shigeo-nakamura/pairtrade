@@ -1524,6 +1524,99 @@ def test_a_padded_execution_variant_is_refused():
         assert ("2026-09-08", "freq") in load_execution([good])
 
 
+def test_a_torn_points_file_is_refused_and_a_torn_ledger_is_not():
+    """The torn-tail tolerance is for files a bot appends to.
+
+    The points export is hand-written for this report, so a truncated
+    last line is a damaged file, not a race, and letting it through
+    dropped that day's points silently (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        torn = Path(tmp) / "points.jsonl"
+        torn.write_text(
+            '{"date": "2026-09-08", "arm": "freq", "points": 1000}\n'
+            '{"date": "2026-09-09", "arm": "fr',
+            encoding="utf-8")
+        try:
+            load_points(torn)
+        except SubsidyLedgerError as error:
+            assert "malformed JSON" in str(error), error
+        else:
+            raise AssertionError("a torn points file must be refused")
+
+        # The live ledgers keep their tolerance: a bot may be mid-append.
+        ledger = Path(tmp) / "execution-freq.jsonl"
+        ledger.write_text(
+            '{"event": "leg_fill", "ts_ms": %d, "variant": "freq", "fill_value": 1}\n'
+            '{"event": "leg_fill", "ts_ms"' % (TS * 1000),
+            encoding="utf-8")
+        assert load_execution([ledger])[("2026-09-08", "freq")].fills == 1
+
+
+def test_invalid_utf8_inside_a_complete_record_is_refused():
+    """A substituted character can parse as valid JSON.
+
+    Corruption inside an execution `variant` becomes a new arm key,
+    splitting its volume from its costs, with a 0 exit (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = Path(tmp) / "execution-freq.jsonl"
+        bad.write_bytes(
+            b'{"event": "leg_fill", "ts_ms": %d, "variant": "fr\xffeq", "fill_value": 1}\n'
+            % (TS * 1000))
+        try:
+            load_execution([bad])
+        except SubsidyLedgerError as error:
+            assert "invalid UTF-8" in str(error), error
+        else:
+            raise AssertionError("invalid UTF-8 in a complete record must be refused")
+
+        # An incomplete multi-byte sequence in an unterminated final line
+        # is a torn write and keeps its tolerance.
+        torn = Path(tmp) / "execution-freq.jsonl"
+        torn.write_bytes(
+            b'{"event": "leg_fill", "ts_ms": %d, "variant": "freq", "fill_value": 1}\n'
+            b'{"event": "leg_fill", "variant": "fr\xe3' % (TS * 1000))
+        assert load_execution([torn])[("2026-09-08", "freq")].fills == 1
+
+
+def test_an_integer_too_large_for_a_float_is_unreadable_not_a_crash():
+    """`json.loads` keeps integers at arbitrary precision.
+
+    `float(10**400)` raises OverflowError, which the classifier did not
+    catch -- so the loaders ended in a traceback instead of their
+    documented unreadable-value handling (Codex, PR #297).
+    """
+    huge = 10 ** 400
+    assert is_not_a_number(huge)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(Path(tmp) / "execution-freq.jsonl",
+                     [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                       "fill_value": huge, "filled_qty": 1.0}])
+        day = load_execution([path])[("2026-09-08", "freq")]
+        assert day.fills == 0 and day.fills_without_value == 1
+
+        pnl_path = pnl_file(Path(tmp),
+                            [{"ts": TS, "source": "exit_fill", "pnl": huge,
+                              "hold_secs": 600}])
+        pday = load_pnl([pnl_path])[("2026-09-08", "freq")]
+        assert pday.incomplete and "unreadable_pnl" in pday.incomplete_reasons
+
+
+def test_an_uncosted_arm_still_reports_a_points_file_that_skipped_it():
+    """The cost_days == 0 branch returns before the later diagnostic.
+
+    So the omission was silent on exactly the arms that have no cost
+    either (Codex, PR #297).
+    """
+    rows = build_rows({("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)}, {})
+    omitted = render_table(rows, summarize(rows, points_input=True))
+    assert "the points file supplied none for this arm" in omitted, omitted
+    # And with no points file there is nothing to report.
+    plain = render_table(rows, summarize(rows, points_input=False))
+    assert "points" not in plain.split("money up):")[1], plain
+
+
 def test_a_run_without_points_says_nothing_about_points():
     """The ordinary invocation must not discuss a KPI it was not given.
 
