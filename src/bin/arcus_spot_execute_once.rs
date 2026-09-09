@@ -10809,10 +10809,16 @@ runtime:
         // declares, and one the runtime has not already handled.
         let mut undeclared = config.clone();
         undeclared.corporate_actions.clear();
+        // (Without a recorded cutoff: an orphan *with* one is the shape the
+        // runtime writes itself and is exempt -- see below.)
+        let mut no_cutoff = current.clone();
+        no_cutoff.corporate_action.as_mut().unwrap().effective_at = None;
+        let mut no_cutoff_baseline = baseline.clone();
+        no_cutoff_baseline.corporate_action = no_cutoff.corporate_action.clone();
         let error = require_risk_state_continuity(
             &undeclared,
-            &baseline,
-            &current,
+            &no_cutoff_baseline,
+            &no_cutoff,
             1,
             not_before,
             not_after,
