@@ -3703,8 +3703,20 @@ fn require_signal_history_continuity(
             // the expected shape on exactly that tick -- and only when
             // `corporate_action_continuity` proved the config declares it
             // (bot-strategy#853).
-            if corporate_action.history_discarded && current.is_empty() {
-                return Ok(());
+            if corporate_action.history_discarded {
+                if current.is_empty() {
+                    return Ok(());
+                }
+                // The degenerate one-tick path: no tick ran between
+                // `effective_at` and `resume_not_before`, so the same
+                // observation discards the pre-event window *and* resumes.
+                // The resume clears the gate, so that tick's own post-event
+                // sample is appended to the emptied window and the shape is
+                // one fresh value -- unrelated to the discarded baseline,
+                // which is why the ordinary `starts_with` rule cannot see it.
+                if corporate_action.resumed_inventory.is_some() && current.len() == 1 {
+                    return Ok(());
+                }
             }
             let expected_len = baseline.len().saturating_add(1).min(signal_window_samples);
             let dropped = baseline
@@ -10200,6 +10212,71 @@ runtime:
             1,
             96,
             &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn a_same_tick_discard_and_resume_authorizes_its_one_fresh_sample() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, current) = resume_pair();
+        // The backup was taken after the reconciled config landed but before
+        // any tick ran inside the window, so it still holds the pre-event
+        // history and carries no progress stamp. The resume tick then does
+        // both: it discards that window and appends its own post-event
+        // sample.
+        baseline.relative_log_price_history = vec![0.10, 0.11, 0.12];
+        baseline.corporate_action = None;
+        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        assert!(authorized.history_discarded);
+        assert!(authorized.resumed_inventory.is_some());
+        assert_eq!(current.relative_log_price_history.len(), 1);
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &authorized,
+        )
+        .unwrap();
+        // Only the resume earns that sample: a discard-only tick that
+        // carries one is still the "stamped a discard it did not perform"
+        // shape, and an undeclared transition is rejected outright.
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &ArcusSpotCorporateActionContinuity {
+                history_discarded: true,
+                resumed_inventory: None,
+            },
+        )
+        .unwrap_err();
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn a_resume_may_not_carry_more_than_one_fresh_sample() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, mut current) = resume_pair();
+        baseline.relative_log_price_history = vec![0.10, 0.11, 0.12];
+        baseline.corporate_action = None;
+        current.relative_log_price_history = vec![0.25, 0.26];
+        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &authorized,
         )
         .unwrap_err();
     }

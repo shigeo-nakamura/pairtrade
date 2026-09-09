@@ -2901,16 +2901,37 @@ impl ArcusSpotRuntime {
         // that no longer exists would report the corporate action itself as
         // a rotation loss and engage the sticky stop on it -- bot-strategy
         // #813's failure mode, reached by a different road.
+        // Priced before anything is written. A reconciled quantity that
+        // overflows at the current reference prices cannot re-anchor the
+        // baskets, and a resume that lands the inventory while leaving the
+        // three equity marks on their pre-event values is worse than no
+        // resume: the checkpoint loads, every later tick fails its initial
+        // valuation, and the event is already in
+        // `handled_corporate_action_ids`, so corrected quantities can never
+        // be applied. Keep it pending instead.
+        let Some(equity) = post_event_inventory
+            .checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)
+        else {
+            return CorporateActionGate {
+                block_entry: Some(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::CorporateActionResumePending,
+                    format!(
+                        "corporate action {} has a reconciled post_event_inventory with no \
+                         representable USD value at the current reference prices; the resume \
+                         waits for the reconciled quantities to be corrected",
+                        event.event_id,
+                    ),
+                )),
+                force_exit: false,
+                suppress_history: true,
+            };
+        };
         self.state.inventory = post_event_inventory;
         self.state.initial_baseline_inventory = Some(post_event_inventory);
         self.state.daily_baseline_inventory = Some(post_event_inventory);
-        if let Some(equity) =
-            post_event_inventory.checked_value_usd(price.token_a_price_usd, price.token_b_price_usd)
-        {
-            self.state.initial_equity_usd = Some(equity);
-            self.state.daily_baseline_equity_usd = Some(equity);
-            self.state.last_equity_usd = Some(equity);
-        }
+        self.state.initial_equity_usd = Some(equity);
+        self.state.daily_baseline_equity_usd = Some(equity);
+        self.state.last_equity_usd = Some(equity);
         self.state
             .handled_corporate_action_ids
             .push(event.event_id.clone());
@@ -6445,6 +6466,60 @@ mod tests {
                 assert_eq!(hold.code, ArcusSpotHoldCode::Warmup)
             }
             other => panic!("expected warm-up after the resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resume_whose_valuation_overflows_stays_pending() {
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        // A representable `Decimal` that cannot be priced: an over-scaled
+        // operator quantity is exactly how this arrives in practice.
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::MAX,
+            token_b: Decimal::ONE,
+        });
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let inventory_before = runtime.state.inventory;
+        let marks_before = (
+            runtime.state.initial_equity_usd,
+            runtime.state.daily_baseline_equity_usd,
+            runtime.state.last_equity_usd,
+        );
+
+        let resumed_at = anchor + Duration::seconds(12);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+
+        // Nothing is committed. A partial resume -- inventory rebased, marks
+        // left behind, the id already handled -- would load fine and then
+        // fail every later valuation with no way to apply corrected
+        // quantities.
+        assert_eq!(runtime.state.inventory, inventory_before);
+        assert_eq!(
+            runtime.state.initial_baseline_inventory,
+            Some(inventory_before)
+        );
+        assert_eq!(
+            (
+                runtime.state.initial_equity_usd,
+                runtime.state.daily_baseline_equity_usd,
+                runtime.state.last_equity_usd,
+            ),
+            marks_before,
+        );
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionResumePending,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected the resume to stay pending, got {other:?}"),
         }
     }
 
