@@ -3654,10 +3654,29 @@ fn corporate_action_continuity(
             "Arcus runtime lost or reordered its handled corporate actions across restart/rollback"
         );
     }
+    // The fingerprints are the identity half of the same record and are
+    // append-only in exactly the same way: dropping one would let a renamed
+    // entry be applied again after a restore (Codex P1, pairtrade#309).
+    let fingerprints_before = baseline.handled_corporate_action_fingerprints.len();
+    if current.handled_corporate_action_fingerprints.len() < fingerprints_before
+        || current.handled_corporate_action_fingerprints[..fingerprints_before]
+            != baseline.handled_corporate_action_fingerprints[..]
+    {
+        bail!(
+            "Arcus runtime lost or reordered its handled corporate-action fingerprints across \
+             restart/rollback"
+        );
+    }
     let resumed =
         &current.handled_corporate_action_ids[baseline.handled_corporate_action_ids.len()..];
+    let resumed_fingerprints =
+        &current.handled_corporate_action_fingerprints[fingerprints_before..];
     match resumed {
-        [] => {}
+        [] => {
+            if !resumed_fingerprints.is_empty() {
+                bail!("Arcus runtime recorded a corporate-action fingerprint without a resume");
+            }
+        }
         [event_id] => {
             if sequence_advance != 1 {
                 bail!("Arcus corporate action {event_id} resumed without a single new observation");
@@ -3686,6 +3705,12 @@ fn corporate_action_continuity(
             }
             if current.corporate_action.is_some() {
                 bail!("Arcus corporate action {event_id} resumed without clearing its progress");
+            }
+            if resumed_fingerprints != [event.fingerprint()] {
+                bail!(
+                    "Arcus corporate action {event_id} resumed without recording the fingerprint \
+                     of the declared event"
+                );
             }
             authorized.resumed_inventory = Some(inventory);
             authorized.history_discarded = true;
@@ -10069,6 +10094,10 @@ runtime:
         .unwrap()
     }
 
+    fn fixture_event() -> ArcusSpotCorporateActionEvent {
+        config_with_corporate_action(None).corporate_actions[0].clone()
+    }
+
     fn config_with_corporate_action(
         post_event_inventory: Option<(&str, &str)>,
     ) -> ArcusSpotRuntimeConfig {
@@ -10112,6 +10141,7 @@ runtime:
         current.relative_log_price_history = vec![0.25];
         current.corporate_action = None;
         current.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        current.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
         // 4 NVDA at 200 + 1 AMD at 100.
         for mark in [
             &mut current.initial_equity_usd,
@@ -10194,6 +10224,47 @@ runtime:
             .unwrap_err()
             .to_string();
         assert!(error.contains("single new observation"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_must_record_the_declared_events_fingerprint() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, mut current) = resume_pair();
+        current.handled_corporate_action_fingerprints.clear();
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("without recording the fingerprint"),
+            "{error}"
+        );
+
+        // And it must be *this* event's: a fingerprint of some other
+        // declaration does not make the rename guard's record.
+        let (baseline, mut current) = resume_pair();
+        current.handled_corporate_action_fingerprints = vec!["deadbeef".to_string()];
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("without recording the fingerprint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dropped_handled_fingerprints_are_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, mut current) = resume_pair();
+        baseline.handled_corporate_action_ids = vec!["OLDER".to_string()];
+        baseline.handled_corporate_action_fingerprints = vec!["older-fp".to_string()];
+        current.handled_corporate_action_ids =
+            vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
+        // The older fingerprint is gone.
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fingerprints"), "{error}");
     }
 
     #[test]

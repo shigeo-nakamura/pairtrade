@@ -349,6 +349,12 @@ pub struct ArcusSpotRuntimeState {
     /// indefinitely; this is what keeps it from being applied twice.
     #[serde(default)]
     pub handled_corporate_action_ids: Vec<String>,
+    /// `ArcusSpotCorporateActionEvent::fingerprint` of each handled event,
+    /// appended alongside its id. The id is the operator's mutable label;
+    /// this is what the event *was*, so renaming a completed entry does not
+    /// resurrect it (Codex P1, pairtrade#309).
+    #[serde(default)]
+    pub handled_corporate_action_fingerprints: Vec<String>,
     #[cfg(feature = "arcus-spot-live")]
     #[serde(default)]
     pub last_live_execution_idempotency_key: Option<String>,
@@ -378,6 +384,7 @@ impl ArcusSpotRuntimeState {
             last_token_identity_at: None,
             corporate_action: None,
             handled_corporate_action_ids: Vec::new(),
+            handled_corporate_action_fingerprints: Vec::new(),
             #[cfg(feature = "arcus-spot-live")]
             last_live_execution_idempotency_key: None,
         }
@@ -2895,6 +2902,31 @@ impl ArcusSpotRuntime {
                     suppress_history: true,
                 };
             }
+            // And a rotation still open here is not unwound by the runtime.
+            // `rotated_quantity` is in pre-event units -- the same units this
+            // phase already refuses to value for a loss halt -- and an exit
+            // sized from it sells one old unit as one new unit after a split
+            // (marking the rotation flat with the split-adjusted remainder
+            // still held) or submits an unfillable oversized order after a
+            // reverse split. The forced exit belongs to the reduce phase,
+            // before `effective_at`; past it, the position is the operator's
+            // to reconcile (Codex P1, pairtrade#309).
+            if self.state.regime != ArcusSpotRegime::Neutral {
+                return CorporateActionGate {
+                    block_entry: Some(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::CorporateActionUnresolved,
+                        format!(
+                            "corporate action {} is effective with the rotation still open \
+                             ({:?}); the tracked open quantity is in pre-event units and will \
+                             not be sized into an exit -- reconcile the position and the \
+                             runtime state before the resume",
+                            event.event_id, self.state.regime,
+                        ),
+                    )),
+                    force_exit: false,
+                    suppress_history: true,
+                };
+            }
         }
 
         // The evaluation clock reaching `resume_not_before` is not enough.
@@ -2936,39 +2968,18 @@ impl ArcusSpotRuntime {
             );
             return CorporateActionGate {
                 block_entry: Some(hold),
+                // Only in the reduce phase. Past `effective_at` an open
+                // rotation has already returned above with its own hold.
                 force_exit: evaluation_time >= event.reduce_exit_at
+                    && evaluation_time < event.effective_at
                     && self.state.regime != ArcusSpotRegime::Neutral,
                 suppress_history: evaluation_time >= event.effective_at,
             };
         }
 
-        // At or past resume_not_before, with the event still unhandled.
-        //
-        // A rotation that is still open here means the forced exit has not
-        // completed -- the venue could not quote it, most likely. That is
-        // not a new condition needing its own hold code: it is the same
-        // phase as before the resume time, and it stays there, still forcing
-        // the exit on every tick, until the position is actually flat. The
-        // reason it cannot simply resume around the open position is
-        // `post_event_inventory`: it describes a wallet, and adopting it
-        // while a rotation is open would overwrite the holding the tracked
-        // open quantity refers to. Whatever gate is blocking the exit is
-        // reported by that gate, which is where an operator can act on it.
-        if self.state.regime != ArcusSpotRegime::Neutral {
-            return CorporateActionGate {
-                block_entry: Some(ArcusSpotHold::new(
-                    ArcusSpotHoldCode::CorporateActionBlock,
-                    format!(
-                        "corporate action {} reached its resume time with the rotation still open \
-                         ({:?}); the resume waits for it to unwind",
-                        event.event_id, self.state.regime,
-                    ),
-                )),
-                force_exit: true,
-                suppress_history: true,
-            };
-        }
-
+        // At or past resume_not_before, with the event still unhandled and
+        // the position flat (an open rotation past `effective_at` returned
+        // above and stays there until the operator reconciles it).
         let Some(post_event_inventory) = event.post_event_inventory else {
             return CorporateActionGate {
                 block_entry: Some(ArcusSpotHold::new(
@@ -3025,6 +3036,9 @@ impl ArcusSpotRuntime {
         self.state
             .handled_corporate_action_ids
             .push(event.event_id.clone());
+        self.state
+            .handled_corporate_action_fingerprints
+            .push(event.fingerprint());
         self.state.corporate_action = None;
         // The signal window was emptied at `effective_at` and nothing was
         // added to it since, so the ordinary warm-up gate now supplies the
@@ -3070,14 +3084,27 @@ impl ArcusSpotRuntime {
         self.config
             .corporate_actions
             .iter()
-            .filter(|event| {
-                !self
-                    .state
-                    .handled_corporate_action_ids
-                    .iter()
-                    .any(|handled| handled.eq_ignore_ascii_case(&event.event_id))
-            })
+            .filter(|event| !self.corporate_action_is_handled(event))
             .find(|event| evaluation_time >= event.entry_block_at)
+    }
+
+    /// Handled by label *or* by identity. A completed entry an operator
+    /// renames keeps its fingerprint, so it stays handled; without this a
+    /// past window whose `entry_block_at` is long gone would become active
+    /// again on the next tick, clear the live signal history and re-apply
+    /// its `post_event_inventory` over every trade made since.
+    fn corporate_action_is_handled(&self, event: &ArcusSpotCorporateActionEvent) -> bool {
+        self.state
+            .handled_corporate_action_ids
+            .iter()
+            .any(|handled| handled.eq_ignore_ascii_case(&event.event_id))
+            || {
+                let fingerprint = event.fingerprint();
+                self.state
+                    .handled_corporate_action_fingerprints
+                    .iter()
+                    .any(|handled| *handled == fingerprint)
+            }
     }
 
     /// Compares each affected symbol's contract and decimals against what
@@ -6721,19 +6748,89 @@ mod tests {
             other => panic!("expected an unresolved hold instead of a forced exit, got {other:?}"),
         }
         assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
-
-        // Control: the same tick with the identity intact does force the exit.
-        let unwound = runtime.step_at(
-            &snapshot_with_valid_row(effective + Duration::seconds(1)),
-            effective + Duration::seconds(1),
+        assert!(
+            outcome_detail_mentions_relisting(&runtime),
+            "the identity drift, not the open rotation, is what is reported first",
         );
+
+        // Control: in the reduce phase, identity intact, the exit is forced.
+        let mut control =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        control.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        control.step_at(&snapshot_with_valid_row(anchor), anchor);
+        seed_open_rotation(&mut control, anchor);
+        let reduce = anchor + Duration::seconds(4);
+        let unwound = control.step_at(&snapshot_with_valid_row(reduce), reduce);
         match unwound.decision {
             ArcusSpotDecision::SimulatedFill { plan } => {
                 assert_eq!(plan.trigger, ArcusSpotRotationTrigger::CorporateActionExit)
             }
-            other => panic!("expected the forced exit once the identity matches, got {other:?}"),
+            other => panic!("expected the forced exit in the reduce phase, got {other:?}"),
         }
-        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+        assert_eq!(control.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    fn cfg_with_window_at(entry_block_at: DateTime<Utc>) -> ArcusSpotRuntimeConfig {
+        let mut cfg = config();
+        let mut event = corporate_action_event(entry_block_at);
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        });
+        cfg.corporate_actions = vec![event];
+        cfg
+    }
+
+    fn outcome_detail_mentions_relisting(runtime: &ArcusSpotRuntime) -> bool {
+        // The drift hold names the relisted address; the open-rotation hold
+        // does not. Checked through the pinned identity rather than the
+        // event text so the assertion does not depend on hold wording.
+        runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .and_then(|p| p.pre_event_token_a.as_ref())
+            .is_some_and(|pinned| {
+                !pinned
+                    .address
+                    .eq_ignore_ascii_case(RELISTED_TOKEN_A_ADDRESS)
+            })
+    }
+
+    #[test]
+    fn a_renamed_handled_event_is_not_applied_again() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+        assert_eq!(runtime.state.handled_corporate_action_fingerprints.len(), 1);
+
+        // Later trades move the wallet, and the window refills.
+        let traded_to = ArcusSpotInventory {
+            token_a: Decimal::from(3),
+            token_b: Decimal::from(2),
+        };
+        runtime.state.inventory = traded_to;
+        runtime.state.relative_log_price_history = vec![0.25, 0.26, 0.27];
+
+        // The operator renames the completed entry.
+        runtime.config.corporate_actions[0].event_id = "NVDA-2026-10-4FOR1-renamed".to_string();
+        let later = resumed_at + Duration::seconds(60);
+        runtime.step_at(&snapshot_with_valid_row(later), later);
+
+        assert_eq!(
+            runtime.state.inventory, traded_to,
+            "post_event_inventory re-applied"
+        );
+        assert!(
+            !runtime.state.relative_log_price_history.is_empty(),
+            "window re-discarded"
+        );
+        assert_eq!(runtime.state.corporate_action, None, "window re-opened");
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
     }
 
     #[test]
@@ -7046,7 +7143,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rotation_still_open_at_the_resume_time_keeps_being_unwound_first() {
+    fn a_rotation_still_open_at_the_effective_time_is_left_to_the_operator() {
         let anchor = event_time();
         let mut cfg = config();
         let mut event = corporate_action_event(anchor);
@@ -7059,18 +7156,35 @@ mod tests {
         let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
         seed_open_rotation(&mut runtime, anchor);
 
-        // The forced exit cannot be quoted, so the position is still open
-        // when the operator's resume time arrives.
-        for offset in [2, 12] {
+        // Reduce phase (+2s to +4s): the exit is forced, and the gate that
+        // actually blocked it is the one reported.
+        let reduce = anchor + Duration::seconds(2);
+        let observed = runtime.step_at(
+            &snapshot_with_route_unavailable(reduce, "200", "100"),
+            reduce,
+        );
+        match observed.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::RouteUnavailable)
+            }
+            other => panic!("expected a hold with no route, got {other:?}"),
+        }
+
+        // From `effective_at` the tracked quantity is in pre-event units:
+        // one old unit sized as one new unit after a split, an unfillable
+        // oversized order after a reverse split. No exit is planned from it,
+        // route or no route -- even past the resume time.
+        for offset in [6, 13] {
             let at = anchor + Duration::seconds(offset);
-            let observed = runtime.step_at(&snapshot_with_route_unavailable(at, "200", "100"), at);
-            match observed.decision {
+            let outcome = runtime.step_at(&snapshot_with_valid_row(at), at);
+            match outcome.decision {
                 ArcusSpotDecision::Observe { hold } => assert_eq!(
                     hold.code,
-                    ArcusSpotHoldCode::RouteUnavailable,
-                    "the gate that actually blocked the exit is the one worth reporting",
+                    ArcusSpotHoldCode::CorporateActionUnresolved,
+                    "{}",
+                    hold.detail
                 ),
-                other => panic!("expected a hold with no route, got {other:?}"),
+                other => panic!("expected an unresolved hold at +{offset}s, got {other:?}"),
             }
         }
         assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
@@ -7080,27 +7194,6 @@ mod tests {
             config().initial_inventory,
             "the reconciled holding describes a flat wallet, so it must not be adopted \
              over a position the tracked open quantity still refers to",
-        );
-
-        // Once a route comes back the exit fires, even past the resume time.
-        let unwound_at = anchor + Duration::seconds(13);
-        let unwound = runtime.step_at(&snapshot_with_valid_row(unwound_at), unwound_at);
-        match unwound.decision {
-            ArcusSpotDecision::SimulatedFill { plan } => {
-                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::CorporateActionExit)
-            }
-            other => panic!("expected the forced exit to fire, got {other:?}"),
-        }
-        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
-        assert!(runtime.state.handled_corporate_action_ids.is_empty());
-
-        // And only then does the resume adopt the reconciled holding.
-        let resumed_at = anchor + Duration::seconds(14);
-        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
-        assert_eq!(runtime.state.inventory, reconciled);
-        assert_eq!(
-            runtime.state.handled_corporate_action_ids,
-            vec!["NVDA-2026-10-4FOR1".to_string()],
         );
     }
 

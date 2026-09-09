@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use dex_connector::ArcusSpotPair;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +96,34 @@ pub struct ArcusSpotCorporateActionEvent {
     /// `resume_not_before` rather than resuming on stale quantities.
     #[serde(default)]
     pub post_event_inventory: Option<ArcusSpotInventory>,
+}
+
+impl ArcusSpotCorporateActionEvent {
+    /// What this event *is*, independent of what it is called: the affected
+    /// symbols and the four window instants. `event_id` is the operator's
+    /// mutable label; the runtime records both once handled, so renaming a
+    /// completed entry cannot turn it back into a new one and re-apply its
+    /// `post_event_inventory` over later trades (Codex P1, pairtrade#309).
+    /// `source` and `post_event_inventory` are deliberately excluded: the
+    /// former is a citation, the latter is the reconciliation an operator
+    /// may correct while the event is pending.
+    pub fn fingerprint(&self) -> String {
+        let mut symbols: Vec<String> = self
+            .symbols
+            .iter()
+            .map(|symbol| symbol.to_ascii_lowercase())
+            .collect();
+        symbols.sort();
+        let canonical = format!(
+            "v1|{}|{}|{}|{}|{}",
+            symbols.join("+"),
+            self.entry_block_at.to_rfc3339(),
+            self.reduce_exit_at.to_rfc3339(),
+            self.effective_at.to_rfc3339(),
+            self.resume_not_before.to_rfc3339(),
+        );
+        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
