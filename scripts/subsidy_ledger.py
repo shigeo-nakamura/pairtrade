@@ -843,6 +843,16 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
         # separate points-only row instead, so the day the operator meant
         # to price reports no points and its rate cannot be produced, with
         # a 0 exit (Codex, PR #297).
+        # `(date, arm)` is one compound join key and both halves have to
+        # survive it. The date is checked below; the arm is compared
+        # against `arm_from_pnl_filename` / the execution ledger's
+        # `variant`, neither of which can produce a padded or non-string
+        # value, so `"freq "` would have become a points-only arm of its
+        # own -- the costed day left without points and its rate silently
+        # suppressed (Codex, PR #297).
+        if not isinstance(arm, str) or arm != arm.strip() or not arm:
+            raise SubsidyLedgerError(
+                f"{path}: a points row needs a bare arm name; got {arm!r}")
         if not is_canonical_date(date):
             raise SubsidyLedgerError(
                 f"{path}: a points row needs a real YYYY-MM-DD date; got {date!r}")

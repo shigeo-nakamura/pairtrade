@@ -1363,9 +1363,29 @@ def test_a_points_date_must_be_canonical():
                 assert "YYYY-MM-DD" in str(error) or "needs date" in str(error), error
             else:
                 raise AssertionError(f"points date {bad!r} must be refused")
+        # The arm is the other half of the same compound key, and the
+        # loaders that produce it -- arm_from_pnl_filename, and the
+        # execution ledger's `variant` -- cannot emit a padded or
+        # non-string value (Codex, PR #297).
+        for bad_arm in ("freq ", " freq", "freq\n", 1, ["freq"]):
+            path = write(Path(tmp) / "points.jsonl",
+                         [{"date": "2026-09-08", "arm": bad_arm, "points": 1000}])
+            try:
+                load_points(path)
+            except SubsidyLedgerError as error:
+                assert "bare arm" in str(error) or "needs date" in str(error), error
+            else:
+                raise AssertionError(f"points arm {bad_arm!r} must be refused")
+
         canonical = write(Path(tmp) / "points.jsonl",
                           [{"date": "2026-09-08", "arm": "freq", "points": 1000}])
         assert load_points(canonical) == {("2026-09-08", "freq"): 1000.0}
+        # An arm with no ledger yet is still legal: points can be
+        # supplied before an arm's export exists, which
+        # `uncosted_points` is there to report.
+        unknown = write(Path(tmp) / "points.jsonl",
+                        [{"date": "2026-09-08", "arm": "brand-new", "points": 7}])
+        assert load_points(unknown) == {("2026-09-08", "brand-new"): 7.0}
         # A real leap day is a real date and must not be collateral.
         leap = write(Path(tmp) / "points.jsonl",
                      [{"date": "2024-02-29", "arm": "freq", "points": 5}])
