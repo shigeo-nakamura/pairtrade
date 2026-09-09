@@ -1295,6 +1295,16 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
                 # can name what to go and fix (Codex, PR #297).
                 "pnl_rejected_days": 0,
                 "pnl_incomplete_reasons": [],
+                # ... and a day whose PnL coverage was incomplete but whose
+                # cost came from the equity series is neither uncosted nor
+                # "further": it is already inside `cost_days`. The two
+                # states are split at the point they are counted, so the
+                # renderer never has to reconstruct the partition from
+                # arithmetic on totals (Codex, PR #297).
+                "pnl_rejected_uncosted_days": 0,
+                "pnl_rejected_uncosted_reasons": [],
+                "pnl_rejected_costed_days": 0,
+                "pnl_rejected_costed_reasons": [],
                 # Days that supplied a real zero. Kept apart from the
                 # ones that supplied nothing (Codex, PR #297).
                 "days_zero_points": 0,
@@ -1317,8 +1327,14 @@ def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
         arm["fills"] += row.fills
         if row.pnl_coverage == "incomplete":
             arm["pnl_rejected_days"] += 1
+            reasons = set(row.pnl_incomplete_reasons or ())
             arm["pnl_incomplete_reasons"] = sorted(
-                set(arm["pnl_incomplete_reasons"]) | set(row.pnl_incomplete_reasons or ())
+                set(arm["pnl_incomplete_reasons"]) | reasons
+            )
+            bucket = "uncosted" if row.cost_usd is None else "costed"
+            arm[f"pnl_rejected_{bucket}_days"] += 1
+            arm[f"pnl_rejected_{bucket}_reasons"] = sorted(
+                set(arm[f"pnl_rejected_{bucket}_reasons"]) | reasons
             )
         # The per-day loaders guard this exact failure; the per-arm roll-up
         # is a second level of accumulation and needs the same guard, or
@@ -1571,10 +1587,15 @@ def render_table(rows: list[Row], summary: dict) -> str:
             if arm["pnl_rejected_days"]:
                 # Supplied and refused, which is a different instruction
                 # to the reader than "nothing covers these days".
+                # "every row was rejected" was wrong: `load_pnl` keeps a
+                # day's valid cycles and marks the *day* incomplete, so one
+                # defective row is enough. Describing the day's coverage
+                # stops sending operators to audit rows that are fine
+                # (Codex, PR #297).
                 out.append(
                     f"{head}, cost unknown: a PnL ledger covers "
-                    f"{arm['pnl_rejected_days']} of these day(s) but every row in them "
-                    f"was rejected ({', '.join(arm['pnl_incomplete_reasons'])}), and no "
+                    f"{arm['pnl_rejected_days']} of these day(s) but its coverage there is "
+                    f"incomplete ({', '.join(arm['pnl_incomplete_reasons'])}), and no "
                     "equity series covers them either"
                 )
             else:
@@ -1619,14 +1640,24 @@ def render_table(rows: list[Row], summary: dict) -> str:
         out.append(
             f"{head}, cost {money(arm['cost_usd'])} across "
             f"{arm['cost_days']} costed day(s)")
-        if arm["pnl_rejected_days"]:
-            # Some days were costed and others' PnL rows were refused.
-            # The reasons are on the rows, which this table does not
-            # print, so an operator had no way to see what to fix
-            # (Codex, PR #297).
+        # Some days had their PnL coverage refused. The reasons are on the
+        # rows, which this table does not print, so an operator had no way
+        # to see what to fix (Codex, PR #297). Reported as two separate
+        # states because they call for different actions: a day the equity
+        # series still priced is not an additional coverage gap, and
+        # calling it "further" implied one that is not there.
+        if arm["pnl_rejected_uncosted_days"]:
             out.append(
-                f"         {arm['pnl_rejected_days']} further day(s) had a PnL ledger "
-                f"whose rows were all rejected ({', '.join(arm['pnl_incomplete_reasons'])})"
+                f"         {arm['pnl_rejected_uncosted_days']} further day(s) had incomplete "
+                f"PnL coverage ({', '.join(arm['pnl_rejected_uncosted_reasons'])}) and no "
+                "equity series covered them"
+            )
+        if arm["pnl_rejected_costed_days"]:
+            out.append(
+                f"         {arm['pnl_rejected_costed_days']} of the costed day(s) had "
+                f"incomplete PnL coverage "
+                f"({', '.join(arm['pnl_rejected_costed_reasons'])}) and were priced from "
+                "the equity series instead"
             )
         if arm["volume_rate_unrepresentable"]:
             out.append(

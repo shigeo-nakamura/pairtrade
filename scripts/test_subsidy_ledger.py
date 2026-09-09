@@ -1944,7 +1944,7 @@ def test_a_rejected_pnl_ledger_is_not_an_absent_one():
         assert arm["pnl_rejected_days"] == 1, arm
         assert arm["pnl_incomplete_reasons"] == ["pnl_available_not_true"], arm
         printed = render_table(rows, summarize(rows))
-        assert "every row in them was rejected" in printed, printed
+        assert "its coverage there is incomplete" in printed, printed
         assert "pnl_available_not_true" in printed, printed
         assert "no PnL ledger or equity series covers" not in printed, printed
 
@@ -1962,7 +1962,25 @@ def test_a_rejected_pnl_ledger_is_not_an_absent_one():
                                                    funding_seen=True)
         mixed_rows = build_rows(mixed_exec, mixed_pnl)
         mixed = render_table(mixed_rows, summarize(mixed_rows))
-        assert "1 further day(s) had a PnL ledger whose rows were all rejected" in mixed, mixed
+        assert ("1 further day(s) had incomplete PnL coverage") in mixed, mixed
+        assert "no equity series covered them" in mixed, mixed
+        mixed_arm = summarize(mixed_rows)["arms"][0]
+        assert mixed_arm["pnl_rejected_uncosted_days"] == 1, mixed_arm
+        assert mixed_arm["pnl_rejected_costed_days"] == 0, mixed_arm
+        assert "of the costed day(s) had incomplete PnL coverage" not in mixed, mixed
+
+        # An incomplete PnL day the equity series *did* price is inside
+        # `cost_days`; calling it a "further" day claimed a coverage gap
+        # that is not there (Codex, PR #297).
+        fallback_rows = build_rows(
+            execution, rejected, equity_costs={"freq": {"2026-09-08": 7.0}})
+        fallback = render_table(fallback_rows, summarize(fallback_rows))
+        fallback_arm = summarize(fallback_rows)["arms"][0]
+        assert fallback_arm["cost_days"] == 1, fallback_arm
+        assert fallback_arm["pnl_rejected_uncosted_days"] == 0, fallback_arm
+        assert fallback_arm["pnl_rejected_costed_days"] == 1, fallback_arm
+        assert "further day(s)" not in fallback, fallback
+        assert "were priced from the equity series instead" in fallback, fallback
 
 
 def test_a_run_without_points_says_nothing_about_points():
