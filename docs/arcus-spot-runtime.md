@@ -144,6 +144,17 @@ reads and exact balance reconciliation allowed to complete. Configuration
 must pin exactly those Arcus and Rialto Permit2 spenders; missing or extra
 addresses fail startup.
 
+Both legs of that reconciliation are anchored to the settlement transaction's
+own logs, not to the signed plan: the buy delta must equal the
+`SwapExecuted` event's `amount_out` (bot-strategy#883), and the sell delta
+must equal the net sell-token outflow its ERC-20 `Transfer` logs report --
+everything that left the taker minus anything the same transaction refunded
+back (bot-strategy#979). The signed amount remains the ceiling on the sell
+side (Permit2 can authorise no more), but a route may take less of it and
+refund the remainder in the same transaction, which a pre/post balance delta
+nets out on its own. The runtime is then credited with what the wallet
+actually moved, on both legs.
+
 When LI.FI or an unknown venue wins, `live-tick` logs one `[arcus-route] ...`
 line and exits successfully. Each decline also appends one analysis-only line
 to `declined-routes.jsonl`, next to the runtime checkpoint. A failed write is
@@ -186,7 +197,8 @@ With `arcus-spot-live`, the library provides:
   much the bot traded), and deployer-pinned raw sell maxima;
 - exactly one submit attempt, sticky `UNKNOWN` on ambiguous delivery, safe
   venue-specific status GETs, canonical SwapShell event verification, and
-  exact pre/post wallet-balance reconciliation;
+  exact pre/post wallet-balance reconciliation against the settlement
+  transaction's own logs;
 - a runtime commit seam that refuses fills inconsistent with the genuine
   strategy plan.
 
