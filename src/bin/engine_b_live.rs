@@ -585,6 +585,14 @@ struct RiskState {
     /// evidence: the exchange decides.
     #[serde(default)]
     open_position: Option<PersistedPosition>,
+    /// A record this instance cannot manage any more -- a position saved
+    /// under a `us_primary` this engine no longer trades. It is moved
+    /// here rather than left in `open_position`, so the configured
+    /// symbol's own exposure can still be tracked and closed while the
+    /// operator retains the durable trace of the other one
+    /// (pairtrade#300 Codex review).
+    #[serde(default)]
+    unmanaged_position: Option<PersistedPosition>,
 }
 
 /// `OpenPosition` reduced to what survives a restart. Deliberately a
@@ -601,6 +609,12 @@ struct PersistedPosition {
     side: String,
     entry_price: f64,
     entry_price_estimated: bool,
+    /// True when adoption found **no** cost basis at all -- neither the
+    /// exchange's `avg_entry_price` nor a WS mid. `entry_price` is then a
+    /// placeholder that must never be arithmetic'd against a real price
+    /// (pairtrade#300 Codex review).
+    #[serde(default)]
+    entry_price_unknown: bool,
     size: f64,
     open_size: f64,
     realized_partial_pnl: f64,
@@ -686,6 +700,11 @@ struct OpenPosition {
     /// than the exchange's own `avg_entry_price` -- the booked PnL is then
     /// an estimate (pairtrade#275 review finding 7).
     entry_price_estimated: bool,
+    /// No cost basis was available at all when this position was adopted:
+    /// neither `avg_entry_price` nor a WS mid. `entry_price` is a
+    /// placeholder, and the close books only what was already realized
+    /// rather than measuring against it (pairtrade#300 Codex review).
+    entry_price_unknown: bool,
     /// Quantity confirmed at entry. PnL is booked on this, not on whatever
     /// remains after partial exits (pairtrade#275 Codex review).
     size: f64,
@@ -1680,6 +1699,7 @@ impl EngineBLiveEngine {
             side: p.side.to_string(),
             entry_price: p.entry_price,
             entry_price_estimated: p.entry_price_estimated,
+            entry_price_unknown: p.entry_price_unknown,
             size: p.size,
             open_size: p.open_size,
             realized_partial_pnl: p.realized_partial_pnl,
@@ -1803,16 +1823,40 @@ impl EngineBLiveEngine {
                 exchange_position_for(&positions, &p.symbol).map(|live| (p.symbol.clone(), live))
             })
         {
-            let (old_symbol, live) = stale;
+            // `stale_live`, not `live`: the outer binding is the
+            // *configured* symbol's position, which is handled below.
+            let (old_symbol, stale_live) = stale;
             let reason = format!(
                 "us_primary is now {symbol} but a {} {old_symbol} position size={:.6} is still \
                  open; this engine only ever sends orders for {symbol}, so it cannot close that \
                  one -- flatten {old_symbol} by hand (or set us_primary back to {old_symbol}). \
                  The record is kept, not discarded",
-                live.side, live.size
+                stale_live.side, stale_live.size
             );
             log::error!("[RECONCILE] {reason}");
             self.halt_session(reason);
+            // The record is kept -- but out of `open_position`, because
+            // the configured symbol may have an exposure of its own that
+            // has to be tracked and closed. Leaving the old record in the
+            // managed slot meant either losing it to the next
+            // `persist_position`, or leaving a live position on the
+            // configured symbol with nothing managing it: the halt blocks
+            // entries, and `maybe_exit` only ever closes `self.position`
+            // (pairtrade#300 Codex review).
+            self.state.unmanaged_position = self.state.open_position.take();
+            self.state_write_pending = true;
+            if let Some(live) = live.as_ref() {
+                self.adopt_from_exchange(
+                    live,
+                    now_us,
+                    &format!(
+                        "us_primary is now {symbol} and the exchange holds a position in it, \
+                         beside the unmanaged {old_symbol} exposure"
+                    ),
+                );
+            } else {
+                self.persist_state();
+            }
             self.reconciled = true;
             return;
         }
@@ -1899,6 +1943,7 @@ impl EngineBLiveEngine {
             side,
             entry_price: p.entry_price,
             entry_price_estimated: p.entry_price_estimated,
+            entry_price_unknown: p.entry_price_unknown,
             size: p.size,
             open_size: p.open_size,
             realized_partial_pnl: p.realized_partial_pnl,
@@ -1935,28 +1980,65 @@ impl EngineBLiveEngine {
             p.symbol == self.cfg.us_primary_symbol && side_from_str(&p.side) == Some(live.side)
         });
         let carried_partial_pnl = carried.map(|p| p.realized_partial_pnl).unwrap_or(0.0);
-        let carried_basis = carried.map(|p| (p.entry_price, p.entry_price_estimated));
+        let carried_basis = carried
+            .filter(|p| !p.entry_price_unknown)
+            .map(|p| (p.entry_price, p.entry_price_estimated));
         if carried_partial_pnl != 0.0 {
             log::warn!(
                 "[RECONCILE] carrying ${carried_partial_pnl:.2} of already-booked partial PnL \
                  into the adopted position"
             );
         }
+        // A side flip makes the old leg's *remainder* unreconcilable, but
+        // the reductions that closed before the shutdown were realized at
+        // their own prices and are not in doubt. Dropping them silently
+        // loses money from the session's books, so they are booked here
+        // instead of carried onto a position they did not come from
+        // (pairtrade#300 Codex review).
+        let orphaned_partial_pnl = self
+            .state
+            .open_position
+            .as_ref()
+            .filter(|p| {
+                p.symbol == self.cfg.us_primary_symbol
+                    && side_from_str(&p.side) != Some(live.side)
+                    && p.realized_partial_pnl != 0.0
+            })
+            .map(|p| (p.realized_partial_pnl, p.side.clone()));
+        if let Some((pnl, old_side)) = orphaned_partial_pnl {
+            log::error!(
+                "[RECONCILE] the saved {old_side} position's ${pnl:.2} of already-realized \
+                 partial PnL is booked now: the exchange reports {} instead, so the record it \
+                 belonged to cannot be resumed",
+                live.side
+            );
+            self.state.realized_pnl_session += pnl;
+            self.state.pnl_today += pnl;
+        }
         let ws_price = self
             .exit_accounting_price(&self.cfg.us_primary_symbol)
             .map(|(mid, _)| mid);
-        let (entry_price, entry_price_estimated) = match (live.entry_price, ws_price) {
-            (Some(e), _) => (e, false),
-            // The record's own basis beats a current mid when it describes
-            // this same position: it is what the carried partial PnL was
-            // booked against.
-            (None, _) if carried_basis.is_some() => carried_basis.expect("checked"),
-            (None, Some(w)) => (w, true),
-            // No cost basis of any kind yet: still adopt (getting flat
-            // matters more than the PnL number), booking against the exit
-            // price itself once it closes.
-            (None, None) => (0.0, true),
-        };
+        let (entry_price, entry_price_estimated, entry_price_unknown) =
+            match (live.entry_price, ws_price) {
+                (Some(e), _) => (e, false, false),
+                // The record's own basis beats a current mid when it
+                // describes this same position: it is what the carried
+                // partial PnL was booked against.
+                (None, _) if carried_basis.is_some() => {
+                    let (price, estimated) = carried_basis.expect("checked");
+                    (price, estimated, false)
+                }
+                (None, Some(w)) => (w, true, false),
+                // No cost basis of any kind. Still adopt -- getting flat
+                // matters more than the PnL number -- but say so, rather
+                // than storing 0.0 as if it were a price. A quote
+                // arriving before the close would otherwise make
+                // `on_exit` book `(quote - 0) * size`: the position's
+                // entire notional as profit, which then feeds the
+                // drawdown halt and the session PnL
+                // (pairtrade#300 Codex review).
+                (None, None) => (0.0, true, true),
+            };
         log::error!(
             "[RECONCILE] adopting {} {} size={:.6} for immediate close -- {reason}",
             live.side,
@@ -1967,6 +2049,7 @@ impl EngineBLiveEngine {
             side: live.side,
             entry_price,
             entry_price_estimated,
+            entry_price_unknown,
             size: live.size,
             open_size: live.size,
             realized_partial_pnl: carried_partial_pnl,
@@ -1975,8 +2058,18 @@ impl EngineBLiveEngine {
             // Flattened on the next tick; there is no window to wait for.
             exit_deadline_us: None,
         });
-        self.persist_position();
+        // The adopted record and the halt it demands land in one write.
+        // Two writes leave a crash window where disk holds a matching
+        // `flatten_asap` position with no halt: the next start reads it
+        // as a plain `Resume`, flattens it, and then allows entries again
+        // without the RISK_ACK this anomaly requires
+        // (pairtrade#300 Codex review).
+        self.sync_open_position_field();
+        self.state_write_pending = true;
         self.halt_session(format!("reconcile_adopted_position: {reason}"));
+        if self.state_write_pending {
+            self.persist_state();
+        }
     }
 
     /// An order this process sent whose outcome it never established, or
@@ -2493,6 +2586,7 @@ impl EngineBLiveEngine {
             side: live.side,
             entry_price,
             entry_price_estimated,
+            entry_price_unknown: false,
             size: live.size,
             open_size: live.size,
             realized_partial_pnl: 0.0,
@@ -2742,6 +2836,7 @@ impl EngineBLiveEngine {
                 side: filled.side,
                 entry_price,
                 entry_price_estimated,
+                entry_price_unknown: false,
                 size: filled.size,
                 open_size: filled.size,
                 realized_partial_pnl: 0.0,
@@ -3216,6 +3311,7 @@ impl EngineBLiveEngine {
                                 side: existing.side,
                                 entry_price,
                                 entry_price_estimated,
+                                entry_price_unknown: false,
                                 size: existing.size,
                                 open_size: existing.size,
                                 realized_partial_pnl: 0.0,
@@ -3346,6 +3442,7 @@ impl EngineBLiveEngine {
                         side,
                         entry_price: price,
                         entry_price_estimated: false,
+                        entry_price_unknown: false,
                         size: requested.to_f64().unwrap_or(size),
                         open_size: requested.to_f64().unwrap_or(size),
                         realized_partial_pnl: 0.0,
@@ -3596,7 +3693,27 @@ impl EngineBLiveEngine {
         };
         // Final remainder at the final price, plus what earlier partial
         // reductions already realized at their own prices.
-        let pnl = pos.realized_partial_pnl + sign * (exit_price - pos.entry_price) * pos.open_size;
+        //
+        // Unless there is no basis to measure against: an adopted position
+        // whose cost basis was never known carries a placeholder
+        // `entry_price`, and `(exit_price - 0.0) * size` would book the
+        // position's whole notional as profit -- inflating the session
+        // PnL, the peak equity and therefore the drawdown halt. Only what
+        // was actually realized is booked, and the unmeasurable part is
+        // said out loud (pairtrade#300 Codex review).
+        let pnl = if pos.entry_price_unknown {
+            log::error!(
+                "[EXIT] {} closed at {exit_price:.4} with NO known cost basis (adopted from the \
+                 exchange with neither an entry price nor a mid): only the ${:.2} already \
+                 realized is booked, and the PnL of this position is not measurable from what \
+                 this process saw",
+                self.cfg.us_primary_symbol,
+                pos.realized_partial_pnl
+            );
+            pos.realized_partial_pnl
+        } else {
+            pos.realized_partial_pnl + sign * (exit_price - pos.entry_price) * pos.open_size
+        };
         log::info!(
             "[EXIT] side={} entry={:.4} exit={:.4} size={:.6} final_open={:.6} pnl=${:.2} \
              (partials=${:.2}) held={}s entry_price_estimated={} (exit price is the WS mid, not the fill)",
@@ -5624,6 +5741,7 @@ mod tests {
             side: OrderSide::Short,
             entry_price: 1700.0,
             entry_price_estimated: true,
+            entry_price_unknown: false,
             size: 0.058,
             open_size: 0.058,
             realized_partial_pnl: 0.0,
@@ -5856,6 +5974,7 @@ mod tests {
             side: OrderSide::Long,
             entry_price: 1700.0,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: 0.058,
             open_size: 0.058,
             realized_partial_pnl: 0.0,
@@ -5951,6 +6070,7 @@ mod tests {
             side: "long".to_string(),
             entry_price: 1756.92,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: open_size,
             open_size,
             realized_partial_pnl: 0.0,
@@ -6272,6 +6392,7 @@ mod tests {
                 side: OrderSide::Long,
                 entry_price: 1756.92,
                 entry_price_estimated: false,
+                entry_price_unknown: false,
                 size: 0.057,
                 open_size: 0.057,
                 realized_partial_pnl: 0.0,
@@ -6363,9 +6484,25 @@ mod tests {
             .clone()
             .unwrap_or_default();
         assert!(reason.contains("SNDK"), "unexpected: {reason}");
-        assert!(
-            h.engine.state.open_position.is_some(),
+        // Kept -- out of the managed slot, so the configured symbol's own
+        // exposure can still be tracked, and still on disk for the operator.
+        assert!(h.engine.state.open_position.is_none());
+        assert_eq!(
+            h.engine
+                .state
+                .unmanaged_position
+                .as_ref()
+                .map(|p| p.symbol.clone()),
+            Some("SNDK".to_string()),
             "the record must be kept, not discarded"
+        );
+        assert_eq!(
+            load_state(&h.engine.cfg.state_path)
+                .unmanaged_position
+                .as_ref()
+                .map(|p| p.symbol.clone()),
+            Some("SNDK".to_string()),
+            "and it must be on disk, not only in memory"
         );
         assert!(
             h.engine.position.is_none(),
@@ -6387,6 +6524,7 @@ mod tests {
             side: OrderSide::Long,
             entry_price: 1756.92,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: 0.057,
             open_size: 0.057,
             realized_partial_pnl: 0.0,
@@ -6402,6 +6540,136 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 4, P1: the configured symbol's own
+    /// exposure must still be managed when an old-symbol record is stuck.
+    #[tokio::test]
+    async fn a_stale_record_does_not_strand_the_configured_symbols_position() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Saved on SNDK; the instance now trades MU -- and the account
+        // holds *both*.
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        {
+            let mut positions = h.connector.positions.lock().unwrap();
+            positions.push(snap("SNDK", "0.057", 1, Some("1756.92")));
+            positions.push(snap("MU", "0.030", 1, Some("120.50")));
+        }
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(h.engine.state.session_halted, "both anomalies halt");
+        let adopted = h
+            .engine
+            .position
+            .clone()
+            .expect("the configured symbol's position must be adopted, not stranded");
+        assert!(
+            adopted.flatten_asap,
+            "an unexplained configured-symbol position is closed at once"
+        );
+        assert!((adopted.size - 0.030).abs() < 1e-12);
+        // And the record this engine cannot act on is still kept.
+        assert_eq!(
+            h.engine
+                .state
+                .unmanaged_position
+                .as_ref()
+                .map(|p| p.symbol.clone()),
+            Some("SNDK".to_string())
+        );
+    }
+
+    /// pairtrade#300 Codex review round 4, P1: a placeholder basis must
+    /// never be arithmetic'd against a real price.
+    #[tokio::test]
+    async fn an_adopted_position_with_no_basis_books_no_fabricated_pnl() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Nothing persisted, the exchange reports no entry price, and no
+        // WS mid has arrived: adoption has no basis of any kind.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, None));
+        {
+            let mut feed = h.engine.feed.lock().unwrap();
+            feed.latest.clear();
+            feed.last_raw_mid.clear();
+        }
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        let adopted = h.engine.position.clone().expect("adopted");
+        assert!(
+            adopted.entry_price_unknown,
+            "an absent basis must be recorded as absent, not as 0.0"
+        );
+        // A quote then arrives and the position closes against it. The
+        // old code booked (quote - 0.0) * size -- the entire notional as
+        // profit, straight into peak equity and the drawdown halt.
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.on_exit(1769.10, T2_US);
+        let booked = h.engine.state.realized_pnl_session - before;
+        assert!(
+            booked.abs() < 1e-9,
+            "only realized PnL may be booked without a basis, got ${booked:.2}"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 4, P2: a side flip does not
+    /// invalidate reductions that were already realized.
+    #[tokio::test]
+    async fn a_side_flip_books_the_partial_pnl_it_cannot_carry() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.realized_partial_pnl = 0.42;
+        h.engine.state.open_position = Some(saved);
+        // The exchange now reports the opposite side.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.030", -1, Some("1750.00")));
+        h.set_now(T1_US);
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.tick().await;
+        let adopted = h.engine.position.clone().expect("adopted");
+        assert_eq!(
+            adopted.realized_partial_pnl, 0.0,
+            "the old leg's PnL does not belong to the new position"
+        );
+        assert!(
+            ((h.engine.state.realized_pnl_session - before) - 0.42).abs() < 1e-12,
+            "but it is money already realized, so it is booked rather than dropped"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 4, P2: the adopted record and its
+    /// halt must land together, as the vanished path already does.
+    #[tokio::test]
+    async fn an_adopted_position_and_its_halt_reach_disk_in_one_write() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        let before = h.engine.state_writes;
+        h.engine.reconcile_startup(T1_US).await;
+        assert_eq!(
+            h.engine.state_writes - before,
+            1,
+            "a crash between the two writes leaves a flatten_asap position with no halt, which \
+             the next start reads as a plain Resume"
+        );
+        let on_disk = load_state(&h.engine.cfg.state_path);
+        assert!(on_disk.open_position.is_some());
+        assert!(on_disk.session_halted);
     }
 
     /// pairtrade#300 Codex review round 3, P1: an order was sent and its
@@ -6457,6 +6725,7 @@ mod tests {
             side: OrderSide::Long,
             entry_price: 1756.92,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: 0.057,
             open_size: 0.057,
             realized_partial_pnl: 0.0,
@@ -6702,6 +6971,7 @@ mod tests {
             side: OrderSide::Long,
             entry_price: 1756.92,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: 0.057,
             open_size: 0.057,
             realized_partial_pnl: 0.0,
@@ -6725,6 +6995,7 @@ mod tests {
             side: OrderSide::Long,
             entry_price: 1756.92,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: 0.057,
             open_size: 0.057,
             realized_partial_pnl: 0.0,
