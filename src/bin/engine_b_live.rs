@@ -596,6 +596,17 @@ struct RiskState {
     /// review).
     #[serde(default)]
     unmanaged_positions: Vec<PersistedPosition>,
+    /// An entry order was sent and its outcome is not yet established.
+    /// Written durably *before* `sendTx` and cleared when the pending
+    /// confirmation resolves, because `PendingConfirm::Entry` lives only
+    /// in memory: a crash inside the confirmation window would otherwise
+    /// leave a restart with nothing to look for, and a single account
+    /// read that comes back flat -- a false negative this file already
+    /// documents -- would be taken as a clean start while
+    /// `last_session_date` blocks any further entry
+    /// (pairtrade#300 Codex review).
+    #[serde(default)]
+    entry_in_flight: bool,
 }
 
 /// `OpenPosition` reduced to what survives a restart. Deliberately a
@@ -687,6 +698,22 @@ fn refreshed_unmanaged(
             record.realized_partial_pnl
         } else {
             0.0
+        },
+        // A flip is a different position, so it must not inherit the old
+        // one's schedule: promoting such a record later would otherwise
+        // match the venue exactly, select `Resume { flatten_asap: false }`
+        // and wait for an exit window that belonged to the position it
+        // replaced (pairtrade#300 Codex review).
+        flatten_asap: if same_side { record.flatten_asap } else { true },
+        exit_deadline_us: if same_side {
+            record.exit_deadline_us
+        } else {
+            None
+        },
+        session_date: if same_side {
+            record.session_date
+        } else {
+            String::new()
         },
         ..record
     }
@@ -1880,6 +1907,26 @@ impl EngineBLiveEngine {
         // is adopted from the exchange as an unknown position and its
         // basis and partial PnL are lost (pairtrade#300 Codex review).
         self.reconcile_unmanaged(&positions);
+        // An order was sent whose outcome this process never established.
+        // A single read that comes back flat proves nothing (the file's
+        // own false-negative caveat), so this becomes the sticky
+        // `position_unconfirmed` claim: `try_adopt_unconfirmed` then
+        // re-checks the exchange every tick and adopts the position if it
+        // appears, and only RISK_ACK clears it
+        // (pairtrade#300 Codex review).
+        if self.state.entry_in_flight {
+            let reason = format!(
+                "entry_in_flight_across_restart: an entry order for {} was sent and this \
+                 process died before its fill was confirmed -- the account may hold a \
+                 position no record describes; reconcile against the exchange, then RISK_ACK",
+                symbol
+            );
+            log::error!("[RECONCILE] {reason}");
+            self.state.entry_in_flight = false;
+            self.state.position_unconfirmed = true;
+            self.state_write_pending = true;
+            self.halt_session(reason);
+        }
         let persisted = self.state.open_position.clone();
         // A change to `us_primary` while a position is still open on the
         // *old* symbol would otherwise look like `Vanished` -- the lookup
@@ -3391,6 +3438,19 @@ impl EngineBLiveEngine {
                 self.cfg.max_session_loss_bps,
                 self.cfg.risk_ack_path.display()
             );
+            // Its own alert. `halt_session` returns early once the halt
+            // is set, so a reconciliation anomaly whose booked PnL
+            // crossed this threshold would otherwise be the *only* kind
+            // that produces no push alert -- exactly the loudest case
+            // (pairtrade#300 Codex review).
+            send_notification(
+                format!("Han Bridge SESSION DD HALT {}", self.cfg.instance_id),
+                format!(
+                    "drawdown {dd_bps:.0}bps >= {:.0}bps. New entries blocked until RISK_ACK at {}",
+                    self.cfg.max_session_loss_bps,
+                    self.cfg.risk_ack_path.display()
+                ),
+            );
         }
     }
 
@@ -3849,6 +3909,10 @@ impl EngineBLiveEngine {
         // checks the exchange, which is the documented recovery.
         self.state.last_session_date = self.current_date.map(|d| d.to_string());
         self.state.last_session_skip_reason = None;
+        // Same write, same reason: from here on, a restart has to know an
+        // order may exist even though nothing is persisted about a
+        // position yet (pairtrade#300 Codex review).
+        self.state.entry_in_flight = true;
         if let Err(e) = atomic_write_json_checked(&self.cfg.state_path, &self.state) {
             // No durable marker, no order: sending now would make the
             // at-most-one guarantee depend on this process surviving.
@@ -3857,6 +3921,7 @@ impl EngineBLiveEngine {
                 "[ENTRY] cannot persist the entry-attempt marker to {} ({e}); NOT sending this tick",
                 self.cfg.state_path.display()
             );
+            self.state.entry_in_flight = false;
             return;
         }
         let submit = self.submit_order(side, size, false).await;
@@ -4215,6 +4280,12 @@ impl EngineBLiveEngine {
         } else {
             self.maybe_enter(now).await;
             self.maybe_exit(now).await;
+        }
+        // The confirmation has resolved (or was never installed), so the
+        // durable in-flight marker is no longer owed to a restart.
+        if self.pending.is_none() && self.state.entry_in_flight {
+            self.state.entry_in_flight = false;
+            self.state_write_pending = true;
         }
         // Backstop for any path above that changed the position without
         // persisting it itself (bot-strategy#917); a no-op when nothing
@@ -6466,6 +6537,13 @@ mod tests {
         assert_eq!(symbol, "SNDK");
         assert_eq!(*side, OrderSide::Long, "KR outperformed, epsilon > 0");
         assert!(!*reduce_only);
+        // The order is out and its fill is not confirmed, so disk has to
+        // say so: a crash here must not restart as a clean start
+        // (pairtrade#300 Codex review).
+        assert!(
+            load_state(&h.engine.cfg.state_path).entry_in_flight,
+            "the in-flight marker must be durable before the send"
+        );
     }
 
     #[tokio::test]
@@ -7042,6 +7120,111 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 12, P1: a crash inside the
+    /// confirmation window must not restart as a clean start.
+    #[tokio::test]
+    async fn an_entry_in_flight_across_a_restart_is_not_a_clean_start() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // What the pre-send marker leaves on disk, with the process
+        // having died before the fill was confirmed.
+        h.engine.state.entry_in_flight = true;
+        h.engine.state.last_session_date = Some(TODAY.to_string());
+        // The account read comes back flat -- which proves nothing.
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            h.engine.state.position_unconfirmed,
+            "a sent order with no confirmed outcome is an unconfirmed position, not a clean start"
+        );
+        assert!(h.engine.state.session_halted);
+        assert!(
+            !h.engine.state.entry_in_flight,
+            "the marker is consumed, not left to repeat"
+        );
+        assert!(
+            load_state(&h.engine.cfg.state_path).position_unconfirmed,
+            "and it reaches disk"
+        );
+        // The position appearing late is then adopted by the existing
+        // unconfirmed machinery rather than being missed.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.engine.tick().await;
+        assert!(h.engine.position.is_some(), "the delayed fill is picked up");
+    }
+
+    /// pairtrade#300 Codex review round 12, P2: a flipped parked record
+    /// is an unknown-origin exposure, not the old one on its old clock.
+    #[test]
+    fn a_flipped_parked_record_does_not_inherit_the_old_schedule() {
+        let record = PersistedPosition {
+            symbol: "AAA".to_string(),
+            side: "long".to_string(),
+            entry_price: 100.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 1.0,
+            open_size: 1.0,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            session_date: TODAY.to_string(),
+            exit_deadline_us: Some(T2_US),
+        };
+        let flipped = ExchangePosition {
+            side: OrderSide::Short,
+            size: 1.0,
+            entry_price: Some(90.0),
+        };
+        let refreshed = refreshed_unmanaged(record.clone(), &flipped, None);
+        assert_eq!(refreshed.side, "short");
+        assert!(
+            refreshed.flatten_asap,
+            "the replacement leg is closed at once"
+        );
+        assert!(refreshed.exit_deadline_us.is_none());
+        assert!(refreshed.session_date.is_empty());
+        // A same-side refresh keeps the schedule it was entered against.
+        let same = ExchangePosition {
+            side: OrderSide::Long,
+            size: 0.5,
+            entry_price: None,
+        };
+        let kept = refreshed_unmanaged(record, &same, None);
+        assert!(!kept.flatten_asap);
+        assert_eq!(kept.exit_deadline_us, Some(T2_US));
+    }
+
+    /// pairtrade#300 Codex review round 12, P2: the drawdown halt must
+    /// not swallow the alert of the anomaly that caused it.
+    #[tokio::test]
+    async fn a_drawdown_halt_from_booked_pnl_still_alerts() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.session_start_equity = 1_000.0;
+        h.engine.state.peak_equity = 1_000.0;
+        h.engine.cfg.max_session_loss_bps = 50.0;
+        let mut saved = persisted_long(0.057, TODAY);
+        saved.realized_partial_pnl = -20.0;
+        h.engine.state.open_position = Some(saved);
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        // The halt reason is the drawdown (it engaged first), which is
+        // exactly why that transition has to announce itself.
+        let reason = h
+            .engine
+            .state
+            .session_halt_reason
+            .clone()
+            .unwrap_or_default();
+        assert!(reason.starts_with("session_dd_"), "unexpected: {reason}");
+        assert!(h.engine.state.session_halted);
     }
 
     /// pairtrade#300 Codex review round 11: coming back to a parked
