@@ -658,24 +658,29 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     #
     # An exit whose entry the stream does not hold: a rotation really closed
     # here and its loss is in none of the figures.
+    # What "the caller asked about" means, in one rule: a bound the caller
+    # supplied is used as given -- including the open side of a one-sided
+    # request, which really does extend past the events. Only when *no*
+    # bound is given at all is the question the window this report
+    # covers; clamping a missing endpoint to the stream in the one-sided
+    # case dropped requested attempts and published a definitive verdict
+    # anyway (PR #298 Codex review, rounds 1 and 2).
+    asked = report_window if since is None and until is None else (since, until)
     orphaned = sorted(swap.sequence for swap in orphan_exits
-                      if within(swap.at, *report_window))
+                      if within(swap.at, *asked))
     # And a ledger swap the caller asked about that the stream cannot price
     # at all -- a bound reaching past the events supplied. Naming it in
     # `ledger_swaps_outside_window` was never enough on its own: the swap is
     # inside the question, so the answer is missing a piece.
     #
-    # What "asked about" means is the *effective* window, not the explicit
-    # bounds. The execution ledger outlives each event export, so with no
-    # bounds given -- the documented invocation -- testing against
-    # `(None, None)` admitted every unmatched attempt the ledger has ever
-    # held, including probes from before the stream begins. A routine
-    # weekly report was therefore incomplete, and its stop verdict
-    # `undecidable`, over a swap outside the period it reports on. An
-    # explicit bound still reaches past the stream, because `report_window`
-    # is that bound when one is given.
+    # With no bounds given -- the documented invocation -- this is judged
+    # against the reported window: the execution ledger outlives each
+    # event export, so testing against `(None, None)` admitted every
+    # unmatched attempt the ledger has ever held, including probes from
+    # before the stream begins, and a routine weekly report came back
+    # `undecidable` over a swap outside the period it reports on.
     unpriceable = sorted(sequence for sequence, dispatched_at in out_of_window
-                         if within(dispatched_at, *report_window))
+                         if within(dispatched_at, *asked))
     complete = not orphaned and not unpriceable
     return {
         "schema_version": 1,

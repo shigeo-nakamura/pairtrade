@@ -594,6 +594,32 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertEqual(asked["coverage"]["requested_but_unpriceable"], [5])
         self.assertTrue(asked["stop_rule"]["undecidable"])
 
+    def test_a_one_sided_bound_stays_open_on_the_side_the_caller_left_open(self):
+        """`--since X` with no `--until` asks about everything after X.
+
+        Filling the missing endpoint from the stream clamps that open
+        side back to the last observation, so a reconciled attempt after
+        the export -- exactly what a mid-window run produces -- fell
+        outside the coverage check while the report still published
+        `complete` and a definitive stop verdict.
+        """
+        events, history = baseline_round_trip()
+        later = EXIT_AT + timedelta(days=1)
+        history.append(attempt(10, later, sell="QQQ", buy="SPY", sell_quantity="0.5",
+                               buy_quantity="0.4"))
+
+        open_ended = report_for(events, history, since=ENTRY_AT - timedelta(hours=1))
+        self.assertEqual(open_ended["coverage"]["requested_but_unpriceable"], [10])
+        self.assertFalse(open_ended["coverage"]["complete"])
+        self.assertTrue(open_ended["stop_rule"]["undecidable"])
+
+        # The mirror image: `--until` after the swap, open start.
+        old = attempt(5, ENTRY_AT - timedelta(days=30), sell="NVDA", buy="AMD",
+                      sell_quantity="0.1", buy_quantity="0.2")
+        open_start = report_for(events, [old] + history,
+                                until=later + timedelta(hours=1))
+        self.assertEqual(open_start["coverage"]["requested_but_unpriceable"], [5, 10])
+
     def test_the_reported_window_is_never_inverted(self):
         """`--since` after the last observation is now a supported case."""
         just_before_midnight = datetime(2026, 9, 4, 23, 59, 59, tzinfo=timezone.utc)
