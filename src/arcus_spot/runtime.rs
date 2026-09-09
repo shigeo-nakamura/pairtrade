@@ -400,6 +400,14 @@ struct PriceContext {
     token_b: ArcusSpotToken,
     token_a_price_usd: Decimal,
     token_b_price_usd: Decimal,
+    /// The earliest instant anything in this context describes: the
+    /// reference overview's own receipt time, or the start of the snapshot
+    /// collection that captured the token identities, whichever is older.
+    /// A consumer that needs "data from after T" must compare against this,
+    /// not against when the snapshot finished -- the overview is captured
+    /// separately and validated on its own `received_at`, and can predate
+    /// the collection that later wrapped it (Codex P1, pairtrade#309).
+    observed_at: DateTime<Utc>,
 }
 
 /// Which leg of `SnapshotContext::row` an exit executes, and therefore how
@@ -1036,8 +1044,7 @@ impl ArcusSpotRuntime {
         // re-anchors its risk baskets on; and before the z-score is read, so
         // a window that discards the signal history has already done it by
         // the time the score is taken from it.
-        let corporate_action =
-            self.corporate_action_gate(evaluation_time, snapshot.collection_finished_at, &price);
+        let corporate_action = self.corporate_action_gate(evaluation_time, &price);
         self.state.last_token_a_identity = Some(observed_token_a_identity);
         self.state.last_token_b_identity = Some(observed_token_b_identity);
         self.state.last_token_identity_at = Some(snapshot.collection_finished_at);
@@ -1395,6 +1402,7 @@ impl ArcusSpotRuntime {
             token_b,
             token_a_price_usd,
             token_b_price_usd,
+            observed_at: overview.received_at.min(snapshot.collection_started_at),
         })
     }
 
@@ -2778,7 +2786,6 @@ impl ArcusSpotRuntime {
     fn corporate_action_gate(
         &mut self,
         evaluation_time: DateTime<Utc>,
-        observed_at: DateTime<Utc>,
         price: &PriceContext,
     ) -> CorporateActionGate {
         // Cheapest possible path for the overwhelmingly common case: an
@@ -2873,6 +2880,21 @@ impl ArcusSpotRuntime {
                     progress.history_invalidated_at = Some(evaluation_time);
                 }
             }
+            // From the effective time the venue may already have repointed
+            // the ticker, and *every* action below -- the forced exit as much
+            // as the resume -- plans against the tracked pre-event state. An
+            // exit planned for the old contract's quantity but routed to the
+            // new address either sells the wrong instrument (if the wallet
+            // holds any of the replacement) or resubmits an impossible order
+            // every tick. So the identity check comes before the exit can be
+            // forced, not only before the resume (Codex P1, pairtrade#309).
+            if let Some(hold) = self.corporate_action_identity_drift(&event, price) {
+                return CorporateActionGate {
+                    block_entry: Some(hold),
+                    force_exit: false,
+                    suppress_history: true,
+                };
+            }
         }
 
         // The evaluation clock reaching `resume_not_before` is not enough.
@@ -2882,7 +2904,11 @@ impl ArcusSpotRuntime {
         // collected shortly before it and still inside `max_quote_age_secs`
         // describes exactly the interval the calendar declares
         // untrustworthy -- the same prints the discard at `effective_at`
-        // threw away (Codex P1, pairtrade#309).
+        // threw away. Judged on the earliest thing the context describes
+        // (the overview's own receipt, or the collection start that
+        // captured the identities), not on when the collection finished
+        // (Codex P1 x2, pairtrade#309).
+        let observed_at = price.observed_at;
         let observation_is_post_cutoff = observed_at >= event.resume_not_before;
         if evaluation_time < event.resume_not_before || !observation_is_post_cutoff {
             let hold = ArcusSpotHold::new(
@@ -2939,14 +2965,6 @@ impl ArcusSpotRuntime {
                     ),
                 )),
                 force_exit: true,
-                suppress_history: true,
-            };
-        }
-
-        if let Some(hold) = self.corporate_action_identity_drift(&event, price) {
-            return CorporateActionGate {
-                block_entry: Some(hold),
-                force_exit: false,
                 suppress_history: true,
             };
         }
@@ -6615,6 +6633,107 @@ mod tests {
             runtime.state.handled_corporate_action_ids,
             vec!["NVDA-2026-10-4FOR1".to_string()],
         );
+    }
+
+    #[test]
+    fn the_resume_cutoff_is_judged_by_the_price_observation_time() {
+        // The overview is captured separately from the snapshot that wraps
+        // it and validated on its own receipt time. A collection that
+        // finishes after `resume_not_before` can still carry an overview
+        // received before it -- and those are the prices the resume would
+        // re-anchor on.
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        let reconciled = ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        };
+        event.post_event_inventory = Some(reconciled);
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+
+        // Collected and evaluated at +13s (past the +12s cutoff); overview
+        // received at +11s.
+        let collected = anchor + Duration::seconds(13);
+        let held = runtime.step_at(
+            &snapshot_with_overview_received_at(collected, anchor + Duration::seconds(11)),
+            collected,
+        );
+        match held.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionBlock);
+                assert!(hold.detail.contains("before"), "{}", hold.detail);
+            }
+            other => panic!("expected the resume to wait, got {other:?}"),
+        }
+        assert!(runtime.state.handled_corporate_action_ids.is_empty());
+        assert_ne!(runtime.state.inventory, reconciled);
+
+        // The same collection with an overview from after the cutoff resumes.
+        let later = anchor + Duration::seconds(14);
+        runtime.step_at(&snapshot_with_overview_received_at(later, later), later);
+        assert_eq!(runtime.state.inventory, reconciled);
+    }
+
+    #[test]
+    fn a_repointed_token_is_not_force_exited() {
+        // Past `effective_at` the ticker may already name a different
+        // contract. A forced exit planned there uses the old contract's
+        // tracked quantity against the new address: it sells the wrong
+        // instrument if the wallet holds any of the replacement, or
+        // resubmits an impossible order every tick. Identity drift must hold
+        // before any exit is forced, not only before the resume.
+        let anchor = event_time();
+        let mut cfg = config();
+        // Window opens at +1s so the tick at `anchor` is a pre-event
+        // observation the guard can pin: reduce_exit at +3s, effective +5s.
+        let mut event = corporate_action_event(anchor + Duration::seconds(1));
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        });
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        seed_open_rotation(&mut runtime, anchor);
+        let inside = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .and_then(|p| p.pre_event_token_a.as_ref())
+            .is_some());
+
+        let effective = anchor + Duration::seconds(6);
+        let outcome = runtime.step_at(&snapshot_with_relisted_token_a(effective), effective);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected an unresolved hold instead of a forced exit, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
+
+        // Control: the same tick with the identity intact does force the exit.
+        let unwound = runtime.step_at(
+            &snapshot_with_valid_row(effective + Duration::seconds(1)),
+            effective + Duration::seconds(1),
+        );
+        match unwound.decision {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::CorporateActionExit)
+            }
+            other => panic!("expected the forced exit once the identity matches, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
     }
 
     #[test]
