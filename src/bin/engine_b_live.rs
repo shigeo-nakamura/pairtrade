@@ -979,14 +979,24 @@ struct PriceFeed {
 /// Convert a *mid-relative* price bound into the touch-relative
 /// `slippage_bps` that `create_order_taker_ioc` takes, so the resulting
 /// limit price is at most `bound_bps` from the mid (bot-strategy#918
-/// Codex P1).
+/// Codex review).
 ///
 /// The connector crosses the **touch** by `slippage_bps`, while the
 /// requirements doc (§6.3) states the bound against the *mid*. Those
 /// agree only on a tight book: on a 90/110 book, handing the connector
 /// the full 50 bps caps a buy near 110.55 -- 10.5% above the 100 mid,
 /// i.e. no bound at all in exactly the torn-book tail the bound exists
-/// for. Subtracting the half-spread restores the documented meaning.
+/// for.
+///
+/// The conversion is **multiplicative and side-aware**, not a
+/// subtraction. The connector applies its collar to the touch, so for a
+/// buy the adverse move against the mid is `(1+h)(1+s) - 1 = h + s +
+/// h*s`, not `h + s`; subtracting the half-spread in bps leaves the
+/// cross term. With `h` the half-spread and `b` the budget, both as
+/// fractions:
+///
+/// - buy:  `s = (1 + b) / (1 + h) - 1`
+/// - sell: `s = 1 - (1 - b) / (1 - h)`
 ///
 /// `None` means the half-spread alone already exceeds the budget, so no
 /// marketable price inside the bound exists. That is a refusal for an
@@ -996,7 +1006,18 @@ struct PriceFeed {
 /// Rounded **down** to a whole bp (the connector takes `u32`), so the
 /// conversion can only tighten, never widen -- the same direction as the
 /// connector's own inward tick rounding.
-fn mid_relative_slippage_bps(bound_bps: u32, best_bid: f64, best_ask: f64) -> Option<u32> {
+///
+/// Not modelled: the connector crosses by one tick *before* applying the
+/// collar, so the realised cap is up to one tick wider than `bound_bps`
+/// from the mid. On SNDK near 1700 with 2 price decimals that is
+/// 0.01/1700 ≈ 0.06 bps. Modelling it would need the market's
+/// `price_decimals`, which lives in the connector, not here.
+fn mid_relative_slippage_bps(
+    bound_bps: u32,
+    best_bid: f64,
+    best_ask: f64,
+    side: OrderSide,
+) -> Option<u32> {
     if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask < best_bid {
         return None;
     }
@@ -1004,18 +1025,25 @@ fn mid_relative_slippage_bps(bound_bps: u32, best_bid: f64, best_ask: f64) -> Op
     if mid <= 0.0 {
         return None;
     }
-    let half_spread_bps = (best_ask - best_bid) / 2.0 / mid * 10_000.0;
+    let budget = f64::from(bound_bps) / 10_000.0;
+    let half_spread = (best_ask - best_bid) / 2.0 / mid;
+    // `best_bid > 0` and `best_ask >= best_bid` bound `half_spread` to
+    // `[0, 1)`, so the sell denominator cannot be zero or negative.
+    let allowance = match side {
+        OrderSide::Long => (1.0 + budget) / (1.0 + half_spread) - 1.0,
+        OrderSide::Short => 1.0 - (1.0 - budget) / (1.0 - half_spread),
+    };
     // The nano-bp tolerance is for f64 representation error, not slack in
-    // the rule: `100.01 - 99.99` is 0.020000000000010232, which makes a
-    // 1.0 bp half-spread measure as 1.0000000000005 and would cost a
-    // whole basis point to the floor below.
-    let allowance = bound_bps as f64 - half_spread_bps + 1e-9;
-    if allowance < 1.0 {
+    // the rule: `100.01 - 99.99` is 0.020000000000010232, which would
+    // otherwise cost a whole basis point to the floor below.
+    let allowance_bps = allowance * 10_000.0 + 1e-9;
+    if allowance_bps < 1.0 {
         return None;
     }
-    // The connector accepts 1..=1000; `validate` already rejected a
-    // configured bound outside it and this only ever shrinks one.
-    Some(allowance.floor() as u32)
+    // `validate` already rejected a configured bound outside the
+    // connector's 1..=1000, and the conversion only ever shrinks one; the
+    // clamp is here so a future caller cannot smuggle a wider one through.
+    Some((allowance_bps.floor() as u32).min(1000))
 }
 
 impl PriceFeed {
@@ -1704,7 +1732,7 @@ impl EngineBLiveEngine {
     /// connector's cache -- both are fed by the same Lighter WS, and a
     /// small disagreement can only make the sent bound tighter than the
     /// mid-relative budget, never wider.
-    fn send_bound_bps(&self, reduce_only: bool) -> Result<u32> {
+    fn send_bound_bps(&self, side: OrderSide, reduce_only: bool) -> Result<u32> {
         let touch = self
             .feed
             .lock()
@@ -1734,7 +1762,7 @@ impl EngineBLiveEngine {
             );
             return Ok(self.cfg.slippage_bps);
         };
-        match mid_relative_slippage_bps(self.cfg.slippage_bps, best_bid, best_ask) {
+        match mid_relative_slippage_bps(self.cfg.slippage_bps, best_bid, best_ask, side) {
             Some(bps) => Ok(bps),
             None if reduce_only => {
                 // Crossing at the touch is the true cost of immediacy on
@@ -1760,7 +1788,7 @@ impl EngineBLiveEngine {
 
     async fn submit_order(&self, side: OrderSide, size: f64, reduce_only: bool) -> Result<Decimal> {
         let size_dec = Decimal::from_str(&format!("{size:.8}")).context("size to Decimal")?;
-        let bound_bps = self.send_bound_bps(reduce_only)?;
+        let bound_bps = self.send_bound_bps(side, reduce_only)?;
         if self.cfg.dry_run {
             log::info!(
                 "[DRY_RUN] would submit {side} size={size_dec} reduce_only={reduce_only} symbol={} \
@@ -5333,11 +5361,13 @@ mod tests {
         h.engine.day.eligibility_confirmed = true;
         h.set_now(T1_US + 1_000_000);
         h.engine.maybe_enter(T1_US + 1_000_000).await;
-        // The fixture book is mid +/- 10 bps, so 25 bps from the mid is
-        // 15 bps from the touch -- the half-spread is spent, not added.
+        // The fixture book is mid +/- 10 bps, so a 25 bps mid-relative
+        // budget leaves 14.985 bps against the ask, floored to 14. (The
+        // matching exit, a sell, gets 15: the multiplication that costs
+        // the buy side works for the sell side.)
         assert_eq!(
             h.connector.taker_ioc_bounds(),
-            vec![15],
+            vec![14],
             "the entry must cross as a marketable limit bounded against \
              the mid, not an unbounded protection-price IOC"
         );
@@ -5373,29 +5403,72 @@ mod tests {
         h.observe_at("SNDK", 1710.0, T2_US, 0);
         h.set_now(T2_US + 1_000_000);
         h.engine.maybe_exit(T2_US + 1_000_000).await;
+        // 15, not the entry's 14: this is the sell side of the same
+        // fixture book (see `an_entry_send_carries_the_configured_price_bound`).
         assert_eq!(h.connector.taker_ioc_bounds(), vec![15]);
         let orders = h.connector.orders.lock().unwrap();
         assert!(orders[0].3, "and it is still the reduce-only close");
     }
 
     #[test]
-    fn a_touch_relative_bound_is_the_mid_relative_one_minus_the_half_spread() {
-        // Tight book: the half-spread is ~1 bp, so nearly the whole
-        // budget survives.
-        assert_eq!(mid_relative_slippage_bps(50, 99.99, 100.01), Some(49));
+    fn the_touch_relative_bound_is_the_mid_relative_one_net_of_the_half_spread() {
+        use OrderSide::{Long, Short};
+        // Tight book (1 bp half-spread): nearly the whole budget
+        // survives. Long lands at 48.9951 bps and short at 49.0049 --
+        // the sell side gains from the same multiplication the buy side
+        // loses to, which is why the conversion is side-aware.
+        assert_eq!(mid_relative_slippage_bps(50, 99.99, 100.01, Long), Some(48));
+        assert_eq!(
+            mid_relative_slippage_bps(50, 99.99, 100.01, Short),
+            Some(49)
+        );
         // Codex's case: a 90/110 book. Handing the connector 50 bps would
         // cap a buy near 110.55 -- 10.5% above the 100 mid.
-        assert_eq!(mid_relative_slippage_bps(50, 90.0, 110.0), None);
-        // Near the boundary: 48 bps of half-spread leaves 2, and a
+        assert_eq!(mid_relative_slippage_bps(50, 90.0, 110.0, Long), None);
+        assert_eq!(mid_relative_slippage_bps(50, 90.0, 110.0, Short), None);
+        // Near the boundary: 48 bps of half-spread leaves ~2, and a
         // half-spread that eats the whole budget leaves nothing. Both
         // sides are checked because the f64 tolerance in the helper must
         // not turn "no bound left" into a 1 bp send.
-        assert_eq!(mid_relative_slippage_bps(50, 99.52, 100.48), Some(2));
-        assert_eq!(mid_relative_slippage_bps(50, 99.5, 100.5), None);
+        assert_eq!(mid_relative_slippage_bps(50, 99.52, 100.48, Long), Some(1));
+        assert_eq!(mid_relative_slippage_bps(50, 99.52, 100.48, Short), Some(2));
+        assert_eq!(mid_relative_slippage_bps(50, 99.5, 100.5, Long), None);
+        assert_eq!(mid_relative_slippage_bps(50, 99.5, 100.5, Short), None);
         // Nonsense books are refusals, not silent full-budget sends.
-        assert_eq!(mid_relative_slippage_bps(50, 101.0, 100.0), None, "crossed");
-        assert_eq!(mid_relative_slippage_bps(50, 0.0, 100.0), None, "no bid");
-        assert_eq!(mid_relative_slippage_bps(50, f64::NAN, 100.0), None);
+        assert_eq!(
+            mid_relative_slippage_bps(50, 101.0, 100.0, Long),
+            None,
+            "crossed"
+        );
+        assert_eq!(
+            mid_relative_slippage_bps(50, 0.0, 100.0, Long),
+            None,
+            "no bid"
+        );
+        assert_eq!(mid_relative_slippage_bps(50, f64::NAN, 100.0, Long), None);
+    }
+
+    #[test]
+    fn the_conversion_is_multiplicative_not_a_subtraction() {
+        // Codex's second case, and the reason this is not `bound -
+        // half_spread`: on a 1695.75/1704.25 book with a 50 bps budget,
+        // the half-spread is 25 bps, so a subtraction says 25. But the
+        // connector multiplies its collar onto the ask, and
+        // 1704.25 * 1.0025 = 1708.510625 is above the 1708.50 that 50 bps
+        // from the 1700 mid allows -- the `h * s` cross term. The exact
+        // ratio gives 24.9377 bps, which floors to 24.
+        assert_eq!(
+            mid_relative_slippage_bps(50, 1695.75, 1704.25, OrderSide::Long),
+            Some(24)
+        );
+        let mid = 1700.0_f64;
+        let sent =
+            f64::from(mid_relative_slippage_bps(50, 1695.75, 1704.25, OrderSide::Long).unwrap());
+        let realised_cap = 1704.25 * (1.0 + sent / 10_000.0);
+        assert!(
+            realised_cap <= mid * (1.0 + 50.0 / 10_000.0),
+            "realised cap {realised_cap} must stay inside the advertised bound"
+        );
     }
 
     #[tokio::test]
@@ -5455,11 +5528,11 @@ mod tests {
             },
         );
         assert!(
-            h.engine.send_bound_bps(false).is_err(),
+            h.engine.send_bound_bps(OrderSide::Long, false).is_err(),
             "an entry has no price inside the bound"
         );
         assert_eq!(
-            h.engine.send_bound_bps(true).unwrap(),
+            h.engine.send_bound_bps(OrderSide::Short, true).unwrap(),
             1,
             "the exit crosses at the touch rather than stranding the position"
         );
@@ -5468,9 +5541,9 @@ mod tests {
     #[test]
     fn an_unobserved_book_refuses_an_entry_and_still_permits_an_exit() {
         let h = harness();
-        assert!(h.engine.send_bound_bps(false).is_err());
+        assert!(h.engine.send_bound_bps(OrderSide::Long, false).is_err());
         assert_eq!(
-            h.engine.send_bound_bps(true).unwrap(),
+            h.engine.send_bound_bps(OrderSide::Short, true).unwrap(),
             h.engine.cfg.slippage_bps,
             "with no book of our own the connector's touch is the only bound left"
         );
