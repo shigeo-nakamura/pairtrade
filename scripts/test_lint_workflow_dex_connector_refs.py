@@ -103,6 +103,18 @@ class LintTestCase(unittest.TestCase):
     def write(self, name: str, body: str) -> None:
         (self.workflows / name).write_text(textwrap.dedent(body))
 
+    def variant(self, body: str, *replacements: tuple[str, str]) -> str:
+        """Apply fixture edits, failing loudly if one no longer matches.
+
+        A `str.replace` that matches nothing returns the fixture unchanged,
+        which would leave a mutation test asserting on the *valid* wiring and
+        passing for the wrong reason.
+        """
+        for old, new in replacements:
+            self.assertIn(old, body, "fixture changed — update this mutation")
+            body = body.replace(old, new, 1)
+        return body
+
     def run_lint(self):
         return lint_workflows(self.workflows)
 
@@ -144,17 +156,17 @@ class ValidWiring(LintTestCase):
 
 class StaticPins(LintTestCase):
     def test_a_literal_env_pin_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}",
-            "DEX_CONNECTOR_REF: v4.7.20",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}",
+            "DEX_CONNECTOR_REF: v4.7.20"),
         ))
         self.assertFlags("caller.yml", "pins DEX_CONNECTOR_REF")
 
     def test_a_workflow_level_literal_pin_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "jobs:\n",
-            "env:\n  DEX_CONNECTOR_REF: v4.7.20\njobs:\n",
-            1,
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("jobs:\n", "env:\n  DEX_CONNECTOR_REF: v4.7.20\njobs:\n"),
         ))
         self.assertFlags("caller.yml", "pins DEX_CONNECTOR_REF")
 
@@ -163,52 +175,96 @@ class CallerWiring(LintTestCase):
     """Codex round 2, pairtrade#314: `.outputs.ref` from *any* job used to pass."""
 
     def test_a_literal_tag_passed_to_the_reusable_workflow_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}",
-            "      dex-connector-ref: v4.7.20",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}",
+            "      dex-connector-ref: v4.7.20"),
         ))
         self.assertFlags("caller.yml", "not a resolver-derived expression")
 
     def test_an_output_named_ref_from_an_unrelated_job_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "  test-arcus-spot-live:\n    needs: resolve-ref",
-            "  test-arcus-spot-live:\n    needs: [resolve-ref, build]",
-        ).replace(
-            "      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}",
-            "      dex-connector-ref: ${{ needs.build.outputs.ref }}",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("  test-arcus-spot-live:\n    needs: resolve-ref",
+            "  test-arcus-spot-live:\n    needs: [resolve-ref, build]"), ("      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}",
+            "      dex-connector-ref: ${{ needs.build.outputs.ref }}"),
         ))
         self.assertFlags("caller.yml", "does not call")
 
     def test_a_resolver_output_the_job_does_not_depend_on_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "  test-arcus-spot-live:\n    needs: resolve-ref\n",
-            "  test-arcus-spot-live:\n",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("  test-arcus-spot-live:\n    needs: resolve-ref\n",
+            "  test-arcus-spot-live:\n"),
         ))
         self.assertFlags("caller.yml", "without listing it in `needs`")
 
     def test_omitting_the_input_entirely_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "    with:\n      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}\n",
-            "",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("    with:\n      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}\n",
+            ""),
         ))
         self.assertFlags("caller.yml", "(missing)")
 
     def test_naming_the_resolver_only_in_a_comment_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml",
             "  # uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n"
-            "  resolve-ref:\n    uses: ./.github/workflows/_other.yml",
+            "  resolve-ref:\n    uses: ./.github/workflows/_other.yml"),
         ))
         self.assertFlags("caller.yml", "does not call")
+
+
+class OutputAndScopePrecedence(LintTestCase):
+    """Codex round 3, pairtrade#314: the output name and env precedence are wiring too."""
+
+    def test_a_resolver_job_output_with_the_wrong_name_is_rejected(self) -> None:
+        # `needs.resolve-ref.outputs.tag` evaluates to the empty string, which
+        # leaves the checkout on its default ref.
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}",
+            "      dex-connector-ref: ${{ needs.resolve-ref.outputs.tag }}"),
+        ))
+        self.assertFlags("caller.yml", "the resolver's only output is `ref`")
+
+    def test_a_step_level_env_override_is_rejected(self) -> None:
+        # GitHub gives the step's own env precedence over the job's, so a
+        # shadowing value is what the checkout actually uses -- and `main` is
+        # not a literal the static-pin check would catch.
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("      - uses: actions/checkout@v5\n        with:\n"
+            "          repository: shigeo-nakamura/dex-connector\n",
+            "      - uses: actions/checkout@v5\n        env:\n"
+            "          DEX_CONNECTOR_REF: main\n        with:\n"
+            "          repository: shigeo-nakamura/dex-connector\n"),
+        ))
+        self.assertFlags("caller.yml", "not a resolver-derived expression")
+
+    def test_a_step_level_env_from_the_resolver_is_accepted(self) -> None:
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("    env:\n      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}\n",
+            ""), ("      - uses: actions/checkout@v5\n        with:\n"
+            "          repository: shigeo-nakamura/dex-connector\n",
+            "      - uses: actions/checkout@v5\n        env:\n"
+            "          DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}\n"
+            "        with:\n          repository: shigeo-nakamura/dex-connector\n"),
+        ))
+        self.assertClean()
 
 
 class CheckoutWiring(LintTestCase):
     """Codex round 2, pairtrade#314: the ref match must belong to *this* checkout."""
 
     def test_a_reusable_workflow_checking_out_a_literal_is_rejected(self) -> None:
-        self.write("_test-arcus-spot-live.yml", REUSABLE_TEST_WORKFLOW.replace(
-            "          ref: ${{ inputs.dex-connector-ref }}",
-            "          ref: v4.7.22",
+        self.write("_test-arcus-spot-live.yml", self.variant(
+            REUSABLE_TEST_WORKFLOW,
+            ("          ref: ${{ inputs.dex-connector-ref }}",
+            "          ref: v4.7.22"),
         ))
         self.assertFlags("_test-arcus-spot-live.yml", "not a resolver-derived expression")
 
@@ -216,35 +272,37 @@ class CheckoutWiring(LintTestCase):
         # The exact shape a file-wide fixed-string grep could not see: the
         # dex-connector checkout moves to a literal while the interpolation
         # stays behind on an unrelated checkout step.
-        self.write("_test-arcus-spot-live.yml", REUSABLE_TEST_WORKFLOW.replace(
-            "      - uses: actions/checkout@v5\n        with:\n          path: debot\n",
+        self.write("_test-arcus-spot-live.yml", self.variant(
+            REUSABLE_TEST_WORKFLOW,
+            ("      - uses: actions/checkout@v5\n        with:\n          path: debot\n",
             "      - uses: actions/checkout@v5\n        with:\n"
             "          repository: shigeo-nakamura/pairtrade\n"
-            "          ref: ${{ inputs.dex-connector-ref }}\n          path: debot\n",
-        ).replace(
-            "          ref: ${{ inputs.dex-connector-ref }}\n          path: dex-connector",
-            "          ref: v4.7.22\n          path: dex-connector",
+            "          ref: ${{ inputs.dex-connector-ref }}\n          path: debot\n"), ("          ref: ${{ inputs.dex-connector-ref }}\n          path: dex-connector",
+            "          ref: v4.7.22\n          path: dex-connector"),
         ))
         self.assertFlags("_test-arcus-spot-live.yml", "not a resolver-derived expression")
 
     def test_a_checkout_reading_an_env_var_defined_from_an_unrelated_job_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}",
-            "      DEX_CONNECTOR_REF: ${{ needs.other.outputs.ref }}",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}",
+            "      DEX_CONNECTOR_REF: ${{ needs.other.outputs.ref }}"),
         ))
         self.assertFlags("caller.yml", "which is not a job here")
 
     def test_a_checkout_reading_an_undefined_env_var_is_rejected(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "    env:\n      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}\n",
-            "",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("    env:\n      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}\n",
+            ""),
         ))
         self.assertFlags("caller.yml", "not defined for this job")
 
     def test_a_non_reusable_workflow_may_not_read_a_workflow_call_input(self) -> None:
-        self.write("caller.yml", CALLER_WORKFLOW.replace(
-            "          ref: ${{ env.DEX_CONNECTOR_REF }}",
-            "          ref: ${{ inputs.dex-connector-ref }}",
+        self.write("caller.yml", self.variant(
+            CALLER_WORKFLOW,
+            ("          ref: ${{ env.DEX_CONNECTOR_REF }}",
+            "          ref: ${{ inputs.dex-connector-ref }}"),
         ))
         self.assertFlags("caller.yml", "does not declare")
 

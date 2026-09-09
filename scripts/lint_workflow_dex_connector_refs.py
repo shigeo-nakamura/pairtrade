@@ -36,6 +36,10 @@ import yaml
 
 DEX_CONNECTOR_REPO = "shigeo-nakamura/dex-connector"
 RESOLVER = "./.github/workflows/_resolve-dex-connector-ref.yml"
+# The resolver publishes exactly one output. Naming any other one yields an
+# empty string, which would leave the checkout on its default ref -- so the
+# output name is part of the wiring, not decoration (Codex, pairtrade#314).
+RESOLVER_OUTPUT = "ref"
 
 NEEDS_OUTPUT_RE = re.compile(
     r"^\$\{\{\s*needs\.(?P<job>[A-Za-z0-9_-]+)\.outputs\.(?P<output>[A-Za-z0-9_-]+)\s*\}\}$"
@@ -132,12 +136,21 @@ def _describe(expression: object) -> str:
     return "(missing)" if expression is None else repr(expression)
 
 
+def _lookup_env(name: str, workflow: dict, job: dict, step: dict | None) -> object:
+    """Read `name` with GitHub's precedence: step, then job, then workflow."""
+    for scope in (step, job, workflow):
+        if scope is not None and name in _env(scope):
+            return _env(scope)[name]
+    return None
+
+
 def _resolve_ref_source(
     expression: object,
     workflow: dict,
     job_name: str,
     job: dict,
     seen_env: set[str],
+    step: dict | None = None,
 ) -> tuple[str, str]:
     """Classify where a checkout's `ref:` value comes from.
 
@@ -167,14 +180,17 @@ def _resolve_ref_source(
         name = match.group("name")
         if name in seen_env:
             return "bad", f"env `{name}` resolves to itself"
-        value = _env(job).get(name, _env(workflow).get(name))
+        value = _lookup_env(name, workflow, job, step)
         if value is None:
             return "bad", f"ref uses env `{name}`, which is not defined for this job"
-        return _resolve_ref_source(value, workflow, job_name, job, seen_env | {name})
+        return _resolve_ref_source(
+            value, workflow, job_name, job, seen_env | {name}, step
+        )
 
     match = NEEDS_OUTPUT_RE.match(expression)
     if match:
         producer_name = match.group("job")
+        output_name = match.group("output")
         producer = _jobs(workflow).get(producer_name)
         if not isinstance(producer, dict):
             return "bad", f"ref comes from `needs.{producer_name}`, which is not a job here"
@@ -182,6 +198,12 @@ def _resolve_ref_source(
             return (
                 "bad",
                 f"ref comes from job `{producer_name}`, which does not call {RESOLVER}",
+            )
+        if output_name != RESOLVER_OUTPUT:
+            return (
+                "bad",
+                f"ref reads `needs.{producer_name}.outputs.{output_name}`, but the "
+                f"resolver's only output is `{RESOLVER_OUTPUT}`",
             )
         if producer_name not in _needs(job):
             return (
@@ -226,7 +248,7 @@ def _check_checkouts(path: Path, workflow: dict, findings: Findings) -> None:
             if str(with_block.get("repository", "")).strip() != DEX_CONNECTOR_REPO:
                 continue
             kind, detail = _resolve_ref_source(
-                with_block.get("ref"), workflow, job_name, job, set()
+                with_block.get("ref"), workflow, job_name, job, set(), step
             )
             where = f"job `{job_name}` step {index}"
             if kind == "resolver":
