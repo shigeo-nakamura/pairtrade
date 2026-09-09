@@ -246,6 +246,16 @@ class QualityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'do not fall on the session date'):
             self.report()
 
+    def test_the_whole_calendar_is_validated_not_just_the_range(self):
+        # A malformed session the requested range never visits. The
+        # collector validates every entry and refuses the file as a unit, so
+        # this is still a calendar it would not load.
+        calendar = json.loads(self.calendar.read_text())
+        calendar['sessions']['2026-12-24'] = {'krx_is_open': 'yes', 'us_is_open': False}
+        self.calendar.write_text(json.dumps(calendar))
+        with self.assertRaisesRegex(ValueError, '2026-12-24: krx_is_open/us_is_open must be booleans'):
+            self.report()
+
     def test_open_connections_are_bounded(self):
         # A full 2026-2027 range touches ~1,900 hourly partitions; one open
         # connection each exhausts RLIMIT_NOFILE and the analysis fails on

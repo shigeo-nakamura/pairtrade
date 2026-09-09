@@ -326,6 +326,14 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
         raise ValueError("start must not exceed end")
     calendar_bytes = calendar_path.read_bytes()
     calendar = json.loads(calendar_bytes)
+    # The whole calendar, before the range is applied: TradingCalendar.load
+    # validates every entry in `sessions` and refuses the file as a unit, so
+    # one malformed session outside --start/--end is still a calendar the
+    # collector would not load -- and the invariant is that such a calendar
+    # never produces a report, not that the days this run reads are clean
+    # (Codex, PR #311).
+    for session_day, session in calendar["sessions"].items():
+        validate_session(session_day, session)
     dataset = Dataset(root)
     days = []
     try:
@@ -333,7 +341,6 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
         while day <= last:
             session = calendar["sessions"][day.isoformat()]
             row = {"date": day.isoformat(), "g0_2": "not_evaluated"}
-            validate_session(day, session)
             if not (session["krx_is_open"] and session["us_is_open"]):
                 row["status"] = "market_closed"
             else:
