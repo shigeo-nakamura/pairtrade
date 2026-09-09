@@ -17,6 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Run subsidy KPI ledger tests
+        run: python3 scripts/test_subsidy_ledger.py
       - name: Install Engine B Phase 0 test dependency
         run: python3 -m pip install -r scripts/engine_b_phase0_requirements.txt
       - name: Run Engine B Phase 0 observer tests
