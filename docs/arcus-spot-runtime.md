@@ -349,24 +349,48 @@ runtime:
 |---|---|---|---|
 | `entry_block_at` | blocked (`corporate_action_block`) | held; mean-reversion and max-hold exits still fire | still accumulating |
 | `reduce_exit_at` | blocked | **forced unwind** (`corporate_action_exit`) | still accumulating |
-| `effective_at` | blocked | forced unwind continues | discarded **once**; nothing accumulates |
+| `effective_at` | blocked | **no exit of any kind** -- holds `corporate_action_unresolved`; operator reconciles | discarded **once**; nothing accumulates |
 | `resume_not_before` | blocked until the resume completes | must be flat | empty; warm-up gates the first new entry |
 
-Exits are never blocked by a window. A guard that could trap an open position
-through the event it exists to protect against would be worse than no guard.
-A forced exit clears **every** ordinary gate -- quote freshness, venue, cost,
-token floor, gas, signing, reconciliation. If it cannot be quoted it holds
-(`route_unavailable`, etc.) and the position stays open; it never bypasses a
-gate and never pretends to have closed.
+Before `effective_at`, exits are never blocked by a window: a guard that could
+trap an open position through the event it exists to protect against would be
+worse than no guard. The forced exit in the reduce phase clears **every**
+ordinary gate -- quote freshness, venue, cost, token floor, gas, signing,
+reconciliation. If it cannot be quoted it holds (`route_unavailable`, etc.)
+and the position stays open; it never bypasses a gate and never pretends to
+have closed.
+
+**From `effective_at` the opposite holds: the runtime submits no exit at
+all** -- not the forced one, not max-hold, not mean-reversion. The venue is
+quoting the post-event instrument while `rotated_quantity` is still in
+pre-event units, so any exit sized from it is wrong in a direction that
+depends on the event: after a 4-for-1 split it sells one old unit as one new
+unit and marks the rotation flat with three split-adjusted units still held;
+after a reverse split it submits an unfillable oversized order every tick. A
+rotation still open at `effective_at` therefore holds
+`corporate_action_unresolved` and stays there. **Do not wait for an exit that
+will not come**; see "Reconciling an open rotation" below.
 
 ### Completing the resume
 
 At `resume_not_before` the runtime resumes only when all three hold:
 
-1. **Flat.** A rotation still open means the forced exit has not completed;
-   the runtime stays in that phase, still forcing the exit each tick, until
-   it is. `post_event_inventory` describes a wallet, and adopting it over an
-   open position would overwrite the holding `rotated_quantity` refers to.
+1. **Flat.** A rotation still open at `effective_at` is not unwound by the
+   runtime (see above); it holds `corporate_action_unresolved` until the
+   operator has reconciled both the position and the runtime state.
+   `post_event_inventory` describes a wallet, and adopting it over an open
+   position would overwrite the holding `rotated_quantity` refers to.
+
+   **Reconciling an open rotation.** The runtime has no command that
+   flattens *tracked* rotation state, so this is a two-step operator action:
+   (a) close the position on the venue by hand, in post-event units, and
+   record the fill in the execution ledger's terms; (b) restore the runtime
+   checkpoint to a backup taken before the rotation opened (or correct
+   `regime`/`rotated_quantity`/`last_rotation_at` to flat under
+   `state-verify-continuity`), then install the config with
+   `post_event_inventory` set to the wallet as read *after* (a). The next
+   tick at or after `resume_not_before` resumes normally. Never edit the
+   checkpoint to flat while the venue position is still open.
 2. **Unchanged token identity.** Each affected symbol's contract address and
    decimals are compared against what they were on the last observation
    *before* the window opened. A mismatch holds on
@@ -416,7 +440,12 @@ accumulate first. There is no second counter that could disagree with it.
 4. **Watch the window open.** The hold code becomes `corporate_action_block`.
    If a rotation is open, confirm it unwinds at `reduce_exit_at`
    (`corporate_action_exit` in the ledger); if the venue cannot quote it,
-   that is the ordinary hold code and the position stays open.
+   that is the ordinary hold code and the position stays open. **The reduce
+   phase is the only time the runtime will exit** -- if it is still open
+   when `effective_at` arrives, the hold becomes
+   `corporate_action_unresolved` and the position is yours to reconcile
+   (step 1 under "Completing the resume"). Size `reduce_exit_at` with a
+   realistic margin for the venue not quoting.
 5. **After `effective_at`, read the wallet.** Use the same `eth_call
    balanceOf` path the cut-over used (`chain.rpc_urls[0]`), for both tokens,
    and put the raw human quantities in `post_event_inventory`.
