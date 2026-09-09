@@ -188,9 +188,16 @@ def quantity_moved(record: dict) -> bool:
         if value is None:
             continue
         try:
-            return abs(float(value)) > 0
+            quantity = abs(float(value))
         except (TypeError, ValueError):
             return True
+        # A non-finite quantity is not "no movement": read as zero it
+        # leaves an unvalued fill counted as nothing at all, so the day's
+        # denominator looks complete while this fill's volume is unknown
+        # (Codex, PR #297).
+        if not math.isfinite(quantity):
+            return True
+        return quantity > 0
     return True
 
 
@@ -436,10 +443,13 @@ def funding_ticks_seen(record: dict) -> bool:
     if ticks is None:
         return False
     try:
-        return float(ticks) > 0
+        count = float(ticks)
     except (TypeError, ValueError):
         # An unreadable tick count is not evidence of zero either.
         return True
+    if not math.isfinite(count):
+        return True
+    return count > 0
 
 
 def spans_a_funding_interval(record: dict) -> bool:
@@ -462,6 +472,8 @@ def spans_a_funding_interval(record: dict) -> bool:
         hold_secs = float(hold)
     except (TypeError, ValueError):
         return True
+    if not math.isfinite(hold_secs):
+        return True
     if hold_secs >= FUNDING_INTERVAL_SECS:
         return True
     close = record.get("ts")
@@ -470,6 +482,8 @@ def spans_a_funding_interval(record: dict) -> bool:
     try:
         close_secs = float(close)
     except (TypeError, ValueError):
+        return True
+    if not math.isfinite(close_secs):
         return True
     if hold_secs < 0:
         return True

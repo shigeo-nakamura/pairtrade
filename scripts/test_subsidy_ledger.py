@@ -20,6 +20,7 @@ from subsidy_ledger import (  # noqa: E402
     load_execution,
     load_pnl,
     load_points,
+    spans_a_funding_interval,
     expand,
     render_table,
     summarize,
@@ -818,6 +819,46 @@ def test_a_non_finite_slippage_diagnostic_is_not_carried_into_the_output():
         row = build_rows({("2026-09-08", "freq"): day}, {})[0]
         assert json.dumps(row.as_json()) == json.dumps(row.as_json())
         assert "NaN" not in json.dumps(row.as_json())
+
+
+def test_a_non_finite_number_never_reads_as_absence_of_movement():
+    """Every remaining `float()` comparison, swept in one pass.
+
+    A NaN compares false against everything, so each of these read as
+    "nothing happened": no quantity moved, no funding ticks, a hold
+    inside the hour. All three leave a day looking complete on an input
+    that is unknown.
+    """
+    # 1. A fill with no value and a NaN quantity is movement, not stillness.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [{"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+              "filled_qty": "NaN"}],
+        )
+        day = load_execution([path])[("2026-09-08", "freq")]
+        assert day.fills_without_value == 1, "unknown movement is a gap, not a zero"
+
+    # 2. A NaN tick count is not "no ticks observed".
+    inside_the_hour = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 600, "funding_ticks_observed": "NaN"}],
+        )
+        pnl_day = load_pnl([path])[("2026-09-08", "freq")]
+        assert pnl_day.incomplete
+        assert pnl_day.incomplete_reasons == {"funding_gap"}
+
+    # 3. A NaN hold or close is not a hold inside one funding hour.
+    # (This one already came out right by NaN propagation through the
+    # boundary comparison; the explicit guard is there so the behaviour
+    # does not depend on that, and this asserts the behaviour itself.)
+    assert spans_a_funding_interval(
+        {"hold_secs": "NaN", "ts": inside_the_hour})
+    assert spans_a_funding_interval(
+        {"hold_secs": 600, "ts": "NaN"})
 
 
 def main() -> int:
