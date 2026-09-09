@@ -506,10 +506,18 @@ impl ArcusSpotRuntimeCheckpointStore {
                     handled_corporate_action_record(&resolved, stored),
                     Some(HandledMatch::Same)
                 )
-                && !config
-                    .corporate_actions
-                    .iter()
-                    .any(|event| event.fingerprint() == stored.fingerprint())
+                // Still declared if *either* half of its identity is there:
+                // a rename keeps the fingerprint, an amendment keeps the id.
+                // Matching on the fingerprint alone made rescheduling an
+                // open window read as removal and hard-fail the load, which
+                // takes live-tick, state-backup, state-verify-continuity and
+                // reset-window down with it -- while the runtime's own gate
+                // already refuses an amended open window with a recoverable
+                // hold (independent review, pairtrade#309).
+                && !config.corporate_actions.iter().any(|event| {
+                    event.fingerprint() == stored.fingerprint()
+                        || event.event_id.eq_ignore_ascii_case(&stored.event_id)
+                })
         }) {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config declaring corporate \
@@ -883,6 +891,15 @@ mod tests {
         let mut renamed = declared.clone();
         renamed.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
         assert!(store.load_existing_at(&renamed, inside).is_ok());
+
+        // Nor is amending it: the id is still there. The runtime's own gate
+        // refuses an amended open window with a recoverable hold; failing
+        // the load instead would take state-backup, state-verify-continuity
+        // and reset-window down with it.
+        let mut amended = declared.clone();
+        amended.corporate_actions[0].effective_at += chrono::Duration::hours(1);
+        amended.corporate_actions[0].resume_not_before += chrono::Duration::hours(1);
+        assert!(store.load_existing_at(&amended, inside).is_ok());
 
         // Downtime does not make a window un-live: the watermark stays before
         // `entry_block_at` while the clock moves past it.

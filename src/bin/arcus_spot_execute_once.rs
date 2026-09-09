@@ -3852,6 +3852,19 @@ fn corporate_action_continuity(
              restart/rollback"
         );
     }
+    // Raw slicing below: a checkpoint whose fingerprint vector is shorter
+    // than its id vector is exactly the adversarially-shaped state this
+    // function exists to reject, so say so rather than panicking on the
+    // index (independent review, pairtrade#309).
+    if current.handled_corporate_action_fingerprints.len() < fingerprints_before
+        || current.handled_corporate_action_fingerprints.len()
+            != current.handled_corporate_action_ids.len()
+    {
+        bail!(
+            "Arcus runtime lost or reordered its handled corporate-action fingerprints across \
+             restart/rollback"
+        );
+    }
     let resumed =
         &current.handled_corporate_action_ids[baseline.handled_corporate_action_ids.len()..];
     let resumed_fingerprints =
@@ -5610,7 +5623,13 @@ async fn main() -> Result<()> {
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = match executor
                 .execute_plan_once(&plan, &plan_config_digest, &|at| {
-                    runtime.validate_plan_consistent_with_state(&plan, at)
+                    // The re-read instance, like the pre-dispatch check
+                    // above: the guard exists to judge the submission seam
+                    // against current state, and closing over the
+                    // pre-lock `runtime` silently defeats that for anything
+                    // added to the validator later (independent review,
+                    // pairtrade#309).
+                    fresh_runtime.validate_plan_consistent_with_state(&plan, at)
                 })
                 .await
             {
@@ -10783,15 +10802,14 @@ runtime:
     #[test]
     fn a_resume_must_record_the_declared_events_fingerprint() {
         let config = config_with_corporate_action(Some(("4", "1")));
+        // A fingerprint vector shorter than the id vector is a malformed
+        // record, caught by the length guard before anything slices it.
         let (baseline, mut current) = resume_pair();
         current.handled_corporate_action_fingerprints.clear();
         let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("without recording the fingerprint"),
-            "{error}"
-        );
+        assert!(error.contains("lost or reordered"), "{error}");
 
         // And it must be *this* event's: a fingerprint of some other
         // declaration does not make the rename guard's record.
