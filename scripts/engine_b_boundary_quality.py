@@ -4,7 +4,7 @@
 import argparse
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -320,7 +320,12 @@ def boundary(dataset, at_us, symbols, max_age_us, window_us):
             try:
                 levels = db.execute("SELECT side,level,price,size FROM book_level WHERE book_event_id=? ORDER BY side,level", (event["book_event_id"],))
                 selected.update(book_metrics(levels))
-            except (ValueError, InvalidOperation, TypeError) as exc:
+            # ArithmeticError covers every decimal signal -- Overflow as much
+            # as InvalidOperation. The collector's canonical_decimal() stores
+            # any finite value, and an extreme finite price or size overflows
+            # the context in the mid/spread/depth arithmetic; that is a bad
+            # book to report, not a traceback to die with (Codex, PR #311).
+            except (ValueError, ArithmeticError, TypeError) as exc:
                 reasons.append(f"invalid_book: {exc}")
             row["selected"] = selected
         row["reasons"] = sorted(set(reasons))

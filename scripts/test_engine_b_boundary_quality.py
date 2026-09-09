@@ -155,6 +155,13 @@ class QualityTests(unittest.TestCase):
         self.assertIn('missing_sequence', reasons)
         self.assertTrue(any(r.startswith('invalid_book:') for r in reasons))
 
+    def test_extreme_finite_book_values_are_an_invalid_book_not_a_crash(self):
+        # Finite, and accepted by the collector's canonical_decimal(), but
+        # far past what the arithmetic can hold: mid/spread/depth overflow.
+        self.sql(T0-SECOND, "UPDATE book_level SET price='9e999999', size='9e999999' WHERE side='ask' AND level=0")
+        reasons = self.cell(self.report())['reasons']
+        self.assertTrue(any(r.startswith('invalid_book:') for r in reasons), reasons)
+
     def test_wrong_market_id_is_not_accepted_by_symbol(self):
         self.sql(T0-SECOND, 'UPDATE book_event SET market_id=999')
         self.assertIn('unverified_event_market', self.cell(self.report())['reasons'])
