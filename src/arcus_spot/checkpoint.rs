@@ -7,8 +7,12 @@
 //! atomic-write and validated-restore logic rather than two independently
 //! maintained copies of it.
 
-use super::{ArcusSpotRegime, ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeState};
+use super::{
+    ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+};
 use anyhow::{bail, Context, Result};
+use dex_connector::ArcusSpotPair;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,6 +30,29 @@ struct ArcusSpotRuntimeCheckpoint {
     schema_version: u32,
     config: ArcusSpotRuntimeConfig,
     state: ArcusSpotRuntimeState,
+}
+
+/// What a checkpoint says about itself, read without comparing it against
+/// any config (see `peek_summary`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArcusSpotCheckpointSummary {
+    /// The pair and mode the stored state was accumulated under -- the two
+    /// state-invalidating fields an operator inspecting a checkpoint before
+    /// resetting it actually needs to see, since the checkpoint's own copy
+    /// of the config is otherwise private to this module.
+    pub pair: ArcusSpotPair,
+    pub mode: ArcusSpotRuntimeMode,
+    pub sequence: u64,
+    pub regime: ArcusSpotRegime,
+    pub rotated_quantity: Option<Decimal>,
+    pub risk_halt: Option<ArcusSpotRiskHalt>,
+    pub relative_log_price_samples: usize,
+    /// What the bot is actually holding, as reconciled fills left it --
+    /// not what the config declared at funding. `reset-window` compares
+    /// the two, because building a fresh runtime takes the *declared*
+    /// figure and would otherwise overwrite realized trading deltas
+    /// (Codex P1 follow-up, bot-strategy#903).
+    pub inventory: ArcusSpotInventory,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -273,6 +300,19 @@ impl ArcusSpotRuntimeCheckpointStore {
     pub fn peek_regime_and_rotated_quantity(
         &self,
     ) -> Result<Option<(ArcusSpotRegime, Option<Decimal>)>> {
+        Ok(self
+            .peek_summary()?
+            .map(|summary| (summary.regime, summary.rotated_quantity)))
+    }
+
+    /// The same config-independent read, reported in full. `reset-window`
+    /// needs it because the whole point of a reset is that the current
+    /// config no longer describes the stored state, so `load_existing`
+    /// refuses to read it at all -- and the checks that decide whether a
+    /// reset is safe (flat regime, no open rotation, no engaged halt) are
+    /// about what the *stored* state says, not what the new config would
+    /// make of it (bot-strategy#903).
+    pub fn peek_summary(&self) -> Result<Option<ArcusSpotCheckpointSummary>> {
         if !self.path.exists() {
             return Ok(None);
         }
@@ -282,10 +322,48 @@ impl ArcusSpotRuntimeCheckpointStore {
         if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
             bail!("unsupported Arcus runtime checkpoint schema");
         }
-        Ok(Some((
-            checkpoint.state.regime,
-            checkpoint.state.rotated_quantity,
-        )))
+        Ok(Some(ArcusSpotCheckpointSummary {
+            pair: checkpoint.config.pair,
+            mode: checkpoint.config.mode,
+            sequence: checkpoint.state.sequence,
+            regime: checkpoint.state.regime,
+            rotated_quantity: checkpoint.state.rotated_quantity,
+            risk_halt: checkpoint.state.risk_halt,
+            relative_log_price_samples: checkpoint.state.relative_log_price_history.len(),
+            inventory: checkpoint.state.inventory,
+        }))
+    }
+
+    /// Which state-invalidating fields differ between the config the
+    /// checkpoint was written under and `current`. `None` when no
+    /// checkpoint exists.
+    ///
+    /// `reset-window` needs this to hold itself to its own purpose. A reset
+    /// discards the accumulated signal window and re-anchors the risk
+    /// baselines -- `initial_equity_usd` and the buy-and-hold basket are
+    /// re-marked on the next tick, so cumulative-loss accounting starts
+    /// over. That is acceptable precisely *because* it accompanies a change
+    /// that already invalidated the stored state. Run with an unchanged
+    /// config it is not a reset at all, just an erasure of the loss
+    /// accounting the cumulative halt is measured against -- repeatable
+    /// before the limit ever engages (Codex P1 follow-up,
+    /// bot-strategy#903).
+    pub fn state_invalidating_drift(
+        &self,
+        current: &ArcusSpotRuntimeConfig,
+    ) -> Result<Option<Vec<&'static str>>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_private_regular_file(&self.path, "runtime checkpoint")?;
+        let checkpoint: ArcusSpotRuntimeCheckpoint = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid runtime checkpoint {}", self.path.display()))?;
+        if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
+            bail!("unsupported Arcus runtime checkpoint schema");
+        }
+        Ok(Some(
+            classify_config_drift(&checkpoint.config, current).state_invalidating,
+        ))
     }
 
     /// Load and validate an already-persisted checkpoint without creating
@@ -310,8 +388,9 @@ impl ArcusSpotRuntimeCheckpointStore {
             bail!(
                 "Arcus runtime checkpoint {} was written under a different {} -- its accumulated \
                  signal window, regime, and risk baselines no longer describe this configuration, \
-                 so reusing them would silently reinterpret them. Reset the checkpoint \
-                 deliberately instead (see docs/arcus-spot-runtime.md).",
+                 so reusing them would silently reinterpret them. Start a fresh window \
+                 deliberately instead: `arcus-spot-execute-once reset-window CONFIG_YAML` (see \
+                 docs/arcus-spot-runtime.md).",
                 self.path.display(),
                 drift.state_invalidating.join(", "),
             );
@@ -513,7 +592,10 @@ mod tests {
                     message.contains("was written under a different pair"),
                     "{message}"
                 );
-                assert!(message.contains("Reset the checkpoint"), "{message}");
+                assert!(
+                    message.contains("arcus-spot-execute-once reset-window CONFIG_YAML"),
+                    "{message}"
+                );
             }
         }
     }

@@ -263,7 +263,35 @@ make the service fail to start (fail-closed, not a silent bad default).
    LIGHTER_WALLET_ADDRESS=<from step 1>
    ```
 
-5. **Verify with DRY_RUN before ever touching CONFIRM_LIVE.**
+5. **Add the notification credentials (bot-strategy#968).** The binary's
+   only push alert path is `EmailClient`, which needs all three of
+   `GMAIL_USER`, `GMAIL_TO` (or `TO_ADDRESS`) and `GMAIL_APP_PASSWORD`.
+   Without them every ENTRY / EXIT / SESSION HALT notification is dropped
+   after a single `WARN`, which is exactly how this service ran from
+   2026-09-01 to 2026-09-08 notifying nobody. `notification_gate` now
+   refuses to start a **live** run without them (DRY_RUN logs an error and
+   continues); an operator who really means to run live with no alert path
+   sets `ENGINE_B_LIVE_ALLOW_NO_NOTIFICATIONS=yes-i-know` and it stays on
+   the record in the log.
+
+   The same three values already exist on this host in
+   `/opt/debot/scripts/debot_secrets_common.env` for the Robinhood arms,
+   but this unit cannot read them: `InaccessiblePaths=/opt/debot` is part
+   of its isolation and stays that way. Copy them into
+   `/etc/engine-b-live/live-secrets.env` instead, **stripping the `export`
+   prefix and any surrounding quotes** -- systemd's `EnvironmentFile=`
+   parses neither (the same trap that broke `ENCRYPTED_DATA_KEY` on
+   2026-09-03):
+   ```
+   GMAIL_USER=<same as the Robinhood arms>
+   GMAIL_TO=<same>
+   GMAIL_APP_PASSWORD=<same>
+   ```
+   Confirm with a real send after the next restart -- an unnoticed SMTP
+   auth failure looks the same as a working channel until something needs
+   to alert.
+
+6. **Verify with DRY_RUN before ever touching CONFIRM_LIVE.**
    `live-config.env` (installed from `configs/engine-b/live.json`) already
    sets `ENGINE_B_LIVE_DRY_RUN=true` by default. Start the service
    (`sudo systemctl start engine-b-live.service` -- this first start is an

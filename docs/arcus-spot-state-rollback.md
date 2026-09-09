@@ -56,6 +56,14 @@ deployed, a rollback candidate that can advance the checkpoint but cannot
 append the same durable stream is ineligible: it would create a detected
 sequence gap and destroy authoritative coverage. Use a forward fix instead.
 
+Replacing a checkpoint for a state-invalidating config change is not a
+reason to touch the stream either: `arcus-spot-execute-once reset-window
+CONFIG_YAML` starts the fresh window at the stream's verified tail, so one
+contiguous chain spans the change (bot-strategy#903, see
+`docs/arcus-spot-runtime.md`). Never renumber the stream, hand-edit a
+checkpoint's sequence, or remove a staged pending event to make a fresh
+checkpoint fit.
+
 ## Offline commands
 
 ```text

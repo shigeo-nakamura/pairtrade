@@ -350,6 +350,29 @@ impl ArcusSpotRuntime {
         Ok(Self { config, state })
     }
 
+    /// A fresh window whose durable event numbering continues from
+    /// `last_event_sequence` (the event stream's tail), rather than from
+    /// zero as `new` does.
+    ///
+    /// The event stream is append-only and hash-chained: it "must never be
+    /// deleted, truncated, or restored" (docs/arcus-spot-state-rollback.md),
+    /// and `validate_event_continuity` refuses any append that is not the
+    /// tail's successor. So a state-invalidating config change -- a new
+    /// pair, a re-funded inventory -- cannot be handled by discarding the
+    /// checkpoint and letting the next tick renumber from 1: that tick
+    /// fails to commit, and every later one fails on the pending event it
+    /// left behind (bot-strategy#903). Starting the fresh window at the
+    /// tail keeps one contiguous audit chain across the strategy change,
+    /// with the event's own `pair`/`mode` fields marking the boundary.
+    pub fn new_continuing_event_sequence(
+        config: ArcusSpotRuntimeConfig,
+        last_event_sequence: u64,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::new(config)?;
+        runtime.state.sequence = last_event_sequence;
+        Ok(runtime)
+    }
+
     pub fn from_state(
         mut config: ArcusSpotRuntimeConfig,
         state: ArcusSpotRuntimeState,
@@ -3419,6 +3442,51 @@ mod tests {
             ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::CostLimit
         ));
         assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn the_all_in_cost_gate_is_inclusive_at_the_cap() {
+        // `hash-config` prints the residual budget an operator sizes
+        // against, and the wording has to match the comparison: build_plan
+        // rejects on `all_in_cost > cap`, so a quote landing exactly on the
+        // cap clears. This matters most when the buffers equal the cap and
+        // the residual is 0 bps (Codex, bot-strategy#903).
+        let plan_at = |cap: Decimal| {
+            let mut cfg = config();
+            cfg.max_all_in_round_trip_cost_bps = cap;
+            let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+            let current = (200.0_f64 / 100.0_f64).ln();
+            runtime.state.relative_log_price_history = vec![current + 0.01, current + 0.02];
+            runtime
+                .step_at(
+                    &snapshot_with_bidirectional_rows(event_time()),
+                    event_time(),
+                )
+                .decision
+        };
+
+        // Read the quote's own all-in cost off a plan built under a cap
+        // that cannot bind, so the boundary below is the real one.
+        let cost = match plan_at(Decimal::from(10_000)) {
+            ArcusSpotDecision::SimulatedFill { plan } => plan.all_in_round_trip_cost_bps,
+            other => panic!("expected a plan under an unbinding cap, got {other:?}"),
+        };
+
+        // Exactly at the cap: accepted.
+        assert!(
+            matches!(plan_at(cost), ArcusSpotDecision::SimulatedFill { .. }),
+            "a quote at exactly {cost} bps must clear a cap of {cost} bps",
+        );
+
+        // One tick under it: held, so the boundary is where it is claimed.
+        let just_under = cost.checked_sub(Decimal::new(1, cost.scale())).unwrap();
+        assert!(
+            matches!(
+                plan_at(just_under),
+                ArcusSpotDecision::Observe { hold } if hold.code == ArcusSpotHoldCode::CostLimit
+            ),
+            "a cap of {just_under} bps must hold a {cost} bps quote",
+        );
     }
 
     #[test]
