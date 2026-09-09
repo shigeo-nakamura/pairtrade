@@ -3869,6 +3869,16 @@ fn require_corporate_action_progress_transition(
         if current.corporate_action != baseline.corporate_action {
             bail!("Arcus corporate-action progress changed without a new observation");
         }
+        // The cached identities are what a window opening copies into its
+        // pre-event pins, so a forged cache would let a relisting compare
+        // the replacement contract against itself and resume. Nothing else
+        // compares them (Codex P1, pairtrade#309).
+        if current.last_token_a_identity != baseline.last_token_a_identity
+            || current.last_token_b_identity != baseline.last_token_b_identity
+            || current.last_token_identity_at != baseline.last_token_identity_at
+        {
+            bail!("Arcus cached token identities changed without a new observation");
+        }
         return Ok(());
     }
     // A discard stamp may only sit at or after the cutoff it claims to mark
@@ -10668,6 +10678,39 @@ runtime:
             .unwrap_err()
             .to_string();
         assert!(error.contains("cleared without a resume"), "{error}");
+    }
+
+    #[test]
+    fn cached_token_identities_may_not_change_without_an_observation() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        corporate_action_continuity(&config, &baseline, &baseline.clone(), 0).unwrap();
+
+        // The post-event contract, dropped into the cache at the same
+        // sequence: a later window would pin it as the *pre-event* identity.
+        let mut forged = baseline.clone();
+        forged.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            address: "0xdeadbeef00000000000000000000000000000000".to_string(),
+            ..observed
+        });
+        let error = corporate_action_continuity(&config, &baseline, &forged, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cached token identities"), "{error}");
+
+        let mut restamped = baseline.clone();
+        restamped.last_token_identity_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
+        let error = corporate_action_continuity(&config, &baseline, &restamped, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cached token identities"), "{error}");
     }
 
     #[test]

@@ -721,6 +721,11 @@ impl ArcusSpotRuntime {
     /// promptly if the rest of the budget goes too. It unfreezes at the next
     /// rollover, now that no halt stands on it.
     pub fn clear_risk_halt(&mut self) -> Result<ArcusSpotRiskHalt, String> {
+        self.clear_risk_halt_at(Utc::now())
+    }
+
+    /// `clear_risk_halt` with the clearance clock supplied.
+    pub fn clear_risk_halt_at(&mut self, now: DateTime<Utc>) -> Result<ArcusSpotRiskHalt, String> {
         // The "condition still holds" check below reads `last_risk_mark`,
         // and while a corporate action is effective that mark values
         // pre-event quantities at post-event prices -- meaningless in both
@@ -729,10 +734,17 @@ impl ArcusSpotRuntime {
         // cleared through it; the resume then re-anchors the baselines and
         // the halt never returns. Decide it after the resume, on marks that
         // mean something (Codex P2, pairtrade#309).
+        // At the clearance time, not the observation watermark: the
+        // watermark does not advance while the bot is down, so an operator
+        // clearing after a window became effective would otherwise be judged
+        // against a pre-event mark, and the next tick's resume would
+        // re-anchor the baskets and lose the halt for good (Codex P2,
+        // pairtrade#309).
         let clock = self
             .state
             .last_observation_at
-            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            .map(|observed_at| observed_at.max(now))
+            .unwrap_or(now);
         if self.corporate_action_units_are_stale(clock) {
             return Err(
                 "refusing to clear the risk halt while a corporate action is effective and the \
@@ -7786,7 +7798,34 @@ mod tests {
             &snapshot_with_valid_row_at_prices(effective, "50", "100"),
             effective,
         );
-        let error = runtime.clear_risk_halt().unwrap_err();
+        let error = runtime
+            .clear_risk_halt_at(effective + Duration::seconds(1))
+            .unwrap_err();
+        assert!(error.contains("no longer quotes"), "{error}");
+        assert!(runtime.state.risk_halt.is_some());
+    }
+
+    #[test]
+    fn a_halt_is_not_cleared_after_downtime_past_the_cutoff() {
+        // The bot stopped before `effective_at`, so the watermark is still
+        // pre-event; the operator clears after the action became effective.
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        runtime.state.inventory.token_a = Decimal::new(98, 2);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert!(runtime.state.risk_halt.is_some());
+        assert_eq!(
+            runtime.state.last_observation_at,
+            Some(anchor),
+            "the watermark stays before the cutoff",
+        );
+
+        let error = runtime
+            .clear_risk_halt_at(anchor + Duration::seconds(10))
+            .unwrap_err();
         assert!(error.contains("no longer quotes"), "{error}");
         assert!(runtime.state.risk_halt.is_some());
     }
