@@ -325,12 +325,25 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
         # two events (PR #298 Codex review). `observed_at` remains the
         # fallback for an event that predates the field.
         quoted_at = plan.get("quote_received_at")
+        observed_at = event_stream.parse_timestamp(event["observed_at"])
         reference = (
-            event_stream.parse_timestamp(quoted_at)
-            if quoted_at
-            else event_stream.parse_timestamp(event["observed_at"])
+            event_stream.parse_timestamp(quoted_at) if quoted_at else observed_at
         )
         if not within_plan_age(reference, prepared_at, max_plan_age_secs):
+            continue
+        # Causality, independent of quote freshness. live-tick commits the
+        # event to the stream *before* it calls `execute_plan_once`
+        # (`src/bin/arcus_spot_execute_once.rs`: `event_publisher.commit`
+        # precedes the executor call), so the event an attempt actually
+        # came from was always observed at or before `prepared_at`. A
+        # later same-shaped event can still be admitted by the freshness
+        # test alone -- its quote may have been received before this
+        # attempt was prepared even though the tick that carried it was
+        # only emitted afterwards -- and admitting it manufactures
+        # ambiguity, or, at a segment boundary where the real event is
+        # absent, prices the swap at a future tick's marks
+        # (PR #298 Codex review).
+        if not observed_before(observed_at, prepared_at):
             continue
         if not token_addresses_match(intent, plan):
             continue
@@ -369,6 +382,18 @@ def within_plan_age(observed_at: datetime, prepared_at: datetime,
     """
     age = int((prepared_at - observed_at).total_seconds())
     return 0 <= age <= limit_secs
+
+
+def observed_before(observed_at: datetime, prepared_at: datetime) -> bool:
+    """Could this event have produced an attempt prepared then?
+
+    To the second, for the same reason `within_plan_age` truncates: the
+    two stamps are written by different code paths on the same host, and
+    holding the comparison to whole seconds keeps a same-second event --
+    which the commit ordering guarantees is the real one -- from being
+    rejected on sub-second serialization noise (PR #298 Codex review).
+    """
+    return int((prepared_at - observed_at).total_seconds()) >= 0
 
 
 def token_addresses_match(intent: dict[str, Any], plan: dict[str, Any]) -> bool:
@@ -546,7 +571,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                     f"ledger sequence {attempt.get('sequence')}: no would-rotate event at or "
                     f"before {attempt['prepared_at']} matches venue/symbols/sell_amount_raw -- "
                     "the event window probably does not cover this swap")
-            if inside_stream:
+            if inside_stream and not (until is not None and dispatched_at > until):
                 # Inside the priced history but outside the caller's
                 # bounds. Not fatal -- a report the caller can ask for
                 # must still be produced -- but not harmless either:
@@ -555,6 +580,13 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                 # open, taking its loss and volume out of the totals
                 # while coverage says complete. It is a coverage hole
                 # (PR #298 Codex review, rounds 5 and 11).
+                #
+                # Only on the `--since` side, though. A leg dispatched
+                # after `--until` is in the future of every rotation this
+                # report can close, so it cannot have unwound one of
+                # them; counting it made an otherwise sound historical
+                # report undecidable purely because the ledger kept
+                # going (PR #298 Codex review, round 12).
                 unmatched_in_stream.append(int(attempt["sequence"]))
             out_of_window.append((int(attempt["sequence"]), dispatched_at))
             continue

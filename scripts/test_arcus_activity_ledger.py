@@ -838,6 +838,77 @@ class ActivityLedgerTests(unittest.TestCase):
         self.assertIn("pairing may be short a leg",
                       ledger_tool.render_markdown(report))
 
+    def test_an_unmatched_leg_after_the_cutoff_is_not_a_coverage_hole(self):
+        """It is in the future of every rotation the report can close.
+
+        The `--since` mirror is a real hole: an unmatched exit before the
+        start still reduced the position, so a later in-window exit
+        cannot pair its rotation. After `--until` there is nothing left
+        to unwind -- the report ends first -- so counting it made an
+        otherwise sound historical report undecidable purely because the
+        ledger kept going (PR #298 Codex review, round 12).
+        """
+        events, history = baseline_round_trip()
+        # The stream keeps observing past the cutoff, so the orphan is
+        # genuinely *inside* the priced history -- the case the coverage
+        # hole was written for -- and only `--until` puts it out of scope.
+        events.append(observe_event(3, EXIT_AT + timedelta(hours=4)))
+        orphan_at = EXIT_AT + timedelta(hours=2)
+        history.append(attempt(20, orphan_at, sell="NVDA", buy="AMD",
+                               sell_quantity="0.1", buy_quantity="0.2"))
+        cutoff = EXIT_AT + timedelta(hours=1)
+        report = report_for(events, history, until=cutoff)
+        self.assertLess(cutoff, orphan_at)
+
+        self.assertEqual(report["coverage"]["unmatched_legs_in_stream"], [])
+        self.assertIn(20, report["ledger_swaps_outside_window"])
+        self.assertEqual(report["totals"]["round_trips"], 1)
+        self.assertTrue(report["coverage"]["complete"])
+        self.assertFalse(report["stop_rule"]["undecidable"])
+
+        # And the `--since` side keeps its hole, unchanged: an orphan
+        # inside the stream but before the requested start.
+        early_at = ENTRY_AT + timedelta(minutes=5)
+        with_early = history + [attempt(3, early_at, sell="NVDA", buy="AMD",
+                                        sell_quantity="0.1", buy_quantity="0.2")]
+        held = report_for(events, with_early,
+                          since=early_at + timedelta(minutes=1),
+                          until=cutoff)
+        self.assertEqual(held["coverage"]["unmatched_legs_in_stream"], [3])
+        self.assertFalse(held["coverage"]["complete"])
+
+    def test_an_event_emitted_after_the_attempt_was_prepared_is_refused(self):
+        """live-tick commits the event before it dispatches the swap.
+
+        So the event an attempt came from was observed at or before
+        `prepared_at`. A later same-shaped tick can still pass the
+        freshness test -- `validate_plan_age` measures from
+        `quote_received_at`, which may predate this attempt even though
+        the tick carrying it was emitted afterwards -- and admitting it
+        manufactures ambiguity, or prices the swap at future marks
+        (PR #298 Codex review, round 12).
+        """
+        events, history = baseline_round_trip()
+        # A second, identically shaped exit tick 30s after the real one,
+        # carrying an older quote so freshness alone would admit it.
+        future = would_rotate_event(
+            3, EXIT_AT + timedelta(seconds=30), trigger="mean_reversion_exit",
+            sell="SPY", buy="QQQ", sell_quantity="0.323269",
+            buy_quantity="0.346345", spy_mark="999.00", qqq_mark="111.00")
+        future["decision"]["plan"]["quote_received_at"] = stamp(
+            EXIT_AT - timedelta(seconds=5))
+
+        index = ledger_tool.would_rotate_index(events + [future])
+        matched = ledger_tool.find_event(history[1], index)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["sequence"], 2,
+                         "the causally possible event, not the later decoy")
+
+        # And with only the decoy present it is refused outright rather
+        # than pricing the swap at its marks.
+        decoy_only = ledger_tool.would_rotate_index([events[0], future])
+        self.assertIsNone(ledger_tool.find_event(history[1], decoy_only))
+
     def test_an_unmatched_attempt_outside_the_stream_is_still_harmless(self):
         """It cannot take part in pairing, so it is only reported."""
         events, history = baseline_round_trip()
