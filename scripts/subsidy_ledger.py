@@ -751,7 +751,18 @@ def build_rows(
         day = pnl.get((date, arm))
         if day is not None:
             row.cycles = day.cycles
-            row.realized_pnl_usd = round(day.realized_pnl_usd, 6)
+            # Same contract as `funding_usd` below, and for the same
+            # reason: `load_pnl` keeps the good closes' subtotal while
+            # marking the day incomplete, so serializing it unconditionally
+            # published a partial sum in a field a consumer reads as the
+            # day's realized PnL. `cost_usd` was already withheld (or taken
+            # from equity) in that case; this makes the two agree
+            # (Codex, PR #297).
+            row.realized_pnl_usd = (
+                round(day.realized_pnl_usd, 6)
+                if day.cycles > 0 and not day.incomplete
+                else None
+            )
             # `null` means "not known", and on a complete day it is not
             # true: every close there either carried a carry or was shown
             # to have met no funding tick, and the cost above was
@@ -1058,7 +1069,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="write the rows as JSONL")
     args = parser.parse_args(argv)
 
-    execution = load_execution(expand(args.exec_glob))
+    exec_paths = expand(args.exec_glob)
+    # `--exec-glob` is required, so matching nothing is a mistyped pattern
+    # or a missing export -- not an empty period. Left alone the command
+    # exited 0, wrote an empty `--out`, and printed no arm-level warning,
+    # making a missing ledger indistinguishable from a real empty report
+    # (Codex, PR #297).
+    if not exec_paths:
+        parser.error(
+            "--exec-glob matched no files ("
+            + ", ".join(repr(p) for p in args.exec_glob)
+            + "); an empty report cannot be told apart from a missing export"
+        )
+    execution = load_execution(exec_paths)
     pnl = load_pnl(expand(args.pnl_glob))
     equity_costs: dict[str, dict[str, float]] = {}
     for spec in args.equity:

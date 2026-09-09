@@ -25,6 +25,7 @@ from subsidy_ledger import (  # noqa: E402
     opening_date,
     spans_a_funding_interval,
     expand,
+    main as ledger_main,
     render_table,
     summarize,
 )
@@ -1118,6 +1119,51 @@ def test_a_complete_day_with_no_funding_ticks_reports_a_known_zero():
         assert gapped.incomplete
         gap_row = build_rows({}, {("2026-09-08", "b"): gapped})[0]
         assert gap_row.funding_usd is None
+
+
+def test_a_partially_covered_day_does_not_publish_its_realized_pnl_either():
+    """Same contract as `funding_usd`, same reason.
+
+    `load_pnl` keeps the good closes' subtotal while marking the day
+    incomplete, so serializing it unconditionally published a partial sum
+    in the field a consumer reads as the day's realized PnL -- next to a
+    `cost_usd` that was already being withheld (Codex, PR #297).
+    """
+    inside_the_hour = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        mixed = pnl_file(
+            Path(tmp),
+            [
+                {"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+                 "hold_secs": 600},
+                # Unreadable PnL: the day is incomplete, and this row's
+                # loss never reached the subtotal.
+                {"ts": inside_the_hour + 60, "source": "exit_fill", "pnl": "n/a",
+                 "hold_secs": 600},
+            ],
+        )
+        day = load_pnl([mixed])[("2026-09-08", "freq")]
+        assert day.incomplete and "unreadable_pnl" in day.incomplete_reasons
+        assert round(day.realized_pnl_usd, 6) == -5.0, "the subtotal is still carried"
+        row = build_rows({}, {("2026-09-08", "freq"): day})[0]
+        assert row.realized_pnl_usd is None, row.realized_pnl_usd
+        assert row.cost_source != "pnl_ledger"
+
+
+def test_exec_globs_that_match_nothing_are_refused():
+    """`--exec-glob` is required, so matching nothing is a mistake.
+
+    Left alone the command exited 0 and wrote an empty `--out`, which a
+    consumer cannot tell from a genuinely empty period (Codex, PR #297).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = str(Path(tmp) / "no-such-export-*.jsonl")
+        try:
+            ledger_main(["--exec-glob", missing])
+        except SystemExit as exit_code:
+            assert exit_code.code == 2, exit_code.code
+        else:
+            raise AssertionError("a required glob that matches nothing must be refused")
 
 
 def test_a_partially_covered_day_does_not_publish_its_known_funding_subtotal():
