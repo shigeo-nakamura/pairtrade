@@ -303,15 +303,22 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
         intent.get("buy_symbol"),
         intent.get("sell_amount_raw"),
     )
-    # The runtime re-runs `validate_plan_age` immediately before
-    # `mark_dispatching` and cancels the prepared attempt if it fails, so
-    # the constraint that actually governed this submission is the quote
-    # against the *dispatch* time, not against preparation. A quote 60.4s
-    # old when prepared but 61s old when dispatched was refused by the
-    # runtime, and matching on `prepared_at` would still select it
-    # (PR #298 Codex review).
-    prepared_at = event_stream.parse_timestamp(
-        attempt.get("dispatched_at") or attempt["prepared_at"])
+    # Two instants, and neither is the validation clock. The runtime
+    # re-runs `validate_plan_age` between them and cancels the attempt if
+    # it fails, so an accepted attempt was fresh at *some* instant in
+    # [prepared_at, dispatched_at]. Age only grows, so `prepared_at` is
+    # the sound admission bound -- an event too old there could not have
+    # passed at any later instant -- while `dispatched_at` is a separate,
+    # later `Utc::now()` and using it to *reject* discards a real event
+    # whose quote crossed the whole-second boundary in between
+    # (PR #298 Codex review, rounds 8 and 9). The dispatch bound is
+    # therefore applied only to break a tie, below.
+    prepared_at = event_stream.parse_timestamp(attempt["prepared_at"])
+    dispatched_at = (
+        event_stream.parse_timestamp(attempt["dispatched_at"])
+        if attempt.get("dispatched_at")
+        else prepared_at
+    )
     candidates = []
     for event in index.get(key, []):
         plan = event["decision"]["plan"]
@@ -333,9 +340,23 @@ def find_event(attempt: dict[str, Any], index: dict[tuple, list[dict[str, Any]]]
             continue
         if not token_addresses_match(intent, plan):
             continue
-        candidates.append(event)
+        candidates.append((event, reference))
     if not candidates:
         return None
+    if len(candidates) > 1:
+        # The tighter bound the runtime applied last, used to choose
+        # between candidates rather than to reject any: an event still
+        # fresh at dispatch is the one that could have been re-validated
+        # there. If that narrows it to exactly one, take it; otherwise
+        # the ambiguity is real and is refused below.
+        fresh_at_dispatch = [
+            (event, reference)
+            for event, reference in candidates
+            if within_plan_age(reference, dispatched_at, max_plan_age_secs)
+        ]
+        if len(fresh_at_dispatch) == 1:
+            candidates = fresh_at_dispatch
+    candidates = [event for event, _ in candidates]
     if len(candidates) > 1:
         raise ActivityLedgerError(
             f"ledger sequence {attempt.get('sequence')}: {len(candidates)} would-rotate events "
@@ -851,9 +872,17 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
         if pending is not None and isinstance(ledger.get("active"), dict)
         else None
     )
-    in_window = pending is not None and (
-        within(pending[1], *asked) or pending_event is not None
+    # The bridge is for the *seam*, so it only applies where the endpoint
+    # is open. An explicit `--until` is the caller saying where the
+    # question stops, and an event match must not override it
+    # (PR #298 Codex review).
+    bridges_seam = (
+        pending is not None
+        and until is None
+        and pending_event is not None
+        and within(pending[1], since, None)
     )
+    in_window = pending is not None and (within(pending[1], *asked) or bridges_seam)
     unresolved = [pending_row] if in_window else []
     # Outside the reported window it is still worth naming -- the ledger
     # holds an unfinished attempt right now -- but it does not spoil a

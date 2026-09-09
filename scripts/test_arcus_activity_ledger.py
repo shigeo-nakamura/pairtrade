@@ -665,6 +665,27 @@ class ActivityLedgerTests(unittest.TestCase):
         with self.assertRaises(ledger_tool.ActivityLedgerError):
             report_for(events, history, max_plan_age_secs=30)
 
+    def test_an_explicit_until_still_excludes_a_matched_pending_attempt(self):
+        """The seam bridge is for an open endpoint, not for any bound.
+
+        With `--until` the caller has said where the question stops, so
+        an event match must not drag a later in-flight attempt back into
+        it and withhold an otherwise valid historical verdict.
+        """
+        events, history = baseline_round_trip()
+        pending = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
+                          sell_quantity="0.347094", buy_quantity="0.323269",
+                          dispatched=ENTRY_AT + timedelta(seconds=3),
+                          phase="confirmed")
+        # Its own event is in the stream, but the caller asked about a
+        # period that ends before it.
+        report = report_for(events, history, active=pending,
+                            until=ENTRY_AT - timedelta(hours=1))
+        self.assertEqual(report["coverage"]["unresolved_attempts"], [])
+        self.assertEqual(report["coverage"]["pending_outside_window"],
+                         [{"sequence": 8, "phase": "confirmed"}])
+        self.assertTrue(report["coverage"]["complete"])
+
     def test_a_pending_attempt_outside_the_window_is_named_not_fatal(self):
         """A historical export must not be spoiled by activity after it.
 
@@ -706,23 +727,43 @@ class ActivityLedgerTests(unittest.TestCase):
         report = report_for(events, history)
         self.assertEqual(report["totals"]["round_trips"], 1)
 
-    def test_plan_freshness_is_measured_at_dispatch(self):
-        """The runtime re-validates the plan immediately before dispatch.
+    def test_the_dispatch_bound_breaks_ties_without_rejecting(self):
+        """Neither stamp is the validation clock, so only one may reject.
 
-        A quote inside the bound at preparation but outside it by the
-        time the attempt was dispatched was refused by the runtime, so an
-        event carrying it cannot be the one that produced this swap.
+        The runtime validates between `prepared_at` and `dispatched_at`,
+        and age only grows: an event too old at preparation could not
+        have passed at any later instant, so that is the sound bound.
+        `dispatched_at` is a separate, later `Utc::now()`, so rejecting on
+        it discards a real event whose quote crossed the whole-second
+        boundary in between -- it is used to choose between candidates
+        instead.
         """
         events, history = baseline_round_trip()
         plan = events[0]["decision"]["plan"]
         plan["quote_received_at"] = stamp(ENTRY_AT - timedelta(seconds=30))
-        # Prepared while the quote was 30s old (inside the bound), then
-        # dispatched much later, by which time it was not.
+        # Prepared while the quote was 30s old, dispatched long after.
+        # The runtime validated somewhere in between, so this event is
+        # still the one that produced the swap.
         history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
                              sell_quantity="0.347094", buy_quantity="0.323269",
                              dispatched=ENTRY_AT + timedelta(minutes=5))
-        with self.assertRaises(ledger_tool.ActivityLedgerError):
-            report_for(events, history)
+        report = report_for(events, history)
+        self.assertEqual(report["totals"]["round_trips"], 1)
+
+        # Two same-shaped candidates, only one of which was still fresh
+        # at dispatch: the tie is broken rather than refused.
+        stale_twin = would_rotate_event(
+            0, ENTRY_AT - timedelta(seconds=50), trigger="entry_signal",
+            sell="QQQ", buy="SPY", sell_quantity="0.347094",
+            buy_quantity="0.323269", spy_mark="700.00", qqq_mark="650.00")
+        stale_twin["decision"]["plan"]["quote_received_at"] = stamp(
+            ENTRY_AT - timedelta(seconds=50))
+        plan["quote_received_at"] = stamp(ENTRY_AT - timedelta(seconds=1))
+        history[0] = attempt(8, ENTRY_AT, sell="QQQ", buy="SPY",
+                             sell_quantity="0.347094", buy_quantity="0.323269",
+                             dispatched=ENTRY_AT + timedelta(seconds=20))
+        picked = report_for([stale_twin] + events, history)
+        self.assertEqual(picked["totals"]["round_trips"], 1)
 
     def test_an_unmatched_attempt_outside_the_requested_bounds_is_not_fatal(self):
         """A stream can span more than the report the caller asked for.
