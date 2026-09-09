@@ -2234,6 +2234,24 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
                           summarize(build_rows(unmeasured, unmeasured_pnl)))
     assert "no costed day has fully measured volume" in absent, absent
 
+    # A PnL cost that cannot be represented must behave like every other
+    # PnL day this ledger cannot cost: fall through to the equity series
+    # rather than leaving the day uncosted with a usable fallback
+    # sitting right there (Codex, PR #297).
+    overflow_pnl = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1e308,
+                                                   funding_usd=-1e308, funding_seen=True)}
+    one_day = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0)}
+    covered = build_rows(one_day, overflow_pnl, {"freq": {"2026-09-08": 25.0}})[0]
+    assert covered.cost_usd == 25.0 and covered.cost_source == "equity_delta", covered
+    # With no equity for that day it is genuinely uncosted.
+    bare = build_rows(one_day, overflow_pnl)[0]
+    assert bare.cost_usd is None and bare.cost_source is None, bare
+    # And a representable PnL day still prefers the ledger over equity.
+    good_pnl = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-40.0,
+                                               funding_seen=True)}
+    preferred = build_rows(one_day, good_pnl, {"freq": {"2026-09-08": 99.0}})[0]
+    assert preferred.cost_usd == 40.0 and preferred.cost_source == "pnl_ledger", preferred
+
     # The equity path has its own derived value: two finite closes of
     # opposite sign whose difference is not finite.
     day_one = 1788825600_000

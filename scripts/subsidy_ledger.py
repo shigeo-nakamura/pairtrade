@@ -1212,11 +1212,21 @@ def build_rows(
             row.cross_day_entries = day.cross_day_entries
             if day.incomplete:
                 row.pnl_incomplete_reasons = sorted(day.incomplete_reasons)
-        if day is not None and not day.incomplete and day.cycles > 0:
-            # Each accumulator is guarded on its own, but their sum is a
-            # third value and can overflow where neither did.
-            row.cost_usd = finite_or_none(-(day.realized_pnl_usd + day.funding_usd), 6)
-            row.cost_source = "pnl_ledger" if row.cost_usd is not None else None
+        # Derived first, so a PnL cost that cannot be represented behaves
+        # like every other PnL day this ledger cannot cost: it falls
+        # through to the equity series. Selecting the branch and *then*
+        # discovering the value is unknown left the day uncosted with a
+        # usable fallback sitting right there (Codex, PR #297). Each
+        # accumulator is guarded on its own, but their sum is a third
+        # value and can overflow where neither did.
+        pnl_cost = (
+            finite_or_none(-(day.realized_pnl_usd + day.funding_usd), 6)
+            if day is not None and not day.incomplete and day.cycles > 0
+            else None
+        )
+        if pnl_cost is not None:
+            row.cost_usd = pnl_cost
+            row.cost_source = "pnl_ledger"
         elif date in equity_costs.get(arm, {}):
             row.cost_usd = round(equity_costs[arm][date], 6)
             row.cost_source = "equity_delta"
