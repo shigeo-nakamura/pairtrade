@@ -76,9 +76,10 @@ pub fn mid_relative_slippage_bps(
     if allowance_bps < 1.0 {
         return None;
     }
-    // `validate` already rejected a configured bound outside the
-    // connector's 1..=1000, and the conversion only ever shrinks one; the
-    // clamp is here so a future caller cannot smuggle a wider one through.
+    // Both callers validate the configured bound into the connector's
+    // 1..=1000 (`EngineBLiveConfig::validate`, `BookConfig::validate`),
+    // and the conversion only ever shrinks one; the clamp is here so a
+    // future caller cannot smuggle a wider one through.
     Some((allowance_bps.floor() as u32).min(1000))
 }
 
