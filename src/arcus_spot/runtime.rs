@@ -2923,6 +2923,7 @@ impl ArcusSpotRuntime {
             .corporate_actions
             .iter()
             .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
+            .cloned()
         {
             gate.block_entry.get_or_insert_with(|| {
                 ArcusSpotHold::new(
@@ -2934,12 +2935,19 @@ impl ArcusSpotRuntime {
                     ),
                 )
             });
-            // No progress record is ever written for a refused declaration,
-            // so its effective phase has to be honoured here: once its
-            // cutoff is reached the venue may be quoting new units, and the
-            // same rule as for a declared event applies -- no exit sized
-            // from the tracked quantity, no post-event prints into the
-            // window (Codex P1, pairtrade#309).
+            // Record the window durably the first time it opens. Without
+            // this the refusal is derived from the config alone, so removing
+            // the declaration erased the fail-closed state and the next tick
+            // resumed accumulating history and trading on unreconciled
+            // pre-event inventory (Codex P1, pairtrade#309).
+            if self.state.corporate_action.is_none() && evaluation_time >= reused.entry_block_at {
+                self.record_corporate_action_progress(&reused, evaluation_time);
+            }
+            // Its effective phase is honoured here too, for the tick that
+            // opens the record: once the cutoff is reached the venue may be
+            // quoting new units, and the same rule as for a declared event
+            // applies -- no exit sized from the tracked quantity, no
+            // post-event prints into the window.
             if evaluation_time >= reused.effective_at {
                 gate.force_exit = false;
                 gate.suppress_history = true;
@@ -2978,6 +2986,22 @@ impl ArcusSpotRuntime {
             // live entry is not a way to cancel a window (Codex P1,
             // pairtrade#309).
             if let Some(progress) = self.state.corporate_action.clone() {
+                // Its declaration may still be there and merely refused (a
+                // handled id reused for a different action): that has known
+                // instants, so it keeps the ordinary phases and only the
+                // resume is impossible.
+                if let Some(refused) = self
+                    .config
+                    .corporate_actions
+                    .iter()
+                    .find(|event| {
+                        Self::progress_matches(&progress, event)
+                            && self.handled_record_for(event) == Some(HandledMatch::ReusedId)
+                    })
+                    .cloned()
+                {
+                    return self.refused_declaration_gate(&refused, evaluation_time);
+                }
                 return self.undeclared_progress_gate(
                     evaluation_time,
                     &progress,
@@ -3030,24 +3054,7 @@ impl ArcusSpotRuntime {
             // pre-event side as unavailable is the honest answer there; the
             // operator's reconciled `post_event_inventory` is what carries
             // the resume.
-            let pre_event_observed = self
-                .state
-                .last_token_identity_at
-                .is_some_and(|observed_at| observed_at < event.entry_block_at);
-            self.state.corporate_action = Some(ArcusSpotCorporateActionProgress {
-                event_id: event.event_id.clone(),
-                blocked_at: evaluation_time,
-                pre_event_token_a: pre_event_observed
-                    .then(|| self.state.last_token_a_identity.clone())
-                    .flatten(),
-                pre_event_token_b: pre_event_observed
-                    .then(|| self.state.last_token_b_identity.clone())
-                    .flatten(),
-                history_invalidated_at: None,
-                fingerprint: event.fingerprint(),
-                effective_at: Some(event.effective_at),
-                symbols: event.symbols.clone(),
-            });
+            self.record_corporate_action_progress(&event, evaluation_time);
         }
 
         if evaluation_time >= event.effective_at {
@@ -3337,6 +3344,77 @@ impl ArcusSpotRuntime {
             .iter()
             .filter(|event| !self.corporate_action_is_handled(event))
             .find(|event| evaluation_time >= event.entry_block_at)
+    }
+
+    /// Opens the durable record for `event`: what the window is, when its
+    /// cutoff is, and the token identities as of the last observation
+    /// *before* it opened. Written for a refused (reused-id) declaration as
+    /// well as a declared one, so that deleting the declaration cannot erase
+    /// the fail-closed state (Codex P1, pairtrade#309).
+    fn record_corporate_action_progress(
+        &mut self,
+        event: &ArcusSpotCorporateActionEvent,
+        evaluation_time: DateTime<Utc>,
+    ) {
+        let pre_event_observed = self
+            .state
+            .last_token_identity_at
+            .is_some_and(|observed_at| observed_at < event.entry_block_at);
+        self.state.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: event.event_id.clone(),
+            blocked_at: evaluation_time,
+            pre_event_token_a: pre_event_observed
+                .then(|| self.state.last_token_a_identity.clone())
+                .flatten(),
+            pre_event_token_b: pre_event_observed
+                .then(|| self.state.last_token_b_identity.clone())
+                .flatten(),
+            history_invalidated_at: None,
+            fingerprint: event.fingerprint(),
+            effective_at: Some(event.effective_at),
+            symbols: event.symbols.clone(),
+        });
+    }
+
+    /// The gate for a window whose declaration is present but *refused* --
+    /// a handled id reused for a different action. Its instants are known,
+    /// so it behaves exactly like a declared window except that it can never
+    /// resume: the operator has to give the new action its own `event_id`,
+    /// after which the same record becomes an ordinary active window.
+    fn refused_declaration_gate(
+        &mut self,
+        event: &ArcusSpotCorporateActionEvent,
+        evaluation_time: DateTime<Utc>,
+    ) -> CorporateActionGate {
+        if evaluation_time >= event.effective_at {
+            let already = self
+                .state
+                .corporate_action
+                .as_ref()
+                .is_some_and(|progress| progress.history_invalidated_at.is_some());
+            if !already {
+                self.state.relative_log_price_history.clear();
+                if let Some(progress) = self.state.corporate_action.as_mut() {
+                    progress.history_invalidated_at = Some(evaluation_time);
+                }
+            }
+        }
+        let effective = evaluation_time >= event.effective_at;
+        CorporateActionGate {
+            block_entry: Some(ArcusSpotHold::new(
+                ArcusSpotHoldCode::CorporateActionBlock,
+                format!(
+                    "corporate action {} reuses the id of an already handled event for a \
+                     different declaration; give the new action its own event_id",
+                    event.event_id,
+                ),
+            )),
+            force_exit: !effective
+                && evaluation_time >= event.reduce_exit_at
+                && self.state.regime != ArcusSpotRegime::Neutral,
+            suppress_history: effective,
+            suppress_exits: effective,
+        }
     }
 
     /// The fail-closed gate for a progress record whose declaration is gone
@@ -7475,7 +7553,13 @@ mod tests {
             other => panic!("a reused id must not trade through its window, got {other:?}"),
         }
         assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
-        assert_eq!(runtime.state.corporate_action, None);
+        // The refused window is recorded, so deleting the declaration cannot
+        // erase the refusal (see the deletion test below).
+        let progress = runtime.state.corporate_action.clone().unwrap();
+        assert_eq!(
+            progress.fingerprint,
+            runtime.config.corporate_actions[0].fingerprint()
+        );
     }
 
     #[test]
@@ -7769,6 +7853,58 @@ mod tests {
             samples_before,
             "no post-event prints"
         );
+    }
+
+    #[test]
+    fn deleting_a_refused_reused_id_declaration_does_not_erase_the_guard() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+
+        // A distinct later action under the old id, already effective, with
+        // an overdue rotation open.
+        let mut reused = corporate_action_event(anchor + Duration::seconds(13));
+        reused.post_event_inventory = None;
+        runtime.config.corporate_actions = vec![reused];
+        seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
+        // The tick that opens the record, then one that stamps its cutoff.
+        let effective = anchor + Duration::seconds(18);
+        runtime.step_at(&snapshot_with_valid_row(effective), effective);
+        assert!(
+            runtime.state.corporate_action.is_some(),
+            "the window is recorded"
+        );
+        let stamped_at = anchor + Duration::seconds(19);
+        runtime.step_at(&snapshot_with_valid_row(stamped_at), stamped_at);
+        let progress = runtime.state.corporate_action.clone().unwrap();
+        assert!(progress.history_invalidated_at.is_some());
+        assert_eq!(progress.effective_at, Some(anchor + Duration::seconds(17)));
+
+        // The operator deletes the offending entry instead of renaming it.
+        runtime.config.corporate_actions.clear();
+        let later = anchor + Duration::seconds(20);
+        let samples_before = runtime.state.relative_log_price_history.len();
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        assert!(
+            matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
+            "the guard must survive the deletion: {:?}",
+            outcome.decision
+        );
+        assert_eq!(
+            runtime.state.regime,
+            ArcusSpotRegime::RotatedAToB,
+            "no exit"
+        );
+        assert_eq!(
+            runtime.state.relative_log_price_history.len(),
+            samples_before,
+            "no post-event prints",
+        );
+        assert!(runtime.state.corporate_action.is_some());
     }
 
     #[test]
