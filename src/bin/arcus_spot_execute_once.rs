@@ -3760,7 +3760,11 @@ fn corporate_action_continuity(
             // entry the operator renamed afterwards is the same event, which
             // is the whole point of the fingerprint (Codex P2,
             // pairtrade#309).
-            let resumed_fingerprint = resumed_fingerprints.first().filter(|it| !it.is_empty());
+            // The appended fingerprint is the *last* of the newly added
+            // entries: a legacy record (ids with no fingerprints) is padded
+            // with empty strings first, so `first()` would read padding
+            // (Codex P2, pairtrade#309).
+            let resumed_fingerprint = resumed_fingerprints.last().filter(|it| !it.is_empty());
             let event = config
                 .corporate_actions
                 .iter()
@@ -3923,9 +3927,34 @@ fn require_corporate_action_progress_transition(
             let same_event = after.fingerprint == before.fingerprint
                 || (before.fingerprint.is_empty()
                     && after.event_id.eq_ignore_ascii_case(&before.event_id));
-            let stamp_ok = after.history_invalidated_at == before.history_invalidated_at
-                || (before.history_invalidated_at.is_none()
-                    && after.history_invalidated_at.is_some());
+            // A stamp may appear, but only at or after the cutoff it claims
+            // to mark and no later than the observation that produced it.
+            // Otherwise a modified checkpoint could discard its window early
+            // and -- because the stamp is what makes the units read as stale
+            // -- suppress exits before the declared cutoff (Codex P1,
+            // pairtrade#309).
+            let stamp_ok = match (before.history_invalidated_at, after.history_invalidated_at) {
+                (Some(was), Some(now)) => was == now,
+                (None, None) => true,
+                (Some(_), None) => false,
+                (None, Some(stamped_at)) => {
+                    let cutoff = after.effective_at.or_else(|| {
+                        config
+                            .corporate_actions
+                            .iter()
+                            .find(|event| {
+                                (!after.fingerprint.is_empty()
+                                    && after.fingerprint == event.fingerprint())
+                                    || event.event_id.eq_ignore_ascii_case(&after.event_id)
+                            })
+                            .map(|event| event.effective_at)
+                    });
+                    cutoff.is_some_and(|cutoff| stamped_at >= cutoff)
+                        && current
+                            .last_observation_at
+                            .is_some_and(|observed_at| stamped_at <= observed_at)
+                }
+            };
             if !same_event
                 || !stamp_ok
                 || after.blocked_at != before.blocked_at
@@ -10627,6 +10656,42 @@ runtime:
     }
 
     #[test]
+    fn a_discard_stamp_must_sit_at_or_after_its_cutoff() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut open = stale_unit_progress();
+        open.history_invalidated_at = None;
+        baseline.corporate_action = Some(open.clone());
+        let stamped = |at: &str| {
+            let mut current = continuity_state(8, ("1", "1"));
+            current.relative_log_price_history.clear();
+            let mut progress = open.clone();
+            progress.history_invalidated_at = Some(at.parse().unwrap());
+            current.corporate_action = Some(progress);
+            current
+        };
+
+        // The cutoff is 02:00Z and the observation 12:00Z.
+        corporate_action_continuity(&config, &baseline, &stamped("2026-08-16T02:00:01Z"), 1)
+            .unwrap();
+
+        // Stamped before the cutoff: a premature discard, which would also
+        // make dispatch treat the units as stale early.
+        let error =
+            corporate_action_continuity(&config, &baseline, &stamped("2026-08-16T01:00:00Z"), 1)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("no observation produces"), "{error}");
+
+        // Stamped after the observation that supposedly produced it.
+        let error =
+            corporate_action_continuity(&config, &baseline, &stamped("2026-08-16T13:00:00Z"), 1)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("no observation produces"), "{error}");
+    }
+
+    #[test]
     fn an_opened_window_must_pin_what_the_backup_observed() {
         let config = config_with_corporate_action(Some(("4", "1")));
         let event = fixture_event();
@@ -10682,6 +10747,22 @@ runtime:
         let (baseline, current) = resume_pair();
         config.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
         let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        assert!(authorized.resumed_inventory.is_some());
+
+        // ... including across legacy padding: the backup has an id with no
+        // fingerprint, so the resume pads before appending and the resumed
+        // event's fingerprint is the *last* new entry, not the first.
+        let (mut legacy_baseline, mut legacy_current) = resume_pair();
+        legacy_baseline.handled_corporate_action_ids = vec!["OLDER".to_string()];
+        legacy_baseline
+            .handled_corporate_action_fingerprints
+            .clear();
+        legacy_current.handled_corporate_action_ids =
+            vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
+        legacy_current.handled_corporate_action_fingerprints =
+            vec![String::new(), fixture_event().fingerprint()];
+        let authorized =
+            corporate_action_continuity(&config, &legacy_baseline, &legacy_current, 1).unwrap();
         assert!(authorized.resumed_inventory.is_some());
 
         // A genuinely undeclared resume is still refused.

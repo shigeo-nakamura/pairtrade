@@ -504,6 +504,23 @@ impl ArcusSpotRuntime {
     pub fn new(mut config: ArcusSpotRuntimeConfig) -> Result<Self, String> {
         config.normalize();
         config.validate()?;
+        // `validate` allows a floor above `initial_inventory` when a declared
+        // reconciliation reaches it -- that is what lets a floor be raised
+        // after a completed split. A *fresh* runtime starts from
+        // `initial_inventory`, though, so the same config would build state
+        // that is already below its floors and wedge on the next
+        // `load_or_create`, which reaches `from_state` with no pending
+        // reconciliation to excuse it (Codex P2, pairtrade#309).
+        if config.initial_inventory.token_a < config.inventory_floors.token_a
+            || config.initial_inventory.token_b < config.inventory_floors.token_b
+        {
+            return Err(
+                "a fresh Arcus runtime starts at initial_inventory, which is below \
+                 inventory_floors; a floor raised to match a declared post_event_inventory can \
+                 only be adopted by a runtime that already holds it"
+                    .to_string(),
+            );
+        }
         let state = ArcusSpotRuntimeState::new(config.initial_inventory);
         Ok(Self { config, state })
     }
@@ -7748,6 +7765,25 @@ mod tests {
         let error = runtime.clear_risk_halt().unwrap_err();
         assert!(error.contains("no longer quotes"), "{error}");
         assert!(runtime.state.risk_halt.is_some());
+    }
+
+    #[test]
+    fn a_fresh_runtime_must_start_above_its_floors() {
+        // The config is valid -- a declared reconciliation reaches the floor
+        // -- but a fresh runtime starts at initial_inventory and would
+        // persist state its own next load rejects.
+        let mut cfg = cfg_with_window_at(event_time());
+        cfg.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(40),
+            token_b: Decimal::ONE,
+        });
+        cfg.inventory_floors.token_a = Decimal::from(5);
+        cfg.validate().unwrap();
+        let error = match ArcusSpotRuntime::new(cfg) {
+            Ok(_) => panic!("a fresh runtime below its floors must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("below"), "{error}");
     }
 
     #[test]
