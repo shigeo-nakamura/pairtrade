@@ -348,7 +348,7 @@ runtime:
 | From | Entries | Open rotation | Signal window |
 |---|---|---|---|
 | `entry_block_at` | blocked (`corporate_action_block`) | held; mean-reversion and max-hold exits still fire | still accumulating |
-| `reduce_exit_at` | blocked | **forced unwind** (`corporate_action_exit`) | still accumulating |
+| `reduce_exit_at` | blocked | **forced unwind** (`corporate_action_exit`), stopping `corporate_action_settlement_margin_secs` before `effective_at` | still accumulating |
 | `effective_at` | blocked | **no exit of any kind** -- holds `corporate_action_unresolved`; operator reconciles | discarded **once**; nothing accumulates |
 | `resume_not_before` | blocked until the resume completes | must be flat | empty; warm-up gates the first new entry |
 
@@ -359,6 +359,14 @@ ordinary gate -- quote freshness, venue, cost, token floor, gas, signing,
 reconciliation. If it cannot be quoted it holds (`route_unavailable`, etc.)
 and the position stays open; it never bypasses a gate and never pretends to
 have closed.
+
+It also stops early: exit dispatch is refused within
+`corporate_action_settlement_margin_secs` (300s by default) of
+`effective_at`, because submission is not execution -- an order sent just
+before the cutoff can still be mined after it, selling the pre-event
+quantity at the post-event denomination, and no in-process check covers the
+venue round trip. Size `reduce_exit_at` to leave room for that margin as
+well as for the venue not quoting.
 
 **From `effective_at` the opposite holds: the runtime submits no exit at
 all** -- not the forced one, not max-hold, not mean-reversion. The venue is
@@ -396,7 +404,10 @@ At `resume_not_before` the runtime resumes only when all three hold:
    command, and it is still the correct outcome -- the alternative is an
    exit sized in the wrong units. The mitigation is upstream of it: set
    `reduce_exit_at` with **real margin** before `effective_at` for the venue
-   not quoting (the forced exit retries every tick through that phase), and
+   not quoting (the forced exit retries every tick through that phase, and
+   stops `corporate_action_settlement_margin_secs` -- 300s by default --
+   before the cutoff, because a submitted swap can still be mined after it),
+   and
    do not open a window with a rotation you cannot afford to have stuck. If
    it happens anyway, close the position on the venue by hand, in post-event
    units, keep the evidence, and wait for #977 rather than editing state.
