@@ -1,0 +1,46 @@
+name: Resolve AL2023 arm64 build image
+description: >
+  Pull the AL2023 build image for linux/arm64 and pin it to its content
+  digest, so every cache key and every `docker run` in the job refers to the
+  exact image the artifact was built in (bot-strategy#899).
+
+inputs:
+  image:
+    description: The floating AL2023 image tag to resolve.
+    required: false
+    default: public.ecr.aws/amazonlinux/amazonlinux:2023
+
+outputs:
+  image_ref:
+    description: The digest-pinned image reference (repo@sha256:...).
+    value: ${{ steps.resolve.outputs.image_ref }}
+  digest:
+    description: The bare sha256 hex digest of the resolved image.
+    value: ${{ steps.resolve.outputs.digest }}
+  cache_key:
+    description: >
+      sha256 of the digest-pinned reference, for use as a cache-key segment.
+    value: ${{ steps.resolve.outputs.cache_key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve build image
+      id: resolve
+      shell: bash
+      env:
+        AL2023_IMAGE: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        docker pull --platform linux/arm64 "${AL2023_IMAGE}"
+        AL2023_IMAGE_RESOLVED=$(docker image inspect --format='{{index .RepoDigests 0}}' "${AL2023_IMAGE}")
+        test -n "${AL2023_IMAGE_RESOLVED}"
+        # Exported for the `docker run ... ${AL2023_IMAGE_RESOLVED}` steps that
+        # callers keep inline; the outputs below cover cache keys.
+        echo "AL2023_IMAGE_RESOLVED=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_ENV}"
+        echo "image_ref=${AL2023_IMAGE_RESOLVED}" >> "${GITHUB_OUTPUT}"
+        DIGEST=${AL2023_IMAGE_RESOLVED##*@sha256:}
+        test -n "${DIGEST}"
+        echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+        CACHE_KEY=$(printf "%s" "${AL2023_IMAGE_RESOLVED}" | sha256sum)
+        echo "cache_key=${CACHE_KEY%% *}" >> "${GITHUB_OUTPUT}"

@@ -89,11 +89,15 @@ pub struct ExecutionConfig {
     pub slippage_bps: u32,
     pub max_attempts: u32,
     pub fill_confirm_timeout_secs: i64,
-    /// Lighter has no price-capped IOC in dex-connector v4.7.20
-    /// (`create_order_taker_ioc` is `Permanent`; bot-strategy#918): when
-    /// true, a live order falls back to `create_order(price=None)`, i.e.
-    /// the venue's own ±20 % protection price instead of `slippage_bps`.
+    /// When a venue has no price-capped IOC (`create_order_taker_ioc`
+    /// answers `Permanent`), a live order falls back to
+    /// `create_order(price = None)` -- the venue's own ±20 % protection
+    /// price instead of `slippage_bps` -- but only if this is true.
     /// Default false = fail closed (the order is not sent).
+    ///
+    /// Lighter needed it up to dex-connector v4.7.21 and does **not**
+    /// since v4.7.22 (bot-strategy#918), so on Lighter there is no
+    /// longer any reason to turn this on.
     #[serde(default)]
     pub allow_venue_protection_fallback: bool,
     pub paper_slippage_bps: f64,

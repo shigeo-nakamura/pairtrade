@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       dex_connector_ref:
-        description: "Dex-connector ref/tag (default: the pinned env ref)"
+        description: "Dex-connector ref/tag (default: Cargo.lock's pin)"
         required: false
         type: string
       target:
@@ -43,17 +43,30 @@ env:
   AWS_REGION: eu-central-1
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
   RUST_TOOLCHAIN: 1.94.1
-  DEX_CONNECTOR_REF: v4.7.20
   ARCUS_S3_PREFIX: arcus-spot-execute-once
   ARCUS_INSTANCE_ID: i-0cb942c2950be020f
   INSTALL_PATH: /usr/local/bin/arcus-spot-execute-once
   PROVENANCE_DIR: /usr/local/share/arcus-spot-execute-once
 
 jobs:
+  # bot-strategy#899: this workflow used to carry a *static*
+  # `DEX_CONNECTOR_REF:` pin while ci.yml resolved the ref from Cargo.lock.
+  # The two drifted silently -- CI stayed green off Cargo.lock's pin while the
+  # binary installed on the Arcus host was built against whatever tag someone
+  # last remembered to type here (the "bump three files by hand" trap in
+  # CLAUDE.md). Both now read the same shared resolver.
+  resolve-ref:
+    uses: ./.github/workflows/_resolve-dex-connector-ref.yml
+    with:
+      input-ref: ${{ inputs.dex_connector_ref || '' }}
+
   test:
     name: Test Arcus Spot executor (x86_64)
+    needs: resolve-ref
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}
     steps:
       - name: Checkout pairtrade
         uses: actions/checkout@v5
@@ -64,7 +77,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: shigeo-nakamura/dex-connector
-          ref: ${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+          ref: ${{ env.DEX_CONNECTOR_REF }}
           path: dex-connector
           token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
 
@@ -80,9 +93,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ env.DEX_CONNECTOR_REF }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ env.DEX_CONNECTOR_REF }}-
             ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Run Arcus Spot executor tests
@@ -94,10 +107,12 @@ jobs:
 
   build-deploy:
     name: Build Arcus Spot executor (native arm64)
-    needs: test
+    needs: [resolve-ref, test]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     environment: debot
+    env:
+      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}
     steps:
       - name: Checkout pairtrade
         uses: actions/checkout@v5
@@ -108,7 +123,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: shigeo-nakamura/dex-connector
-          ref: ${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+          ref: ${{ env.DEX_CONNECTOR_REF }}
           path: dex-connector
           token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
 
@@ -123,14 +138,9 @@ jobs:
 
       - name: Resolve build image
         id: build_image
-        run: |
-          docker pull --platform linux/arm64 "${AL2023_IMAGE}"
-          IMAGE_REF=$(docker image inspect --format '{{index .RepoDigests 0}}' "${AL2023_IMAGE}")
-          test -n "${IMAGE_REF}"
-          echo "image_ref=${IMAGE_REF}" >> "${GITHUB_OUTPUT}"
-          IMAGE_CACHE_KEY=${IMAGE_REF##*@sha256:}
-          test -n "${IMAGE_CACHE_KEY}"
-          echo "image_cache_key=${IMAGE_CACHE_KEY}" >> "${GITHUB_OUTPUT}"
+        uses: ./debot/.github/actions/al2023-build-image
+        with:
+          image: ${{ env.AL2023_IMAGE }}
 
       - name: Cache cargo (native arm64, Arcus live)
         uses: actions/cache@v5
@@ -141,9 +151,9 @@ jobs:
             .cache/cargo/bin
             .cache/rustup
             debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ steps.build_image.outputs.image_cache_key }}-${{ hashFiles('debot/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ steps.build_image.outputs.digest }}-${{ hashFiles('debot/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ steps.build_image.outputs.image_cache_key }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ steps.source_ids.outputs.dex_connector_sha }}-${{ steps.build_image.outputs.digest }}-
 
       - name: Build Arcus Spot executor in AL2023 (native arm64)
         run: |
@@ -183,7 +193,7 @@ jobs:
         env:
           PAIRTRADE_SHA: ${{ steps.source_ids.outputs.pairtrade_sha }}
           DEX_CONNECTOR_SHA: ${{ steps.source_ids.outputs.dex_connector_sha }}
-          DEX_CONNECTOR_INPUT_REF: ${{ inputs.dex_connector_ref || env.DEX_CONNECTOR_REF }}
+          DEX_CONNECTOR_INPUT_REF: ${{ env.DEX_CONNECTOR_REF }}
           BUILD_IMAGE_REF: ${{ steps.build_image.outputs.image_ref }}
         run: |
           sudo chown -R "$(id -u):$(id -g)" .cache/cargo .cache/rustup debot/target

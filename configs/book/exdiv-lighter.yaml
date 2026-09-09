@@ -79,9 +79,11 @@ sizing:
   rebalance_deadband_usd: 5
 
 execution:
-  # Pre-send drift guard; the producer already skipped anything wider than
-  # 30 bps. Lighter has no price-capped IOC (bot-strategy#918): stays
-  # false while DRY_RUN, see docs/book-runtime-operations.md.
+  # Pre-send drift guard, and since dex-connector v4.7.22 also the real
+  # IOC price cap on Lighter (bot-strategy#918): the producer already
+  # skipped anything wider than 30 bps. allow_venue_protection_fallback
+  # stays at its default false -- Lighter no longer needs it, so enabling
+  # it would only widen a fill. See docs/book-runtime-operations.md.
   slippage_bps: 30
   max_attempts: 3
   fill_confirm_timeout_secs: 10
