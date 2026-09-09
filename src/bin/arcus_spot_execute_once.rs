@@ -2660,9 +2660,9 @@ fn corporate_action_units_are_stale(
     let Some(progress) = current.corporate_action.as_ref() else {
         return false;
     };
-    if progress.history_invalidated_at.is_none() {
+    let Some(stamped_at) = progress.history_invalidated_at else {
         return false;
-    }
+    };
     if current
         .handled_corporate_action_ids
         .iter()
@@ -2670,10 +2670,17 @@ fn corporate_action_units_are_stale(
     {
         return false;
     }
+    // Declared, or an orphaned record that carries its own cutoff and was
+    // stamped at or after it -- the runtime stamps those itself when the
+    // declaration is gone (Codex P1, pairtrade#309). A stamp with neither
+    // is not something the runtime writes.
     config
         .corporate_actions
         .iter()
         .any(|event| event.event_id.eq_ignore_ascii_case(&progress.event_id))
+        || progress
+            .effective_at
+            .is_some_and(|effective_at| stamped_at >= effective_at)
 }
 
 fn require_risk_state_continuity(
@@ -10136,6 +10143,7 @@ runtime:
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
             fingerprint: String::new(),
+            effective_at: None,
         });
 
         let mut current = continuity_state(8, ("4", "1"));
@@ -10291,6 +10299,7 @@ runtime:
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
             fingerprint: String::new(),
+            effective_at: None,
         });
         assert!(!current.relative_log_price_history.is_empty());
         let error = corporate_action_continuity(&config, &baseline, &current, 1)
@@ -10315,6 +10324,7 @@ runtime:
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
             fingerprint: String::new(),
+            effective_at: None,
         });
         let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
         assert!(authorized.history_discarded);
@@ -10346,6 +10356,7 @@ runtime:
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
             fingerprint: String::new(),
+            effective_at: None,
         }
     }
 
@@ -10405,6 +10416,35 @@ runtime:
             error.contains("omitted a newly triggered loss halt"),
             "{error}"
         );
+        // ... unless the orphaned record carries its own cutoff and a stamp
+        // at or after it -- the one shape the runtime writes without a
+        // declaration -- and is not already handled.
+        let mut orphaned = current.clone();
+        orphaned.corporate_action.as_mut().unwrap().effective_at =
+            Some("2026-08-16T02:00:00Z".parse().unwrap());
+        require_risk_state_continuity(
+            &undeclared,
+            &baseline,
+            &orphaned,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap();
+        let mut inconsistent = orphaned.clone();
+        inconsistent.corporate_action.as_mut().unwrap().effective_at =
+            Some("2026-08-16T02:30:00Z".parse().unwrap());
+        require_risk_state_continuity(
+            &undeclared,
+            &baseline,
+            &inconsistent,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap_err();
 
         let mut handled = current.clone();
         handled.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];

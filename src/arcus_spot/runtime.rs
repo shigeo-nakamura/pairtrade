@@ -245,6 +245,15 @@ pub struct ArcusSpotCorporateActionProgress {
     /// Empty on records written before it existed; those match by id.
     #[serde(default)]
     pub fingerprint: String,
+    /// The declaration's `effective_at`, copied when the window opened, so
+    /// the record can cross into the stale-unit phase on its own -- and
+    /// stamp `history_invalidated_at` at the right instant -- even if the
+    /// declaration is deleted or replaced before then. Without it a record
+    /// orphaned in the reduce phase never became stale, and the old
+    /// quantities kept being valued at post-event prices (Codex P1,
+    /// pairtrade#309). `None` on records that predate the field.
+    #[serde(default)]
+    pub effective_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2819,6 +2828,29 @@ impl ArcusSpotRuntime {
             return CorporateActionGate::default();
         }
 
+        // A new declaration wearing a handled id would be filtered out as
+        // "already handled" and its window skipped entirely, so it is
+        // refused up front, whatever its instants.
+        if let Some(event) = self
+            .config
+            .corporate_actions
+            .iter()
+            .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
+        {
+            return CorporateActionGate {
+                block_entry: Some(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::CorporateActionBlock,
+                    format!(
+                        "corporate action {} reuses the id of an already handled event for a \
+                         different declaration; give the new action its own event_id",
+                        event.event_id,
+                    ),
+                )),
+                force_exit: false,
+                suppress_history: false,
+                suppress_exits: false,
+            };
+        }
         let Some(event) = self.active_corporate_action(evaluation_time) else {
             // Retiring a declaration whose window never opened is ordinary
             // housekeeping: nothing was pinned, nothing was discarded,
@@ -2833,7 +2865,11 @@ impl ArcusSpotRuntime {
             // live entry is not a way to cancel a window (Codex P1,
             // pairtrade#309).
             if let Some(progress) = self.state.corporate_action.clone() {
-                return self.undeclared_progress_gate(&progress, "is no longer declared in");
+                return self.undeclared_progress_gate(
+                    evaluation_time,
+                    &progress,
+                    "is no longer declared in",
+                );
             }
             self.state.corporate_action = None;
             return CorporateActionGate::default();
@@ -2864,6 +2900,7 @@ impl ArcusSpotRuntime {
                 // resolved first.
                 let progress = progress.clone();
                 return self.undeclared_progress_gate(
+                    evaluation_time,
                     &progress,
                     "was replaced by a different declaration in",
                 );
@@ -2895,6 +2932,7 @@ impl ArcusSpotRuntime {
                     .flatten(),
                 history_invalidated_at: None,
                 fingerprint: event.fingerprint(),
+                effective_at: Some(event.effective_at),
             });
         }
 
@@ -3086,13 +3124,24 @@ impl ArcusSpotRuntime {
         // The stamp is the durable half: it is written at `effective_at`
         // and cleared only by the resume, so it survives a restart and an
         // operator deleting the declaration out from under an open window.
-        if self
-            .state
-            .corporate_action
-            .as_ref()
-            .is_some_and(|progress| progress.history_invalidated_at.is_some())
-        {
-            return true;
+        if let Some(progress) = self.state.corporate_action.as_ref() {
+            if progress.history_invalidated_at.is_some() {
+                return true;
+            }
+            // An orphaned record (its declaration deleted or replaced) past
+            // its own recorded cutoff is stale before the gate has run this
+            // tick and stamped it; one with no recorded cutoff cannot say
+            // and is treated as stale rather than halted on.
+            let declared = self
+                .config
+                .corporate_actions
+                .iter()
+                .any(|event| Self::progress_matches(progress, event));
+            if !declared {
+                return progress
+                    .effective_at
+                    .is_none_or(|effective_at| evaluation_time >= effective_at);
+            }
         }
         // ... and the calendar covers the tick that first crosses
         // `effective_at`, where the halt is evaluated before the gate has
@@ -3127,10 +3176,26 @@ impl ArcusSpotRuntime {
     /// open position under an undeclared window is the operator's to
     /// reconcile, full stop (Codex P1 x3, pairtrade#309).
     fn undeclared_progress_gate(
-        &self,
+        &mut self,
+        evaluation_time: DateTime<Utc>,
         progress: &ArcusSpotCorporateActionProgress,
         because: &str,
     ) -> CorporateActionGate {
+        // The one thing the declared path does at `effective_at` that this
+        // record still needs done: discard the pre-event window and stamp
+        // it, so halt suppression, the continuity verifier and anything
+        // else keyed on the stamp see the same transition at the same
+        // instant whether or not the declaration survived.
+        if progress.history_invalidated_at.is_none()
+            && progress
+                .effective_at
+                .is_some_and(|effective_at| evaluation_time >= effective_at)
+        {
+            self.state.relative_log_price_history.clear();
+            if let Some(live) = self.state.corporate_action.as_mut() {
+                live.history_invalidated_at = Some(evaluation_time);
+            }
+        }
         CorporateActionGate {
             block_entry: Some(ArcusSpotHold::new(
                 ArcusSpotHoldCode::CorporateActionBlock,
@@ -3166,17 +3231,38 @@ impl ArcusSpotRuntime {
     /// again on the next tick, clear the live signal history and re-apply
     /// its `post_event_inventory` over every trade made since.
     fn corporate_action_is_handled(&self, event: &ArcusSpotCorporateActionEvent) -> bool {
-        self.state
+        matches!(
+            self.handled_record_for(event),
+            Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
+        )
+    }
+
+    /// How `event` relates to the handled record, if at all. The id and the
+    /// fingerprint are recorded side by side, so a handled id whose recorded
+    /// fingerprint differs from this event's is a *reused label* -- a new,
+    /// distinct action declared under an old name -- and must not be read as
+    /// "already handled", or its window is skipped entirely (Codex P1,
+    /// pairtrade#309). Records that predate fingerprints match by id alone.
+    fn handled_record_for(&self, event: &ArcusSpotCorporateActionEvent) -> Option<HandledMatch> {
+        let fingerprint = event.fingerprint();
+        if self
+            .state
+            .handled_corporate_action_fingerprints
+            .iter()
+            .any(|handled| *handled == fingerprint)
+        {
+            return Some(HandledMatch::Same);
+        }
+        let index = self
+            .state
             .handled_corporate_action_ids
             .iter()
-            .any(|handled| handled.eq_ignore_ascii_case(&event.event_id))
-            || {
-                let fingerprint = event.fingerprint();
-                self.state
-                    .handled_corporate_action_fingerprints
-                    .iter()
-                    .any(|handled| *handled == fingerprint)
-            }
+            .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))?;
+        match self.state.handled_corporate_action_fingerprints.get(index) {
+            None => Some(HandledMatch::LegacyById),
+            Some(recorded) if *recorded == fingerprint => Some(HandledMatch::Same),
+            Some(_) => Some(HandledMatch::ReusedId),
+        }
     }
 
     /// Compares each affected symbol's contract and decimals against what
@@ -3221,6 +3307,17 @@ impl ArcusSpotRuntime {
         }
         None
     }
+}
+
+/// See `ArcusSpotRuntime::handled_record_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandledMatch {
+    /// This exact declaration (by fingerprint) was handled.
+    Same,
+    /// Handled by id on a record written before fingerprints existed.
+    LegacyById,
+    /// A handled id, but the recorded fingerprint is a different event.
+    ReusedId,
 }
 
 /// The rotation signal after the corporate-action calendar has had its say.
@@ -6979,6 +7076,73 @@ mod tests {
         }
         assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
         assert!(runtime.state.corporate_action.is_some(), "progress is kept");
+    }
+
+    #[test]
+    fn an_orphaned_window_still_goes_stale_at_its_own_effective_time() {
+        // Deleted in the reduce phase; the record carries the cutoff, so it
+        // still discards the window and stops halting on stale units at the
+        // original effective_at -- the reverse-split shortfall from the
+        // round-3 test, valued at $800, must not halt here either.
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        runtime.state.inventory.token_a = Decimal::new(995, 3);
+        let reduce = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(reduce), reduce);
+        assert_eq!(runtime.state.risk_halt, None);
+        runtime.config.corporate_actions.clear();
+
+        let effective = anchor + Duration::seconds(6);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(effective, "800", "100"),
+            effective,
+        );
+        let progress = runtime.state.corporate_action.clone().unwrap();
+        assert_eq!(progress.effective_at, Some(anchor + Duration::seconds(4)));
+        assert!(
+            progress.history_invalidated_at.is_some(),
+            "the orphan still stamps"
+        );
+        assert!(runtime.state.relative_log_price_history.is_empty());
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "old units at new prices are not a loss"
+        );
+        assert!(runtime.corporate_action_units_are_stale(effective));
+    }
+
+    #[test]
+    fn a_handled_id_reused_for_a_different_action_is_refused() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+
+        // A later, distinct action declared under the old id.
+        let later = resumed_at + Duration::days(30);
+        let mut reused = corporate_action_event(later);
+        reused.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(8),
+            token_b: Decimal::ONE,
+        });
+        runtime.config.corporate_actions = vec![reused];
+        runtime.state.relative_log_price_history = vec![0.10, 0.11, 0.12];
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => {
+                assert_eq!(hold.code, ArcusSpotHoldCode::CorporateActionBlock);
+                assert!(hold.detail.contains("reuses the id"), "{}", hold.detail);
+            }
+            other => panic!("a reused id must not trade through its window, got {other:?}"),
+        }
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+        assert_eq!(runtime.state.corporate_action, None);
     }
 
     #[test]
