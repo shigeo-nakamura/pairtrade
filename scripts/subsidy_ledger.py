@@ -104,6 +104,21 @@ from pathlib import Path
 from typing import Iterable
 
 
+def add_or_none(total: float | None, addend: float | None) -> float | None:
+    """Running total for an aggregate, or `None` once it stops being one.
+
+    The per-day loaders already refuse a value, or a sum, that leaves the
+    reals. A roll-up across days is a *second* level of accumulation and
+    can overflow where every day was finite, after which the printed
+    rates are `NaN` or a misleading zero. `None` is sticky: once a total
+    is unknown, nothing later makes it known again (Codex, PR #297).
+    """
+    if total is None or addend is None:
+        return None
+    combined = total + addend
+    return combined if math.isfinite(combined) else None
+
+
 def finite_or_none(value: float, places: int) -> float | None:
     """A derived number, or `None` when the arithmetic left the reals.
 
@@ -556,6 +571,19 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             day.realized_pnl_usd += pnl
             day.cycles += 1
+            # `in`, not `.get()`, for the same reason as the tick count:
+            # the documented writer omits this field for a genuine zero,
+            # so a present `null` is a malformed claim, not that. Round 34
+            # asserted a present null "still takes the conservative
+            # branch" and tested it on a boundary-spanning row -- which
+            # is the one shape where that happens to be true. On a short
+            # same-hour hold with no tick claim the missing-carry branch
+            # marks no gap, and the day published `funding_usd: 0` as a
+            # verified zero (Codex, PR #297).
+            if "funding_carry_usd" in record and record["funding_carry_usd"] is None:
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_funding")
+                continue
             funding = record.get("funding_carry_usd")
             if funding is None:
                 # A positive `funding_ticks_observed` is the row's own
@@ -1126,31 +1154,40 @@ def summarize(rows: list[Row]) -> dict:
         )
         arm["days"] += 1
         arm["fills"] += row.fills
-        arm["volume_usd"] += row.volume_usd
+        # The per-day loaders guard this exact failure; the per-arm roll-up
+        # is a second level of accumulation and needs the same guard, or
+        # two finite days total to `Infinity` and the printed rates become
+        # NaN or a misleading zero (Codex, PR #297).
+        arm["volume_usd"] = add_or_none(arm["volume_usd"], row.volume_usd)
         arm["fills_without_value"] += row.fills_without_value or 0
         arm["cross_day_cycles"] += row.cross_day_cycles
         if row.fills_without_value or row.cost_spans_two_days():
             arm["incomplete_volume_days"] += 1
         if row.cost_usd is None:
-            arm["uncosted_volume_usd"] += row.volume_usd
+            arm["uncosted_volume_usd"] = add_or_none(arm["uncosted_volume_usd"], row.volume_usd)
         else:
-            arm["cost_usd"] += row.cost_usd
+            arm["cost_usd"] = add_or_none(arm["cost_usd"], row.cost_usd)
             arm["cost_days"] += 1
             # Volume ratio: this cost counts only if this row measured the
             # volume it was spent on.
             if (row.volume_usd > 0 and not row.fills_without_value
                     and not row.cost_spans_two_days()):
-                arm["cost_usd_on_measured_volume"] += row.cost_usd
-                arm["costed_volume_usd"] += row.volume_usd
+                arm["cost_usd_on_measured_volume"] = add_or_none(
+                    arm["cost_usd_on_measured_volume"], row.cost_usd)
+                arm["costed_volume_usd"] = add_or_none(
+                    arm["costed_volume_usd"], row.volume_usd)
             else:
-                arm["cost_usd_without_volume"] += row.cost_usd
+                arm["cost_usd_without_volume"] = add_or_none(
+                    arm["cost_usd_without_volume"], row.cost_usd)
             # Points ratio: likewise, only if this row supplied points
             # *and* its cost belongs to the day those points were earned.
             if (row.points is not None and row.points > 0
                     and not row.cost_spans_two_days()):
-                arm["cost_usd_on_pointed_days"] += row.cost_usd
+                arm["cost_usd_on_pointed_days"] = add_or_none(
+                    arm["cost_usd_on_pointed_days"], row.cost_usd)
             else:
-                arm["cost_usd_without_points"] += row.cost_usd
+                arm["cost_usd_without_points"] = add_or_none(
+                    arm["cost_usd_without_points"], row.cost_usd)
         if row.points is not None:
             arm["points_seen"] = True
             if row.cost_usd is None or row.cost_spans_two_days():
@@ -1158,32 +1195,60 @@ def summarize(rows: list[Row]) -> dict:
                 # whose cost belongs partly to a cycle that opened
                 # yesterday. Counting them would divide a numerator and a
                 # denominator drawn from different days (Codex, PR #297).
-                arm["uncosted_points"] += row.points
+                arm["uncosted_points"] = add_or_none(arm["uncosted_points"], row.points)
             else:
-                arm["points"] += row.points
+                arm["points"] = add_or_none(arm["points"], row.points)
     for arm in by_arm.values():
         for key in ("volume_usd", "costed_volume_usd", "uncosted_volume_usd", "cost_usd",
                     "cost_usd_on_measured_volume", "cost_usd_without_volume",
                     "cost_usd_on_pointed_days", "cost_usd_without_points"):
-            arm[key] = round(arm[key], 6)
+            arm[key] = None if arm[key] is None else round(arm[key], 6)
+        # A rate needs both of its terms. `None` on either is the total
+        # saying it is not known, and a rate over an unknown total is not
+        # a number to print (Codex, PR #297).
         arm["cost_per_musd_volume"] = (
-            round(arm["cost_usd_on_measured_volume"] / (arm["costed_volume_usd"] / 1e6), 4)
-            if arm["costed_volume_usd"] > 0
+            finite_or_none(
+                arm["cost_usd_on_measured_volume"] / (arm["costed_volume_usd"] / 1e6), 4)
+            if arm["cost_usd_on_measured_volume"] is not None
+            and arm["costed_volume_usd"] is not None
+            and arm["costed_volume_usd"] > 0
             else None
         )
         arm["cost_per_point"] = (
-            round(arm["cost_usd_on_pointed_days"] / arm["points"], 8)
-            if arm["points_seen"] and arm["points"] > 0
+            finite_or_none(arm["cost_usd_on_pointed_days"] / arm["points"], 8)
+            if arm["points_seen"]
+            and arm["cost_usd_on_pointed_days"] is not None
+            and arm["points"] is not None
+            and arm["points"] > 0
             else None
+        )
+        # `None` on a points total means two different things and the
+        # table has to tell them apart: no points were supplied at all,
+        # or they were and the roll-up could not be represented. Only the
+        # second is worth explaining to the reader (Codex, PR #297).
+        arm["points_unrepresentable"] = bool(arm["points_seen"]) and (
+            arm["points"] is None or arm["uncosted_points"] is None
         )
         if not arm["points_seen"]:
             arm["points"] = None
             arm["uncosted_points"] = None
             arm["cost_usd_without_points"] = None
-        else:
+        elif arm["uncosted_points"] is not None:
             arm["uncosted_points"] = round(arm["uncosted_points"], 6)
         del arm["points_seen"]
     return {"arms": [by_arm[a] for a in sorted(by_arm)]}
+
+
+def money(value: float | None, places: int = 2) -> str:
+    """A dollar amount for the table, or the word for "not known".
+
+    Every total can now be `None` -- a roll-up that overflowed says so
+    rather than printing `Infinity` -- so the renderer has to be able to
+    say it too. Without this the CLI raised
+    `unsupported format string passed to NoneType.__format__` instead of
+    producing the report (Codex, PR #297).
+    """
+    return "unknown" if value is None else f"${value:,.{places}f}"
 
 
 def render_table(rows: list[Row], summary: dict) -> str:
@@ -1202,7 +1267,8 @@ def render_table(rows: list[Row], summary: dict) -> str:
     out.append("")
     out.append("Totals (cost is positive when the arm gave money up):")
     for arm in summary["arms"]:
-        head = f"  {arm['arm']:6s} volume ${arm['volume_usd']:,.0f} over {arm['days']}d"
+        head = (f"  {arm['arm']:6s} volume {money(arm['volume_usd'], 0)} "
+                f"over {arm['days']}d")
         if arm["cost_days"] == 0:
             # Nothing priced this arm at all. Saying "cost $0.00" here would
             # read as free rather than as unmeasured.
@@ -1211,7 +1277,12 @@ def render_table(rows: list[Row], summary: dict) -> str:
             # Still say what was supplied and excluded: an all-uncosted
             # points export otherwise printed "cost unknown" and nothing
             # about the points it was given (Codex, PR #297).
-            if arm["uncosted_points"]:
+            if arm["points_unrepresentable"]:
+                out.append(
+                    "         the points total could not be represented, so no price per "
+                    "point can be computed"
+                )
+            elif arm["uncosted_points"]:
                 out.append(
                     f"         {arm['uncosted_points']:,.1f} points were supplied for days with "
                     f"no usable cost, so no price per point can be computed"
@@ -1230,7 +1301,7 @@ def render_table(rows: list[Row], summary: dict) -> str:
         # subset is simply false, and a caveat further down does not repair
         # it.
         out.append(
-            f"{head}, cost ${arm['cost_usd']:,.2f} across "
+            f"{head}, cost {money(arm['cost_usd'])} across "
             f"{arm['cost_days']} costed day(s)")
         if arm["cost_per_musd_volume"] is None:
             out.append(
@@ -1239,18 +1310,18 @@ def render_table(rows: list[Row], summary: dict) -> str:
             )
         else:
             out.append(
-                f"         ${arm['cost_usd_on_measured_volume']:,.2f} of it fell on "
-                f"${arm['costed_volume_usd']:,.0f} of measured volume"
+                f"         {money(arm['cost_usd_on_measured_volume'])} of it fell on "
+                f"{money(arm['costed_volume_usd'], 0)} of measured volume"
                 f" = ${arm['cost_per_musd_volume']:,.2f} per $1M traded"
             )
-        if arm["uncosted_volume_usd"] > 0:
+        if arm["uncosted_volume_usd"] is None or arm["uncosted_volume_usd"] > 0:
             out.append(
-                f"         ${arm['uncosted_volume_usd']:,.0f} of that volume has no cost "
+                f"         {money(arm['uncosted_volume_usd'], 0)} of that volume has no cost "
                 f"source and is excluded above"
             )
         if arm["cost_usd_without_volume"]:
             out.append(
-                f"         ${arm['cost_usd_without_volume']:,.2f} of cost fell on days whose "
+                f"         {money(arm['cost_usd_without_volume'])} of cost fell on days whose "
                 f"volume is unmeasured and is excluded from that rate"
             )
         if arm["fills_without_value"]:
@@ -1261,7 +1332,7 @@ def render_table(rows: list[Row], summary: dict) -> str:
             )
         if arm["cost_per_point"] is not None:
             out.append(
-                f"         ${arm['cost_usd_on_pointed_days']:,.2f} of it over "
+                f"         {money(arm['cost_usd_on_pointed_days'])} of it over "
                 f"{arm['points']:,.1f} points = ${arm['cost_per_point']:.6f} per point"
             )
         elif arm["points"] is not None:
@@ -1275,14 +1346,19 @@ def render_table(rows: list[Row], summary: dict) -> str:
             )
         # These say which side was missing, and are worth printing
         # whether or not a rate came out of what remained.
-        if arm["uncosted_points"]:
+        if arm["points_unrepresentable"]:
+            out.append(
+                "         the points total could not be represented, so it is excluded "
+                "from that price"
+            )
+        elif arm["uncosted_points"]:
             out.append(
                 f"         {arm['uncosted_points']:,.1f} points earned on days with no usable "
                 f"cost are excluded from that price"
             )
         if arm["cost_usd_without_points"]:
             out.append(
-                f"         ${arm['cost_usd_without_points']:,.2f} of cost fell on days with "
+                f"         {money(arm['cost_usd_without_points'])} of cost fell on days with "
                 f"no points supplied and is excluded from that price"
             )
     return "\n".join(out)

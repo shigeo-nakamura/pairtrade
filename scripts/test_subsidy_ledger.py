@@ -1303,19 +1303,35 @@ def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
             assert row.funding_usd is None
             assert row.cost_source != "pnl_ledger"
 
-        # The comment on `funding_tick_claim` claims this is the only
-        # field where absent is the permissive answer. Back it up: a
-        # present-null *carry* still takes the conservative branch, so it
-        # needs no such distinction.
-        null_carry = pnl_file(
+        # A present-null *carry* is malformed too, and it has to be
+        # asserted on BOTH hold shapes. Round 34 claimed this field took
+        # the conservative branch anyway and tested only the spanning row
+        # -- the one shape where that is true. On a short same-hour hold
+        # the missing-carry branch marks no gap, so the day published
+        # `funding_usd: 0` as a verified zero (Codex, PR #297).
+        for arm, hold in (("g", 20 * 3600), ("h", 600)):
+            null_carry = pnl_file(
+                Path(tmp),
+                [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
+                  "hold_secs": hold, "funding_carry_usd": None}],
+                arm=arm,
+            )
+            carry_day = load_pnl([null_carry])[("2026-09-08", arm)]
+            assert carry_day.incomplete, (arm, hold)
+            assert "unreadable_funding" in carry_day.incomplete_reasons, \
+                carry_day.incomplete_reasons
+            crow = build_rows({}, {("2026-09-08", arm): carry_day})[0]
+            assert crow.funding_usd is None and crow.cost_source != "pnl_ledger"
+
+        # Omitting the field entirely on a short hold is still the
+        # documented genuine zero, so the fix did not swallow it.
+        omitted = pnl_file(
             Path(tmp),
-            [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
-              "hold_secs": 20 * 3600, "funding_carry_usd": None}],
-            arm="g",
+            [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0, "hold_secs": 600}],
+            arm="i",
         )
-        carry_day = load_pnl([null_carry])[("2026-09-08", "g")]
-        assert carry_day.incomplete, "a spanning row with no carry is a gap either way"
-        assert "funding_gap" in carry_day.incomplete_reasons
+        omitted_day = load_pnl([omitted])[("2026-09-08", "i")]
+        assert not omitted_day.incomplete, omitted_day.incomplete_reasons
 
         # A readable positive count with a carry is the normal case and
         # stays complete.
@@ -1542,6 +1558,45 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
                         # contract `--out` has with its consumers.
                         blob = json.dumps({n: getattr(row, n) for n in serialized})
                         assert "Infinity" not in blob and "NaN" not in blob, blob
+
+    # And the same property one level up: `summarize` rolls the rows into
+    # per-arm totals, which is a second accumulation that can overflow
+    # where every row was finite. Round 36 asserted the property on rows
+    # only -- the same "tested one level of it" mistake this test exists
+    # to stop repeating (Codex, PR #297).
+    many = {}
+    pnl_days = {}
+    for i in range(4):
+        date = f"2026-09-0{i + 1}"
+        many[(date, "freq")] = ExecDay(fills=1, volume_usd=1e308)
+        pnl_days[(date, "freq")] = PnlDay(cycles=1, realized_pnl_usd=-1e308,
+                                          funding_seen=True)
+    big_rows = build_rows(many, pnl_days)
+    totals = summarize(big_rows)
+    blob = json.dumps(totals, default=str)
+    assert "Infinity" not in blob and "NaN" not in blob, blob
+    # And it has to *render*: every total can now be None, so the table
+    # must be able to say "unknown" instead of raising
+    # `unsupported format string passed to NoneType.__format__`.
+    printed = render_table(big_rows, totals)
+    assert "unknown" in printed and "Infinity" not in printed, printed
+
+    # An overflowing points roll-up is explained rather than silently
+    # dropped, and the ordinary no-points arm must not borrow that
+    # message.
+    pts = {(f"2026-09-0{i + 1}", "freq"): 1e308 for i in range(4)}
+    small = {(f"2026-09-0{i + 1}", "freq"): ExecDay(fills=1, volume_usd=100.0)
+             for i in range(4)}
+    small_pnl = {(f"2026-09-0{i + 1}", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                                       funding_seen=True)
+                 for i in range(4)}
+    pt_rows = build_rows(small, small_pnl, points=pts)
+    pt_printed = render_table(pt_rows, summarize(pt_rows))
+    assert "points total could not be represented" in pt_printed, pt_printed
+
+    plain_rows = build_rows(small, small_pnl)
+    plain = render_table(plain_rows, summarize(plain_rows))
+    assert "points total could not be represented" not in plain, plain
 
     # The equity path has its own derived value: two finite closes of
     # opposite sign whose difference is not finite.
