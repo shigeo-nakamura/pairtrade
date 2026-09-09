@@ -3049,23 +3049,7 @@ impl ArcusSpotRuntime {
                     progress.history_invalidated_at = Some(evaluation_time);
                 }
             }
-            // From the effective time the venue may already have repointed
-            // the ticker, and *every* action below -- the forced exit as much
-            // as the resume -- plans against the tracked pre-event state. An
-            // exit planned for the old contract's quantity but routed to the
-            // new address either sells the wrong instrument (if the wallet
-            // holds any of the replacement) or resubmits an impossible order
-            // every tick. So the identity check comes before the exit can be
-            // forced, not only before the resume (Codex P1, pairtrade#309).
-            if let Some(hold) = self.corporate_action_identity_drift(&event, price) {
-                return CorporateActionGate {
-                    block_entry: Some(hold),
-                    force_exit: false,
-                    suppress_history: true,
-                    suppress_exits: true,
-                };
-            }
-            // And a rotation still open here is not unwound by the runtime.
+            // A rotation still open here is not unwound by the runtime.
             // `rotated_quantity` is in pre-event units -- the same units this
             // phase already refuses to value for a loss halt -- and an exit
             // sized from it sells one old unit as one new unit after a split
@@ -3091,6 +3075,25 @@ impl ArcusSpotRuntime {
                     suppress_exits: true,
                 };
             }
+        }
+
+        // Identity drift, for the *whole* window rather than from
+        // `effective_at`. `effective_at` is the operator's declared date;
+        // the issuer's ticker can be repointed before it, and the reduce
+        // phase is precisely where the runtime forces an exit -- which would
+        // route the old instrument's `rotated_quantity` to the new contract,
+        // selling the wrong asset if the wallet holds any of the replacement
+        // and submitting an unfillable amount otherwise. Every action below
+        // plans against tracked pre-event state, so nothing may pass this
+        // point once the pair no longer names the same instrument (Codex P1,
+        // pairtrade#309).
+        if let Some(hold) = self.corporate_action_identity_drift(&event, price) {
+            return CorporateActionGate {
+                block_entry: Some(hold),
+                force_exit: false,
+                suppress_history: true,
+                suppress_exits: true,
+            };
         }
 
         // The evaluation clock reaching `resume_not_before` is not enough.
@@ -7132,6 +7135,44 @@ mod tests {
         let later = anchor + Duration::seconds(14);
         runtime.step_at(&snapshot_with_overview_received_at(later, later), later);
         assert_eq!(runtime.state.inventory, reconciled);
+    }
+
+    #[test]
+    fn a_token_repointed_before_the_effective_time_is_not_force_exited() {
+        // `effective_at` is the operator's declared date; the issuer can
+        // repoint the ticker earlier. The reduce phase is exactly where the
+        // runtime forces an exit, so drift has to be caught from the moment
+        // the window opens, not from the declared cutoff.
+        let anchor = event_time();
+        // entry_block +1s, reduce_exit +3s, effective +5s.
+        let mut runtime =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        // One observation strictly before the window, so a pin exists.
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        seed_open_rotation(&mut runtime, anchor);
+        let inside = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(inside), inside);
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .and_then(|p| p.pre_event_token_a.as_ref())
+            .is_some());
+
+        // Reduce phase (+4s), still before `effective_at`, relisted.
+        let reduce = anchor + Duration::seconds(4);
+        let outcome = runtime.step_at(&snapshot_with_relisted_token_a(reduce), reduce);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected an unresolved hold instead of a forced exit, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
     }
 
     #[test]
