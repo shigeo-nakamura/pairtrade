@@ -90,60 +90,25 @@ jobs:
       # "bump three files by hand" trap documented in CLAUDE.md: ci.yml
       # follows Cargo.lock and stays green while a deploy workflow's static
       # pin silently ships a binary built against an older dex-connector
-      # (bot-strategy#865 hit exactly this). Lint it here rather than trust
-      # the next deploy workflow's author to remember.
+      # (bot-strategy#865 hit exactly this). bot-strategy#973 added a second
+      # shape: a reusable workflow does the checkout for its caller and takes
+      # the ref as an input, so `dex-connector-ref: v4.7.20` in a `with:`
+      # block is the same pin wearing a different hat.
+      #
+      # The check lives in a script rather than a grep pipeline here because
+      # a file-wide text search cannot tell which block a match came from --
+      # Codex found two ways past the grep version (pairtrade#314): the
+      # resolver filename matched the explanatory comment every caller
+      # carries, and `.outputs.ref` matched any job's output. The script
+      # walks the parsed workflows and resolves each ref expression back to
+      # the job that produced it. Its own regression tests run in
+      # test-scripts.yml, which is also what re-checks the committed
+      # workflows when the script changes: scripts/** is deliberately not in
+      # this workflow's path filter (see the comment on `on:` above).
+      - name: Install the workflow lint's YAML parser
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
       - name: Forbid per-workflow dex-connector ref pins
-        run: |
-          rc=0
-          # The resolver has to be *called*, not merely named: every file
-          # below explains itself in comments, and matching the filename
-          # anywhere in the file would let a comment satisfy the guard
-          # (Codex, pairtrade#314).
-          resolver_call='^[[:space:]]*uses:[[:space:]]*\./\.github/workflows/_resolve-dex-connector-ref\.yml[[:space:]]*$'
-          for f in .github/workflows/*.yml; do
-            if grep -qE '^\s*DEX_CONNECTOR_REF:\s*v[0-9]' "$f"; then
-              echo "::error file=${f}::hardcoded DEX_CONNECTOR_REF pin — resolve the ref from Cargo.lock via _resolve-dex-connector-ref.yml instead (bot-strategy#899)."
-              rc=1
-            fi
-            # bot-strategy#973: a workflow may delegate the checkout to a
-            # reusable workflow instead of doing it itself. The ref is then
-            # handed over as an input, and `dex-connector-ref: v4.7.20` is
-            # the same static pin as the env var above wearing a different
-            # hat -- so the value has to come from a resolver job's output,
-            # and nothing else. (A line with no value is the reusable
-            # workflow's own input declaration.)
-            if grep -E '^\s+dex-connector-ref:[[:space:]]*[^[:space:]]' "$f" \
-              | grep -qvE '^\s+dex-connector-ref:[[:space:]]*\$\{\{[[:space:]]*needs\.[A-Za-z0-9_-]+\.outputs\.ref[[:space:]]*\}\}[[:space:]]*$'; then
-              echo "::error file=${f}::passes dex-connector-ref from something other than a resolve-ref job output (bot-strategy#899/#973)."
-              rc=1
-            fi
-            # ...and that output must be the shared resolver's, which is
-            # what makes the job named in `needs.<job>.outputs.ref` above
-            # the one that reads Cargo.lock.
-            if grep -q 'workflows/_test-arcus-spot-live\.yml' "$f" \
-              && ! grep -qE "$resolver_call" "$f"; then
-              echo "::error file=${f}::calls _test-arcus-spot-live.yml without calling ./.github/workflows/_resolve-dex-connector-ref.yml (bot-strategy#899/#973)."
-              rc=1
-            fi
-            grep -q 'repository: shigeo-nakamura/dex-connector' "$f" || continue
-            # A reusable workflow has no ref of its own to keep in sync --
-            # but only if it actually checks out what the caller passed
-            # down. Requiring the interpolation, not just the input
-            # declaration, is what stops "declares dex-connector-ref, checks
-            # out something else". Its callers are covered above.
-            if grep -qE '^\s+workflow_call:' "$f"; then
-              if ! grep -qF 'ref: ${{ inputs.dex-connector-ref }}' "$f"; then
-                echo "::error file=${f}::reusable workflow checks out dex-connector from something other than its own \`dex-connector-ref\` input (bot-strategy#973)."
-                rc=1
-              fi
-              continue
-            fi
-            if ! grep -qE "$resolver_call" "$f"; then
-              echo "::error file=${f}::checks out dex-connector without calling ./.github/workflows/_resolve-dex-connector-ref.yml (bot-strategy#899)."
-              rc=1
-            fi
-          done
-          exit $rc
+        run: python3 scripts/lint_workflow_dex_connector_refs.py
 
   resolve-ref:
     # bot-strategy#899: the resolution logic lives in one place now
