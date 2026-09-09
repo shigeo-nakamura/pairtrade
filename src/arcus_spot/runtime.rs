@@ -1196,7 +1196,16 @@ impl ArcusSpotRuntime {
         // *started* before the cutoff but whose prices arrived after it is
         // already a post-event mark and must stay suppressed (Codex P2 x2,
         // pairtrade#309).
-        if !self.corporate_action_units_are_stale(price.priced_at) {
+        // Identity drift makes the mark mixed-unit *before* `effective_at`
+        // too: the tracked quantity is the old contract's while the price is
+        // the replacement's. A halt engaged from that is artificial and
+        // sticky, and it wedges the documented relisting recovery --
+        // `reset-window` refuses to discard a halt, `clear-risk-halt` sees
+        // the same artificial breach before the cutoff and refuses on stale
+        // units after it (Codex P1, pairtrade#309).
+        if !self.corporate_action_units_are_stale(price.priced_at)
+            && !self.corporate_action_identity_drifted(evaluation_time, &price)
+        {
             self.engage_risk_halt(evaluation_time, risk_before);
         }
         self.update_risk_baselines(evaluation_time, equity_before, inventory_before);
@@ -3694,6 +3703,42 @@ impl ArcusSpotRuntime {
     /// pairtrade#309). Records that predate fingerprints match by id alone.
     fn handled_record_for(&self, event: &ArcusSpotCorporateActionEvent) -> Option<HandledMatch> {
         handled_corporate_action_record(&self.state, event)
+    }
+
+    /// Whether an affected symbol has already been repointed away from the
+    /// identity pinned when the window opened. The mark this tick would
+    /// engage a halt on mixes the old contract's quantity with the new
+    /// contract's price, so it is not evidence of anything.
+    fn corporate_action_identity_drifted(
+        &self,
+        evaluation_time: DateTime<Utc>,
+        price: &PriceContext,
+    ) -> bool {
+        let Some(event) = self.active_corporate_action(evaluation_time).cloned() else {
+            return false;
+        };
+        if self
+            .corporate_action_identity_drift(&event, price)
+            .is_some()
+        {
+            return true;
+        }
+        // The first tick inside a window has no progress record yet -- the
+        // gate writes it after the risk marks -- so there is no pin to
+        // compare against. The identity the previous observation saw is the
+        // same evidence, and a change from it during a declared window is
+        // the same drift.
+        if self.state.corporate_action.is_some() {
+            return false;
+        }
+        event.symbols.iter().any(|symbol| {
+            let (last, token) = if symbol.eq_ignore_ascii_case(&self.config.pair.sell_symbol) {
+                (self.state.last_token_a_identity.as_ref(), &price.token_a)
+            } else {
+                (self.state.last_token_b_identity.as_ref(), &price.token_b)
+            };
+            last.is_some_and(|last| !last.matches(token))
+        })
     }
 
     /// An affected symbol whose pre-event identity was never observed, if
@@ -7067,7 +7112,16 @@ mod tests {
     const RELISTED_TOKEN_A_ADDRESS: &str = "0x00000000000000000000000000000000DeaDBeeF";
 
     fn snapshot_with_relisted_token_a(collected_at: DateTime<Utc>) -> ArcusSpotRecorderSnapshot {
-        let mut snapshot = snapshot_with_valid_row(collected_at);
+        snapshot_with_relisted_token_a_at_prices(collected_at, "200", "100")
+    }
+
+    fn snapshot_with_relisted_token_a_at_prices(
+        collected_at: DateTime<Utc>,
+        token_a_price: &str,
+        token_b_price: &str,
+    ) -> ArcusSpotRecorderSnapshot {
+        let mut snapshot =
+            snapshot_with_valid_row_at_prices(collected_at, token_a_price, token_b_price);
         let ArcusSpotCapture::Success { observation } = &mut snapshot.token_metadata else {
             panic!("token metadata fixture is a success capture");
         };
@@ -7589,6 +7643,66 @@ mod tests {
                 .decision,
             ArcusSpotDecision::SimulatedFill { .. }
         ));
+    }
+
+    #[test]
+    fn a_repointed_ticker_does_not_engage_an_artificial_halt() {
+        // Before `effective_at` the units are not yet "stale" by the
+        // calendar, but a repointed ticker already makes the mark mixed:
+        // old quantity, new contract's price. A halt from that is artificial
+        // and sticky, and it wedges the relisting recovery.
+        let anchor = event_time();
+        let mut runtime =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        // A prior rotation left the wallet 0.005 NVDA short of its basket:
+        // $1.00 at 200, but $4.00 at the replacement's 800.
+        runtime.state.inventory.token_a = Decimal::new(995, 3);
+        // One observation before the window, so the identity is pinned.
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "$4 at 200 is over the $2 limit only later"
+        );
+
+        // Inside the window, before `effective_at` (+5s), the ticker is
+        // repointed and the replacement quotes at 800.
+        let inside = anchor + Duration::seconds(3);
+        let outcome = runtime.step_at(
+            &snapshot_with_relisted_token_a_at_prices(inside, "800", "100"),
+            inside,
+        );
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected the relisting to hold, got {other:?}"),
+        }
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "the mark mixes the old quantity with the replacement's price",
+        );
+
+        // Control: the same price move without a relisting is a real breach.
+        let mut control =
+            ArcusSpotRuntime::new(cfg_with_window_at(anchor + Duration::seconds(1))).unwrap();
+        control.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        control.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        control.state.inventory.token_a = Decimal::new(995, 3);
+        control.step_at(&snapshot_with_valid_row(anchor), anchor);
+        control.step_at(
+            &snapshot_with_valid_row_at_prices(inside, "800", "100"),
+            inside,
+        );
+        assert!(
+            control.state.risk_halt.is_some(),
+            "a real shortfall still halts"
+        );
     }
 
     #[test]

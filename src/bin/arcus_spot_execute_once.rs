@@ -2742,6 +2742,40 @@ fn corporate_action_units_are_stale(
     let Some(progress) = current.corporate_action.as_ref() else {
         return false;
     };
+    // Identity drift makes the mark mixed-unit even before the cutoff -- old
+    // quantity, replacement's price -- and the runtime declines to halt on
+    // it, so a checkpoint from that tick must not be required to carry one
+    // (Codex P1, pairtrade#309).
+    let declared = config
+        .corporate_actions
+        .iter()
+        .find(|event| {
+            (!progress.fingerprint.is_empty() && progress.fingerprint == event.fingerprint())
+                || event.event_id.eq_ignore_ascii_case(&progress.event_id)
+        })
+        .cloned();
+    if let Some(event) = declared.as_ref() {
+        let drifted = event.symbols.iter().any(|symbol| {
+            let (pinned, observed) = if symbol.eq_ignore_ascii_case(&config.pair.sell_symbol) {
+                (
+                    progress.pre_event_token_a.as_ref(),
+                    current.last_token_a_identity.as_ref(),
+                )
+            } else {
+                (
+                    progress.pre_event_token_b.as_ref(),
+                    current.last_token_b_identity.as_ref(),
+                )
+            };
+            match (pinned, observed) {
+                (Some(pinned), Some(observed)) => pinned != observed,
+                _ => false,
+            }
+        });
+        if drifted {
+            return true;
+        }
+    }
     let Some(stamped_at) = progress.history_invalidated_at else {
         return false;
     };
@@ -11535,6 +11569,53 @@ runtime:
         for state in [&mut baseline, &mut current] {
             state.last_reference_price_at = Some("2026-08-16T02:01:00Z".parse().unwrap());
         }
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_drifted_identity_does_not_owe_a_halt() {
+        // The runtime declines to halt on a mark whose quantity and price
+        // belong to different contracts, so this must not demand one.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let pinned = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        let mut progress = stale_unit_progress();
+        progress.history_invalidated_at = None;
+        progress.pre_event_token_a = Some(pinned.clone());
+        current.corporate_action = Some(progress.clone());
+        baseline.corporate_action = Some(progress);
+        for state in [&mut baseline, &mut current] {
+            state.last_token_a_identity = Some(pinned.clone());
+        }
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Identity intact: the halt is owed.
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Repointed: the mark is mixed-unit and no halt is owed.
+        current.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            address: "0xdeadbeef00000000000000000000000000000000".to_string(),
+            ..pinned
+        });
         require_risk_state_continuity(
             &config, &baseline, &current, 1, not_before, not_after, &none,
         )
