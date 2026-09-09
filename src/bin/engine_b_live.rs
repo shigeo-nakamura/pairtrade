@@ -1744,7 +1744,22 @@ impl EngineBLiveEngine {
     }
 
     fn entries_allowed(&self) -> bool {
-        !self.kill_switch_engaged() && !self.state.session_halted && self.reconciled
+        // `entry_in_flight` is part of the gate, not only a restart hint.
+        // `maybe_clear_halt` clears `session_halted` and
+        // `position_unconfirmed` on a RISK_ACK file but never the marker,
+        // so a former-symbol claim can outlive the halt it caused. With
+        // only the halt checked, another flat poll would let `maybe_enter`
+        // submit for the configured symbol while that older order is still
+        // live; the delayed fill then lands between polls and the account
+        // holds two exposures before the next tick re-engages the halt.
+        // Blocking here is a no-op for this process's own entries -- the
+        // marker is written immediately before `sendTx`, and `pending`
+        // already suppresses `maybe_enter` until the confirmation resolves
+        // and clears it (pairtrade#300 Codex review).
+        !self.kill_switch_engaged()
+            && !self.state.session_halted
+            && self.reconciled
+            && self.state.entry_in_flight.is_none()
     }
 
     /// `t2 + exit_deadline_secs` for the session currently in `window` --
@@ -2635,6 +2650,21 @@ impl EngineBLiveEngine {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// The unconfirmed claim that the shutdown match below would *not*
+    /// report, because some other exposure claims the arm first.
+    ///
+    /// `None` when there is nothing in flight, and also when nothing else
+    /// is claimed -- the match's last arm reports that case itself and
+    /// classifies it as `UnconfirmedOrder`, so reporting it here too would
+    /// double the alert (pairtrade#300 Codex review).
+    fn coexisting_unconfirmed_note(&self) -> Option<String> {
+        let note = self.unconfirmed_order_note()?;
+        let also_claimed = self.position.is_some()
+            || self.state.open_position.is_some()
+            || !self.state.unmanaged_positions.is_empty();
+        also_claimed.then_some(note)
+    }
+
     /// SIGTERM / stop policy (bot-strategy#917): this prototype does not
     /// reduce-only-close on shutdown, so say so loudly and leave the
     /// persisted record behind for the next process to resume from --
@@ -2667,6 +2697,30 @@ impl EngineBLiveEngine {
                 format!(
                     "{listed} -- on symbols this engine no longer trades, so it never sent a \
                      close for them. Flatten each by hand."
+                ),
+            );
+        }
+        // Same rule, same reason as the parked exposures above: an
+        // unconfirmed order is not made harmless by a tracked position
+        // existing beside it. A managed position and a former-symbol
+        // claim genuinely coexist -- startup keeps A's flat-read claim
+        // while restoring or adopting configured symbol B -- and the
+        // match below returns on the first arm that applies, so without
+        // this the alert named B and said nothing about the A order that
+        // may still fill. Reported here for the arms that return early;
+        // the "nothing tracked, nothing saved" arm below still classifies
+        // it as `UnconfirmedOrder` (pairtrade#300 Codex review).
+        let unconfirmed = self.unconfirmed_order_note();
+        if let Some(note) = self.coexisting_unconfirmed_note() {
+            log::error!(
+                "[SHUTDOWN] {signal}: {note} -- in addition to the exposure(s) reported \
+                 alongside; the exchange may hold more than this process tracks"
+            );
+            send_notification(
+                format!("Han Bridge SHUTDOWN with an unconfirmed order ({signal})"),
+                format!(
+                    "{note}. This is on top of the position(s) reported separately. Verify the \
+                     account before restarting."
                 ),
             );
         }
@@ -2731,7 +2785,7 @@ impl EngineBLiveEngine {
                 // order went out. Reporting "nothing open" there sends an
                 // operator away from a live exposure (pairtrade#300 Codex
                 // review).
-                None => match self.unconfirmed_order_note() {
+                None => match unconfirmed {
                     Some(note) => {
                         log::error!(
                             "[SHUTDOWN] {signal}: nothing is tracked and nothing is saved, but \
@@ -3947,7 +4001,14 @@ impl EngineBLiveEngine {
             return;
         }
         if !self.entries_allowed() {
-            log::warn!("[ENTRY] signal fired but entries blocked (kill_switch or session halt)");
+            log::warn!(
+                "[ENTRY] signal fired but entries blocked (kill_switch={}, session_halted={}, \
+                 reconciled={}, entry_in_flight={:?})",
+                self.kill_switch_engaged(),
+                self.state.session_halted,
+                self.reconciled,
+                self.state.entry_in_flight
+            );
             return;
         }
         let predicted_direction = epsilon.signum() * self.cfg.direction_multiplier.signum();
@@ -8748,7 +8809,10 @@ mod tests {
         h.engine.state.entry_in_flight = Some("SNDK".to_string());
         h.engine.state.session_halted = false;
         h.engine.state.session_halt_reason = None;
-        assert!(h.engine.entries_allowed(), "precondition: entries are open");
+        assert!(
+            !h.engine.state.session_halted,
+            "precondition: the halt this sighting must re-engage is gone"
+        );
         // Now the fill shows up.
         h.connector
             .positions
@@ -8766,7 +8830,10 @@ mod tests {
             h.engine.state.session_halted,
             "and the session must be halted again, not assumed to still be"
         );
-        assert!(!h.engine.entries_allowed());
+        assert!(
+            !h.engine.entries_allowed(),
+            "the halt blocks entries on its own, whatever the marker now says"
+        );
         let reason = h
             .engine
             .state
@@ -8817,6 +8884,75 @@ mod tests {
         assert_eq!(
             h.engine.note_shutdown_signal("SIGTERM"),
             ShutdownReport::Nothing
+        );
+    }
+
+    /// pairtrade#300 Codex review round 15, P1: the marker is part of the
+    /// entry gate, not only a restart hint. RISK_ACK clears the halt but
+    /// never the claim, so `maybe_enter` could open a second exposure
+    /// while the first order was still live.
+    #[tokio::test]
+    async fn a_foreign_in_flight_claim_blocks_entries_even_after_risk_ack() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        // Exactly what maybe_clear_halt leaves behind: halt gone,
+        // position_unconfirmed gone, marker untouched.
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        h.engine.state.position_unconfirmed = false;
+        assert!(
+            !h.engine.entries_allowed(),
+            "an unresolved submission must keep entries blocked"
+        );
+        // The claim resolving is what re-opens them.
+        h.engine.state.entry_in_flight = None;
+        assert!(h.engine.entries_allowed());
+    }
+
+    /// pairtrade#300 Codex review round 15, P1: a tracked position does
+    /// not make a coexisting in-flight claim go away, and the match arms
+    /// return on the first one that applies.
+    #[tokio::test]
+    async fn shutdown_reports_an_in_flight_claim_alongside_a_tracked_position() {
+        let mut h = harness();
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.engine.sync_open_position_field();
+        // Startup kept old symbol A's flat-read claim while B is managed.
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::TrackedPosition,
+            "the tracked position still classifies the report"
+        );
+        // ... and the claim is reported alongside it rather than being
+        // swallowed by the arm the tracked position took.
+        let note = h
+            .engine
+            .coexisting_unconfirmed_note()
+            .expect("the claim is reported next to the tracked position");
+        assert!(note.contains("SNDK"), "unexpected: {note}");
+        // With nothing else claimed the last arm reports it itself, so
+        // this must stay silent rather than double the alert.
+        h.engine.position = None;
+        h.engine.state.open_position = None;
+        assert!(h.engine.coexisting_unconfirmed_note().is_none());
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnconfirmedOrder
         );
     }
 
