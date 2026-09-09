@@ -6,8 +6,10 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
-from engine_b_boundary_quality import analyze, HOUR, SECOND
+import engine_b_boundary_quality
+from engine_b_boundary_quality import analyze, Dataset, digest, HOUR, SECOND
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA = next(ast.literal_eval(node.value) for node in ast.parse((SCRIPT_DIR / 'engine_b_phase0.py').read_text()).body
@@ -198,6 +200,75 @@ class QualityTests(unittest.TestCase):
                 self.calendar.write_text(json.dumps(calendar))
                 with self.assertRaisesRegex(ValueError, 'invalid boundary timestamps'):
                     self.report()
+
+    def test_open_connections_are_bounded(self):
+        # A full 2026-2027 range touches ~1,900 hourly partitions; one open
+        # connection each exhausts RLIMIT_NOFILE and the analysis fails on
+        # exactly the multi-day range it is for. The hashes and manifests
+        # are retained for every partition read, so bounding the handles
+        # costs nothing the integrity check depends on.
+        dataset = Dataset(self.root, max_open=1)
+        try:
+            first_hour = TIMES[0] // HOUR * HOUR
+            self.assertIsNotNone(dataset.open_window([first_hour])[0])
+            self.assertIsNotNone(dataset.open_window([TIMES[1] // HOUR * HOUR])[0])
+            self.assertEqual(len(dataset.opened), 1)
+            self.assertEqual(len(dataset.inventory), 2)
+            # An evicted partition is reopened on demand and still answers.
+            reopened = dataset.open_window([first_hour])[0]
+            self.assertIsNotNone(reopened)
+            self.assertEqual(len(dataset.opened), 1)
+        finally:
+            dataset.verify_and_close()
+
+        # And the whole report still comes out the same under the bound.
+        # Two is the floor here: a +/-900s window straddles at most two
+        # hourly partitions, and the fixture holds four distinct ones, so
+        # this run really does evict and reopen.
+        with mock.patch.object(Dataset, 'MAX_OPEN', 2):
+            bounded = self.report()
+        self.assertEqual(bounded['days'][0]['status'], 'boundary_preflight_pass')
+        self.assertEqual(bounded['days'], self.report()['days'])
+
+    def test_an_evicted_partition_may_not_change_unnoticed(self):
+        # verify_and_close covers every partition that was read, not only
+        # the ones a bounded cache still holds open.
+        dataset = Dataset(self.root, max_open=1)
+        first_hour = TIMES[0] // HOUR * HOUR
+        dataset.open_window([first_hour])
+        dataset.open_window([TIMES[1] // HOUR * HOUR])
+        self.assertEqual(len(dataset.opened), 1)
+        self.path(first_hour).write_bytes(self.path(first_hour).read_bytes() + b'\0')
+        with self.assertRaisesRegex(ValueError, 'input changed during analysis'):
+            dataset.verify_and_close()
+
+    def test_a_window_wider_than_the_bound_is_refused(self):
+        dataset = Dataset(self.root, max_open=1)
+        try:
+            with self.assertRaisesRegex(ValueError, 'more than the 1 connections'):
+                dataset.open_window([TIMES[0] // HOUR * HOUR, TIMES[1] // HOUR * HOUR])
+        finally:
+            dataset.verify_and_close()
+
+    def test_the_code_hash_names_the_code_that_ran(self):
+        script = engine_b_boundary_quality.__file__
+        self.assertEqual(self.report()['code_sha256'], digest(Path(script)))
+
+        # Python keeps executing the already-loaded module when the file is
+        # replaced mid-run, so an end-of-run digest would name code that did
+        # not produce the report.
+        real, seen = engine_b_boundary_quality.digest, []
+
+        def replaced(path):
+            if str(path) == script:
+                seen.append(path)
+                return 'before' if len(seen) == 1 else 'after'
+            return real(path)
+
+        with mock.patch.object(engine_b_boundary_quality, 'digest', replaced):
+            with self.assertRaisesRegex(ValueError, 'analysis code changed'):
+                self.report()
+        self.assertEqual(len(seen), 2)
 
     def test_conflicting_alias_snapshot_is_ambiguous(self):
         combined = json.loads(json.dumps(self.config))

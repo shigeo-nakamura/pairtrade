@@ -2,6 +2,7 @@
 """Offline boundary preflight for Engine B; never a complete G0-2 verdict."""
 
 import argparse
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -63,23 +64,73 @@ def provenance(db):
 
 class Dataset:
     """Only closed copies: hashes cover the DBs actually read, never a live WAL."""
-    def __init__(self, root):
+
+    # A full 2026-2027 calendar range touches ~1,900 hourly partitions, and
+    # holding one connection open for each exhausts a typical 1,024
+    # RLIMIT_NOFILE -- sqlite3.connect then fails and the CLI exits 2 on
+    # exactly the multi-day range this tool exists to support. The integrity
+    # guarantee never depended on the handle staying open: it comes from the
+    # recorded SHA-256, which is now checked on every reopen as well as at
+    # the end. So connections are a bounded LRU while the hashes and
+    # manifests are retained for every partition read (Codex, PR #311).
+    MAX_OPEN = 64
+
+    def __init__(self, root, max_open=None):
         self.root = root.resolve()
-        self.opened = {}
+        self.max_open = self.MAX_OPEN if max_open is None else max_open
+        # name -> connection, least-recently-used first.
+        self.opened = OrderedDict()
+        self.mappings = {}
         self.inventory = {}
+        self.absent = set()
+
+    @staticmethod
+    def name_for(hour_us):
+        hour = datetime.fromtimestamp(hour_us / SECOND, timezone.utc).strftime("%Y%m%d_%H")
+        return f"engine_b_phase0_{hour}.sqlite3"
+
+    def open_window(self, hours_us):
+        """Open every partition one boundary needs, all live at once.
+
+        Eviction runs only after the whole window is open and protects
+        exactly this set, so a bounded cache can never close a handle the
+        caller is still reading from.
+        """
+        names = [self.name_for(hour_us) for hour_us in hours_us]
+        if len(set(names)) > self.max_open:
+            raise ValueError(
+                f"window spans {len(set(names))} partitions, more than the {self.max_open} "
+                "connections this analysis may hold open at once")
+        sources = [self._open(name) for name in names]
+        self._evict(set(names))
+        return sources
 
     def open(self, hour_us):
-        hour = datetime.fromtimestamp(hour_us / SECOND, timezone.utc).strftime("%Y%m%d_%H")
-        name = f"engine_b_phase0_{hour}.sqlite3"
+        source = self._open(self.name_for(hour_us))
+        self._evict(set())
+        return source
+
+    def _open(self, name):
+        if name in self.absent:
+            return None
         if name in self.opened:
-            return self.opened[name]
+            self.opened.move_to_end(name)
+            return (name, self.opened[name], self.mappings[name])
         path = self.root / name
         if not path.exists():
             self.inventory[name] = {"missing": True}
+            self.absent.add(name)
             return None
         if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")):
             raise ValueError(f"{name}: use a closed offline copy without WAL/SHM")
         sha = digest(path)
+        known = self.inventory.get(name, {}).get("sha256")
+        if known is not None and known != sha:
+            # A reopen is a second chance to catch what verify_and_close
+            # checks at the end, and it catches it earlier: everything read
+            # after this point would otherwise come from a different file
+            # than the one the report's hash names.
+            raise ValueError(f"{name}: input changed during analysis")
         db = sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)
         db.row_factory = sqlite3.Row
         try:
@@ -88,19 +139,31 @@ class Dataset:
             db.close()
             raise
         self.inventory[name] = {"sha256": sha, "bytes": path.stat().st_size}
-        self.opened[name] = (name, db, mapping)
-        return self.opened[name]
+        self.mappings[name] = mapping
+        self.opened[name] = db
+        return (name, db, mapping)
+
+    def _evict(self, protected):
+        for name in [n for n in self.opened if n not in protected]:
+            if len(self.opened) <= self.max_open:
+                break
+            self.opened.pop(name).close()
 
     def verify_and_close(self):
         try:
-            for name in self.opened:
+            # Every partition that was read, not merely the ones still
+            # cached: an evicted file must not be able to change unnoticed.
+            for name, entry in self.inventory.items():
+                if entry.get("missing"):
+                    continue
                 path = self.root / name
-                if (digest(path) != self.inventory[name]["sha256"]
+                if (digest(path) != entry["sha256"]
                         or any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm"))):
                     raise ValueError(f"{name}: input changed during analysis")
         finally:
-            for _, db, _ in self.opened.values():
+            for db in self.opened.values():
                 db.close()
+            self.opened.clear()
 
 
 def book_metrics(rows):
@@ -130,7 +193,7 @@ def book_metrics(rows):
 
 def boundary(dataset, at_us, symbols, max_age_us, window_us):
     start, end = at_us - window_us, at_us + window_us
-    sources = [dataset.open(t) for t in range(start // HOUR * HOUR, end // HOUR * HOUR + 1, HOUR)]
+    sources = dataset.open_window(range(start // HOUR * HOUR, end // HOUR * HOUR + 1, HOUR))
     missing = sum(source is None for source in sources)
     result = {"at_us": at_us, "missing_window_partitions": missing, "symbols": {}}
     for symbol in symbols:
@@ -204,6 +267,13 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
         raise ValueError("provide distinct required symbols")
     if not 0 < max_age_seconds <= window_seconds:
         raise ValueError("require 0 < max age <= window")
+    # Taken before anything is read, and checked again at the end. A
+    # checkout or deployment that replaces this file mid-run leaves Python
+    # executing the already-loaded code while an end-of-run digest would
+    # name the new file, so the report and its analysis_hash would claim
+    # provenance for code that did not produce them -- the same failure the
+    # database inputs are already protected from (Codex, PR #311).
+    code_sha256 = digest(Path(__file__))
     first, last = date.fromisoformat(start), date.fromisoformat(end)
     if first > last:
         raise ValueError("start must not exceed end")
@@ -232,10 +302,12 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
             day += timedelta(days=1)
     finally:
         dataset.verify_and_close()
+    if digest(Path(__file__)) != code_sha256:
+        raise ValueError(f"{Path(__file__).name}: analysis code changed during analysis")
     parameters = {"symbols": symbols, "start": start, "end": end,
                   "max_age_seconds": max_age_seconds, "window_seconds": window_seconds}
     evidence = {"inputs": dataset.inventory, "calendar_sha256": hashlib.sha256(calendar_bytes).hexdigest(),
-                "code_sha256": digest(Path(__file__)), "parameters": parameters}
+                "code_sha256": code_sha256, "parameters": parameters}
     return {"schema_version": 1, "scope": "boundary_preflight_only", "g0_2": "not_evaluated",
             "calendar_version": calendar["calendar_version"], **evidence,
             "analysis_hash": hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest(), "days": days}
