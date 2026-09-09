@@ -608,7 +608,11 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     broken writer, so it raises, as an unattributable row does in the
     other two loaders.
     """
-    last_by_day: dict[str, float] = {}
+    # Keyed by the *latest* timestamp seen for the day, not by arrival
+    # order: an export written newest-first would otherwise leave an
+    # earlier intraday sample standing as the close, and the resulting
+    # delta is published as a known cost (Codex, PR #297).
+    last_by_day: dict[str, tuple[float, float]] = {}
     invalid_days: set[str] = set()
     for row in rows:
         ts = row.get("ts")
@@ -627,15 +631,17 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
             invalid_days.add(day)
             continue
         try:
-            value = float(equity)
+            stamp, value = float(ts), float(equity)
         except (TypeError, ValueError):
             invalid_days.add(day)
         else:
             # "NaN"/"Infinity" parse but are not a close: the next
             # consecutive-day delta would be non-finite and accepted as a
             # known `equity_delta` cost.
-            if math.isfinite(value):
-                last_by_day[day] = value
+            if math.isfinite(value) and math.isfinite(stamp):
+                seen = last_by_day.get(day)
+                if seen is None or stamp >= seen[0]:
+                    last_by_day[day] = (stamp, value)
             else:
                 invalid_days.add(day)
     costs: dict[str, float] = {}
@@ -643,7 +649,7 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     for day in sorted(last_by_day):
         if (previous_day is not None and is_next_calendar_day(previous_day, day)
                 and day not in invalid_days and previous_day not in invalid_days):
-            costs[day] = -(last_by_day[day] - last_by_day[previous_day])
+            costs[day] = -(last_by_day[day][1] - last_by_day[previous_day][1])
         previous_day = day
     return costs
 
