@@ -1860,6 +1860,13 @@ impl EngineBLiveEngine {
             self.reconciled = true;
             return;
         }
+        // A record parked in `unmanaged_position` is still an exposure
+        // claim, and nothing else looks at it: `reconcile_action`,
+        // `write_status_if_due` and the shutdown report all read
+        // `open_position` / `self.position`. Left unchecked it would go
+        // quiet after one restart while the position stayed on the
+        // exchange (pairtrade#300 Codex review).
+        self.reconcile_unmanaged(&positions);
         let action = reconcile_action(persisted.as_ref(), live.as_ref(), &symbol, &today, now_us);
         match action {
             ReconcileAction::Clean => {
@@ -1928,6 +1935,41 @@ impl EngineBLiveEngine {
             }
         }
         self.reconciled = true;
+    }
+
+    /// Check the exposure this engine cannot manage against the exchange
+    /// on every start: cleared when the venue says it is gone, and kept
+    /// with the session halted while it is still there. Without this the
+    /// claim survives on disk but nothing ever looks at it again
+    /// (pairtrade#300 Codex review).
+    fn reconcile_unmanaged(&mut self, positions: &[PositionSnapshot]) {
+        let Some(p) = self.state.unmanaged_position.clone() else {
+            return;
+        };
+        match exchange_position_for(positions, &p.symbol) {
+            Some(live) => {
+                let reason = format!(
+                    "unmanaged_position_still_open: {} {} size={:.6} is open on a symbol this \
+                     engine no longer trades (us_primary={}), so it cannot be closed from here \
+                     -- flatten it by hand",
+                    live.side, p.symbol, live.size, self.cfg.us_primary_symbol
+                );
+                log::error!("[RECONCILE] {reason}");
+                self.halt_session(reason);
+            }
+            None => {
+                log::warn!(
+                    "[RECONCILE] the unmanaged {} record ({} size={:.6}) is gone from the \
+                     exchange -- clearing it; whatever closed it did so at a price this process \
+                     never saw, so its PnL is unbooked",
+                    p.symbol,
+                    p.side,
+                    p.open_size
+                );
+                self.state.unmanaged_position = None;
+                self.state_write_pending = true;
+            }
+        }
     }
 
     /// Rebuild `self.position` from a persisted record. `Err` only when
@@ -2133,7 +2175,15 @@ impl EngineBLiveEngine {
             // only thing that knows about an exposure. Reporting "no open
             // position" there would be falsely reassuring
             // (pairtrade#300 Codex review).
-            None => match self.state.open_position.as_ref() {
+            // `unmanaged_position` counts as a claim too: it is an
+            // exposure this engine refused to manage, not one that went
+            // away (pairtrade#300 Codex review).
+            None => match self
+                .state
+                .open_position
+                .as_ref()
+                .or(self.state.unmanaged_position.as_ref())
+            {
                 Some(p) => {
                     log::error!(
                         "[SHUTDOWN] {signal}: nothing is tracked in memory, but the saved record \
@@ -2866,7 +2916,21 @@ impl EngineBLiveEngine {
                 OrderSide::Long => 1.0,
                 OrderSide::Short => -1.0,
             };
-            let pnl = sign * (price - p.entry_price) * closed;
+            // Same guard as `on_exit`, and it has to be here too: a
+            // placeholder basis run through this arithmetic fabricates
+            // roughly the closed notional as *realized* PnL, which
+            // `on_exit` then books as already-realized money
+            // (pairtrade#300 Codex review).
+            let pnl = if p.entry_price_unknown {
+                log::error!(
+                    "[EXIT] partial close ({context}): closed={closed:.6} at {price:.4} with NO \
+                     known cost basis -- booking $0.00 for it; this reduction's PnL is not \
+                     measurable from what this process saw"
+                );
+                0.0
+            } else {
+                sign * (price - p.entry_price) * closed
+            };
             p.realized_partial_pnl += pnl;
             log::warn!(
                 "[EXIT] partial close ({context}): closed={closed:.6} at {price:.4} pnl=${pnl:.2} \
@@ -2886,15 +2950,22 @@ impl EngineBLiveEngine {
             let old_basis = p.entry_price;
             match live.entry_price {
                 Some(e) => {
+                    // The exchange's average covers the whole position,
+                    // so this is a real basis even for a position that
+                    // had none.
                     p.entry_price = e;
                     p.entry_price_estimated = false;
+                    p.entry_price_unknown = false;
                 }
                 None => {
                     // No exchange basis: assume the added quantity was
                     // bought near the current mid and blend, rather than
                     // valuing it at the old basis (pairtrade#275 Codex
-                    // review).
-                    if new_open_size > 0.0 && price > 0.0 {
+                    // review). Nothing to blend when the old basis is a
+                    // placeholder -- averaging a real price with 0.0 is
+                    // not a better guess than admitting the position has
+                    // no basis (pairtrade#300 Codex review).
+                    if !p.entry_price_unknown && new_open_size > 0.0 && price > 0.0 {
                         p.entry_price =
                             (p.entry_price * p.open_size + price * grown) / new_open_size;
                     }
@@ -3831,7 +3902,7 @@ impl EngineBLiveEngine {
         } else {
             0.0
         };
-        let positions: Vec<DashboardPosition> = match &self.position {
+        let mut positions: Vec<DashboardPosition> = match &self.position {
             Some(pos) => vec![DashboardPosition {
                 symbol: self.cfg.us_primary_symbol.clone(),
                 side: match pos.side {
@@ -3845,6 +3916,22 @@ impl EngineBLiveEngine {
             }],
             None => vec![],
         };
+        // An exposure this engine cannot send orders for is still an
+        // exposure the account holds. Omitting it reported
+        // `has_position=false` on a dashboard while the position was
+        // sitting on the exchange (pairtrade#300 Codex review).
+        if let Some(p) = self.state.unmanaged_position.as_ref() {
+            positions.push(DashboardPosition {
+                symbol: p.symbol.clone(),
+                side: match side_from_str(&p.side) {
+                    Some(dex_connector::OrderSide::Short) => "short",
+                    _ => "long",
+                },
+                size: p.open_size.to_string(),
+                entry_price: p.entry_price.to_string(),
+            });
+        }
+        let positions = positions;
         // Derived from `positions` itself rather than re-reading
         // `self.position` independently for each field -- one source of
         // truth for "do we think we're holding" (bot-strategy#866 PR #255
@@ -6540,6 +6627,103 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 5, P1: the unknown-basis guard has
+    /// to cover partial reductions, not only the final remainder.
+    #[tokio::test]
+    async fn a_partial_close_with_no_basis_books_nothing() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 0.0,
+            entry_price_estimated: true,
+            entry_price_unknown: true,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        });
+        // A reduce-only partially fills once a quote exists.
+        h.engine.book_partial_close(
+            &ExchangePosition {
+                side: OrderSide::Long,
+                size: 0.030,
+                entry_price: None,
+            },
+            1756.92,
+            "test",
+        );
+        let pos = h.engine.position.clone().expect("still open");
+        assert_eq!(
+            pos.realized_partial_pnl, 0.0,
+            "a placeholder basis must not fabricate realized PnL for the closed part"
+        );
+        assert!(
+            (pos.open_size - 0.030).abs() < 1e-12,
+            "but the size still moves"
+        );
+        // And the final close books nothing either.
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.on_exit(1769.10, T2_US);
+        assert!((h.engine.state.realized_pnl_session - before).abs() < 1e-9);
+    }
+
+    /// pairtrade#300 Codex review round 5, P1: a record parked as
+    /// unmanaged must stay visible until the exchange says it is gone.
+    #[tokio::test]
+    async fn an_unmanaged_position_is_rechecked_reported_and_shown() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let mut stale = persisted_long(0.057, TODAY);
+        stale.symbol = "SNDK".to_string();
+        h.engine.state.unmanaged_position = Some(stale);
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        // The old symbol is still open; the configured one is flat.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            h.engine.state.session_halted,
+            "a flat configured symbol is not a clean start while this is open"
+        );
+        assert!(
+            h.engine.state.unmanaged_position.is_some(),
+            "and it is kept"
+        );
+
+        // The dashboard must see the exposure rather than has_position=false.
+        h.engine.last_status_write_us = 0;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(status["has_position"], serde_json::json!(true));
+        assert_eq!(status["positions"][0]["symbol"], serde_json::json!("SNDK"));
+
+        // SIGTERM must not say "nothing open" either.
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnreconciledClaim
+        );
+
+        // Once the venue reports it gone, the claim is cleared.
+        h.connector.positions.lock().unwrap().clear();
+        h.engine.reconciled = false;
+        h.engine.tick().await;
+        assert!(h.engine.state.unmanaged_position.is_none());
+        assert!(
+            load_state(&h.engine.cfg.state_path)
+                .unmanaged_position
+                .is_none(),
+            "and the clearing reaches disk"
+        );
     }
 
     /// pairtrade#300 Codex review round 4, P1: the configured symbol's own
