@@ -22,6 +22,7 @@ from subsidy_ledger import (  # noqa: E402
     load_points,
     render_table,
     funding_ticks_are_zero,
+    funding_tick_claim,
     funding_ticks_seen,
     is_not_a_number,
     opening_date,
@@ -1251,6 +1252,82 @@ def test_a_boolean_is_never_a_number_anywhere_in_the_ledger():
         assert carry_day.incomplete
         assert "unreadable_funding" in carry_day.incomplete_reasons
         assert round(carry_day.funding_usd, 6) == 0.0, "nothing was booked from it"
+
+
+def test_a_malformed_tick_count_is_a_gap_even_when_the_carry_is_present():
+    """A supplied carry bypasses the `funding_ticks_seen` fail-safe.
+
+    So a row spanning a boundary with `funding_carry_usd: 0` and an
+    impossible count stayed complete, while the same row with a readable
+    `0` correctly produced a gap (Codex, PR #297).
+    """
+    assert funding_tick_claim({}) == "absent"
+    assert funding_tick_claim({"funding_ticks_observed": 0}) == "none"
+    assert funding_tick_claim({"funding_ticks_observed": "0"}) == "none"
+    assert funding_tick_claim({"funding_ticks_observed": 3}) == "some"
+    for bad in (-1, float("nan"), float("inf"), False, True, "n/a"):
+        claim = funding_tick_claim({"funding_ticks_observed": bad})
+        expected = "malformed" if bad is not True else "malformed"
+        assert claim == expected, (bad, claim)
+
+    on_the_hour = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        for arm, ticks in (("freq", -1), ("b", "NaN"), ("c", False)):
+            path = pnl_file(
+                Path(tmp),
+                [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
+                  "hold_secs": 20 * 3600, "funding_carry_usd": 0.0,
+                  "funding_ticks_observed": ticks}],
+                arm=arm,
+            )
+            day = load_pnl([path])[("2026-09-08", arm)]
+            assert day.incomplete, f"{ticks!r} is not a countable claim"
+            assert "unreadable_funding" in day.incomplete_reasons, day.incomplete_reasons
+            row = build_rows({}, {("2026-09-08", arm): day})[0]
+            assert row.funding_usd is None
+            assert row.cost_source != "pnl_ledger"
+
+        # A readable positive count with a carry is the normal case and
+        # stays complete.
+        good = pnl_file(
+            Path(tmp),
+            [{"ts": on_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 20 * 3600, "funding_carry_usd": -0.03,
+              "funding_ticks_observed": 20}],
+            arm="d",
+        )
+        fine = load_pnl([good])[("2026-09-08", "d")]
+        assert not fine.incomplete, fine.incomplete_reasons
+
+
+def test_two_equity_closes_at_the_same_instant_settle_nothing():
+    """`>=` made export order decide the day's close.
+
+    Two samples sharing the latest `ts` with different equity meant that
+    merely reversing an otherwise equivalent export changed the next
+    day's `equity_delta` cost (Codex, PR #297).
+    """
+    def history(rows):
+        return equity_daily_costs(rows)
+
+    day_one = 1788868800_000          # 2026-09-08 00:00 UTC, ms
+    day_two = day_one + 86_400_000
+    tie_a = {"ts": day_one + 100, "equity": 1000.0}
+    tie_b = {"ts": day_one + 100, "equity": 1200.0}
+    close_two = {"ts": day_two + 100, "equity": 900.0}
+
+    forward = history([tie_a, tie_b, close_two])
+    reverse = history([tie_b, tie_a, close_two])
+    assert forward == reverse, "the answer must not depend on export order"
+    assert "2026-09-09" not in forward, "a day measured from an ambiguous close is not a cost"
+
+    # A strictly later sample settles the tie, so the day is usable again.
+    settled = history([tie_a, tie_b, {"ts": day_one + 200, "equity": 1100.0}, close_two])
+    assert settled.get("2026-09-09") == 200.0, settled
+
+    # And an exactly repeated sample is not a conflict.
+    repeated = history([tie_a, dict(tie_a), close_two])
+    assert repeated.get("2026-09-09") == 100.0, repeated
 
 
 def test_an_epoch_too_large_to_render_is_a_gap_not_a_traceback():

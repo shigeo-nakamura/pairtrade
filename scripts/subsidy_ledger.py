@@ -494,7 +494,17 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             day.funding_usd += carry
             day.funding_seen = True
-            if funding_ticks_are_zero(record) and spans_a_funding_interval(record):
+            # A supplied carry bypasses `funding_ticks_seen` entirely, so
+            # this is the only place a malformed count is looked at on
+            # this path. Without it a row spanning a boundary with
+            # `funding_carry_usd: 0` and an impossible count (-1, NaN,
+            # false) stayed complete, while the same row with a readable
+            # `0` correctly produced a gap (Codex, PR #297).
+            claim = funding_tick_claim(record)
+            if claim == FUNDING_TICKS_MALFORMED:
+                day.incomplete = True
+                day.incomplete_reasons.add("unreadable_funding")
+            elif claim == FUNDING_TICKS_NONE and spans_a_funding_interval(record):
                 day.incomplete = True
                 day.incomplete_reasons.add("funding_gap")
     return dict(days)
@@ -548,29 +558,59 @@ def opening_date(record: dict) -> str | None:
     return utc_date_or_none(opened)
 
 
-def funding_ticks_seen(record: dict) -> bool:
-    """Does the row itself say a funding tick landed inside its life?"""
+# What a row's `funding_ticks_observed` field claims, classified once.
+# Three call sites used to read the field with three different ad-hoc
+# parses, and every round of review found another value one of them
+# disagreed about -- `"0"`, `False`, `-1`, `NaN`. There is one parse now,
+# and the callers differ only in what they do with the answer
+# (Codex, PR #297).
+FUNDING_TICKS_ABSENT = "absent"
+FUNDING_TICKS_NONE = "none"
+FUNDING_TICKS_SOME = "some"
+FUNDING_TICKS_MALFORMED = "malformed"
+
+
+def funding_tick_claim(record: dict) -> str:
+    """`absent` / `none` / `some` / `malformed`.
+
+    `malformed` is anything present that cannot be a count: a boolean, an
+    unparseable token, a non-finite number, or a negative one. It is
+    deliberately distinct from `none`, because a row that cannot say how
+    many ticks it saw is not a row saying it saw none.
+    """
     ticks = record.get("funding_ticks_observed")
     if ticks is None:
-        return False
-    # A boolean is not a count. `float(False)` is `0.0`, so without this
-    # it read as a clean "no ticks" here while `funding_ticks_are_zero`
-    # rightly refused to call it zero -- and a malformed row with no
-    # carry passed *both* tests and left the day complete
-    # (Codex, PR #297).
-    if isinstance(ticks, bool):
-        return True
-    try:
-        count = float(ticks)
-    except (TypeError, ValueError):
-        # An unreadable tick count is not evidence of zero either.
-        return True
+        return FUNDING_TICKS_ABSENT
+    if is_not_a_number(ticks):
+        return FUNDING_TICKS_MALFORMED
+    count = float(ticks)
     # Finite is not the same as possible: a tick count cannot be
     # negative, and reading one as "no ticks" would make a malformed row
     # into evidence that no funding occurred (Codex, PR #297).
     if not math.isfinite(count) or count < 0:
-        return True
-    return count > 0
+        return FUNDING_TICKS_MALFORMED
+    return FUNDING_TICKS_NONE if count == 0.0 else FUNDING_TICKS_SOME
+
+
+def funding_ticks_seen(record: dict) -> bool:
+    """Does the row itself say a funding tick landed inside its life?
+
+    A malformed count answers yes, because it is not evidence of zero:
+    read as "no ticks" it would turn a missing carry into a verified one.
+    """
+    return funding_tick_claim(record) in (FUNDING_TICKS_SOME, FUNDING_TICKS_MALFORMED)
+
+
+def funding_ticks_are_zero(record: dict) -> bool:
+    """Does the row *readably* claim that no funding tick landed?
+
+    Only a value that is present and parses to exactly zero. An exact
+    `== 0` used to let an export that writes its numbers as strings
+    through: `"0"` is not `0`, so a row spanning an hourly boundary with a
+    zero carry was accepted as a complete day and its zero went into the
+    cost (Codex, PR #297).
+    """
+    return funding_tick_claim(record) == FUNDING_TICKS_NONE
 
 
 def is_not_a_number(value: object) -> bool:
@@ -591,32 +631,6 @@ def is_not_a_number(value: object) -> bool:
     except (TypeError, ValueError):
         return True
     return False
-
-
-def funding_ticks_are_zero(record: dict) -> bool:
-    """Does the row *readably* claim that no funding tick landed?
-
-    An exact `== 0` let an export that writes its numbers as strings
-    through: `"0"` is not `0`, so a row spanning an hourly boundary with a
-    zero carry was accepted as a complete day and its zero went into the
-    cost -- while the identical row written with a numeric `0` correctly
-    produced a `funding_gap` (Codex, PR #297).
-
-    Only a value that is present and parses to exactly zero counts.
-    Missing means the row makes no claim (the caller's other branch
-    handles a missing carry), and unreadable, negative or non-finite is
-    not evidence of zero either -- the same doctrine as
-    `funding_ticks_seen`, which this deliberately mirrors rather than
-    negates: both must answer "no" for a count that cannot be read.
-    """
-    ticks = record.get("funding_ticks_observed")
-    if ticks is None or isinstance(ticks, bool):
-        return False
-    try:
-        count = float(ticks)
-    except (TypeError, ValueError):
-        return False
-    return math.isfinite(count) and count == 0.0
 
 
 def spans_a_funding_interval(record: dict) -> bool:
@@ -702,6 +716,11 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
     # delta is published as a known cost (Codex, PR #297).
     last_by_day: dict[str, tuple[float, float]] = {}
     invalid_days: set[str] = set()
+    # Days whose *latest* stamp carries two different equity values. Not
+    # merged into `invalid_days` as they are found, because a later,
+    # strictly greater sample settles the day and clears the tie
+    # (Codex, PR #297).
+    tied_closes: set[str] = set()
     for row in rows:
         ts = row.get("ts")
         if ts is None:
@@ -725,10 +744,21 @@ def equity_daily_costs(rows: Iterable[dict]) -> dict[str, float]:
             # known `equity_delta` cost.
             if math.isfinite(value) and math.isfinite(stamp):
                 seen = last_by_day.get(day)
-                if seen is None or stamp >= seen[0]:
+                if seen is None or stamp > seen[0]:
                     last_by_day[day] = (stamp, value)
+                    # A strictly later sample is the close, whatever the
+                    # earlier instants disagreed about.
+                    tied_closes.discard(day)
+                elif stamp == seen[0] and value != seen[1]:
+                    # Two different closes claiming the same instant.
+                    # `>=` made whichever row came last win, so merely
+                    # reversing an equivalent export changed the next
+                    # day's `equity_delta` cost. Neither is the day's
+                    # close (Codex, PR #297).
+                    tied_closes.add(day)
             else:
                 invalid_days.add(day)
+    invalid_days |= tied_closes
     costs: dict[str, float] = {}
     previous_day: str | None = None
     for day in sorted(last_by_day):
