@@ -198,8 +198,40 @@ class QualityTests(unittest.TestCase):
                 (session['krx_open_utc_us'], session['krx_close_utc_us'],
                  session['us_open_utc_us']) = times
                 self.calendar.write_text(json.dumps(calendar))
-                with self.assertRaisesRegex(ValueError, 'invalid boundary timestamps'):
+                with self.assertRaisesRegex(ValueError, r'invalid \w+_utc_us'):
                     self.report()
+
+    def test_a_one_sided_session_still_validates_the_open_side(self):
+        # KRX open on a US holiday short-circuits to market_closed, so the
+        # boundary branch never runs -- but TradingCalendar.load still
+        # rejects the whole calendar for a malformed KRX pair, and so must
+        # this. The mirror is the producer's entire session rule, not the
+        # subset this run happens to read.
+        for session, expected in (
+            ({'krx_is_open': True, 'us_is_open': False,
+              'krx_open_utc_us': None, 'krx_close_utc_us': TIMES[1]},
+             r'invalid krx_open_utc_us'),
+            ({'krx_is_open': True, 'us_is_open': False,
+              'krx_open_utc_us': TIMES[1], 'krx_close_utc_us': TIMES[0]},
+             r'krx_open_utc_us must be before krx_close_utc_us'),
+            ({'krx_is_open': False, 'us_is_open': True,
+              'us_open_utc_us': -1},
+             r'invalid us_open_utc_us'),
+        ):
+            with self.subTest(session=session):
+                calendar = json.loads(self.calendar.read_text())
+                calendar['sessions']['2026-09-08'] = session
+                self.calendar.write_text(json.dumps(calendar))
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.report()
+
+        # A well-formed one-sided session is an ordinary closed day.
+        calendar = json.loads(self.calendar.read_text())
+        calendar['sessions']['2026-09-08'] = {
+            'krx_is_open': True, 'us_is_open': False,
+            'krx_open_utc_us': TIMES[0], 'krx_close_utc_us': TIMES[1]}
+        self.calendar.write_text(json.dumps(calendar))
+        self.assertEqual(self.report()['days'][0]['status'], 'market_closed')
 
     def test_open_connections_are_bounded(self):
         # A full 2026-2027 range touches ~1,900 hourly partitions; one open

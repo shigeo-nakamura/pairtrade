@@ -32,6 +32,33 @@ def valid_timestamp_us(value) -> bool:
     return type(value) is int and 0 <= value <= SQLITE_INT_MAX
 
 
+def validate_session(day, session):
+    """The collector's session-entry rules, applied whole.
+
+    Mirrors `TradingCalendar.load` (scripts/engine_b_phase0.py) field for
+    field: both flags must be booleans; a valid, ordered open/close pair is
+    required on the KRX side exactly when KRX is open, and a valid US open
+    exactly when the US is open. Deliberately the producer's whole rule
+    rather than the subset a given run happens to read -- a calendar the
+    collector would refuse to load must never produce a report, whichever
+    field is wrong and whether or not this day's branch would have looked
+    at it. A one-sided session (KRX open on a US holiday) short-circuits to
+    `market_closed`, so validating inside that branch is how malformed
+    timestamps got through (Codex, PR #311).
+    """
+    for flag in ("krx_is_open", "us_is_open"):
+        if type(session[flag]) is not bool:
+            raise ValueError(f"{day}: krx_is_open/us_is_open must be booleans")
+    if session["krx_is_open"]:
+        krx_open, krx_close = session["krx_open_utc_us"], session["krx_close_utc_us"]
+        if not valid_timestamp_us(krx_open) or not valid_timestamp_us(krx_close):
+            raise ValueError(f"{day}: invalid krx_open_utc_us/krx_close_utc_us")
+        if krx_open >= krx_close:
+            raise ValueError(f"{day}: krx_open_utc_us must be before krx_close_utc_us")
+    if session["us_is_open"] and not valid_timestamp_us(session["us_open_utc_us"]):
+        raise ValueError(f"{day}: invalid us_open_utc_us")
+
+
 def digest(path):
     h = hashlib.sha256()
     with path.open("rb") as stream:
@@ -286,15 +313,15 @@ def analyze(root, calendar_path, start, end, symbols, max_age_seconds=30, window
         while day <= last:
             session = calendar["sessions"][day.isoformat()]
             row = {"date": day.isoformat(), "g0_2": "not_evaluated"}
-            flags = [session["krx_is_open"], session["us_is_open"]]
-            if any(type(f) is not bool for f in flags):
-                raise ValueError(f"{day}: krx_is_open/us_is_open must be booleans")
-            if not all(flags):
+            validate_session(day, session)
+            if not (session["krx_is_open"] and session["us_is_open"]):
                 row["status"] = "market_closed"
             else:
                 times = [session["krx_open_utc_us"], session["krx_close_utc_us"], session["us_open_utc_us"]]
-                if not all(valid_timestamp_us(t) for t in times) or not times[0] < times[1] < times[2]:
-                    raise ValueError(f"{day}: invalid boundary timestamps")
+                # What the producer does not check: the two markets'
+                # boundaries must be usable as t0 < t1 < t2.
+                if not times[0] < times[1] < times[2]:
+                    raise ValueError(f"{day}: boundary timestamps out of order")
                 row["boundaries"] = {label: boundary(dataset, t, symbols, max_age_seconds * SECOND, window_seconds * SECOND)
                                      for label, t in zip(("t0", "t1", "t2"), times)}
                 row["status"] = "boundary_preflight_pass" if all(b["boundary_preflight_pass"] for b in row["boundaries"].values()) else "boundary_preflight_fail"
