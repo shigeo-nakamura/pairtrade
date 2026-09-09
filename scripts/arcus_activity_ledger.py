@@ -545,7 +545,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
                      since: datetime | None = None,
                      until: datetime | None = None,
                      max_plan_age_secs: int = HARD_MAX_PLAN_AGE_SECS,
-                     ) -> tuple[list[Swap], list[tuple[int, datetime]], list[int]]:
+                     ) -> tuple[list[Swap], list[tuple[int, datetime]], list[int], list[int]]:
     """Price every reconciled swap the event window actually covers.
 
     Coverage is decided by the *pricing event*, not by the dispatch clock.
@@ -567,6 +567,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     swaps: list[Swap] = []
     out_of_window: list[tuple[int, datetime]] = []
     unmatched_in_stream: list[int] = []
+    after_cutoff: list[int] = []
     for attempt in reconciled_attempts(ledger):
         dispatched_at = event_stream.parse_timestamp(attempt["dispatched_at"])
         # Past an explicit `--until` there is nothing to match *for*. The
@@ -578,7 +579,24 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
         # historical report with it -- the same premise as the unmatched
         # leg below, applied one step earlier (PR #298 Codex review).
         if until is not None and dispatched_at > until:
-            out_of_window.append((int(attempt["sequence"]), dispatched_at))
+            # Past the cutoff the match cannot change the report, so an
+            # ambiguity here is excluded rather than fatal -- that was the
+            # round-13 finding. But which list it lands in still has to be
+            # true: `out_of_window` is rendered as "not priceable from
+            # this event stream", and a swap whose pricing event is
+            # sitting right there is not that. It is absent because the
+            # caller's question ends earlier, which is a different fact
+            # and gets its own line (PR #298 Codex review, round 14).
+            try:
+                priceable = find_event(attempt, index, max_plan_age_secs) is not None
+            except ActivityLedgerError:
+                # Ambiguous: the stream does hold candidate events for it,
+                # so it is not an export gap either.
+                priceable = True
+            if priceable:
+                after_cutoff.append(int(attempt["sequence"]))
+            else:
+                out_of_window.append((int(attempt["sequence"]), dispatched_at))
             continue
         event = find_event(attempt, index, max_plan_age_secs)
         if event is None:
@@ -615,7 +633,7 @@ def reconciled_swaps(ledger: dict[str, Any], index: dict[tuple, list[dict[str, A
     # The dispatch time rides along so the caller can tell an unpriceable
     # swap it was asked about from one it was not: the first is a hole in
     # the answer, the second is simply outside the question.
-    return swaps, sorted(out_of_window), sorted(unmatched_in_stream)
+    return swaps, sorted(out_of_window), sorted(unmatched_in_stream), sorted(after_cutoff)
 
 
 def pair_round_trips(swaps: Sequence[Swap]) -> tuple[list[RoundTrip], list[Swap]]:
@@ -782,7 +800,7 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
     # belongs to the day the caller named.
     if since is not None and until is not None and since > until:
         raise ActivityLedgerError("--since is after --until")
-    swaps, out_of_window, unmatched_in_stream = reconciled_swaps(
+    swaps, out_of_window, unmatched_in_stream, after_cutoff = reconciled_swaps(
         ledger, index, stream, since, until, max_plan_age_secs)
     # Pair over everything the stream priced, so a rotation that spans a
     # requested bound is still recognised as one rotation.
@@ -973,6 +991,12 @@ def build_report(ledger: dict[str, Any], events: Sequence[dict[str, Any]],
             "to": stream[1].isoformat().replace("+00:00", "Z"),
         },
         "ledger_swaps_outside_window": [sequence for sequence, _ in out_of_window],
+        # Reconciled swaps the ledger holds after an explicit `--until`.
+        # Separate from the list above because the reason is different and
+        # so is what an operator should do about it: nothing is missing
+        # from the export, the question simply ended earlier
+        # (PR #298 Codex review, round 14).
+        "ledger_swaps_after_cutoff": after_cutoff,
         "ceiling_usd_per_1k": as_number(ceiling),
         "gas_price_usd": as_number(gas_price_usd),
         "days": [
@@ -1104,6 +1128,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"Not priceable from this event stream ({report['event_stream']['from']} .. "
             f"{report['event_stream']['to']}): ledger sequences "
             + ", ".join(str(sequence) for sequence in skipped))
+    later = report.get("ledger_swaps_after_cutoff") or []
+    if later:
+        lines.append("")
+        lines.append(
+            f"After the requested cutoff ({report['window']['to']}), so not reported here -- "
+            "this is not a gap in the export: ledger sequences "
+            + ", ".join(str(sequence) for sequence in later))
     return "\n".join(lines)
 
 

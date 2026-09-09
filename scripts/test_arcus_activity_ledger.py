@@ -941,9 +941,47 @@ class ActivityLedgerTests(unittest.TestCase):
 
         report = report_for(events, history, until=cutoff)
         self.assertEqual(report["totals"]["round_trips"], 1)
-        self.assertIn(20, report["ledger_swaps_outside_window"])
+        # The stream does hold candidate events for it, so it is an
+        # after-cutoff exclusion, not an export gap.
+        self.assertEqual(report["ledger_swaps_after_cutoff"], [20])
+        self.assertEqual(report["ledger_swaps_outside_window"], [])
         self.assertEqual(report["coverage"]["unmatched_legs_in_stream"], [])
         self.assertTrue(report["coverage"]["complete"])
+        self.assertIn("After the requested cutoff", ledger_tool.render_markdown(report))
+
+    def test_a_priceable_swap_after_the_cutoff_is_not_called_unpriceable(self):
+        """Its pricing event is in the stream; only the question ended.
+
+        `ledger_swaps_outside_window` is rendered as "not priceable from
+        this event stream", so putting a swap there whose exact event is
+        present told an operator the export was incomplete when it was not
+        (PR #298 Codex review, round 14).
+        """
+        events, history = baseline_round_trip()
+        after = EXIT_AT + timedelta(hours=2)
+        events.append(would_rotate_event(
+            3, after, trigger="entry_signal", sell="QQQ", buy="SPY",
+            sell_quantity="0.5", buy_quantity="0.4",
+            spy_mark="780.00", qqq_mark="700.00"))
+        history.append(attempt(20, after + timedelta(seconds=5), sell="QQQ", buy="SPY",
+                               sell_quantity="0.5", buy_quantity="0.4"))
+        report = report_for(events, history, until=EXIT_AT + timedelta(hours=1))
+
+        self.assertEqual(report["ledger_swaps_after_cutoff"], [20])
+        self.assertEqual(report["ledger_swaps_outside_window"], [],
+                         "its event is right there -- this is not an export gap")
+        self.assertTrue(report["coverage"]["complete"])
+        rendered = ledger_tool.render_markdown(report)
+        self.assertIn("After the requested cutoff", rendered)
+        self.assertNotIn("Not priceable from this event stream", rendered)
+
+        # A post-cutoff swap the stream really cannot price keeps saying so.
+        unpriceable = attempt(21, EXIT_AT + timedelta(days=1), sell="NVDA", buy="AMD",
+                              sell_quantity="0.1", buy_quantity="0.2")
+        mixed = report_for(events, history + [unpriceable],
+                           until=EXIT_AT + timedelta(hours=1))
+        self.assertEqual(mixed["ledger_swaps_after_cutoff"], [20])
+        self.assertEqual(mixed["ledger_swaps_outside_window"], [21])
 
     def test_causality_is_compared_exactly_not_to_the_second(self):
         """`int(-0.5) == 0` let a tick observed after preparation through.
