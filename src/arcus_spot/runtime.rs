@@ -3744,6 +3744,33 @@ impl ArcusSpotRuntime {
         handled_corporate_action_record(&self.state, event)
     }
 
+    /// The window this tick is inside, whichever way it got there: a
+    /// declared unhandled event, or a *refused* declaration reusing a
+    /// handled id -- which `active_corporate_action` deliberately excludes,
+    /// so anything asking "is there a window here" has to resolve it too
+    /// (Codex P1, pairtrade#309).
+    fn corporate_action_window_in_force(
+        &self,
+        evaluation_time: DateTime<Utc>,
+    ) -> Option<ArcusSpotCorporateActionEvent> {
+        if let Some(event) = self.active_corporate_action(evaluation_time) {
+            return Some(event.clone());
+        }
+        self.config
+            .corporate_actions
+            .iter()
+            .find(|event| {
+                self.handled_record_for(event) == Some(HandledMatch::ReusedId)
+                    && evaluation_time >= event.entry_block_at
+                    && self
+                        .state
+                        .corporate_action
+                        .as_ref()
+                        .is_none_or(|progress| Self::progress_matches(progress, event))
+            })
+            .cloned()
+    }
+
     /// Whether an affected symbol has already been repointed away from the
     /// identity pinned when the window opened. The mark this tick would
     /// engage a halt on mixes the old contract's quantity with the new
@@ -3753,7 +3780,7 @@ impl ArcusSpotRuntime {
         evaluation_time: DateTime<Utc>,
         price: &PriceContext,
     ) -> bool {
-        let Some(event) = self.active_corporate_action(evaluation_time).cloned() else {
+        let Some(event) = self.corporate_action_window_in_force(evaluation_time) else {
             return false;
         };
         if self
@@ -8713,6 +8740,45 @@ mod tests {
         assert!(
             runtime.state.corporate_action.is_some(),
             "the window is recorded"
+        );
+    }
+
+    #[test]
+    fn a_reused_id_window_does_not_engage_an_artificial_halt() {
+        // `active_corporate_action` excludes a refused declaration, so the
+        // halt-suppression path has to resolve it separately -- otherwise a
+        // repointed ticker inside a reused-id window engages an artificial
+        // sticky halt, and renaming the event cannot recover because
+        // reset-window refuses an active halt.
+        let anchor = event_time();
+        let mut runtime = runtime_with_reused_id_window(anchor);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut runtime, anchor);
+        runtime.state.inventory.token_a = Decimal::new(995, 3);
+
+        let inside = anchor + Duration::seconds(3);
+        runtime.step_at(
+            &snapshot_with_relisted_token_a_at_prices(inside, "800", "100"),
+            inside,
+        );
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "the mark mixes the old quantity with the replacement's price",
+        );
+
+        // Control: the same price move without a relisting is a real breach.
+        let mut control = runtime_with_reused_id_window(anchor);
+        control.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        seed_observed_identities(&mut control, anchor);
+        control.state.inventory.token_a = Decimal::new(995, 3);
+        control.step_at(
+            &snapshot_with_valid_row_at_prices(inside, "800", "100"),
+            inside,
+        );
+        assert!(
+            control.state.risk_halt.is_some(),
+            "a real shortfall still halts"
         );
     }
 
