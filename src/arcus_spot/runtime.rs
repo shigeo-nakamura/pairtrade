@@ -7468,12 +7468,14 @@ mod tests {
         assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
 
         // A distinct later action under the old id, already effective, with
-        // an overdue rotation open.
-        let later = resumed_at + Duration::seconds(60);
-        let mut reused = corporate_action_event(later - Duration::seconds(10));
+        // an overdue rotation open. Kept within the fixture quote's 30s
+        // freshness of `anchor`: otherwise StaleQuote blocks the exit on its
+        // own and the test proves nothing about the overlay.
+        let mut reused = corporate_action_event(anchor + Duration::seconds(13));
         reused.post_event_inventory = None;
         runtime.config.corporate_actions = vec![reused];
-        seed_open_rotation(&mut runtime, later - Duration::hours(2));
+        seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
+        let later = anchor + Duration::seconds(18); // past effective_at (+17s)
         let samples_before = runtime.state.relative_log_price_history.len();
         let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
         assert!(
