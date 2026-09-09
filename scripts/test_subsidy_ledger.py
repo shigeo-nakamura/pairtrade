@@ -1086,6 +1086,40 @@ def test_a_row_without_a_timestamp_is_always_fatal():
             raise AssertionError("a row with no ts must raise even without a pnl")
 
 
+def test_a_complete_day_with_no_funding_ticks_reports_a_known_zero():
+    """`null` must mean "not known", not "known to be nothing".
+
+    A day whose closes all stayed inside one funding interval carries no
+    `funding_carry_usd` at all -- the documented shape -- and its cost is
+    computed with that zero, so reporting the field as unknown left a
+    consumer unable to tell it from a real coverage gap.
+    """
+    inside_the_hour = 1788868800 + 1800
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 600}],
+        )
+        day = load_pnl([clean])[("2026-09-08", "freq")]
+        assert not day.incomplete and not day.funding_seen
+        row = build_rows({}, {("2026-09-08", "freq"): day})[0]
+        assert row.funding_usd == 0.0, row.funding_usd
+        assert row.cost_usd == 5.0
+
+        # A day whose funding coverage really is unknown still says so.
+        gap = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 20 * 3600}],
+            arm="b",
+        )
+        gapped = load_pnl([gap])[("2026-09-08", "b")]
+        assert gapped.incomplete
+        gap_row = build_rows({}, {("2026-09-08", "b"): gapped})[0]
+        assert gap_row.funding_usd is None
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

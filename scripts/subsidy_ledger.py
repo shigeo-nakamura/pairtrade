@@ -720,7 +720,18 @@ def build_rows(
         if day is not None:
             row.cycles = day.cycles
             row.realized_pnl_usd = round(day.realized_pnl_usd, 6)
-            row.funding_usd = round(day.funding_usd, 6) if day.funding_seen else None
+            # `null` means "not known", and on a complete day it is not
+            # true: every close there either carried a carry or was shown
+            # to have met no funding tick, and the cost above was
+            # computed with that zero. Reporting it as unknown left a
+            # JSON consumer unable to tell a verified zero from a gap --
+            # and the gap case is exactly what `incomplete` marks
+            # (Codex, PR #297).
+            row.funding_usd = (
+                round(day.funding_usd, 6)
+                if day.funding_seen or (day.cycles > 0 and not day.incomplete)
+                else None
+            )
             row.pnl_coverage = "incomplete" if day.incomplete else "complete"
             row.cross_day_cycles = day.cross_day_cycles
             row.cross_day_entries = day.cross_day_entries
