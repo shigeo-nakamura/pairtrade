@@ -16,7 +16,7 @@ use super::{
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use dex_connector::ArcusSpotPair;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -477,6 +477,20 @@ impl ArcusSpotRuntimeCheckpointStore {
             .last_observation_at
             .map(|observed_at| observed_at.max(now))
             .unwrap_or(now);
+        // The window need not have opened yet: this load builds the runtime
+        // that a submit guard closes over, and quote/preflight/signing can
+        // cross `entry_block_at` before the order goes out -- at which point
+        // the guard cannot see a declaration the stripped config never had.
+        // The margin that bounds how long a submission takes is the same one
+        // exits already stop for, so removal is only housekeeping for a
+        // window that cannot open within it (Codex P1, pairtrade#309).
+        let submit_margin = Duration::seconds(
+            checkpoint
+                .config
+                .corporate_action_settlement_margin_secs
+                .max(config.corporate_action_settlement_margin_secs),
+        );
+        let live_by = live_by + submit_margin;
         if let Some(dropped) = checkpoint.config.corporate_actions.iter().find(|stored| {
             live_by >= stored.entry_block_at
                 // "Handled" by the same rule a tick applies: an id whose
@@ -494,9 +508,10 @@ impl ArcusSpotRuntimeCheckpointStore {
         }) {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config declaring corporate \
-                 action {} (window open since {}, not yet handled), which the supplied config \
-                 does not declare. Removing a live window drops the guard it exists to be; \
-                 restore the declaration, or resolve the window first",
+                 action {} (window opening at {}, within the submission margin of now and not \
+                 yet handled), which the supplied config does not declare. Removing a live \
+                 window drops the guard it exists to be; restore the declaration, or resolve \
+                 the window first",
                 self.path.display(),
                 dropped.event_id,
                 dropped.entry_block_at.to_rfc3339(),
@@ -877,9 +892,17 @@ mod tests {
         };
         assert!(error.contains("Removing a live window"), "{error}");
 
-        // Retiring one that has not opened by either clock is housekeeping.
+        // Retiring one that cannot open within the submission margin is
+        // housekeeping. The default margin is 300s, so a minute before the
+        // window is still refused -- the runtime this load builds could
+        // submit after it opened.
+        let error = match store.load_existing_at(&dropped, anchor - chrono::Duration::minutes(1)) {
+            Ok(_) => panic!("a window that can open mid-submission is still live"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
         assert!(store
-            .load_existing_at(&dropped, anchor - chrono::Duration::minutes(1))
+            .load_existing_at(&dropped, anchor - chrono::Duration::hours(1))
             .is_ok());
 
         // A reused id is not "handled": the recorded fingerprint is another
