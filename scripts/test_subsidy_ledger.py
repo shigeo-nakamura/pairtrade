@@ -1184,6 +1184,22 @@ def test_a_string_zero_tick_count_is_still_a_gap():
     assert not funding_ticks_are_zero({"funding_ticks_observed": "n/a"})
     assert not funding_ticks_are_zero({"funding_ticks_observed": 2})
     assert not funding_ticks_are_zero({"funding_ticks_observed": "NaN"})
+    # A boolean is not a count, and the two helpers must agree about it:
+    # `float(False)` is `0.0`, so a `false` that read as "no ticks" here
+    # while the zero test refused it slipped through both checks and left
+    # a carry-less, boundary-spanning day complete (Codex, PR #297).
+    assert not funding_ticks_are_zero({"funding_ticks_observed": False})
+    assert funding_ticks_seen({"funding_ticks_observed": False})
+    assert funding_ticks_seen({"funding_ticks_observed": True})
+    with tempfile.TemporaryDirectory() as tmp2:
+        boolean = pnl_file(
+            Path(tmp2),
+            [{"ts": 1788868800 + 1800, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 600, "funding_ticks_observed": False}],
+        )
+        malformed = load_pnl([boolean])[("2026-09-08", "freq")]
+        assert malformed.incomplete, "a boolean tick count is not a known zero"
+        assert "funding_gap" in malformed.incomplete_reasons
 
     with tempfile.TemporaryDirectory() as tmp:
         as_text = pnl_file(

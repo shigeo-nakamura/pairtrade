@@ -523,6 +523,13 @@ def funding_ticks_seen(record: dict) -> bool:
     ticks = record.get("funding_ticks_observed")
     if ticks is None:
         return False
+    # A boolean is not a count. `float(False)` is `0.0`, so without this
+    # it read as a clean "no ticks" here while `funding_ticks_are_zero`
+    # rightly refused to call it zero -- and a malformed row with no
+    # carry passed *both* tests and left the day complete
+    # (Codex, PR #297).
+    if isinstance(ticks, bool):
+        return True
     try:
         count = float(ticks)
     except (TypeError, ValueError):
