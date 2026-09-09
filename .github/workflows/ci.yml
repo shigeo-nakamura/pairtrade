@@ -100,7 +100,28 @@ jobs:
               echo "::error file=${f}::hardcoded DEX_CONNECTOR_REF pin — resolve the ref from Cargo.lock via _resolve-dex-connector-ref.yml instead (bot-strategy#899)."
               rc=1
             fi
+            # bot-strategy#973: a workflow may delegate the checkout to a
+            # reusable workflow instead of doing it itself. It is then the
+            # caller that owns the ref, so the resolver requirement has to be
+            # checked here rather than on the file that holds the checkout.
+            if grep -q 'workflows/_test-arcus-spot-live\.yml' "$f" \
+              && ! grep -q '_resolve-dex-connector-ref\.yml' "$f"; then
+              echo "::error file=${f}::calls _test-arcus-spot-live.yml without resolving dex-connector-ref through _resolve-dex-connector-ref.yml (bot-strategy#899/#973)."
+              rc=1
+            fi
             grep -q 'repository: shigeo-nakamura/dex-connector' "$f" || continue
+            # A reusable workflow has no ref of its own to keep in sync --
+            # but only if it actually checks out what the caller passed
+            # down. Requiring the interpolation, not just the input
+            # declaration, is what stops "declares dex-connector-ref, checks
+            # out something else". Its callers are covered above.
+            if grep -qE '^\s+workflow_call:' "$f"; then
+              if ! grep -qF 'ref: ${{ inputs.dex-connector-ref }}' "$f"; then
+                echo "::error file=${f}::reusable workflow checks out dex-connector from something other than its own \`dex-connector-ref\` input (bot-strategy#973)."
+                rc=1
+              fi
+              continue
+            fi
             if ! grep -q '_resolve-dex-connector-ref\.yml' "$f"; then
               echo "::error file=${f}::checks out dex-connector without calling ./.github/workflows/_resolve-dex-connector-ref.yml (bot-strategy#899)."
               rc=1
@@ -189,6 +210,33 @@ jobs:
       # actually ran in CI (Codex P2 follow-up, pairtrade#177).
       - name: Arcus Spot runtime binary tests
         run: cargo test --bin arcus-spot-runtime --no-default-features --features arcus-spot-sdk --locked
+
+  # bot-strategy#973: none of the passes in build-test above ever compiles
+  # the `arcus-spot-live` feature -- the live executor that signs with KMS
+  # and moves real inventory. Its two binaries carry
+  # `required-features = ["arcus-spot-live"]`, which excludes them from
+  # `--all-targets`, and the `arcus-spot-sdk` passes stop short of the
+  # feature that pulls in dex-connector/arcus-spot-execution, ethers and
+  # rusoto (379 lib tests with it against 109 without). Before this job the
+  # only run of these tests was deploy-arcus-spot-executor.yml, on master
+  # push -- verification strictly after merge, where a break also blocks the
+  # executor deploy (pairtrade#309 shipped six failing tests past a fully
+  # green ci.yml). It is a separate job, not a step in build-test, so the
+  # extra compile runs in parallel and does not extend the pipeline's
+  # wall-clock.
+  #
+  # Deliberately NOT in `deploy`'s needs: this repo's deploy job builds
+  # engine_b_live and book-runtime, which share no code with the Arcus
+  # executor, and the Arcus binary has its own deploy workflow that gates on
+  # the same tests in release profile.
+  test-arcus-spot-live:
+    needs: resolve-ref
+    uses: ./.github/workflows/_test-arcus-spot-live.yml
+    with:
+      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}
+      cargo-profile: debug
+    secrets:
+      DEX_CONNECTOR_PAT: ${{ secrets.DEX_CONNECTOR_PAT }}
 
   deploy:
     runs-on: ubuntu-24.04-arm

@@ -1,0 +1,124 @@
+name: Test Arcus Spot live executor
+
+# Reusable workflow (bot-strategy#973). Single source of truth for the test
+# commands that cover the `arcus-spot-live` feature: the KMS-signing live
+# executor, its chain/ledger/checkpoint/event-stream modules, and both of its
+# binaries.
+#
+# Why this is not just a step in ci.yml: those targets carry
+# `required-features = ["arcus-spot-live"]`, so `cargo check/test
+# --all-targets` on default features never compiles them, and neither does
+# the `arcus-spot-sdk` pass (that feature does not pull in
+# dex-connector/arcus-spot-execution, ethers or rusoto). Until this workflow
+# existed the only place these tests ran was deploy-arcus-spot-executor.yml,
+# which triggers on `push: branches: [master]` -- i.e. the repository's
+# highest-consequence code was verified only *after* merge. pairtrade#309 hit
+# exactly that: its first commit broke six arcus-spot-execute-once tests with
+# every ci.yml job green.
+#
+# Both callers now run the same commands from here, so the PR-time and
+# deploy-time coverage cannot drift the way ci.yml and the deploy workflows
+# drifted over the dex-connector ref in bot-strategy#899.
+
+on:
+  workflow_call:
+    inputs:
+      dex-connector-ref:
+        description: >
+          The dex-connector ref to check out. Callers must resolve this
+          through _resolve-dex-connector-ref.yml (bot-strategy#899): this
+          workflow deliberately has no ref of its own to keep in sync, and
+          ci.yml's lint job rejects a caller that passes a static pin.
+        required: true
+        type: string
+      cargo-profile:
+        description: >
+          "debug" (PR-time coverage: the point is to compile and run the
+          tests as early as possible) or "release" (what the deploy workflow
+          gates its build on, matching the profile it ships).
+        required: false
+        type: string
+        default: debug
+    secrets:
+      DEX_CONNECTOR_PAT:
+        description: PAT with read access to the private dex-connector repo.
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.94.1
+
+jobs:
+  test:
+    name: Test Arcus Spot live executor (x86_64, ${{ inputs.cargo-profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate the requested cargo profile
+        env:
+          CARGO_PROFILE: ${{ inputs.cargo-profile }}
+        run: |
+          case "${CARGO_PROFILE}" in
+            debug|release) ;;
+            *)
+              echo "::error::cargo-profile must be 'debug' or 'release', got '${CARGO_PROFILE}'"
+              exit 1 ;;
+          esac
+
+      - name: Checkout pairtrade
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout pinned dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ inputs.dex-connector-ref }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo tests
+        uses: actions/cache@v5
+        # The profile is part of the key: debug and release builds of the
+        # same tree write disjoint target/ subtrees, so sharing one key would
+        # have the two callers repeatedly save a cache that is twice the size
+        # either of them can use.
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            debot/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.cargo-profile }}-${{ env.RUST_TOOLCHAIN }}-${{ inputs.dex-connector-ref }}-${{ hashFiles('debot/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.cargo-profile }}-${{ env.RUST_TOOLCHAIN }}-${{ inputs.dex-connector-ref }}-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ inputs.cargo-profile }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Run Arcus Spot live executor tests
+        working-directory: debot
+        env:
+          CARGO_PROFILE: ${{ inputs.cargo-profile }}
+        # The lib filter is `arcus_spot` rather than the whole library: with
+        # `--no-default-features --features arcus-spot-live` the non-Arcus
+        # modules that still compile bring their own tests along, and they are
+        # already covered by ci.yml's default-feature `cargo test`.
+        run: |
+          set -x
+          if [ "${CARGO_PROFILE}" = release ]; then
+            PROFILE_FLAG=--release
+          else
+            PROFILE_FLAG=
+          fi
+          # shellcheck disable=SC2086 # PROFILE_FLAG is deliberately unquoted: empty means "no flag".
+          cargo test ${PROFILE_FLAG} --locked --no-default-features --features arcus-spot-live --lib arcus_spot
+          # shellcheck disable=SC2086
+          cargo test ${PROFILE_FLAG} --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once
+          # shellcheck disable=SC2086
+          cargo test ${PROFILE_FLAG} --locked --no-default-features --features arcus-spot-live --bin arcus-spot-propose-plan
