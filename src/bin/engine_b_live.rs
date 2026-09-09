@@ -630,13 +630,6 @@ fn load_state(path: &Path) -> RiskState {
     }
 }
 
-fn atomic_write_json(path: &Path, value: &impl Serialize) {
-    match serde_json::to_string_pretty(value) {
-        Ok(json) => atomic_write_bytes(path, json.as_bytes()),
-        Err(_) => log::warn!("[STATE] serialize failed for {}", path.display()),
-    }
-}
-
 /// Shared tmp+rename atomic-write primitive. Split out from
 /// `atomic_write_json` so `write_status_if_due` can serialize the status
 /// document exactly once and reuse the same bytes for both this local
@@ -829,6 +822,10 @@ enum ShutdownReport {
     /// Nothing in memory, but the persisted record still claims one this
     /// process never reconciled against the exchange.
     UnreconciledClaim,
+    /// Nothing tracked or claimed, but an order was sent whose fill this
+    /// process never confirmed -- the exchange may hold a position that
+    /// no record describes.
+    UnconfirmedOrder,
     /// Nothing tracked and nothing claimed.
     Nothing,
 }
@@ -1510,6 +1507,16 @@ struct EngineBLiveEngine {
     /// entry goes out while this is false: entering blind to what the
     /// account already holds is how a restart doubles exposure.
     reconciled: bool,
+    /// A state write is owed to disk: either one failed, or a field was
+    /// changed by a caller that persists other state in the same breath.
+    /// `tick`'s backstop retries until one succeeds (pairtrade#300 Codex
+    /// review).
+    state_write_pending: bool,
+    /// Successful `state_path` writes, so a test can assert that a change
+    /// which must be atomic really did land in **one** write rather than
+    /// in two with a crash window between them (pairtrade#300 Codex
+    /// review). Never read by the engine itself.
+    state_writes: u64,
     last_status_write_us: i64,
     status_s3_mirror: Option<Arc<S3Mirror>>,
 }
@@ -1569,7 +1576,7 @@ impl EngineBLiveEngine {
             }
             self.state.peak_equity =
                 self.state.session_start_equity + self.state.realized_pnl_session;
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            self.persist_state();
             if let Err(e) = std::fs::remove_file(&self.cfg.risk_ack_path) {
                 log::warn!(
                     "[RISK_ACK] failed to remove {} after ack: {e:?}",
@@ -1600,7 +1607,36 @@ impl EngineBLiveEngine {
     /// the common case is an unchanged `None`.
     fn persist_position(&mut self) {
         if self.sync_open_position_field() {
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            self.state_write_pending = true;
+        }
+        if self.state_write_pending {
+            self.persist_state();
+        }
+    }
+
+    /// The engine's only writer of `state_path`, so that a failed write is
+    /// retried rather than lost. `sync_open_position_field` has already
+    /// updated the in-memory record by the time the write is attempted, so
+    /// a transient failure used to be permanent: every later backstop saw
+    /// the field equal to what it wanted and skipped the write, and a
+    /// partial-close update -- which has no second write behind it -- could
+    /// never reach disk again. A crash then restored a stale size and PnL,
+    /// which is the exact failure the recovery record exists to prevent.
+    /// The flag stays set until some write succeeds, and `tick`'s backstop
+    /// retries every tick (pairtrade#300 Codex review).
+    fn persist_state(&mut self) {
+        match atomic_write_json_checked(&self.cfg.state_path, &self.state) {
+            Ok(()) => {
+                self.state_write_pending = false;
+                self.state_writes += 1;
+            }
+            Err(e) => {
+                self.state_write_pending = true;
+                log::warn!(
+                    "[STATE] write failed for {}: {e} -- retrying on the next tick",
+                    self.cfg.state_path.display()
+                );
+            }
         }
     }
 
@@ -1701,12 +1737,20 @@ impl EngineBLiveEngine {
                 // record, refuse to manage it, and say so
                 // (pairtrade#300 Codex review).
                 if p.symbol != symbol {
-                    log::error!(
-                        "[RECONCILE] DRY_RUN: the saved position is on {} but this instance now \
-                         trades {symbol} -- not resuming it, and not relabelling it. The record \
-                         is kept for the operator",
+                    let reason = format!(
+                        "dry_run_position_on_another_symbol: the saved simulated position is on \
+                         {} but this instance now trades {symbol} -- it is neither resumed nor \
+                         relabelled, and the record is kept",
                         p.symbol
                     );
+                    log::error!("[RECONCILE] {reason}");
+                    // And no *new* simulated entry may join it. Marking
+                    // this reconciled without halting let the next session
+                    // enter on the new symbol, whose `persist_position`
+                    // then overwrote the kept record -- losing the very
+                    // trade this branch refused to relabel
+                    // (pairtrade#300 Codex review).
+                    self.halt_session(reason);
                     self.reconciled = true;
                     return;
                 }
@@ -1726,7 +1770,7 @@ impl EngineBLiveEngine {
                             "[RECONCILE] DRY_RUN: dropping unusable persisted position: {reason}"
                         );
                         self.state.open_position = None;
-                        atomic_write_json(&self.cfg.state_path, &self.state);
+                        self.persist_state();
                     }
                 }
             }
@@ -1823,9 +1867,20 @@ impl EngineBLiveEngine {
                     p.side, p.open_size, p.entered_at_us
                 );
                 log::error!("[RECONCILE] {reason}");
+                // Both fields in one write. Clearing the record first and
+                // halting second leaves a crash window in which disk says
+                // "flat, nothing to reconcile" while the close this
+                // process never saw is still unbooked, so the next start
+                // would enter as if nothing had happened
+                // (pairtrade#300 Codex review).
                 self.state.open_position = None;
-                atomic_write_json(&self.cfg.state_path, &self.state);
+                self.state_write_pending = true;
                 self.halt_session(reason);
+                if self.state_write_pending {
+                    // Already halted, so `halt_session` returned without
+                    // writing; the cleared record still has to land.
+                    self.persist_state();
+                }
             }
         }
         self.reconciled = true;
@@ -1869,10 +1924,15 @@ impl EngineBLiveEngine {
         // the cost basis it was booked against) forward. A side or symbol
         // disagreement is a different position and carries nothing
         // (pairtrade#300 Codex review).
+        // Identity alone decides this. Requiring nonzero partial PnL also
+        // threw away the *cost basis* of a same-symbol, same-side position
+        // whose size merely changed while the process was down: with no
+        // `avg_entry_price` from the exchange the adoption then priced it
+        // at the current mid (or zero), and the immediate close omitted
+        // every dollar between the real entry and the restart
+        // (pairtrade#300 Codex review).
         let carried = self.state.open_position.as_ref().filter(|p| {
-            p.symbol == self.cfg.us_primary_symbol
-                && side_from_str(&p.side) == Some(live.side)
-                && p.realized_partial_pnl != 0.0
+            p.symbol == self.cfg.us_primary_symbol && side_from_str(&p.side) == Some(live.side)
         });
         let carried_partial_pnl = carried.map(|p| p.realized_partial_pnl).unwrap_or(0.0);
         let carried_basis = carried.map(|p| (p.entry_price, p.entry_price_estimated));
@@ -1917,6 +1977,35 @@ impl EngineBLiveEngine {
         });
         self.persist_position();
         self.halt_session(format!("reconcile_adopted_position: {reason}"));
+    }
+
+    /// An order this process sent whose outcome it never established, or
+    /// `None` when nothing is in flight. Both an in-flight confirmation
+    /// and the sticky `position_unconfirmed` marker mean the same thing
+    /// for shutdown: the account may hold something no record describes.
+    fn unconfirmed_order_note(&self) -> Option<String> {
+        match self.pending.as_ref() {
+            Some(PendingConfirm::Entry {
+                side,
+                requested,
+                after_send_error,
+                ..
+            }) => Some(format!(
+                "an entry ({side} size={requested:.6} {}) was sent and its fill was never \
+                 confirmed (send_error={after_send_error:?})",
+                self.cfg.us_primary_symbol
+            )),
+            Some(PendingConfirm::Exit { exit_price, .. }) => Some(format!(
+                "a reduce-only exit at {exit_price:.4} {} was accepted and the account was never \
+                 seen flat",
+                self.cfg.us_primary_symbol
+            )),
+            None if self.state.position_unconfirmed => Some(format!(
+                "state carries position_unconfirmed for {}",
+                self.cfg.us_primary_symbol
+            )),
+            None => None,
+        }
     }
 
     /// SIGTERM / stop policy (bot-strategy#917): this prototype does not
@@ -1972,10 +2061,33 @@ impl EngineBLiveEngine {
                     );
                     ShutdownReport::UnreconciledClaim
                 }
-                None => {
-                    log::warn!("[SHUTDOWN] {signal}: no open position tracked; exiting");
-                    ShutdownReport::Nothing
-                }
+                // An accepted order whose fill was never confirmed leaves
+                // both of the above empty while the exchange may well hold
+                // the position: `pending` is the only thing that knows an
+                // order went out. Reporting "nothing open" there sends an
+                // operator away from a live exposure (pairtrade#300 Codex
+                // review).
+                None => match self.unconfirmed_order_note() {
+                    Some(note) => {
+                        log::error!(
+                            "[SHUTDOWN] {signal}: nothing is tracked and nothing is saved, but \
+                             {note} -- the exchange may hold a position this process never \
+                             recorded; check the account"
+                        );
+                        send_notification(
+                            format!("Han Bridge SHUTDOWN with an unconfirmed order ({signal})"),
+                            format!(
+                                "{note}. No position is tracked or saved, so the next start has \
+                                 nothing to resume. Verify the account before restarting."
+                            ),
+                        );
+                        ShutdownReport::UnconfirmedOrder
+                    }
+                    None => {
+                        log::warn!("[SHUTDOWN] {signal}: no open position tracked; exiting");
+                        ShutdownReport::Nothing
+                    }
+                },
             },
         }
     }
@@ -2016,7 +2128,7 @@ impl EngineBLiveEngine {
             self.day.skip_reason = Some("carried_over_position".to_string());
             self.state.last_session_date = Some(today.to_string());
             self.state.last_session_skip_reason = self.day.skip_reason.clone();
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            self.persist_state();
         }
         // Keyed off the *persisted* pnl_today_date, not the in-memory
         // current_date this function just reset -- current_date is always
@@ -2188,7 +2300,7 @@ impl EngineBLiveEngine {
     fn mark_day_acted(&mut self, skip_reason: Option<String>) {
         self.state.last_session_date = self.current_date.map(|d| d.to_string());
         self.state.last_session_skip_reason = skip_reason;
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.persist_state();
     }
 
     async fn submit_order(&self, side: OrderSide, size: f64, reduce_only: bool) -> Result<Decimal> {
@@ -2322,7 +2434,7 @@ impl EngineBLiveEngine {
         if let Some(today) = self.current_date {
             self.state.t0_snapshot_date = Some(today.to_string());
             self.state.t0_prices = prices;
-            atomic_write_json(&self.cfg.state_path, &self.state);
+            self.persist_state();
         }
     }
 
@@ -2766,7 +2878,7 @@ impl EngineBLiveEngine {
         }
         self.state.session_halted = true;
         self.state.session_halt_reason = Some(reason.clone());
-        atomic_write_json(&self.cfg.state_path, &self.state);
+        self.persist_state();
         send_notification(
             format!("Han Bridge SESSION HALT {}", self.cfg.instance_id),
             format!(
@@ -3859,6 +3971,8 @@ async fn main() -> Result<()> {
         // The first tick reconciles against the exchange before any entry
         // is allowed (bot-strategy#917).
         reconciled: false,
+        state_write_pending: false,
+        state_writes: 0,
         last_status_write_us: 0,
         status_s3_mirror: S3Mirror::from_env(),
     };
@@ -5157,6 +5271,8 @@ mod tests {
             // startup reconciliation has its own tests below, which set
             // this back to false.
             reconciled: true,
+            state_write_pending: false,
+            state_writes: 0,
             last_status_write_us: 0,
             status_s3_mirror: None,
         };
@@ -6286,6 +6402,167 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 3, P1: an order was sent and its
+    /// outcome never established -- that is not "nothing open".
+    #[tokio::test]
+    async fn shutdown_reports_an_entry_whose_fill_was_never_confirmed() {
+        let mut h = harness();
+        h.engine.position = None;
+        h.engine.state.open_position = None;
+        h.engine.pending = Some(PendingConfirm::Entry {
+            side: OrderSide::Long,
+            requested: 0.057,
+            price: 1756.92,
+            epsilon: 0.01,
+            notional_usd: 100.0,
+            deadline_us: T1_US + 60_000_000,
+            after_send_error: None,
+            saw_reading: false,
+        });
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnconfirmedOrder,
+            "an accepted order with no confirmed fill must not be reported as nothing open"
+        );
+        // The sticky marker means the same thing once the window has
+        // already given up on the confirmation.
+        h.engine.pending = None;
+        h.engine.state.position_unconfirmed = true;
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnconfirmedOrder
+        );
+        // Genuinely idle is still reported as such.
+        h.engine.state.position_unconfirmed = false;
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::Nothing
+        );
+    }
+
+    /// pairtrade#300 Codex review round 3, P1: a failed state write is
+    /// owed to disk, not forgotten because memory already changed.
+    #[tokio::test]
+    async fn a_failed_position_write_is_retried_until_it_lands() {
+        let mut h = harness();
+        // Point the state file at a path that cannot be written (its
+        // parent is a file, not a directory), then change the position.
+        let blocked = h.engine.cfg.state_path.with_extension("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let good_path = h.engine.cfg.state_path.clone();
+        h.engine.cfg.state_path = blocked.join("state.json");
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.engine.persist_position();
+        assert!(
+            h.engine.state_write_pending,
+            "a failed write must leave the state owed to disk"
+        );
+        // The in-memory field is already updated, so the old code's
+        // change test would skip every later write. Storage recovers:
+        h.engine.cfg.state_path = good_path.clone();
+        h.engine.persist_position();
+        assert!(!h.engine.state_write_pending);
+        let on_disk = load_state(&good_path);
+        assert_eq!(
+            on_disk.open_position.as_ref().map(|p| p.open_size),
+            Some(0.057),
+            "the position must reach disk once storage recovers"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 3, P2: the known basis carries on
+    /// position identity, not on whether partial PnL happens to be zero.
+    #[tokio::test]
+    async fn adopting_a_resized_position_keeps_its_basis_without_partial_pnl() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        // Same symbol and side, different size, nothing booked yet, and
+        // the exchange reports no `avg_entry_price`.
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.030", 1, None));
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        let adopted = h.engine.position.clone().expect("adopted");
+        assert!(
+            (adopted.entry_price - 1756.92).abs() < 1e-9,
+            "the record's own basis describes this same position, got {}",
+            adopted.entry_price
+        );
+        assert!(
+            !adopted.entry_price_estimated,
+            "and it is a known entry price, not an estimate"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 3, P2: a DRY_RUN record for
+    /// another symbol must block entries, not just decline to resume.
+    #[tokio::test]
+    async fn dry_run_halts_while_a_foreign_symbol_record_is_unresolved() {
+        let mut h = harness();
+        h.engine.cfg.dry_run = true;
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.set_now(T1_US);
+        h.engine.tick().await;
+        assert!(
+            h.engine.state.session_halted,
+            "entries must stay blocked until the incompatible record is resolved"
+        );
+        assert!(
+            !h.engine.entries_allowed(),
+            "otherwise a new simulated entry overwrites the kept record"
+        );
+        assert_eq!(
+            h.engine
+                .state
+                .open_position
+                .as_ref()
+                .map(|p| p.symbol.clone()),
+            Some("SNDK".to_string())
+        );
+    }
+
+    /// pairtrade#300 Codex review round 3, P2: the cleared record and the
+    /// halt it demands must reach disk in the same write.
+    #[tokio::test]
+    async fn a_vanished_position_clears_and_halts_in_one_write() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        // The exchange is flat: closed at a price this process never saw.
+        h.set_now(T1_US);
+        let before = h.engine.state_writes;
+        h.engine.reconcile_startup(T1_US).await;
+        assert_eq!(
+            h.engine.state_writes - before,
+            1,
+            "the cleared record and the halt must land together: two writes leave a crash \
+             window where disk says 'flat, nothing to reconcile'"
+        );
+        let on_disk = load_state(&h.engine.cfg.state_path);
+        assert!(on_disk.open_position.is_none(), "the record is cleared");
+        assert!(
+            on_disk.session_halted,
+            "and disk must never show a clean flat start without the halt"
+        );
+        assert!(on_disk.session_halt_reason.is_some());
     }
 
     /// pairtrade#300 Codex review round 2, P2: a calendar or
