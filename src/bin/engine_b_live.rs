@@ -881,6 +881,13 @@ enum PendingConfirm {
     /// flat, or for the window to end.
     Exit {
         exit_price: f64,
+        /// True when `exit_price` came from the feed (validated mid or
+        /// last raw mid). False when `maybe_exit` had no price of any
+        /// kind and fell back to the tracked leg's own entry price: that
+        /// number books PnL as zero on purpose, and must never be handed
+        /// to `reconcile_side_flip_if_any` as the replacement leg's cost
+        /// basis (pairtrade#300 Codex review).
+        price_is_market: bool,
         deadline_us: i64,
         saw_reading: bool,
     },
@@ -2230,10 +2237,22 @@ impl EngineBLiveEngine {
             .unmanaged_positions
             .retain(|q| q.symbol != record.symbol);
         self.state.unmanaged_positions.push(record);
-        // Resolved: the exposure now has a record that every start
-        // re-checks, and the session is already halted.
+        // Resolved as a *claim*: the exposure now has a record that
+        // every start re-checks. The halt has to be re-engaged rather
+        // than assumed -- `maybe_clear_halt` only needs a RISK_ACK file,
+        // and it clears `session_halted` without touching
+        // `entry_in_flight`, so an operator who acknowledged the
+        // "an order went out for a symbol we no longer trade" halt
+        // before the fill was visible leaves this arriving exposure with
+        // entries unblocked (pairtrade#300 Codex review).
         self.state.entry_in_flight = None;
         self.state_write_pending = true;
+        self.halt_session(format!(
+            "unmanaged_position_sighted: the unconfirmed {sent_for} order filled after \
+             us_primary moved to {}; {} size={:.6} is open on a symbol this engine cannot \
+             close -- flatten it by hand, then RISK_ACK",
+            self.cfg.us_primary_symbol, live.side, live.size
+        ));
         let _ = now_us;
     }
 
@@ -2563,28 +2582,57 @@ impl EngineBLiveEngine {
     /// and the sticky `position_unconfirmed` marker mean the same thing
     /// for shutdown: the account may hold something no record describes.
     fn unconfirmed_order_note(&self) -> Option<String> {
+        // Every live claim, not the first one. The three are
+        // independent: `pending` is this process's memory, and both
+        // `position_unconfirmed` and `entry_in_flight` are durable
+        // markers that can be set while `pending` is `None` (a restart)
+        // or alongside it. Reporting only the first hides the others
+        // from the operator the shutdown alert is written for
+        // (pairtrade#300 Codex review).
+        let mut notes: Vec<String> = Vec::new();
         match self.pending.as_ref() {
             Some(PendingConfirm::Entry {
                 side,
                 requested,
                 after_send_error,
                 ..
-            }) => Some(format!(
+            }) => notes.push(format!(
                 "an entry ({side} size={requested:.6} {}) was sent and its fill was never \
                  confirmed (send_error={after_send_error:?})",
                 self.cfg.us_primary_symbol
             )),
-            Some(PendingConfirm::Exit { exit_price, .. }) => Some(format!(
+            Some(PendingConfirm::Exit { exit_price, .. }) => notes.push(format!(
                 "a reduce-only exit at {exit_price:.4} {} was accepted and the account was never \
                  seen flat",
                 self.cfg.us_primary_symbol
             )),
-            None if self.state.position_unconfirmed => Some(format!(
+            None => {}
+        }
+        if self.state.position_unconfirmed {
+            notes.push(format!(
                 "state carries position_unconfirmed for {}",
                 self.cfg.us_primary_symbol
-            )),
-            None => None,
+            ));
         }
+        // The durable marker outlives the `pending` that created it and
+        // is the *only* record of a former-symbol order whose first
+        // account read came back flat: no tracked position, no persisted
+        // record and no unmanaged record exists yet in that state, so
+        // without this the shutdown report says nothing is open while an
+        // order on a symbol this engine cannot close may still fill
+        // (pairtrade#300 Codex review).
+        if let Some(sent_for) = self.state.entry_in_flight.as_deref() {
+            notes.push(if sent_for == self.cfg.us_primary_symbol {
+                format!("state carries entry_in_flight for {sent_for}")
+            } else {
+                format!(
+                    "state carries entry_in_flight for {sent_for}, a symbol us_primary no longer \
+                     names ({}) -- this engine cannot close it",
+                    self.cfg.us_primary_symbol
+                )
+            });
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
     }
 
     /// SIGTERM / stop policy (bot-strategy#917): this prototype does not
@@ -3244,6 +3292,7 @@ impl EngineBLiveEngine {
             }
             PendingConfirm::Exit {
                 exit_price,
+                price_is_market,
                 deadline_us,
                 saw_reading,
             } => {
@@ -3260,9 +3309,16 @@ impl EngineBLiveEngine {
                                 // the same anomaly as in maybe_exit: halt and
                                 // reconcile, whether or not the window ended
                                 // (pairtrade#275 Codex review).
+                                // `Some` only when the exit was priced
+                                // off the feed: `maybe_exit`'s
+                                // no-price-of-any-kind fallback is the
+                                // tracked leg's own entry, and installing
+                                // *that* as the replacement leg's basis
+                                // prices the new leg against the one it
+                                // replaced (pairtrade#300 Codex review).
                                 self.reconcile_side_flip_if_any(
                                     &remaining,
-                                    Some(exit_price),
+                                    price_is_market.then_some(exit_price),
                                     "exit confirm",
                                 );
                                 if expired {
@@ -3286,6 +3342,7 @@ impl EngineBLiveEngine {
                                 } else {
                                     self.pending = Some(PendingConfirm::Exit {
                                         exit_price,
+                                        price_is_market,
                                         deadline_us,
                                         saw_reading: true,
                                     });
@@ -4330,6 +4387,7 @@ impl EngineBLiveEngine {
         // tick with the then-current remainder.
         self.pending = Some(PendingConfirm::Exit {
             exit_price: price,
+            price_is_market: price_source != "entry_price_pnl_unknown",
             // Fresh clock after the send, same reason as the entry path.
             deadline_us: self.now() + self.cfg.fill_confirm_timeout_secs.max(1) * 1_000_000,
             saw_reading: false,
@@ -8672,5 +8730,137 @@ mod tests {
         let allowed =
             notification_gate(false, false, true).expect("an explicit opt-out is allowed");
         assert!(allowed.is_some(), "the reason is still reported");
+    }
+
+    /// pairtrade#300 Codex review round 14, P1: an operator can RISK_ACK
+    /// the "an order went out on a symbol we no longer trade" halt while
+    /// the fill is still invisible. When it does appear, the sighting has
+    /// to engage its own halt -- otherwise entries are open alongside an
+    /// exposure this engine cannot close.
+    #[tokio::test]
+    async fn a_delayed_former_symbol_fill_re_engages_the_halt() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        // The claim survived a flat startup read, and the operator then
+        // acknowledged the halt (which clears session_halted and
+        // position_unconfirmed, but never the marker).
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        assert!(h.engine.entries_allowed(), "precondition: entries are open");
+        // Now the fill shows up.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", 1, Some("1756.92")));
+        h.set_now(T1_US);
+        h.engine.poll_foreign_in_flight(T1_US).await;
+        assert_eq!(
+            unmanaged_symbols(&h.engine.state),
+            vec!["SNDK".to_string()],
+            "the sighted exposure is recorded"
+        );
+        assert!(
+            h.engine.state.session_halted,
+            "and the session must be halted again, not assumed to still be"
+        );
+        assert!(!h.engine.entries_allowed());
+        let reason = h
+            .engine
+            .state
+            .session_halt_reason
+            .clone()
+            .unwrap_or_default();
+        assert!(reason.contains("SNDK"), "unexpected: {reason}");
+        assert!(
+            load_state(&h.engine.cfg.state_path).session_halted,
+            "and it reaches disk"
+        );
+    }
+
+    /// pairtrade#300 Codex review round 14, P1: after a flat first read
+    /// the durable marker is the *only* record of a former-symbol order.
+    /// Shutdown must name it rather than report an idle process.
+    #[tokio::test]
+    async fn shutdown_reports_a_retained_former_symbol_claim() {
+        let mut h = harness();
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.position = None;
+        h.engine.state.open_position = None;
+        h.engine.state.unmanaged_positions.clear();
+        h.engine.pending = None;
+        h.engine.state.position_unconfirmed = false;
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::UnconfirmedOrder,
+            "nothing tracked, nothing saved, but an order on SNDK may still fill"
+        );
+        let note = h
+            .engine
+            .unconfirmed_order_note()
+            .expect("the marker is a claim");
+        assert!(note.contains("SNDK"), "the stored symbol is named: {note}");
+        assert!(note.contains("MU"), "and the one it is not: {note}");
+        // Both markers at once are both reported, not just the first.
+        h.engine.state.position_unconfirmed = true;
+        let note = h.engine.unconfirmed_order_note().expect("still a claim");
+        assert!(
+            note.contains("position_unconfirmed") && note.contains("SNDK"),
+            "unexpected: {note}"
+        );
+        // Genuinely idle is still reported as such.
+        h.engine.state.position_unconfirmed = false;
+        h.engine.state.entry_in_flight = None;
+        assert_eq!(
+            h.engine.note_shutdown_signal("SIGTERM"),
+            ShutdownReport::Nothing
+        );
+    }
+
+    /// pairtrade#300 Codex review round 14, P2: `maybe_exit`'s
+    /// no-price-of-any-kind fallback is the tracked leg's own entry
+    /// price. Confirmation must not hand that to the side-flip path as
+    /// the replacement leg's cost basis.
+    #[tokio::test]
+    async fn an_exit_priced_off_the_fallback_leaves_the_replacement_basis_unknown() {
+        let mut h = harness();
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.engine.sync_open_position_field();
+        // Exactly what maybe_exit installs when no price of any kind was
+        // ever seen: the entry price, flagged as not a market price.
+        h.engine.pending = Some(PendingConfirm::Exit {
+            exit_price: 1756.92,
+            price_is_market: false,
+            deadline_us: T1_US + 60_000_000,
+            saw_reading: false,
+        });
+        // The venue reports the opposite side with no cost basis of its own.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.057", -1, None));
+        h.set_now(T1_US);
+        h.engine.poll_pending_confirm(T1_US).await;
+        let pos = h.engine.position.as_ref().expect("the flip is adopted");
+        assert_eq!(pos.side, OrderSide::Short, "the replacement leg is taken");
+        assert!(
+            pos.entry_price_unknown,
+            "the old leg's entry must not become the new leg's basis"
+        );
     }
 }
