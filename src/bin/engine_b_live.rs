@@ -7204,11 +7204,13 @@ mod tests {
             side: OrderSide::Long,
             entry_price: 1700.0,
             entry_price_estimated: false,
+            entry_price_unknown: false,
             size: 0.058,
             open_size: 0.058,
             realized_partial_pnl: 0.0,
             entered_at_us: T1_US,
             flatten_asap: false,
+            exit_deadline_us: None,
         });
         h.connector
             .positions
@@ -7335,7 +7337,7 @@ mod tests {
         // The asymmetry is deliberate: declining to enter costs a
         // session, declining to exit leaves an unmanaged position
         // through the tear.
-        let mut h = harness();
+        let h = harness();
         h.engine.feed.lock().unwrap().latest.insert(
             "SNDK".to_string(),
             PriceObs {
