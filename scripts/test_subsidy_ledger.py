@@ -22,7 +22,7 @@ from subsidy_ledger import (  # noqa: E402
     load_points,
     render_table,
     funding_ticks_seen,
-    opened_on_an_earlier_day,
+    opening_date,
     spans_a_funding_interval,
     expand,
     render_table,
@@ -858,8 +858,7 @@ def test_a_non_finite_number_never_reads_as_absence_of_movement():
     # be negative, and a hold that ends before it starts says nothing
     # about which day the cycle opened on.
     assert funding_ticks_seen({"funding_ticks_observed": -1})
-    assert opened_on_an_earlier_day({"ts": inside_the_hour, "hold_secs": -600},
-                                    "2026-09-08")
+    assert opening_date({"ts": inside_the_hour, "hold_secs": -600}) is None
 
     # 4. A NaN hold or close is not a hold inside one funding hour.
     # (This one already came out right by NaN propagation through the
@@ -953,6 +952,68 @@ def test_point_coverage_is_explained_even_when_no_rate_exists():
     assert "no price per point" in rendered, rendered
     assert "1,000.0 points earned on days with no usable cost" in rendered, rendered
     assert "$100.00 of cost fell on days with no points supplied" in rendered, rendered
+
+
+def test_the_opening_day_of_an_overnight_cycle_is_marked_too():
+    """The entry leg inflates the opening day's denominator.
+
+    That day's execution volume holds the overnight entry while none of
+    its cost does, so a *different* close on that same day is divided by
+    a denominator that is too big -- the mirror of the close-day case.
+    """
+    close = 1788868800 + 3600  # 2026-09-08 13:00 UTC
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [
+                # Opened 2026-09-07, closed 2026-09-08.
+                {"ts": close, "source": "exit_fill", "pnl": -100.0,
+                 "hold_secs": 20 * 3600, "funding_carry_usd": 0.0},
+            ],
+        )
+        days = load_pnl([path])
+        assert days[("2026-09-08", "freq")].cross_day_cycles == 1
+        opening = days[("2026-09-07", "freq")]
+        assert opening.cross_day_entries == 1
+        assert opening.cycles == 0
+
+        # A same-day close on the opening date is not costed against a
+        # denominator that also holds the overnight entry.
+        opening.cycles = 1
+        opening.realized_pnl_usd = -100.0
+        opening.funding_seen = True
+        rows = build_rows(
+            {("2026-09-07", "freq"): ExecDay(fills=2, volume_usd=1_500_000.0)},
+            {("2026-09-07", "freq"): opening},
+        )
+        assert rows[0].cross_day_entries == 1
+        assert rows[0].cost_usd == 100.0
+        assert rows[0].cost_per_musd_volume is None, rows[0].cost_per_musd_volume
+
+
+def test_an_entry_marker_alone_does_not_cost_a_day_at_zero():
+    """The opening date may hold no realized close of its own.
+
+    The marker creates that day in the PnL map; costing it from an empty
+    `PnlDay` would report a free day rather than an uncosted one.
+    """
+    close = 1788868800 + 3600
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": close, "source": "exit_fill", "pnl": -100.0,
+              "hold_secs": 20 * 3600, "funding_carry_usd": 0.0}],
+        )
+        days = load_pnl([path])
+        rows = build_rows(
+            {("2026-09-07", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+            days,
+        )
+        opening = next(r for r in rows if r.date == "2026-09-07")
+        assert opening.cost_usd is None, "a day with no realized close is uncosted, not free"
+        assert opening.cost_source is None
+        arm = summarize(rows)["arms"][0]
+        assert arm["uncosted_volume_usd"] == 500_000.0
 
 
 def main() -> int:

@@ -40,9 +40,11 @@ day it closed. The entry notional therefore sits on a day with no cost
 (reported as uncosted volume) while the whole cost lands on the next,
 with only the exit side to divide by. A `leg_fill` carries no cycle id,
 so the fills cannot be tied back and re-attributed from what is written
-today; the close day is marked instead (`cross_day_cycles`) and its
-per-volume rate suppressed, the same treatment an unvalued fill gets.
-Closing it properly needs the bot to stamp a cycle id on both ledgers.
+today; both days are marked instead -- the close day (`cross_day_cycles`)
+and the day the entry landed on (`cross_day_entries`), whose own volume
+holds that leg while none of the cost does -- and their rates are
+suppressed, the same treatment an unvalued fill gets. Closing it properly
+needs the bot to stamp a cycle id on both ledgers.
 
 `cost_per_musd_volume` needs no points at all and is the KPI to steer by
 in the meantime: points programs are volume-weighted, so the conversion
@@ -121,6 +123,12 @@ class PnlDay:
     # of their cost lands here, so this day's denominator is short by the
     # entry side (Codex, PR #297).
     cross_day_cycles: int = 0
+    # Cycles whose *entry* fell on this date but which closed on a later
+    # one. Their entry notional is in this day's execution volume while
+    # every dollar of their cost is filed under the close date, so this
+    # day's denominator is inflated by exactly that leg -- the mirror of
+    # `cross_day_cycles`, and just as unusable as a rate (Codex, PR #297).
+    cross_day_entries: int = 0
 
 
 @dataclass
@@ -142,6 +150,7 @@ class Row:
     cost_per_point: float | None = None
     cost_per_musd_volume: float | None = None
     cross_day_cycles: int = 0
+    cross_day_entries: int = 0
     slippage_unreadable: int = 0
 
     def cost_spans_two_days(self) -> bool:
@@ -152,7 +161,10 @@ class Row:
         two daily closes, so it is already aligned with this date's own
         volume and points and must not be suppressed (Codex, PR #297).
         """
-        return bool(self.cross_day_cycles) and self.cost_source == "pnl_ledger"
+        return (
+            bool(self.cross_day_cycles or self.cross_day_entries)
+            and self.cost_source == "pnl_ledger"
+        )
 
     def as_json(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -386,8 +398,16 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 continue
             day.realized_pnl_usd += pnl
             day.cycles += 1
-            if opened_on_an_earlier_day(record, key[0]):
+            opened_on = opening_date(record)
+            if opened_on is not None and opened_on != key[0]:
                 day.cross_day_cycles += 1
+                # And the day the entry landed on: its execution volume
+                # holds that leg while none of this cost does, so its own
+                # rates are over a denominator that is too big. The entry
+                # date may have no PnL rows of its own, so this can create
+                # the day -- `build_rows` costs a day from this ledger
+                # only when it actually holds a realized cycle.
+                days[(opened_on, arm)].cross_day_entries += 1
             funding = record.get("funding_carry_usd")
             if funding is None:
                 # A positive `funding_ticks_observed` is the row's own
@@ -418,8 +438,8 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
     return dict(days)
 
 
-def opened_on_an_earlier_day(record: dict, close_date: str) -> bool:
-    """Did this cycle open on a UTC date before the one it closed on?
+def opening_date(record: dict) -> str | None:
+    """The UTC date this cycle opened on, or `None` when it cannot be read.
 
     The two ledgers are keyed differently: `load_execution` files a fill
     under the date it happened, `load_pnl` files a whole realized cycle
@@ -437,21 +457,21 @@ def opened_on_an_earlier_day(record: dict, close_date: str) -> bool:
     hold = record.get("hold_secs")
     ts = record.get("ts")
     if hold is None or ts is None:
-        return True
+        return None
     try:
         hold_secs, close_secs = float(hold), float(ts)
     except (TypeError, ValueError):
-        return True
+        return None
     # A negative hold puts the open *after* the close, which usually
     # lands on the same date and would clear the marker on a row whose
     # real opening date is unknowable -- the same fail-safe
     # `spans_a_funding_interval` already applies (Codex, PR #297).
     if not math.isfinite(hold_secs) or not math.isfinite(close_secs) or hold_secs < 0:
-        return True
+        return None
     opened = close_secs - hold_secs
     if not math.isfinite(opened):
-        return True
-    return utc_date(opened) != close_date
+        return None
+    return utc_date(opened)
 
 
 def funding_ticks_seen(record: dict) -> bool:
@@ -672,9 +692,10 @@ def build_rows(
             row.funding_usd = round(day.funding_usd, 6) if day.funding_seen else None
             row.pnl_coverage = "incomplete" if day.incomplete else "complete"
             row.cross_day_cycles = day.cross_day_cycles
+            row.cross_day_entries = day.cross_day_entries
             if day.incomplete:
                 row.pnl_incomplete_reasons = sorted(day.incomplete_reasons)
-        if day is not None and not day.incomplete:
+        if day is not None and not day.incomplete and day.cycles > 0:
             row.cost_usd = round(-(day.realized_pnl_usd + day.funding_usd), 6)
             row.cost_source = "pnl_ledger"
         elif date in equity_costs.get(arm, {}):
