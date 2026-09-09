@@ -292,13 +292,13 @@ make the service fail to start (fail-closed, not a silent bad default).
   deliberately -- a close this process cannot confirm is worse than a
   documented open position (bot-strategy#917).
 - The open position **is** persisted, as `RiskState.open_position` in
-  `state.json`, and reconciled against the exchange on the first tick
+  `risk_state.json`, and reconciled against the exchange on the first tick
   after a start (`[RECONCILE]` lines, bot-strategy#917). No entry is sent
   before that comparison succeeds, and a `get_positions()` that keeps
   failing keeps entries blocked rather than letting one through blind.
   What the reconciliation does, live:
 
-  | state.json | exchange | outcome |
+  | risk_state.json | exchange | outcome |
   |---|---|---|
   | no position | flat | clean start |
   | matching position | same side and size | resumed; exits at its own `t2`, or at once if that window has already passed |
@@ -309,7 +309,7 @@ make the service fail to start (fail-closed, not a silent bad default).
   Every halt above clears only via `RISK_ACK` (see the risk runbook), so
   an operator sees it before any new entry goes out.
 - Under `DRY_RUN` the exchange is not the authority: the simulated
-  position is resumed from `state.json`, and a real position on the
+  position is resumed from `risk_state.json`, and a real position on the
   account is reported (`[RECONCILE] DRY_RUN, but the exchange holds ...`)
   but never adopted or closed by this process.
 - A crash mid-day still loses the in-memory `t0`/`t1` price snapshots

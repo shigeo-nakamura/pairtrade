@@ -632,6 +632,43 @@ struct PersistedPosition {
     exit_deadline_us: Option<i64>,
 }
 
+/// Bring a parked record up to what the exchange currently reports, so
+/// the status document and the shutdown alert describe the exposure an
+/// operator would actually find. Side and size come from the venue; the
+/// cost basis and already-realized PnL are kept only while the record
+/// still describes the same position (same side), because a flip makes
+/// the basis meaningless for what is there now (pairtrade#300 Codex
+/// review).
+fn refreshed_unmanaged(record: PersistedPosition, live: &ExchangePosition) -> PersistedPosition {
+    let same_side = side_from_str(&record.side) == Some(live.side);
+    PersistedPosition {
+        side: live.side.to_string(),
+        size: if same_side { record.size } else { live.size },
+        open_size: live.size,
+        entry_price: match live.entry_price {
+            Some(e) => e,
+            None if same_side => record.entry_price,
+            None => 0.0,
+        },
+        entry_price_estimated: match live.entry_price {
+            Some(_) => false,
+            None if same_side => record.entry_price_estimated,
+            None => true,
+        },
+        entry_price_unknown: match live.entry_price {
+            Some(_) => false,
+            None if same_side => record.entry_price_unknown,
+            None => true,
+        },
+        realized_partial_pnl: if same_side {
+            record.realized_partial_pnl
+        } else {
+            0.0
+        },
+        ..record
+    }
+}
+
 fn side_from_str(s: &str) -> Option<OrderSide> {
     match s.to_ascii_lowercase().as_str() {
         "long" => Some(OrderSide::Long),
@@ -2040,7 +2077,23 @@ impl EngineBLiveEngine {
                     );
                     log::error!("[RECONCILE] {reason}");
                     halt_reason.get_or_insert(reason);
-                    kept.push(p);
+                    // The exchange is the authority on what is open, and
+                    // this record is what `status.json` and the shutdown
+                    // alert show. Keeping the pre-shutdown side and size
+                    // pointed the operator following the flatten warning
+                    // at the wrong exposure (pairtrade#300 Codex review).
+                    //
+                    // A flip retires the old leg, so what it realized is
+                    // booked here rather than carried onto the new one --
+                    // the same rule every other replacement follows.
+                    if side_from_str(&p.side) != Some(live.side) {
+                        self.book_orphaned_partial_pnl(
+                            &p,
+                            "the venue now reports the opposite side on this parked symbol",
+                        );
+                    }
+                    self.state_write_pending = true;
+                    kept.push(refreshed_unmanaged(p, &live));
                 }
                 None => {
                     log::warn!(
@@ -6782,6 +6835,56 @@ mod tests {
         assert!(on_disk.open_position.is_none());
         assert_eq!(on_disk.total_trades, 1);
         assert!(on_disk.realized_pnl_session > 0.0);
+    }
+
+    /// pairtrade#300 Codex review round 8: a parked record is what the
+    /// operator is told to flatten, so it has to describe what is there.
+    #[tokio::test]
+    async fn a_parked_record_is_refreshed_from_the_exchange() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        let mut parked = persisted_long(0.057, TODAY);
+        parked.symbol = "AAA".to_string();
+        parked.realized_partial_pnl = 0.42;
+        h.engine.state.unmanaged_positions = vec![parked];
+        // While the service was stopped it flipped and shrank.
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("AAA", "0.030", -1, Some("11.0")));
+        h.set_now(T1_US);
+        let before = h.engine.state.realized_pnl_session;
+        h.engine.tick().await;
+        let kept = h
+            .engine
+            .state
+            .unmanaged_positions
+            .first()
+            .cloned()
+            .expect("still open, so still kept");
+        assert_eq!(kept.side, "short", "the venue decides the side");
+        assert!((kept.open_size - 0.030).abs() < 1e-12, "and the size");
+        assert!(
+            (kept.entry_price - 11.0).abs() < 1e-9,
+            "and the basis it reports"
+        );
+        assert_eq!(
+            kept.realized_partial_pnl, 0.0,
+            "a flip retires the old leg, so its PnL does not ride along"
+        );
+        assert!(
+            ((h.engine.state.realized_pnl_session - before) - 0.42).abs() < 1e-12,
+            "it is booked instead of dropped"
+        );
+        // What the operator is shown matches.
+        h.engine.last_status_write_us = 0;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(status["positions"][0]["side"], serde_json::json!("short"));
+        assert_eq!(status["positions"][0]["size"], serde_json::json!("0.03"));
     }
 
     /// pairtrade#300 Codex review round 7: every path that discards a
