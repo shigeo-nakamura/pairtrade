@@ -24,6 +24,7 @@ from subsidy_ledger import (  # noqa: E402
     funding_ticks_are_zero,
     funding_tick_claim,
     funding_ticks_seen,
+    is_bare_arm,
     is_canonical_date,
     is_not_a_number,
     opening_date,
@@ -1541,7 +1542,10 @@ def test_an_equity_spec_needs_both_an_arm_and_a_path():
         execution.write_text("")
         equity = write(Path(tmp) / "equity_history.jsonl",
                        [{"ts": 1788868800_000, "equity": 1000.0}])
-        for bad in (f"={equity}", "freq=", "freq", "", "="):
+        # Padded arms fail the same silent way an empty one did: the
+        # costs land under an arm that joins nothing (Codex, PR #297).
+        for bad in (f"={equity}", "freq=", "freq", "", "=",
+                    f"freq ={equity}", f" freq={equity}", f"\tfreq={equity}"):
             try:
                 ledger_main(["--exec-glob", str(execution), "--equity", bad])
             except SystemExit as exit_code:
@@ -1551,6 +1555,10 @@ def test_an_equity_spec_needs_both_an_arm_and_a_path():
         # The documented form still works.
         assert ledger_main(["--exec-glob", str(execution),
                             "--equity", f"freq={equity}"]) == 0
+        # One validator behind both operator-supplied arms.
+        assert is_bare_arm("freq") and is_bare_arm("brand-new")
+        for bad_arm in ("freq ", " freq", "freq\n", "", 1, None, ["freq"]):
+            assert not is_bare_arm(bad_arm), bad_arm
 
 
 def test_a_supplied_pnl_glob_that_matches_nothing_is_refused():

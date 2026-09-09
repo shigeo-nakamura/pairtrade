@@ -104,6 +104,24 @@ from pathlib import Path
 from typing import Iterable
 
 
+def is_bare_arm(value: object) -> bool:
+    """Is this exactly an arm name the other loaders could have produced?
+
+    The arm is half of the `(date, arm)` join key, and the two machine
+    sources -- `arm_from_pnl_filename` and the execution ledger's
+    `variant` -- cannot emit a padded, empty or non-string value. So an
+    operator-supplied arm that is any of those can only ever be a key
+    matching nothing, and it fails silently: the intended arm is left
+    uncosted while a separate zero-volume arm appears beside it
+    (Codex, PR #297).
+
+    Deliberately *not* a check that the arm exists elsewhere: points and
+    equity may legitimately be supplied for an arm whose ledger has not
+    been exported yet, which `uncosted_points` reports.
+    """
+    return isinstance(value, str) and bool(value) and value == value.strip()
+
+
 def is_canonical_date(value: object) -> bool:
     """Is this exactly a date `utc_date` could have produced?
 
@@ -850,7 +868,7 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
         # value, so `"freq "` would have become a points-only arm of its
         # own -- the costed day left without points and its rate silently
         # suppressed (Codex, PR #297).
-        if not isinstance(arm, str) or arm != arm.strip() or not arm:
+        if not is_bare_arm(arm):
             raise SubsidyLedgerError(
                 f"{path}: a points row needs a bare arm name; got {arm!r}")
         if not is_canonical_date(date):
@@ -1281,8 +1299,11 @@ def main(argv: list[str] | None = None) -> int:
         # Both sides, not just the path: `--equity =PATH` used to load the
         # costs under the arm `""` and emit them as a separate blank-arm
         # series, leaving the arm the operator meant to cost uncosted --
-        # and exiting 0 (Codex, PR #297).
-        if not sep or not arm or not path:
+        # and exiting 0. The arm goes through the same `is_bare_arm` the
+        # points file uses, because it is the same join key and
+        # `--equity 'freq =h.jsonl'` failed the same silent way
+        # (Codex, PR #297).
+        if not sep or not path or not is_bare_arm(arm):
             parser.error(f"--equity expects ARM=PATH, got {spec!r}")
         # `--equity` repeats, and a second file for the same arm replaced
         # the first silently: costs the operator did supply would vanish,
