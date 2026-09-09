@@ -2768,8 +2768,17 @@ fn corporate_action_units_are_stale(
                 )
             };
             match (pinned, observed) {
-                (Some(pinned), Some(observed)) => pinned != observed,
-                _ => false,
+                // The runtime's rule: address case-insensitive, decimals
+                // exact, symbol irrelevant. A derived `!=` disagreed with it
+                // on checksum casing (verifier says drift, runtime halts)
+                // and on a missing pin (runtime suppresses, verifier demanded
+                // a halt) -- both let a rollback drop a genuine sticky halt
+                // (Codex P1, pairtrade#309).
+                (Some(pinned), Some(observed)) => !pinned.same_contract(observed),
+                // No pin: the runtime cannot verify the mark and does not
+                // engage, so neither may this demand one.
+                (None, _) => true,
+                (Some(_), None) => false,
             }
         });
         if drifted {
@@ -3822,14 +3831,21 @@ fn corporate_action_continuity(
     // append-only in exactly the same way: dropping one would let a renamed
     // entry be applied again after a restore (Codex P1, pairtrade#309).
     let fingerprints_before = baseline.handled_corporate_action_fingerprints.len();
-    if resolved_current.handled_corporate_action_fingerprints.len()
-        < resolved_baseline
-            .handled_corporate_action_fingerprints
-            .len()
-        || resolved_current.handled_corporate_action_fingerprints[..resolved_baseline
-            .handled_corporate_action_fingerprints
-            .len()]
-            != resolved_baseline.handled_corporate_action_fingerprints[..]
+    // Resolution is a first-load event. Once the backup says it happened,
+    // the raw slots are what must match: comparing resolved copies would
+    // otherwise let a candidate blank a slot, claim the marker, and look
+    // identical -- after which `from_state` skips the backfill and the
+    // declaration silently becomes a reused id (Codex P1, pairtrade#309).
+    let (compare_baseline, compare_current) = if baseline.handled_corporate_actions_resolved {
+        (baseline, current)
+    } else {
+        (&resolved_baseline, &resolved_current)
+    };
+    if compare_current.handled_corporate_action_fingerprints.len()
+        < compare_baseline.handled_corporate_action_fingerprints.len()
+        || compare_current.handled_corporate_action_fingerprints
+            [..compare_baseline.handled_corporate_action_fingerprints.len()]
+            != compare_baseline.handled_corporate_action_fingerprints[..]
     {
         bail!(
             "Arcus runtime lost or reordered its handled corporate-action fingerprints across \
@@ -3979,6 +3995,16 @@ fn require_corporate_action_progress_transition(
         // forgeable evidence and gets the same treatment.
         if current.last_reference_price_at != baseline.last_reference_price_at {
             bail!("Arcus reference-price timestamp changed without a new observation");
+        }
+        // Resolution may run at load without advancing the sequence, so the
+        // marker is allowed to go false -> true; the reverse, and any change
+        // to an already-resolved record, is not.
+        if baseline.handled_corporate_actions_resolved
+            && (!current.handled_corporate_actions_resolved
+                || current.handled_corporate_action_fingerprints
+                    != baseline.handled_corporate_action_fingerprints)
+        {
+            bail!("Arcus handled corporate-action resolution changed without a new observation");
         }
         return Ok(());
     }
@@ -11299,7 +11325,14 @@ runtime:
         ArcusSpotCorporateActionProgress {
             event_id: "NVDA-2026-08-SPLIT".to_string(),
             blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
-            pre_event_token_a: None,
+            // Pinned: an unpinned window is the "cannot verify" shape, which
+            // the runtime treats as suppressing halt engagement, and these
+            // fixtures are about the ordinary stale-unit phase.
+            pre_event_token_a: Some(ArcusSpotTokenIdentity {
+                symbol: "NVDA".to_string(),
+                address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+                decimals: 18,
+            }),
             pre_event_token_b: None,
             history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
             fingerprint: fixture_event().fingerprint(),
@@ -11620,6 +11653,113 @@ runtime:
             &config, &baseline, &current, 1, not_before, not_after, &none,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn identity_comparison_matches_the_runtimes_rule() {
+        // The runtime compares address case-insensitively and ignores the
+        // symbol; a derived `!=` disagreed on checksum casing, and on a
+        // missing pin the runtime suppresses while this used to demand a
+        // halt. Both let a rollback drop a genuine sticky halt.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        let mut progress = stale_unit_progress();
+        progress.history_invalidated_at = None;
+        current.corporate_action = Some(progress.clone());
+        baseline.corporate_action = Some(progress);
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Same contract, lower-cased and with a different symbol string:
+        // the runtime sees no drift and halts, so this must demand one.
+        current.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "nvda.us".to_string(),
+            address: "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec".to_string(),
+            decimals: 18,
+        });
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Different decimals is a different instrument.
+        current.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 6,
+        });
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+
+        // No pin: the runtime cannot verify the mark and does not engage.
+        let mut unpinned = current.clone();
+        unpinned
+            .corporate_action
+            .as_mut()
+            .unwrap()
+            .pre_event_token_a = None;
+        let mut unpinned_baseline = baseline.clone();
+        unpinned_baseline.corporate_action = unpinned.corporate_action.clone();
+        require_risk_state_continuity(
+            &config,
+            &unpinned_baseline,
+            &unpinned,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_resolved_record_may_not_be_blanked_at_the_same_sequence() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        baseline.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
+        baseline.handled_corporate_actions_resolved = true;
+        corporate_action_continuity(&config, &baseline, &baseline.clone(), 0, verified_now())
+            .unwrap();
+
+        // Blank the slot but keep the marker: after a restore `from_state`
+        // skips the backfill and the declaration becomes a reused id. The
+        // raw prefix comparison catches it, because the backup says the
+        // record is already resolved.
+        let mut blanked = baseline.clone();
+        blanked.handled_corporate_action_fingerprints = vec![String::new()];
+        let error = corporate_action_continuity(&config, &baseline, &blanked, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+
+        // Un-resolving a resolved record is not a transition either.
+        let mut unresolved = baseline.clone();
+        unresolved.handled_corporate_actions_resolved = false;
+        let error = corporate_action_continuity(&config, &baseline, &unresolved, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("resolution changed"), "{error}");
+
+        // The same blanking one observation later is caught by the
+        // append-only prefix, which now compares raw slots once the backup
+        // says the record is resolved.
+        let mut later = blanked.clone();
+        later.sequence = 8;
+        let error = corporate_action_continuity(&config, &baseline, &later, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
     }
 
     #[test]

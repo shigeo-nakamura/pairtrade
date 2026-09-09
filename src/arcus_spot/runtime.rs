@@ -207,6 +207,15 @@ impl ArcusSpotTokenIdentity {
         }
     }
 
+    /// Whether two recorded identities describe the same contract, by the
+    /// same rule `matches` uses against a live token. The continuity
+    /// verifier compares stored identities and has to reach the same answer
+    /// the runtime did, so this is the one definition (Codex P1,
+    /// pairtrade#309).
+    pub fn same_contract(&self, other: &Self) -> bool {
+        self.address.eq_ignore_ascii_case(&other.address) && self.decimals == other.decimals
+    }
+
     /// Addresses are compared case-insensitively: the same contract is
     /// legitimately rendered checksummed or lower-case by different
     /// responses, and treating that as a change would fail closed on a
