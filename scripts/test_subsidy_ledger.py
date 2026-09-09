@@ -740,6 +740,20 @@ def test_a_cycle_that_crossed_midnight_suppresses_the_day_rate():
         assert arm["cost_per_musd_volume"] is None
         assert arm["cost_usd_without_volume"] == 100.0
 
+        # Points are short by the same entry side, and cannot be
+        # re-attributed either -- they are supplied per day.
+        pointed = build_rows(
+            {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+            {("2026-09-08", "freq"): day},
+            None,
+            {("2026-09-08", "freq"): 1000.0},
+        )[0]
+        assert pointed.cost_per_point is None
+        pointed_arm = summarize([pointed])["arms"][0]
+        assert pointed_arm["cost_per_point"] is None
+        assert pointed_arm["uncosted_points"] == 1000.0
+        assert pointed_arm["cost_usd_without_points"] == 100.0
+
         # A same-day cycle is unaffected.
         same_day = pnl_file(
             Path(tmp),
@@ -782,6 +796,28 @@ def test_non_finite_pnl_funding_and_equity_are_not_costs():
         {"ts": 1788768000000, "equity": 4950.0},   # 2026-09-07
     ])
     assert costs == {}, costs
+
+
+def test_a_non_finite_slippage_diagnostic_is_not_carried_into_the_output():
+    """The column is a diagnostic, but a NaN still breaks `--out`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 10_000.0, "filled_qty": 1.0,
+                 "slippage_usd_vs_decision": 1.5},
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 10_000.0, "filled_qty": 1.0,
+                 "slippage_usd_vs_decision": "NaN"},
+            ],
+        )
+        day = load_execution([path])[("2026-09-08", "freq")]
+        assert day.slippage_usd == 1.5
+        assert day.slippage_unreadable == 1
+        row = build_rows({("2026-09-08", "freq"): day}, {})[0]
+        assert json.dumps(row.as_json()) == json.dumps(row.as_json())
+        assert "NaN" not in json.dumps(row.as_json())
 
 
 def main() -> int:
