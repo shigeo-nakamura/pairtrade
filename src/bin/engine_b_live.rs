@@ -1765,11 +1765,25 @@ impl EngineBLiveEngine {
         // had. The record itself is the durable claim, and only
         // `reconcile_unmanaged` retires it -- when the venue says that
         // exposure is gone (pairtrade#300 Codex review).
+        // And a saved record naming another symbol, for the third time
+        // the same shape: DRY_RUN's reconciliation deliberately keeps
+        // such a record in `open_position` rather than relabelling it,
+        // and nothing parks it, so `session_halted` was its only gate --
+        // one RISK_ACK and the next simulated entry overwrote it, losing
+        // that exposure and its PnL. The live path already parks it into
+        // `unmanaged_positions` during reconciliation, so this clause is
+        // false there by the time it matters; it holds the DRY_RUN case
+        // and the pre-reconciliation window (pairtrade#300 Codex review).
         !self.kill_switch_engaged()
             && !self.state.session_halted
             && self.reconciled
             && self.state.entry_in_flight.is_none()
             && self.state.unmanaged_positions.is_empty()
+            && !self
+                .state
+                .open_position
+                .as_ref()
+                .is_some_and(|p| p.symbol != self.cfg.us_primary_symbol)
     }
 
     /// `t2 + exit_deadline_secs` for the session currently in `window` --
@@ -4075,7 +4089,7 @@ impl EngineBLiveEngine {
         if !self.entries_allowed() {
             log::warn!(
                 "[ENTRY] signal fired but entries blocked (kill_switch={}, session_halted={}, \
-                 reconciled={}, entry_in_flight={:?}, unmanaged={:?})",
+                 reconciled={}, entry_in_flight={:?}, unmanaged={:?}, saved_symbol={:?})",
                 self.kill_switch_engaged(),
                 self.state.session_halted,
                 self.reconciled,
@@ -4084,7 +4098,8 @@ impl EngineBLiveEngine {
                     .unmanaged_positions
                     .iter()
                     .map(|p| p.symbol.as_str())
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                self.state.open_position.as_ref().map(|p| p.symbol.as_str())
             );
             return;
         }
@@ -9023,6 +9038,45 @@ mod tests {
         );
         // Only the venue reporting it gone retires the claim.
         h.engine.state.unmanaged_positions.clear();
+        assert!(h.engine.entries_allowed());
+    }
+
+    /// pairtrade#300 Codex review round 20, P2: DRY_RUN keeps a
+    /// foreign-symbol record in `open_position` rather than relabelling
+    /// it, and nothing parks it -- so the halt was its only gate, and a
+    /// RISK_ACK let the next simulated entry overwrite it.
+    #[tokio::test]
+    async fn a_saved_record_for_another_symbol_blocks_entries_on_its_own() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.cfg.us_primary_symbol = "MU".to_string();
+        h.engine.state.entry_in_flight = None;
+        h.engine.state.unmanaged_positions.clear();
+        h.engine.state.session_halted = false;
+        h.engine.state.session_halt_reason = None;
+        h.engine.state.open_position = Some(PersistedPosition {
+            symbol: "SNDK".to_string(),
+            side: OrderSide::Long.to_string(),
+            entry_price: 1756.92,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.057,
+            open_size: 0.057,
+            realized_partial_pnl: -3.5,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            session_date: "2026-09-08".to_string(),
+            exit_deadline_us: None,
+        });
+        assert!(
+            !h.engine.entries_allowed(),
+            "an entry here would overwrite the saved SNDK record and its PnL"
+        );
+        // A record for the configured symbol is the normal case and does
+        // not gate anything.
+        if let Some(p) = h.engine.state.open_position.as_mut() {
+            p.symbol = "MU".to_string();
+        }
         assert!(h.engine.entries_allowed());
     }
 
