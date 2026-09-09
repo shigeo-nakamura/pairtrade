@@ -17,7 +17,8 @@ use debot::arcus_spot::{
     build_arcus_spot_kms_signer, is_supported_live_route,
     manual_reconciled_runtime_fill_for_attempt, open_exit_fixed_sell_amount_row_for,
     verify_archive_events, verify_record, ArcusSpotChainClient, ArcusSpotChainConfig,
-    ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
+    ArcusSpotCorporateActionEvent, ArcusSpotCorporateActionProgress, ArcusSpotDecision,
+    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
     ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
     ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
     ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream,
@@ -2606,6 +2607,36 @@ fn positive_loss_from_mark(reference: Option<Decimal>, equity: Option<Decimal>) 
     }
 }
 
+/// The single equity number a corporate-action resume writes to all three
+/// marks, re-derived from the reconciled holding and this tick's reference
+/// prices. Requiring the marks to *be* it is what keeps the resume from
+/// being an exemption: a checkpoint that moved them anywhere else fails.
+fn require_corporate_action_rebase_marks(
+    current: &ArcusSpotRuntimeState,
+    inventory: ArcusSpotInventory,
+) -> Result<Decimal> {
+    let (price_a, price_b) = current
+        .last_token_a_reference_price_usd
+        .zip(current.last_token_b_reference_price_usd)
+        .context("resumed without the reference marks it valued the holding at")?;
+    let equity = inventory
+        .checked_value_usd(price_a, price_b)
+        .context("reconciled holding valuation exceeds Decimal range")?;
+    if current.initial_equity_usd != Some(equity)
+        || current.daily_baseline_equity_usd != Some(equity)
+        || current.last_equity_usd != Some(equity)
+    {
+        bail!(
+            "cumulative, daily and last equity marks must all be the reconciled holding priced at \
+             this tick ({equity}); found {:?} / {:?} / {:?}",
+            current.initial_equity_usd,
+            current.daily_baseline_equity_usd,
+            current.last_equity_usd,
+        );
+    }
+    Ok(equity)
+}
+
 fn require_risk_state_continuity(
     config: &ArcusSpotRuntimeConfig,
     baseline: &ArcusSpotRuntimeState,
@@ -2613,9 +2644,24 @@ fn require_risk_state_continuity(
     sequence_advance: u64,
     acceptance_not_before: DateTime<Utc>,
     acceptance_not_after: DateTime<Utc>,
+    corporate_action: &ArcusSpotCorporateActionContinuity,
 ) -> Result<()> {
+    // A resume re-anchors both risk baskets and the cumulative baseline onto
+    // the reconciled holding, because they are buy-and-hold counterfactuals
+    // and the old basket no longer exists (bot-strategy#813/#853). The three
+    // equity marks it writes are all the same number -- that holding priced
+    // at this tick's reference marks -- so rather than exempting the fields,
+    // this re-derives the number and requires them to be it.
+    let rebased_equity = match corporate_action.resumed_inventory {
+        Some(inventory) => Some(
+            require_corporate_action_rebase_marks(current, inventory)
+                .context("Arcus corporate-action resume marks are inconsistent")?,
+        ),
+        None => None,
+    };
     let baseline_daily = daily_risk_baseline(baseline, "backup")?;
-    if baseline.initial_equity_usd.is_some()
+    if rebased_equity.is_none()
+        && baseline.initial_equity_usd.is_some()
         && current.initial_equity_usd != baseline.initial_equity_usd
     {
         bail!("Arcus runtime cumulative equity baseline changed across restart/rollback");
@@ -2658,7 +2704,7 @@ fn require_risk_state_continuity(
         }
         (Some((baseline_day, baseline_equity)), Some((current_day, current_equity))) => {
             if current_day == baseline_day {
-                if current_equity != baseline_equity {
+                if current_equity != baseline_equity && rebased_equity != Some(current_equity) {
                     bail!("Arcus runtime daily equity baseline changed without a UTC rollover");
                 }
             } else {
@@ -3284,6 +3330,7 @@ fn require_acceptance_ledger_and_position_continuity(
     runtime_sequence_advance: u64,
     acceptance_not_before: DateTime<Utc>,
     acceptance_not_after: DateTime<Utc>,
+    corporate_action: &ArcusSpotCorporateActionContinuity,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
     let current_runtime = current.runtime.state();
@@ -3344,8 +3391,31 @@ fn require_acceptance_ledger_and_position_continuity(
                     bail!("Arcus no-swap runtime state does not match its recorder evidence");
                 }
             }
-            if !position_state_matches(baseline_runtime, current_runtime) {
-                bail!("Arcus position state changed without a reconciled acceptance attempt");
+            // A corporate-action resume moves inventory with no swap and no
+            // ledger attempt -- that is the whole point of it -- so the one
+            // transition the approved config declares is compared against
+            // the reconciled holding instead of against the backup. The
+            // replay directly above has already reproduced this same state
+            // from the recorder evidence; this keeps the independent check
+            // meaningful rather than skipping it (bot-strategy#853).
+            match corporate_action.resumed_inventory {
+                Some(inventory) => {
+                    let mut expected = baseline_runtime.clone();
+                    expected.inventory = inventory;
+                    if !position_state_matches(&expected, current_runtime) {
+                        bail!(
+                            "Arcus position state changed beyond the declared corporate-action \
+                             resume"
+                        );
+                    }
+                }
+                None => {
+                    if !position_state_matches(baseline_runtime, current_runtime) {
+                        bail!(
+                            "Arcus position state changed without a reconciled acceptance attempt"
+                        );
+                    }
+                }
             }
         }
         1 => {
@@ -3499,11 +3569,116 @@ fn require_acceptance_ledger_and_position_continuity(
     Ok(())
 }
 
+/// A corporate-action transition (bot-strategy#853) that the approved config
+/// itself authorizes, for the continuity checks below.
+///
+/// A resume and the history discard that precedes it both change state with
+/// no ledger attempt and no swap: inventory, both risk baskets, the
+/// cumulative equity baseline and the whole signal window move on an
+/// ordinary observation tick. Every one of those is, correctly, a violation
+/// for any *other* reason, so rather than loosening the rules this derives
+/// the one transition the config declares and hands the checks its exact
+/// shape. Nothing here trusts the current checkpoint's say-so: the event has
+/// to be declared, with a reconciled holding, and every field the resume
+/// touches has to have landed on the value that holding implies.
+#[derive(Debug, Clone, Default)]
+struct ArcusSpotCorporateActionContinuity {
+    /// The pre-event signal window was discarded at a declared
+    /// `effective_at`, or by the resume that followed it.
+    history_discarded: bool,
+    /// The runtime resumed onto the operator's reconciled holding.
+    resumed_inventory: Option<ArcusSpotInventory>,
+}
+
+fn corporate_action_continuity(
+    config: &ArcusSpotRuntimeConfig,
+    baseline: &ArcusSpotRuntimeState,
+    current: &ArcusSpotRuntimeState,
+    sequence_advance: u64,
+) -> Result<ArcusSpotCorporateActionContinuity> {
+    let mut authorized = ArcusSpotCorporateActionContinuity::default();
+
+    if current.handled_corporate_action_ids.len() < baseline.handled_corporate_action_ids.len()
+        || current.handled_corporate_action_ids[..baseline.handled_corporate_action_ids.len()]
+            != baseline.handled_corporate_action_ids[..]
+    {
+        bail!(
+            "Arcus runtime lost or reordered its handled corporate actions across restart/rollback"
+        );
+    }
+    let resumed =
+        &current.handled_corporate_action_ids[baseline.handled_corporate_action_ids.len()..];
+    match resumed {
+        [] => {}
+        [event_id] => {
+            if sequence_advance != 1 {
+                bail!("Arcus corporate action {event_id} resumed without a single new observation");
+            }
+            let event = config
+                .corporate_actions
+                .iter()
+                .find(|event| event.event_id.eq_ignore_ascii_case(event_id))
+                .with_context(|| {
+                    format!("Arcus runtime resumed corporate action {event_id}, which the approved config does not declare")
+                })?;
+            let inventory = event.post_event_inventory.with_context(|| {
+                format!("Arcus corporate action {event_id} resumed without a reconciled post_event_inventory")
+            })?;
+            if current.inventory != inventory
+                || current.initial_baseline_inventory != Some(inventory)
+                || current.daily_baseline_inventory != Some(inventory)
+            {
+                bail!("Arcus corporate action {event_id} did not land on its reconciled holding");
+            }
+            if current.regime != ArcusSpotRegime::Neutral
+                || current.rotated_quantity.is_some()
+                || current.last_rotation_at.is_some()
+            {
+                bail!("Arcus corporate action {event_id} resumed with a rotation still open");
+            }
+            if current.corporate_action.is_some() {
+                bail!("Arcus corporate action {event_id} resumed without clearing its progress");
+            }
+            authorized.resumed_inventory = Some(inventory);
+            authorized.history_discarded = true;
+        }
+        _ => bail!("Arcus runtime resumed more than one corporate action in a single observation"),
+    }
+
+    // The discard is its own tick, at `effective_at`, and leaves the window
+    // empty with the progress record stamped. `resumed` above covers the
+    // degenerate case where one tick does both.
+    let baseline_invalidated = baseline
+        .corporate_action
+        .as_ref()
+        .and_then(|progress| progress.history_invalidated_at);
+    if let Some(progress) = &current.corporate_action {
+        if progress.history_invalidated_at.is_some() && baseline_invalidated.is_none() {
+            if sequence_advance != 1 {
+                bail!(
+                    "Arcus corporate action {} discarded its signal window without a new observation",
+                    progress.event_id
+                );
+            }
+            if !current.relative_log_price_history.is_empty() {
+                bail!(
+                    "Arcus corporate action {} stamped a discard it did not perform",
+                    progress.event_id
+                );
+            }
+            authorized.history_discarded = true;
+        }
+    }
+
+    Ok(authorized)
+}
+
 fn require_signal_history_continuity(
     baseline: &[f64],
     current: &[f64],
     sequence_advance: u64,
     signal_window_samples: usize,
+    corporate_action: &ArcusSpotCorporateActionContinuity,
 ) -> Result<()> {
     if baseline.len() > signal_window_samples || current.len() > signal_window_samples {
         bail!("Arcus runtime signal history exceeds the configured window");
@@ -3521,6 +3696,14 @@ fn require_signal_history_continuity(
             // must remain byte-for-byte equal and in order; a full window drops
             // exactly its oldest value.
             if current == baseline {
+                return Ok(());
+            }
+            // A declared `effective_at` discards the window outright and
+            // accumulates nothing until the resume, so an empty history is
+            // the expected shape on exactly that tick -- and only when
+            // `corporate_action_continuity` proved the config declares it
+            // (bot-strategy#853).
+            if corporate_action.history_discarded && current.is_empty() {
                 return Ok(());
             }
             let expected_len = baseline.len().saturating_add(1).min(signal_window_samples);
@@ -3553,11 +3736,22 @@ fn require_arcus_state_continuity(
         .sequence
         .checked_sub(baseline_runtime.sequence)
         .context("Arcus runtime sequence regressed across restart/rollback")?;
+    // Derived once, before anything relaxes: an unexplained move in any of
+    // these fields is still a violation, and this is what separates the
+    // transition the approved config declares from one that merely looks
+    // like it (bot-strategy#853).
+    let corporate_action = corporate_action_continuity(
+        &config.runtime,
+        baseline_runtime,
+        current_runtime,
+        sequence_advance,
+    )?;
     require_signal_history_continuity(
         &baseline_runtime.relative_log_price_history,
         &current_runtime.relative_log_price_history,
         sequence_advance,
         config.runtime.signal_window_samples,
+        &corporate_action,
     )?;
     require_risk_state_continuity(
         &config.runtime,
@@ -3566,6 +3760,7 @@ fn require_arcus_state_continuity(
         sequence_advance,
         acceptance_not_before,
         acceptance_not_after,
+        &corporate_action,
     )?;
     if sequence_advance == 1
         && current_runtime.last_observation_at != baseline_runtime.last_observation_at
@@ -3599,6 +3794,7 @@ fn require_arcus_state_continuity(
         sequence_advance,
         acceptance_not_before,
         acceptance_not_after,
+        &corporate_action,
     )
 }
 
@@ -5586,6 +5782,27 @@ runtime:
         .unwrap();
     }
 
+    /// The token identities, and the observation they were read from, that
+    /// `step_at` now records on every structurally valid observation
+    /// (bot-strategy#853). A hand-written checkpoint has to carry them for
+    /// exactly the reason it already carries `last_token_*_reference_price_usd`:
+    /// the continuity replay reproduces them from the recorder evidence, and
+    /// a fixture without them is not a checkpoint the runtime would ever
+    /// have written.
+    fn set_observed_token_identities(state: &mut serde_json::Value, observed_at: &str) {
+        state["last_token_a_identity"] = json!({
+            "symbol": "NVDA",
+            "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "decimals": 18,
+        });
+        state["last_token_b_identity"] = json!({
+            "symbol": "AMD",
+            "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+            "decimals": 18,
+        });
+        state["last_token_identity_at"] = json!(observed_at);
+    }
+
     fn rewrite_checkpoint_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -5814,6 +6031,7 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            set_observed_token_identities(state, "2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
             state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -5898,6 +6116,7 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("57.300959372038022");
+            set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["initial_equity_usd"] = json!("79.16815349952608352");
             state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -5945,6 +6164,7 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
             state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -6253,6 +6473,7 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
             state["last_token_a_reference_price_usd"] = json!("200");
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            set_observed_token_identities(state, "2026-08-16T00:00:01Z");
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
             state["daily_baseline_inventory"] = state["inventory"].clone();
@@ -6309,6 +6530,7 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
             state["last_token_a_reference_price_usd"] = json!("600");
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
+            set_observed_token_identities(state, "2026-08-16T00:00:01Z");
             // The day and its equity mark roll, as they always did...
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("294.7197026481211824");
@@ -6448,6 +6670,7 @@ runtime:
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("600");
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
+            set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["last_equity_usd"] = json!("294.7197026481211824");
         });
         let observed_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
@@ -9760,5 +9983,247 @@ runtime:
 
         assert!(error.contains("risk halt"), "{error}");
         assert!(error.contains("clear-risk-halt"), "{error}");
+    }
+
+    // ---- corporate-action continuity (bot-strategy#853, Codex P1) ----
+
+    fn continuity_state(sequence: u64, inventory: (&str, &str)) -> ArcusSpotRuntimeState {
+        serde_json::from_value(json!({
+            "sequence": sequence,
+            "inventory": {"token_a": inventory.0, "token_b": inventory.1},
+            "regime": "neutral",
+            "relative_log_price_history": [0.25],
+            "last_token_a_reference_price_usd": "200",
+            "last_token_b_reference_price_usd": "100",
+            "last_observation_at": "2026-08-16T12:00:00Z",
+            "last_rotation_at": null,
+            "rotated_quantity": null,
+            "initial_equity_usd": "300",
+            "initial_baseline_inventory": {"token_a": inventory.0, "token_b": inventory.1},
+            "daily_baseline_day": "2026-08-16",
+            "daily_baseline_equity_usd": "300",
+            "daily_baseline_inventory": {"token_a": inventory.0, "token_b": inventory.1},
+            "last_equity_usd": "300",
+            "risk_halt": null,
+        }))
+        .unwrap()
+    }
+
+    fn config_with_corporate_action(
+        post_event_inventory: Option<(&str, &str)>,
+    ) -> ArcusSpotRuntimeConfig {
+        let dir = tempdir().unwrap();
+        let mut config = execute_once_config(
+            dir.path().join("l.json").to_str().unwrap(),
+            dir.path().join("r.json").to_str().unwrap(),
+            "100000000000000000",
+        )
+        .runtime;
+        config.corporate_actions = vec![ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec!["NVDA".to_string()],
+            entry_block_at: "2026-08-16T00:00:00Z".parse().unwrap(),
+            reduce_exit_at: "2026-08-16T01:00:00Z".parse().unwrap(),
+            effective_at: "2026-08-16T02:00:00Z".parse().unwrap(),
+            resume_not_before: "2026-08-16T03:00:00Z".parse().unwrap(),
+            source: "issuer notice".to_string(),
+            post_event_inventory: post_event_inventory.map(|(a, b)| ArcusSpotInventory {
+                token_a: a.parse().unwrap(),
+                token_b: b.parse().unwrap(),
+            }),
+        }];
+        config
+    }
+
+    /// baseline: mid-window, history already discarded. current: resumed onto
+    /// the reconciled holding, with all three equity marks re-derived from it.
+    fn resume_pair() -> (ArcusSpotRuntimeState, ArcusSpotRuntimeState) {
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.relative_log_price_history.clear();
+        baseline.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+        });
+
+        let mut current = continuity_state(8, ("4", "1"));
+        current.relative_log_price_history = vec![0.25];
+        current.corporate_action = None;
+        current.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        // 4 NVDA at 200 + 1 AMD at 100.
+        for mark in [
+            &mut current.initial_equity_usd,
+            &mut current.daily_baseline_equity_usd,
+            &mut current.last_equity_usd,
+        ] {
+            *mark = Some(Decimal::from(900));
+        }
+        (baseline, current)
+    }
+
+    #[test]
+    fn a_declared_corporate_action_resume_is_authorized() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, current) = resume_pair();
+        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        assert_eq!(
+            authorized.resumed_inventory,
+            Some(ArcusSpotInventory {
+                token_a: Decimal::from(4),
+                token_b: Decimal::ONE,
+            }),
+        );
+        assert!(authorized.history_discarded);
+    }
+
+    #[test]
+    fn a_resume_of_an_undeclared_event_is_rejected() {
+        let mut config = config_with_corporate_action(Some(("4", "1")));
+        config.corporate_actions.clear();
+        let (baseline, current) = resume_pair();
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not declare"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_without_a_reconciled_holding_is_rejected() {
+        let config = config_with_corporate_action(None);
+        let (baseline, current) = resume_pair();
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("post_event_inventory"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_onto_a_holding_the_config_did_not_declare_is_rejected() {
+        // The checkpoint claims the resume but landed somewhere else.
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, mut current) = resume_pair();
+        current.inventory.token_a = Decimal::from(5);
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("did not land on its reconciled holding"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_left_a_rotation_open_is_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, mut current) = resume_pair();
+        current.regime = ArcusSpotRegime::RotatedAToB;
+        current.rotated_quantity = Some(Decimal::ONE);
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rotation still open"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_without_a_new_observation_is_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, current) = resume_pair();
+        let error = corporate_action_continuity(&config, &baseline, &current, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("single new observation"), "{error}");
+    }
+
+    #[test]
+    fn dropped_or_reordered_handled_events_are_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, current) = resume_pair();
+        baseline.handled_corporate_action_ids = vec!["SOMETHING-ELSE".to_string()];
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+    }
+
+    #[test]
+    fn a_stamped_discard_that_did_not_empty_the_window_is_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+        });
+        assert!(!current.relative_log_price_history.is_empty());
+        let error = corporate_action_continuity(&config, &baseline, &current, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("stamped a discard it did not perform"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_discard_authorizes_the_emptied_window() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.relative_log_price_history.clear();
+        current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+        });
+        let authorized = corporate_action_continuity(&config, &baseline, &current, 1).unwrap();
+        assert!(authorized.history_discarded);
+        assert_eq!(authorized.resumed_inventory, None);
+        // And that is exactly what lets the history check accept it.
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &authorized,
+        )
+        .unwrap();
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn rebase_marks_must_be_the_reconciled_holding_priced_at_this_tick() {
+        let (_, current) = resume_pair();
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        };
+        assert_eq!(
+            require_corporate_action_rebase_marks(&current, inventory).unwrap(),
+            Decimal::from(900),
+        );
+
+        let mut drifted = current.clone();
+        drifted.daily_baseline_equity_usd = Some(Decimal::from(901));
+        let error = require_corporate_action_rebase_marks(&drifted, inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must all be the reconciled holding"),
+            "{error}"
+        );
     }
 }

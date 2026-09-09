@@ -374,9 +374,18 @@ At `resume_not_before` the runtime resumes only when all three hold:
    instrument and needs a new `pair`, i.e. a config change and
    `reset-window`, not a resume. If the runtime never observed the pre-event
    side (it was down, or the window was declared after the fact) there is
-   nothing to compare and it says so rather than inventing a comparison.
+   nothing to compare and it says so rather than inventing a comparison. Only
+   an observation taken **strictly before** `entry_block_at` counts: a
+   calendar installed mid-window on a runtime that kept ticking holds an
+   identity from inside the event, and pinning that would compare the new
+   contract against itself.
 3. **`post_event_inventory` supplied.** Otherwise it holds on
-   `corporate_action_resume_pending`.
+   `corporate_action_resume_pending`. It must also sit at or above
+   `inventory_floors`: the resume persists it, and every later checkpoint
+   load re-checks it, so a reverse split or partial redemption that shrinks a
+   leg below its floor has to move the floor in the same config change. The
+   config is refused otherwise, which turns what would be a wedged
+   `live-tick` one tick later into a visible edit now.
 
 On resume the reconciled holding replaces the tracked inventory **and both
 risk baskets are re-anchored to it**. They are buy-and-hold counterfactuals
@@ -415,6 +424,19 @@ accumulate first. There is no second counter that could disagree with it.
    the holding, re-anchors the baselines, records the `event_id` as handled,
    and returns to warm-up. The event can stay in the config forever; it is
    never applied twice.
+
+### state-verify-continuity across a window
+
+Both no-swap transitions a window makes -- the discard at `effective_at` and
+the resume -- are recognised by `state-verify-continuity`, so a backup taken
+on either side of one still verifies. They are not exemptions: the checker
+re-derives the transition from the **approved config** and requires the
+checkpoint to have landed on exactly what it implies. A resume must name an
+event the config declares, with a `post_event_inventory`; the tracked
+inventory and both risk baskets must equal that holding; the regime must be
+flat; and the cumulative, daily and last equity marks must all be that
+holding priced at the tick's own reference marks. A discard must have
+actually emptied the window. Anything else is still a continuity violation.
 
 If the token was relisted at a different contract, stop: that is a new
 instrument. Change `pair` and use `reset-window` (see below) rather than

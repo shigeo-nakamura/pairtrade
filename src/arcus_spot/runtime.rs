@@ -333,6 +333,15 @@ pub struct ArcusSpotRuntimeState {
     pub last_token_a_identity: Option<ArcusSpotTokenIdentity>,
     #[serde(default)]
     pub last_token_b_identity: Option<ArcusSpotTokenIdentity>,
+    /// `collection_finished_at` of the observation the two identities above
+    /// were read from. Without it the corporate-action guard cannot tell a
+    /// genuinely pre-event identity from one it happened to record *inside*
+    /// the window -- which is the normal case when a calendar is installed
+    /// after `entry_block_at` while the runtime kept ticking, and which
+    /// would make the resume compare the new contract against itself and
+    /// report no drift (Codex P2, pairtrade#309).
+    #[serde(default)]
+    pub last_token_identity_at: Option<DateTime<Utc>>,
     /// The corporate-action window currently being applied, if any.
     #[serde(default)]
     pub corporate_action: Option<ArcusSpotCorporateActionProgress>,
@@ -366,6 +375,7 @@ impl ArcusSpotRuntimeState {
             risk_halt: None,
             last_token_a_identity: None,
             last_token_b_identity: None,
+            last_token_identity_at: None,
             corporate_action: None,
             handled_corporate_action_ids: Vec::new(),
             #[cfg(feature = "arcus-spot-live")]
@@ -1012,6 +1022,7 @@ impl ArcusSpotRuntime {
         let corporate_action = self.corporate_action_gate(evaluation_time, &price);
         self.state.last_token_a_identity = Some(observed_token_a_identity);
         self.state.last_token_b_identity = Some(observed_token_b_identity);
+        self.state.last_token_identity_at = Some(snapshot.collection_finished_at);
 
         let informative_signal_samples =
             informative_signal_sample_count(&self.state.relative_log_price_history);
@@ -2774,11 +2785,28 @@ impl ArcusSpotRuntime {
             .as_ref()
             .is_none_or(|progress| progress.event_id != event.event_id)
         {
+            // Only an observation taken strictly before the window opened
+            // describes the pre-event instrument. A calendar installed after
+            // `entry_block_at` on a runtime that kept ticking has a
+            // `last_token_*_identity` from inside -- or after -- the event,
+            // and pinning that would compare the new contract against itself
+            // and report no drift (Codex P2, pairtrade#309). Recording the
+            // pre-event side as unavailable is the honest answer there; the
+            // operator's reconciled `post_event_inventory` is what carries
+            // the resume.
+            let pre_event_observed = self
+                .state
+                .last_token_identity_at
+                .is_some_and(|observed_at| observed_at < event.entry_block_at);
             self.state.corporate_action = Some(ArcusSpotCorporateActionProgress {
                 event_id: event.event_id.clone(),
                 blocked_at: evaluation_time,
-                pre_event_token_a: self.state.last_token_a_identity.clone(),
-                pre_event_token_b: self.state.last_token_b_identity.clone(),
+                pre_event_token_a: pre_event_observed
+                    .then(|| self.state.last_token_a_identity.clone())
+                    .flatten(),
+                pre_event_token_b: pre_event_observed
+                    .then(|| self.state.last_token_b_identity.clone())
+                    .flatten(),
                 history_invalidated_at: None,
             });
         }
@@ -6557,6 +6585,84 @@ mod tests {
         assert_eq!(
             runtime.state.handled_corporate_action_ids,
             vec!["NVDA-2026-10-4FOR1".to_string()],
+        );
+    }
+
+    #[test]
+    fn an_identity_first_seen_inside_the_window_is_not_pinned_as_pre_event() {
+        let anchor = event_time();
+        // The runtime ticks normally with no calendar, recording an identity
+        // whose observation lands *inside* what will later be declared as the
+        // window. Installing the calendar afterwards must not let that
+        // identity pass as the pre-event side: it would compare the
+        // post-event contract against itself and report no drift (Codex P2,
+        // pairtrade#309).
+        let mut runtime = ArcusSpotRuntime::new(config()).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        runtime.step_at(&snapshot_with_relisted_token_a(anchor), anchor);
+        assert_eq!(runtime.state.last_token_identity_at, Some(anchor));
+        assert!(runtime.state.last_token_a_identity.is_some());
+
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor - Duration::seconds(1));
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        });
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::from_state(cfg, runtime.state.clone()).unwrap();
+
+        let blocked_at = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_relisted_token_a(blocked_at), blocked_at);
+        let progress = runtime.state.corporate_action.as_ref().unwrap();
+        assert_eq!(
+            progress.pre_event_token_a,
+            None,
+            "an identity observed at {anchor} cannot describe the side of a window that opened \
+             at {}",
+            anchor - Duration::seconds(1),
+        );
+        assert_eq!(progress.pre_event_token_b, None);
+
+        // With no pre-event side to compare, the resume rests on the
+        // reconciled holding alone rather than claiming a drift check it
+        // could not make.
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_relisted_token_a(resumed_at), resumed_at);
+        assert_eq!(
+            runtime.state.handled_corporate_action_ids,
+            vec!["NVDA-2026-10-4FOR1".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_pre_window_identity_is_pinned_with_its_observation_time() {
+        let anchor = event_time();
+        let mut cfg = config();
+        cfg.corporate_actions = vec![corporate_action_event(anchor + Duration::seconds(1))];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert_eq!(runtime.state.last_token_identity_at, Some(anchor));
+        assert_eq!(runtime.state.corporate_action, None);
+
+        let blocked_at = anchor + Duration::seconds(2);
+        runtime.step_at(&snapshot_with_valid_row(blocked_at), blocked_at);
+        let progress = runtime.state.corporate_action.as_ref().unwrap();
+        assert_eq!(
+            progress
+                .pre_event_token_a
+                .as_ref()
+                .map(|id| id.symbol.as_str()),
+            Some("NVDA"),
+        );
+        assert_eq!(
+            progress
+                .pre_event_token_b
+                .as_ref()
+                .map(|id| id.symbol.as_str()),
+            Some("AMD"),
         );
     }
 
