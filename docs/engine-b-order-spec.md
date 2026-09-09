@@ -267,15 +267,37 @@ matters if a future change adds REST polling (e.g. a reconcile loop).
 | FOK | **does not exist on Lighter** | — | no |
 | reduce_only | bool in the signed tx | `OrderPayload.reduce_only` | yes (passed through verbatim) |
 
-### 3.2 `create_order` mapping as used by `engine_b_live.rs`
+### 3.2 `create_order_taker_ioc` mapping as used by `engine_b_live.rs`
 
-`submit_order` calls `create_order(us_primary, size, side, price=None,
-spread=None, reduce_only, expiry=None)`. With `price = None` the
-connector builds a **MARKET (1) + IOC (0)** order whose `price` field is
-a *protection price* = last ticker price × 0.8 (sell) / × 1.2 (buy);
-Lighter treats a market order's price as the worst acceptable price and
-"the sequencer cancels if better terms unavailable". `order_expiry` is
-`0` (nil) for IOC, form field `price_protection=false`.
+`submit_order` calls `create_order_taker_ioc(us_primary, size, side,
+slippage_bps, reduce_only)` (dex-connector v4.7.22, bot-strategy#918).
+The connector reads the touch from the WS-fed book cache
+(`fetch_order_book(symbol, 1)`, which refuses a book older than
+`ob_stale_after`), crosses it by `slippage_bps`, rounds the result
+**inward** to the tick (down for a buy, up for a sell, so tick rounding
+can only tighten the bound), and sends **LIMIT + TIF_IOC** at that
+price. The unfilled remainder is cancelled rather than left resting.
+`slippage_bps` is clamped to `1..=1000` by the connector, so the old
+2,000 bps is unreachable through this path, and `engine_b_live` refuses
+an out-of-range `ENGINE_B_LIVE_SLIPPAGE_BPS` at startup rather than at
+send time. Default: **50 bps** (§6.3's bound).
+
+Two behaviour differences from the predecessor path worth knowing at the
+first live cycle:
+
+- A frozen feed now **fails the send** (no fresh book → no price) where
+  `create_order(price = None)` would have priced off a stale ticker.
+- A size that truncates to zero at the market's size decimals is
+  **rejected**, where `create_order` silently forced it up to one size
+  tick (G-7).
+
+**Predecessor, for reading older logs:** `create_order(us_primary, size,
+side, price=None, spread=None, reduce_only, expiry=None)` built a
+**MARKET (1) + IOC (0)** order whose `price` field was a *protection
+price* = last ticker price × 0.8 (sell) / × 1.2 (buy) — a fill
+guarantee, not a price constraint. `order_expiry` is `0` (nil) for IOC,
+form field `price_protection=false`. `create_order` itself is unchanged
+and still used by other binaries.
 
 Other mappings (not used by Engine B today, recorded for §5.2 / §6.3
 work):
@@ -285,11 +307,18 @@ work):
 - `spread = Some(-2)` → LIMIT + POST_ONLY (venue rejects a crossing
   order instead of executing as taker).
 - `spread = Some(-1)` ("IOC" sentinel) is **degraded to GTT** by the
-  connector. **A limit-price IOC with an explicit collar is not reachable
-  through `create_order` for Lighter**; `create_order_taker_ioc` returns
-  `Permanent("not implemented")` for this connector. Getting §6.3's
-  "marketable limit, IOC, ≤ 50 bps from mid" would need a connector
-  change (LIMIT + TIF_IOC is a legal Lighter combination). See §4 G-3.
+  connector. A limit-price IOC with an explicit collar is still not
+  reachable through `create_order` for Lighter — it is reachable through
+  `create_order_taker_ioc`, which is what §3.2 now uses, so §6.3's
+  "marketable limit, IOC, ≤ 50 bps from mid" is implemented and needs no
+  further connector change to be *available*. See §4 G-3.
+
+  One caveat on the "from mid" half: the connector's collar is applied to
+  the **touch**, and `engine_b_live` converts its mid-relative budget into
+  a touch-relative one before calling (`mid_relative_slippage_bps`). That
+  conversion reads this process's book, not the connector's, so it is not
+  atomic with the limit the connector builds — see §4 G-3 for the residual
+  and where it is tracked.
 
 ### 3.3 reduce-only
 
@@ -360,11 +389,11 @@ below.
 |---|---|---|---|---|
 | G-1 | `set_leverage` is a **no-op** on the Lighter connector (`dex_impl.rs`: logs at debug, returns `Ok`). `ENGINE_B_LIVE_LEVERAGE=2` only feeds the notional cap (`equity × leverage × 0.9`); the exchange applies its per-market default margin (SNDK `default_initial_margin_fraction=666`, `maintenance=300`, raw units — interpret under A-5 / #877). | entry | none: $100 notional on ~$1,000 equity is far below any margin bound | document; do not read `leverage=2` as an exchange setting |
 | G-2 | **Fill was assumed on HTTP 200.** `OpenPosition.size` = requested size, `entry_price` = last WS mid. If the IOC filled partially or not at all, the engine held a phantom position, logged a fictitious PnL, and sent a reduce-only exit sized to a position that might not exist. | entry → exit | real for the smoke test — exactly the class of bug the test is meant to surface | **Addressed in pairtrade#275 (open, not yet merged -- the running binary still has this gap)**: after an accepted IOC the engine polls the WS-fed `get_positions()` for up to `ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS` (15 s) and records the exchange's side / size / entry price; no position → treated as unfilled, no retry that day; exits are sized to the exchange's current position and only complete once it reports flat. Verify on the first live cycle. |
-| G-3 | Entry/exit is MARKET+IOC with a **±20 % protection price**, not the doc's "marketable limit ≤ 50 bps from mid" (§6.3). No limit-IOC path exists in the connector for Lighter. | entry, exit | low: SNDK does ~$15 M/day with ~1.3 bps spread; observed top-5 depth ≈ $83 k vs a $100 order | accept for the smoke test; open a dex-connector item (LIMIT + TIF_IOC) before any Phase 2 sizing |
+| G-3 | ~~Entry/exit is MARKET+IOC with a **±20 % protection price**, not the doc's "marketable limit ≤ 50 bps from mid" (§6.3). No limit-IOC path exists in the connector for Lighter.~~ **Largely closed** by dex-connector#88 + the pairtrade v4.7.22 bump and wiring (bot-strategy#918): `create_order_taker_ioc` sends LIMIT + TIF_IOC, tick-rounded inward. The connector's collar is *touch*-relative, so the engine converts its mid-relative `ENGINE_B_LIVE_SLIPPAGE_BPS` (default 50) budget with `mid_relative_slippage_bps` before calling — multiplicatively and per side, since the collar multiplies onto the touch. **Residual**: that conversion reads the engine's own book, not the connector's, so it is not atomic with the limit the connector builds; a tear between the two reads, a connector fallback to the WS mid or REST last trade instead of a touch, and the one tick the connector crosses before applying the collar (~0.06 bps on SNDK) all escape it. Closing those means moving the conversion into the connector, which also redefines `slippage_bps` for `book_runtime` — tracked as bot-strategy#971. | entry, exit | was low anyway: SNDK does ~$15 M/day with ~1.3 bps spread; observed top-5 depth ≈ $83 k vs a $100 order. The bound matters for the torn-book tail, not the median fill, and the residual is a sub-millisecond window inside that tail | verify on the first live cycle that a fill occurs at all at 50 bps; widen only with evidence, never back to a protection price. Close the residual connector-side before any live sizing increase |
 | G-4 | **No idempotency journal.** A `sendTx` that timed out after Lighter accepted it returned `Transient`; `day.entered` stayed `false`, and the next 5 s tick re-submitted → possible double entry (2 × notional). §6.5 (persist intent, then send; on timeout query by client ID) is unimplemented. A position check alone does not close this: REST and WS rate limits are coupled (§2.1), so the same stress that timed out the `sendTx` can delay the WS `account_all` update, and a single `get_positions()` read right after the timeout can be a false negative. | entry | **not** bounded at 2×: before #275, `day.entered` stays false after every error and the tick loop re-submits every 5 s for the 180 s window, so if every acknowledgment is lost up to ~36 orders × $100 can be accepted (the notional cap is per order, not cumulative) | **Addressed in pairtrade#275 (open, not yet merged) by construction: at most one entry `sendTx` per session day.** Any `submit_order` outcome (Ok, `Transient`, `RateLimited`, `ServerResponse`) ends the day's submitting; after an error the engine still polls the exchange position for the full confirm window and adopts a position if one appears. The exchange position is also read before the single submit (catches a position left by a crashed prior process). A persisted `order_intent` journal remains Phase 2 work. |
 | G-5 | Rate limiter sidecar models a 60,000-weight/min bucket; Standard tier is 60 req/min unweighted. The connector's real Standard-tier protection is reactive (429 → 90–120 s cooldown) plus the `[API_TRACKER]` warning at 45/60 s. | REST | none at ≤ 8 req/day | do not add REST polling loops to this binary without revisiting; if `reconcile` polling is added for G-2, poll ≤ 1/s and prefer the WS-fed `get_positions()` |
 | G-6 | Startup / reconnect reconcile (§6.4) is not implemented: the engine does not compare its state file with exchange positions at boot and does not cancel unknown open orders. `OpenPosition` is in-memory only (already in the binary's KNOWN GAPS). | boot | matters only if the service restarts between entry and exit | keep the documented manual rule (check the exchange before trusting `status.json`); Phase 2 item |
-| G-7 | No `min_base_amount` / `min_quote_amount` / decimals guard in the engine; sizing relies on connector truncation, and the connector silently substitutes `base_amount = 1` (one size tick) when truncation yields zero rather than refusing — on a thin symbol that is a different order than the one intended, not a rejection. | entry | none at $100 / SNDK (11× the minimum) | add an explicit floor check (and reject a zero-after-truncation size) when `lot_usd` becomes `Q_gate`-driven |
+| G-7 | ~~the connector silently substitutes `base_amount = 1` (one size tick) when truncation yields zero rather than refusing~~ **Closed for this binary** by dex-connector#88: `create_order_taker_ioc` rejects a size that truncates to zero instead of forcing one size tick. `create_order` keeps the old behaviour for its other callers. The engine still has no explicit `min_base_amount` / `min_quote_amount` floor of its own. | entry | none at $100 / SNDK (11× the minimum) | add an explicit floor check when `lot_usd` becomes `Q_gate`-driven; the zero-after-truncation half is now handled by the connector |
 | G-8 | Lighter's reduce-only semantics for an order larger than the position (reject the whole order vs clip to the position) are **not documented on the pages read and not yet observed live**. Before #275 this was the only guard against an over-sized exit flipping the position. | exit | after #275 reduce-only is no longer load-bearing (exits are sized to the exchange position), but the exchange behaviour is still unverified | observe on the first live exit; if a partial exit ever leaves a remainder, the next tick's re-read + re-send covers it either way |
 
 G-2 and G-4 were the two worth a code change before the first
