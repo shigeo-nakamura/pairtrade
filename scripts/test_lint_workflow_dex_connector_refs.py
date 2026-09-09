@@ -271,14 +271,42 @@ class ResolverInvocation(LintTestCase):
         ))
         self.assertFlags("caller.yml", "overrides Cargo.lock")
 
+    DISPATCH = (
+        "on:\n  push: {}\n",
+        "on:\n  push: {}\n  workflow_dispatch:\n    inputs:\n"
+        "      dex_connector_ref:\n        required: false\n        type: string\n",
+    )
+
+    def _with_input_ref(self, expression: str, *, declare: bool = True) -> str:
+        edits = [(
+            "  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n",
+            "  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n"
+            f"    with:\n      input-ref: {expression}\n",
+        )]
+        if declare:
+            edits.insert(0, self.DISPATCH)
+        return self.variant(CALLER_WORKFLOW, *edits)
+
     def test_a_dispatch_input_passed_through_to_the_resolver_is_accepted(self) -> None:
-        self.write("caller.yml", self.variant(
-            CALLER_WORKFLOW,
-            ("  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n",
-             "  resolve-ref:\n    uses: ./.github/workflows/_resolve-dex-connector-ref.yml\n"
-             "    with:\n      input-ref: ${{ inputs.dex_connector_ref || '' }}\n"),
-        ))
+        self.write("caller.yml", self._with_input_ref("${{ inputs.dex_connector_ref || '' }}"))
         self.assertClean()
+
+    def test_a_bare_dispatch_input_pass_through_is_accepted(self) -> None:
+        self.write("caller.yml", self._with_input_ref("${{ inputs.dex_connector_ref }}"))
+        self.assertClean()
+
+    def test_a_static_fallback_in_the_pass_through_is_rejected(self) -> None:
+        # Runs with no dispatch value take the tag, which is the pin again.
+        self.write("caller.yml", self._with_input_ref(
+            "${{ inputs.dex_connector_ref || 'v4.7.20' }}"
+        ))
+        self.assertFlags("caller.yml", "overrides Cargo.lock")
+
+    def test_passing_through_an_undeclared_input_is_rejected(self) -> None:
+        self.write("caller.yml", self._with_input_ref(
+            "${{ inputs.dex_connector_ref }}", declare=False
+        ))
+        self.assertFlags("caller.yml", "declares no `dex_connector_ref`")
 
     def test_a_resolver_that_renames_its_output_is_rejected(self) -> None:
         self.write("_resolve-dex-connector-ref.yml", self.variant(
@@ -286,6 +314,17 @@ class ResolverInvocation(LintTestCase):
             ("    outputs:\n      ref:\n", "    outputs:\n      tag:\n"),
         ))
         self.assertFlags("_resolve-dex-connector-ref.yml", "does not declare a `ref`")
+
+    def test_a_job_output_from_a_missing_step_is_rejected(self) -> None:
+        # The workflow_call output and the job output key both survive; only
+        # the step they ultimately read from is gone, so the public output is
+        # the empty string and a checkout takes the default branch.
+        self.write("_resolve-dex-connector-ref.yml", self.variant(
+            RESOLVER_WORKFLOW,
+            ("      ref: ${{ steps.resolve.outputs.ref }}",
+             "      ref: ${{ steps.missing.outputs.ref }}"),
+        ))
+        self.assertFlags("_resolve-dex-connector-ref.yml", "does not exist")
 
     def test_a_resolver_output_mapped_to_a_missing_job_output_is_rejected(self) -> None:
         self.write("_resolve-dex-connector-ref.yml", self.variant(

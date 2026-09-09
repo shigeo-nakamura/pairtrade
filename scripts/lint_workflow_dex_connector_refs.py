@@ -45,6 +45,16 @@ NEEDS_OUTPUT_RE = re.compile(
     r"^\$\{\{\s*needs\.(?P<job>[A-Za-z0-9_-]+)\.outputs\.(?P<output>[A-Za-z0-9_-]+)\s*\}\}$"
 )
 ENV_RE = re.compile(r"^\$\{\{\s*env\.(?P<name>[A-Za-z0-9_-]+)\s*\}\}$")
+# The one `input-ref` shape the resolver documents: this workflow's own
+# dispatch input, with an empty-string default. Anything richer -- notably
+# `${{ inputs.x || 'v4.7.20' }}` -- puts a static tag back on every run that
+# has no dispatch value (Codex, pairtrade#314).
+DISPATCH_PASSTHROUGH_RE = re.compile(
+    r"^\$\{\{\s*inputs\.(?P<name>[A-Za-z0-9_-]+)\s*(?:\|\|\s*''\s*)?\}\}$"
+)
+STEP_OUTPUT_RE = re.compile(
+    r"^\$\{\{\s*steps\.(?P<step>[A-Za-z0-9_-]+)\.outputs\.(?P<output>[A-Za-z0-9_-]+)\s*\}\}$"
+)
 INPUTS_RE = re.compile(r"^\$\{\{\s*inputs\.(?P<name>[A-Za-z0-9_-]+)\s*\}\}$")
 STATIC_PIN_RE = re.compile(r"^v[0-9]")
 
@@ -105,7 +115,13 @@ def _is_resolver_job(job: dict) -> bool:
     return isinstance(job.get("uses"), str) and job["uses"].strip() == RESOLVER
 
 
-def _resolver_input_ref_problem(job: dict) -> str | None:
+def _dispatch_inputs(workflow: dict) -> dict:
+    dispatch = _on(workflow).get("workflow_dispatch")
+    inputs = dispatch.get("inputs") if isinstance(dispatch, dict) else None
+    return inputs if isinstance(inputs, dict) else {}
+
+
+def _resolver_input_ref_problem(job: dict, workflow: dict) -> str | None:
     """Reject a resolver call that pins the ref through its own input.
 
     The resolver treats a non-empty `input-ref` as a deliberate draft/test
@@ -124,12 +140,19 @@ def _resolver_input_ref_problem(job: dict) -> str | None:
     text = str(value).strip()
     if not text:
         return None
-    if "${{" in text and re.search(r"\binputs\.", text):
-        return None
-    return (
-        f"calls the resolver with `input-ref: {text}`, which overrides "
-        "Cargo.lock for every consumer of its output"
-    )
+    match = DISPATCH_PASSTHROUGH_RE.match(text)
+    if match is None:
+        return (
+            f"calls the resolver with `input-ref: {text}`, which overrides "
+            "Cargo.lock for every consumer of its output"
+        )
+    name = match.group("name")
+    if name not in _dispatch_inputs(workflow):
+        return (
+            f"calls the resolver with `input-ref: {text}`, but declares no "
+            f"`{name}` workflow_dispatch input for it to pass through"
+        )
+    return None
 
 
 def _check_resolver_publishes_its_output(workflows_dir: Path, findings: Findings) -> None:
@@ -167,13 +190,40 @@ def _check_resolver_publishes_its_output(workflows_dir: Path, findings: Findings
             "one of its own job outputs (bot-strategy#899/#973).",
         )
         return
-    producer = _jobs(workflow).get(match.group("job"))
+    producer_name = match.group("job")
+    producer = _jobs(workflow).get(producer_name)
     produced = producer.get("outputs") if isinstance(producer, dict) else None
     if not isinstance(produced, dict) or match.group("output") not in produced:
         findings.add(
             str(path),
             f"maps its `{RESOLVER_OUTPUT}` output to `{value}`, but job "
-            f"`{match.group('job')}` does not publish `{match.group('output')}` "
+            f"`{producer_name}` does not publish `{match.group('output')}` "
+            "(bot-strategy#899/#973).",
+        )
+        return
+    # ...and that job output has to name a step that exists: a dangling
+    # `${{ steps.<gone>.outputs.ref }}` publishes the empty string just as a
+    # missing key would, and an empty checkout ref takes the default branch.
+    job_value = str(produced[match.group("output")]).strip()
+    step_match = STEP_OUTPUT_RE.match(job_value)
+    if step_match is None:
+        findings.add(
+            str(path),
+            f"job `{producer_name}` sets `{match.group('output')}` to "
+            f"`{job_value or '(missing)'}`, which is not one of its own step outputs "
+            "(bot-strategy#899/#973).",
+        )
+        return
+    step_ids = {
+        step.get("id")
+        for step in _steps(producer)
+        if isinstance(step.get("id"), str)
+    }
+    if step_match.group("step") not in step_ids:
+        findings.add(
+            str(path),
+            f"job `{producer_name}` sets `{match.group('output')}` from step "
+            f"`{step_match.group('step')}`, which does not exist "
             "(bot-strategy#899/#973).",
         )
 
@@ -272,7 +322,7 @@ def _resolve_ref_source(
                 "bad",
                 f"ref comes from job `{producer_name}`, which does not call {RESOLVER}",
             )
-        problem = _resolver_input_ref_problem(producer)
+        problem = _resolver_input_ref_problem(producer, workflow)
         if problem is not None:
             return "bad", f"ref comes from job `{producer_name}`, which {problem}"
         if output_name != RESOLVER_OUTPUT:
