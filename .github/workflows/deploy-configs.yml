@@ -251,6 +251,10 @@ jobs:
           {
             "commands": [
               "set -e",
+              "# Same reason as ci.yml: both staging dirs below are disposable once their installers have promoted them, and /tmp here is a ~900M tmpfs on a 1.8G host. A trap rather than a delete at the end, because `set -e` lets any step above abort the script and it was the failing runs that leaked.",
+              "trap 'rm -rf /tmp/book-units-__GITHUB_SHA__ /tmp/engine-b-phase0-__GITHUB_SHA__ || true' EXIT",
+              "# Before the downloads, for the same reason as ci.yml, and matching the whole generated shape so a hand-made /tmp/engine-b-phase0-remote-smoke or /tmp/book-units-backup is never a candidate.",
+              "find /tmp -xdev -maxdepth 1 -type d -regextype posix-extended -regex '/tmp/(book-units|engine-b-phase0)-[0-9a-f]{40}' -mmin +60 -exec rm -rf {} + 2>/dev/null || true",
               "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/deploy",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",

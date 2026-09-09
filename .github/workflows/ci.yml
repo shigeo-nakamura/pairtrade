@@ -440,6 +440,10 @@ jobs:
           {
             "commands": [
               "set -e",
+              "# /tmp on this host is a ~900M tmpfs -- i.e. RAM on a 1.8G box -- and the staging dir below is disposable once install_book_runtime.sh has promoted it into __INSTALL_DIR__. Leaving one 43M dir per master push behind filled it in about two days and broke this very step with ENOSPC (2026-09-09). A trap, not a delete at the end: `set -e` means any step above can abort the script, and it was exactly the failing runs that leaked. Same pattern the arcus deploys already use.",
+              "trap 'rm -rf /tmp/book-runtime-__BOOK_STAGE__ || true' EXIT",
+              "# Before the downloads, not after: once /tmp is full the fetch below fails and `set -e` ends the script, so a prune placed at the end can never be the thing that recovers it. -regex matches the whole generated shape -- <40 hex>-<run id>-<attempt> -- rather than a prefix, because [0-9a-f]* would also match a hand-made /tmp/book-runtime-backup.",
+              "find /tmp -xdev -maxdepth 1 -type d -regextype posix-extended -regex '/tmp/book-runtime-[0-9a-f]{40}-[0-9]+-[0-9]+' -mmin +60 -exec rm -rf {} + 2>/dev/null || true",
               "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/bin __INSTALL_DIR__/deploy",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
