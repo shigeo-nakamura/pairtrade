@@ -188,6 +188,11 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   position is not reduce-only-closed on service stop/restart. Before any
   planned restart, check `status.json`'s `has_position` field and either
   wait for the scheduled exit window or manually close the position first.
+  Since bot-strategy#917 the restart is at least no longer *blind*: the
+  position is persisted and the next start reconciles it against the
+  exchange before it is allowed to enter anything (see Stop and recovery).
+  That is recovery, not graceful shutdown -- the position still rides
+  through the restart unhedged.
 
 ## Host and service
 
@@ -324,10 +329,36 @@ make the service fail to start (fail-closed, not a silent bad default).
 
 - `sudo systemctl stop engine-b-live.service` does not close an open
   position (see Safety boundary above) -- check `status.json` first.
-- A crash mid-day loses in-memory `t0`/`t1` price snapshots and any
-  not-yet-persisted entry state; `RiskState.last_session_date` prevents
-  re-entering a day already acted on before the crash, but does not
-  recover an in-flight entry/exit decision. This prototype does not persist
-  `OpenPosition` to disk -- after a restart mid-position, check the real
-  Lighter account balance/position via the exchange directly, not this
-  service's own state file, before assuming no position is open.
+  SIGTERM/SIGINT are handled only to make the state durable and to log and
+  notify exactly what stays open (`[SHUTDOWN] SIGTERM: ... is STILL OPEN
+  and is NOT being closed here`); no reduce-only is sent on the way out,
+  deliberately -- a close this process cannot confirm is worse than a
+  documented open position (bot-strategy#917).
+- The open position **is** persisted, as `RiskState.open_position` in
+  `risk_state.json`, and reconciled against the exchange on the first tick
+  after a start (`[RECONCILE]` lines, bot-strategy#917). No entry is sent
+  before that comparison succeeds, and a `get_positions()` that keeps
+  failing keeps entries blocked rather than letting one through blind.
+  What the reconciliation does, live:
+
+  | risk_state.json | exchange | outcome |
+  |---|---|---|
+  | no position | flat | clean start |
+  | matching position | same side and size | resumed; exits at its own `t2`, or at once if that window has already passed |
+  | position | *different* side or size, same symbol | the exchange's position is adopted for immediate close **and** the session halts |
+  | position on a symbol `us_primary` no longer names | that symbol still open | **not** closed here: this engine only ever submits orders for `us_primary`. The record is parked in `unmanaged_positions`, the session halts, and **an operator must flatten it by hand**. It stays in `status.json`'s position list and in the shutdown alert, refreshed from the venue on every start, until the venue reports it gone |
+  | position | flat | halt: it was closed at a price this process never saw, so its PnL is unbooked |
+  | no position | holds one | adopted for immediate close **and** the session halts |
+
+  Every halt above clears only via `RISK_ACK` (see the risk runbook), so
+  an operator sees it before any new entry goes out.
+- Under `DRY_RUN` the exchange is not the authority: the simulated
+  position is resumed from `risk_state.json`, and a real position on the
+  account is reported (`[RECONCILE] DRY_RUN, but the exchange holds ...`)
+  but never adopted or closed by this process.
+- A crash mid-day still loses the in-memory `t0`/`t1` price snapshots
+  beyond what `RiskState.t0_prices` recovers, and
+  `RiskState.last_session_date` remains what prevents re-entering a day
+  already acted on. After a restart mid-position, the `[RECONCILE]` line
+  in the journal is the record of what the account actually held -- read
+  it rather than assuming the state file alone was right.
