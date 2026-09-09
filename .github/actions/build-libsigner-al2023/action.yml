@@ -1,0 +1,61 @@
+name: Build libsigner in AL2023 (native arm64)
+description: >
+  Cache-or-build lighter-go's libsigner.so inside the pinned AL2023 arm64
+  image, at lighter-go/build/libsigner.so. Shared by every workflow that
+  ships a Lighter-linked binary (bot-strategy#899).
+
+inputs:
+  image-ref:
+    description: Digest-pinned AL2023 image reference to build in.
+    required: true
+  image-cache-key:
+    description: >
+      The build image's cache-key segment (al2023-build-image's `cache_key`),
+      so a new base image never reuses a libsigner built in the old one.
+    required: true
+  lighter-go-ref:
+    description: The lighter-go tag being built, used as a cache-key segment.
+    required: true
+  path:
+    description: Working-tree path the lighter-go checkout lives at.
+    required: false
+    default: lighter-go
+
+outputs:
+  cache_hit:
+    description: "'true' when the libsigner was restored from cache."
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Cache libsigner (native arm64)
+      id: cache
+      uses: actions/cache@v5
+      with:
+        path: ${{ inputs.path }}/build/libsigner.so
+        key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ inputs.lighter-go-ref }}-${{ inputs.image-cache-key }}-${{ hashFiles(format('{0}/go.sum', inputs.path)) }}
+
+    - name: Build libsigner in AL2023 (native arm64)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        IMAGE_REF: ${{ inputs.image-ref }}
+        LIGHTER_GO_DIR: ${{ inputs.path }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${LIGHTER_GO_DIR}/build"
+        docker run --rm --platform linux/arm64 \
+          -v "${GITHUB_WORKSPACE}/${LIGHTER_GO_DIR}:/go/src/sdk" \
+          -w /go/src/sdk \
+          -e HOST_UID="$(id -u)" \
+          -e HOST_GID="$(id -g)" \
+          "${IMAGE_REF}" \
+          /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; grep VERSION_ID /etc/os-release; dnf -y install golang gcc; CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildvcs=false -buildmode=c-shared -trimpath -o ./build/libsigner.so ./sharedlib; chown -R \${HOST_UID}:\${HOST_GID} /go/src/sdk/build"
+
+    - name: Save libsigner cache (native arm64)
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ inputs.path }}/build/libsigner.so
+        key: ${{ runner.os }}-${{ runner.arch }}-libsigner-${{ inputs.lighter-go-ref }}-${{ inputs.image-cache-key }}-${{ hashFiles(format('{0}/go.sum', inputs.path)) }}
