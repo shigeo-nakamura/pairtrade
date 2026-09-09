@@ -2198,10 +2198,20 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
         );
     }
 
+    // The handled corporate-action record outlives the window: the
+    // completed declarations may still be in the config, and a fresh state
+    // that had forgotten them would treat each as unhandled on the next
+    // tick and resume it again -- clearing the new window and replacing the
+    // newly declared initial_inventory with the old post_event_inventory
+    // (Codex P1, pairtrade#309).
     let runtime =
         ArcusSpotRuntime::new_continuing_event_sequence(config.runtime.clone(), tail_sequence)
             .map_err(anyhow::Error::msg)
-            .context("the configuration being reset to is itself invalid")?;
+            .context("the configuration being reset to is itself invalid")?
+            .with_handled_corporate_actions(
+                previous.handled_corporate_action_ids.clone(),
+                previous.handled_corporate_action_fingerprints.clone(),
+            );
 
     // The evidence sidecar describes the state being discarded, so it is
     // retired before the checkpoint is replaced: the reverse order could
@@ -3601,7 +3611,7 @@ fn require_acceptance_ledger_and_position_continuity(
             let (actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt, evidence.evaluation_time)?;
             replayed_runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, evidence.evaluation_time)
                 .map_err(anyhow::Error::msg)
                 .context("Arcus acceptance plan is inconsistent with the backup position")?;
             let applied = replayed_runtime
@@ -4892,7 +4902,7 @@ async fn main() -> Result<()> {
                 ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = executor
@@ -4939,7 +4949,7 @@ async fn main() -> Result<()> {
                 ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = executor
@@ -5212,7 +5222,7 @@ async fn main() -> Result<()> {
                 );
             }
             fresh_runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = match executor.execute_plan_once(&plan, &plan_config_digest).await {
@@ -9827,6 +9837,41 @@ runtime:
         let at = fixture_now() + chrono::Duration::seconds(60);
         assert!(stream.append(&reset_window_observe_event(1, at)).is_err());
         stream.append(&reset_window_observe_event(4, at)).unwrap();
+    }
+
+    #[test]
+    fn reset_window_carries_the_handled_corporate_actions_forward() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        // The state being reset already resumed from a split.
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        state.handled_corporate_action_fingerprints = vec!["fp-split".to_string()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+        let next = reset_window_next_config(dir.path());
+
+        commit_runtime_window_reset(&next).unwrap();
+
+        let fresh = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone())
+            .load_existing(&next.runtime)
+            .unwrap();
+        assert!(fresh.state().relative_log_price_history.is_empty());
+        assert_eq!(
+            fresh.state().handled_corporate_action_ids,
+            vec!["NVDA-2026-08-SPLIT".to_string()],
+        );
+        assert_eq!(
+            fresh.state().handled_corporate_action_fingerprints,
+            vec!["fp-split".to_string()],
+        );
     }
 
     #[test]

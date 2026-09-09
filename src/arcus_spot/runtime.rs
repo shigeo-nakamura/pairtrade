@@ -517,6 +517,20 @@ impl ArcusSpotRuntime {
         Ok(runtime)
     }
 
+    /// Carry the handled corporate-action record into a fresh runtime. The
+    /// record is append-only for the life of an account, not of a window:
+    /// `reset-window` discards the signal window and re-anchors the risk
+    /// baselines, and neither of those makes a completed split un-happen.
+    pub fn with_handled_corporate_actions(
+        mut self,
+        ids: Vec<String>,
+        fingerprints: Vec<String>,
+    ) -> Self {
+        self.state.handled_corporate_action_ids = ids;
+        self.state.handled_corporate_action_fingerprints = fingerprints;
+        self
+    }
+
     pub fn from_state(
         mut config: ArcusSpotRuntimeConfig,
         state: ArcusSpotRuntimeState,
@@ -730,10 +744,20 @@ impl ArcusSpotRuntime {
     ///   quantity from a prior partial exit;
     /// - an entry plan must not be dispatched while a sticky risk halt is
     ///   engaged, matching the planning path's own hard block.
+    ///
+    /// `dispatched_at` is the clock at the moment of submission, not the
+    /// plan's. A plan made in the reduce phase of a declared corporate
+    /// action is still consistent with the regime and the tracked quantity
+    /// after `effective_at` -- neither changed -- but the venue's units
+    /// did, and `max_plan_age_secs` does not know where the cutoff is. The
+    /// phase is therefore re-read here against the dispatch clock: no exit
+    /// once the tracked units are stale, no entry once a window has opened
+    /// (Codex P1, pairtrade#309).
     #[cfg(feature = "arcus-spot-live")]
     pub fn validate_plan_consistent_with_state(
         &self,
         plan: &ArcusSpotRotationPlan,
+        dispatched_at: DateTime<Utc>,
     ) -> Result<(), String> {
         require_fill_consistent_with_regime(self.state.regime, plan.trigger, plan.direction)?;
         match plan.trigger {
@@ -743,10 +767,24 @@ impl ArcusSpotRuntime {
                         "cannot dispatch an entry plan while the risk halt is active: {halt:?}"
                     ));
                 }
+                if let Some(event) = self.active_corporate_action(dispatched_at) {
+                    return Err(format!(
+                        "cannot dispatch an entry plan inside corporate action {}'s window \
+                         (entries blocked from {})",
+                        event.event_id, event.entry_block_at
+                    ));
+                }
             }
             ArcusSpotRotationTrigger::MeanReversionExit
             | ArcusSpotRotationTrigger::MaxHoldExit
             | ArcusSpotRotationTrigger::CorporateActionExit => {
+                if self.corporate_action_units_are_stale(dispatched_at) {
+                    return Err(
+                        "cannot dispatch an exit plan: a corporate action is effective and the \
+                         tracked open quantity is in units the venue no longer quotes"
+                            .to_string(),
+                    );
+                }
                 let open = self
                     .state
                     .rotated_quantity
@@ -2818,6 +2856,39 @@ impl ArcusSpotRuntime {
         evaluation_time: DateTime<Utc>,
         price: &PriceContext,
     ) -> CorporateActionGate {
+        let mut gate = self.corporate_action_gate_inner(evaluation_time, price);
+        // A new declaration wearing a handled id is never active (see
+        // `active_corporate_action`), so its window would be skipped
+        // entirely. It is refused here -- as an overlay on whatever the
+        // live progress already decided, never in place of it: returning
+        // early with both suppressions off let a reused id re-open the
+        // window and the exits of an event already past `effective_at`
+        // (Codex P1, pairtrade#309).
+        if let Some(reused) = self
+            .config
+            .corporate_actions
+            .iter()
+            .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
+        {
+            gate.block_entry.get_or_insert_with(|| {
+                ArcusSpotHold::new(
+                    ArcusSpotHoldCode::CorporateActionBlock,
+                    format!(
+                        "corporate action {} reuses the id of an already handled event for a \
+                         different declaration; give the new action its own event_id",
+                        reused.event_id,
+                    ),
+                )
+            });
+        }
+        gate
+    }
+
+    fn corporate_action_gate_inner(
+        &mut self,
+        evaluation_time: DateTime<Utc>,
+        price: &PriceContext,
+    ) -> CorporateActionGate {
         // Cheapest possible path for the overwhelmingly common case: an
         // empty calendar cannot change any decision, and must not cost one.
         // Only when there is no open window to resolve, though -- emptying
@@ -2828,29 +2899,6 @@ impl ArcusSpotRuntime {
             return CorporateActionGate::default();
         }
 
-        // A new declaration wearing a handled id would be filtered out as
-        // "already handled" and its window skipped entirely, so it is
-        // refused up front, whatever its instants.
-        if let Some(event) = self
-            .config
-            .corporate_actions
-            .iter()
-            .find(|event| self.handled_record_for(event) == Some(HandledMatch::ReusedId))
-        {
-            return CorporateActionGate {
-                block_entry: Some(ArcusSpotHold::new(
-                    ArcusSpotHoldCode::CorporateActionBlock,
-                    format!(
-                        "corporate action {} reuses the id of an already handled event for a \
-                         different declaration; give the new action its own event_id",
-                        event.event_id,
-                    ),
-                )),
-                force_exit: false,
-                suppress_history: false,
-                suppress_exits: false,
-            };
-        }
         let Some(event) = self.active_corporate_action(evaluation_time) else {
             // Retiring a declaration whose window never opened is ordinary
             // housekeeping: nothing was pinned, nothing was discarded,
@@ -3230,11 +3278,11 @@ impl ArcusSpotRuntime {
     /// past window whose `entry_block_at` is long gone would become active
     /// again on the next tick, clear the live signal history and re-apply
     /// its `post_event_inventory` over every trade made since.
+    /// Anything with a handled record is excluded from becoming active --
+    /// including a reused id, which is refused by the gate's overlay rather
+    /// than allowed to open a window under an old name.
     fn corporate_action_is_handled(&self, event: &ArcusSpotCorporateActionEvent) -> bool {
-        matches!(
-            self.handled_record_for(event),
-            Some(HandledMatch::Same) | Some(HandledMatch::LegacyById)
-        )
+        self.handled_record_for(event).is_some()
     }
 
     /// How `event` relates to the handled record, if at all. The id and the
@@ -6268,7 +6316,64 @@ mod tests {
                 runtime.state.inventory,
             )
             .unwrap();
-        runtime.validate_plan_consistent_with_state(&plan).unwrap();
+        runtime
+            .validate_plan_consistent_with_state(&plan, event_time())
+            .unwrap();
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn an_exit_plan_is_refused_at_dispatch_once_the_units_are_stale() {
+        // Planned in the reduce phase, dispatched after effective_at: the
+        // regime and the tracked quantity are unchanged, the venue's units
+        // are not, and max_plan_age_secs does not know where the cutoff is.
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor);
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_open_rotation(&mut runtime, anchor);
+        let planned_at = anchor + Duration::seconds(3);
+        let plan = runtime
+            .build_plan(
+                &context(planned_at - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenBToTokenA,
+                ArcusSpotRotationTrigger::CorporateActionExit,
+                planned_at,
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime
+            .validate_plan_consistent_with_state(&plan, planned_at)
+            .unwrap();
+        let error = runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(4))
+            .unwrap_err();
+        assert!(error.contains("no longer quotes"), "{error}");
+    }
+
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn an_entry_plan_is_refused_at_dispatch_once_a_window_has_opened() {
+        let anchor = event_time();
+        let mut cfg = cfg_with_window_at(anchor + Duration::seconds(10));
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(anchor - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                anchor,
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime
+            .validate_plan_consistent_with_state(&plan, anchor)
+            .unwrap();
+        let error = runtime
+            .validate_plan_consistent_with_state(&plan, anchor + Duration::seconds(10))
+            .unwrap_err();
+        assert!(error.contains("entries blocked"), "{error}");
     }
 
     #[cfg(feature = "arcus-spot-live")]
@@ -6299,7 +6404,7 @@ mod tests {
             )
             .unwrap();
         assert!(runtime
-            .validate_plan_consistent_with_state(&stale_entry_plan)
+            .validate_plan_consistent_with_state(&stale_entry_plan, event_time())
             .is_err());
     }
 
@@ -6327,7 +6432,9 @@ mod tests {
         runtime
             .apply_confirmed_live_fill(&plan, plan.sell_quantity, plan.buy_quantity, event_time())
             .unwrap();
-        assert!(runtime.validate_plan_consistent_with_state(&plan).is_err());
+        assert!(runtime
+            .validate_plan_consistent_with_state(&plan, event_time())
+            .is_err());
     }
 
     #[cfg(feature = "arcus-spot-live")]
@@ -6349,7 +6456,9 @@ mod tests {
         runtime.update_risk_baselines(event_time(), Decimal::from(300), baseline_inventory);
         let mark = runtime.risk_mark(Decimal::from(297), Decimal::from(200), Decimal::from(100));
         runtime.engage_risk_halt(event_time(), mark);
-        assert!(runtime.validate_plan_consistent_with_state(&plan).is_err());
+        assert!(runtime
+            .validate_plan_consistent_with_state(&plan, event_time())
+            .is_err());
     }
 
     #[cfg(feature = "arcus-spot-live")]
@@ -7143,6 +7252,60 @@ mod tests {
         }
         assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
         assert_eq!(runtime.state.corporate_action, None);
+    }
+
+    #[test]
+    fn a_reused_id_does_not_lift_an_effective_windows_suppression() {
+        let anchor = event_time();
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(&snapshot_with_valid_row(resumed_at), resumed_at);
+        assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+
+        // A second, distinct action, now past its effective_at with a
+        // rotation open: stamped, exits suppressed.
+        let second_at = anchor + Duration::seconds(20);
+        let mut second = corporate_action_event(second_at);
+        second.event_id = "NVDA-2026-11-2FOR1".to_string();
+        second.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(2),
+            token_b: Decimal::ONE,
+        });
+        runtime.config.corporate_actions = vec![second];
+        seed_open_rotation(&mut runtime, second_at);
+        let effective = second_at + Duration::seconds(6);
+        runtime.step_at(&snapshot_with_valid_row(effective), effective);
+        assert!(runtime
+            .state
+            .corporate_action
+            .as_ref()
+            .is_some_and(|p| p.history_invalidated_at.is_some()));
+        assert!(runtime.state.relative_log_price_history.is_empty());
+
+        // The operator adds a third entry under the *first* event's id.
+        let mut reused = corporate_action_event(anchor + Duration::days(30));
+        runtime.config.corporate_actions.push({
+            reused.post_event_inventory = None;
+            reused
+        });
+        let later = effective + Duration::seconds(1);
+        let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
+        assert!(
+            matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
+            "{:?}",
+            outcome.decision
+        );
+        assert!(
+            runtime.state.relative_log_price_history.is_empty(),
+            "the effective window's history suppression must survive the reused id",
+        );
+        assert_eq!(
+            runtime.state.regime,
+            ArcusSpotRegime::RotatedAToB,
+            "no exit"
+        );
     }
 
     #[test]

@@ -53,6 +53,14 @@ pub struct ArcusSpotCheckpointSummary {
     /// figure and would otherwise overwrite realized trading deltas
     /// (Codex P1 follow-up, bot-strategy#903).
     pub inventory: ArcusSpotInventory,
+    /// Corporate actions this state already resumed from. A fresh window
+    /// built by `reset-window` must carry these forward: the completed
+    /// declarations may still be in the config, and a fresh state that has
+    /// forgotten them treats each as unhandled, re-applies its obsolete
+    /// `post_event_inventory` over the newly declared holding and clears
+    /// the window again (Codex P1, pairtrade#309).
+    pub handled_corporate_action_ids: Vec<String>,
+    pub handled_corporate_action_fingerprints: Vec<String>,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -345,6 +353,11 @@ impl ArcusSpotRuntimeCheckpointStore {
             rotated_quantity: checkpoint.state.rotated_quantity,
             risk_halt: checkpoint.state.risk_halt,
             relative_log_price_samples: checkpoint.state.relative_log_price_history.len(),
+            handled_corporate_action_ids: checkpoint.state.handled_corporate_action_ids.clone(),
+            handled_corporate_action_fingerprints: checkpoint
+                .state
+                .handled_corporate_action_fingerprints
+                .clone(),
             inventory: checkpoint.state.inventory,
         }))
     }
