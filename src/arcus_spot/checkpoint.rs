@@ -514,17 +514,30 @@ impl ArcusSpotRuntimeCheckpointStore {
                 // reset-window down with it -- while the runtime's own gate
                 // already refuses an amended open window with a recoverable
                 // hold (independent review, pairtrade#309).
+                //
+                // That hold is a *progress* record, though, and a window
+                // whose first tick has not run yet has none: keeping the id
+                // while pushing `entry_block_at` past the stored one leaves
+                // the open window with nothing guarding it, because
+                // `active_corporate_action` does not see the rescheduled one
+                // either. An amendment therefore only counts as still
+                // declaring this window if it still covers where the stored
+                // one opened; moving the opening later is removal by another
+                // name (Codex P1, pairtrade#309).
                 && !config.corporate_actions.iter().any(|event| {
                     event.fingerprint() == stored.fingerprint()
-                        || event.event_id.eq_ignore_ascii_case(&stored.event_id)
+                        || (event.event_id.eq_ignore_ascii_case(&stored.event_id)
+                            && event.entry_block_at <= stored.entry_block_at)
                 })
         }) {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config declaring corporate \
                  action {} (window opening at {}, within the submission margin of now and not \
-                 yet handled), which the supplied config does not declare. Removing a live \
-                 window drops the guard it exists to be; restore the declaration, or resolve \
-                 the window first",
+                 yet handled), which the supplied config no longer declares from that instant \
+                 -- it is absent, or re-declared under the same id but opening later. Removing \
+                 a live window, or rescheduling it out from under itself, drops the guard it \
+                 exists to be; restore the declaration at its stored opening, or resolve the \
+                 window first",
                 self.path.display(),
                 dropped.event_id,
                 dropped.entry_block_at.to_rfc3339(),
@@ -900,6 +913,28 @@ mod tests {
         amended.corporate_actions[0].effective_at += chrono::Duration::hours(1);
         amended.corporate_actions[0].resume_not_before += chrono::Duration::hours(1);
         assert!(store.load_existing_at(&amended, inside).is_ok());
+
+        // Rescheduling the *opening* later under the same label is removal
+        // by another name. The runtime's hold is a progress record, and a
+        // window whose first tick has not run has none; the rescheduled
+        // declaration is not active yet either, so nothing would refuse an
+        // entry inside the window that is open right now.
+        let mut rescheduled = declared.clone();
+        rescheduled.corporate_actions[0].entry_block_at += chrono::Duration::hours(1);
+        rescheduled.corporate_actions[0].reduce_exit_at += chrono::Duration::hours(1);
+        rescheduled.corporate_actions[0].effective_at += chrono::Duration::hours(1);
+        rescheduled.corporate_actions[0].resume_not_before += chrono::Duration::hours(1);
+        let error = match store.load_existing_at(&rescheduled, inside) {
+            Ok(_) => panic!("rescheduling a live window's opening later is removal"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Pulling the opening earlier only widens the guard, so it stays a
+        // declaration of the same window.
+        let mut earlier = declared.clone();
+        earlier.corporate_actions[0].entry_block_at -= chrono::Duration::hours(1);
+        assert!(store.load_existing_at(&earlier, inside).is_ok());
 
         // Downtime does not make a window un-live: the watermark stays before
         // `entry_block_at` while the clock moves past it.
