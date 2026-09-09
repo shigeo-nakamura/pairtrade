@@ -980,7 +980,24 @@ impl ArcusSpotRuntime {
         // basket is gone by the time anything can tell a halt now stands on
         // it. `engage_risk_halt` reads only the config limits and this mark,
         // so nothing here depends on the baselines being current.
-        self.engage_risk_halt(evaluation_time, risk_before);
+        // ... except while a declared corporate-action window has passed
+        // its `effective_at` and its resume has not been committed. The
+        // venue is already quoting the post-event instrument by then while
+        // `state.inventory` still holds the pre-event quantities, so
+        // `equity_before` above multiplies old units by new prices: a
+        // 4-for-1 split reads as a 75% loss, a 1-for-4 reverse split as a
+        // 4x gain. Neither is evidence of anything, and a halt is sticky --
+        // it would survive the resume that repairs the units, keep the
+        // rebased runtime blocked until an operator cleared it by hand, and
+        // make `state-verify-continuity` reject the authorized transition as
+        // an unexplained halt. The mark itself is still taken and still
+        // recorded on the event; it just may not engage a halt. Entry is
+        // blocked and the exit forced throughout this window regardless, so
+        // nothing accumulates exposure while the limits are unenforceable
+        // (Codex, PR #309).
+        if !self.corporate_action_units_are_stale(evaluation_time) {
+            self.engage_risk_halt(evaluation_time, risk_before);
+        }
         self.update_risk_baselines(evaluation_time, equity_before, inventory_before);
         self.state.last_equity_usd = Some(equity_before);
 
@@ -2942,6 +2959,17 @@ impl ArcusSpotRuntime {
         // before a new entry" requirement without a second counter that
         // could disagree with it.
         CorporateActionGate::default()
+    }
+
+    /// True while the tracked inventory is denominated in units the venue
+    /// no longer quotes: a declared window has passed its `effective_at`
+    /// and its resume has not been committed (either because
+    /// `post_event_inventory` is still missing, or because the forced exit
+    /// has not unwound). Any equity derived from `state.inventory` is
+    /// meaningless until the reconciled holding replaces it.
+    fn corporate_action_units_are_stale(&self, evaluation_time: DateTime<Utc>) -> bool {
+        self.active_corporate_action(evaluation_time)
+            .is_some_and(|event| evaluation_time >= event.effective_at)
     }
 
     /// The one declared window this tick falls in, if any: unhandled, and
@@ -6467,6 +6495,105 @@ mod tests {
             }
             other => panic!("expected warm-up after the resume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_reverse_split_price_may_not_engage_a_loss_halt() {
+        // The risk mark reprices the buy-and-hold basket at this tick, so a
+        // price move alone cannot halt -- only the *gap* between the wallet
+        // and its basket, left by prior rotations, can. From `effective_at`
+        // the venue quotes the post-split instrument while both the wallet
+        // and its basket are still in pre-split units, so that gap is priced
+        // in the wrong denomination: a 1-for-4 reverse split multiplies the
+        // same shortfall by four. A halt is sticky, so engaging one here
+        // would survive the resume that repairs the units, leave the
+        // authorized rebase blocked until an operator cleared it by hand,
+        // and make `state-verify-continuity` reject the transition as an
+        // unexplained halt (Codex, PR #309).
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        let reconciled = ArcusSpotInventory {
+            token_a: Decimal::new(25, 2),
+            token_b: Decimal::ONE,
+        };
+        event.post_event_inventory = Some(reconciled);
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        // A prior rotation left the wallet 0.005 NVDA short of its basket.
+        runtime.state.inventory.token_a = Decimal::new(995, 3);
+
+        // Pre-split, that shortfall is $1.00 against the $2 daily limit.
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert_eq!(runtime.state.risk_halt, None);
+
+        // Past `effective_at`, at the post-split price: the same 0.005 NVDA
+        // gap is now priced at $800 -- $4.00, twice the limit -- purely
+        // because the units are stale.
+        let during = anchor + Duration::seconds(6);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(during, "800", "100"),
+            during,
+        );
+        assert_eq!(
+            runtime.state.risk_halt, None,
+            "the split's own unit change is not a loss",
+        );
+
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(resumed_at, "800", "100"),
+            resumed_at,
+        );
+
+        assert_eq!(runtime.state.risk_halt, None);
+        assert_eq!(runtime.state.inventory, reconciled);
+        assert_eq!(runtime.state.initial_baseline_inventory, Some(reconciled));
+        assert_eq!(
+            runtime.state.handled_corporate_action_ids,
+            vec!["NVDA-2026-10-4FOR1".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_halt_engaged_before_the_effective_time_still_stands() {
+        // The suppression is scoped to the ticks whose units are stale. The
+        // same shortfall, large enough to breach in the units the venue is
+        // still quoting, halts as usual before `effective_at` -- and the
+        // halt is sticky, so the resume does not clear it.
+        let anchor = event_time();
+        let mut cfg = config();
+        let mut event = corporate_action_event(anchor);
+        event.post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::new(25, 2),
+            token_b: Decimal::ONE,
+        });
+        cfg.corporate_actions = vec![event];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+        let basket = runtime.state.inventory;
+        runtime.update_risk_baselines(anchor - Duration::seconds(1), Decimal::from(300), basket);
+        // 0.02 NVDA short: $4.00 at the pre-split price, over the $2 limit.
+        runtime.state.inventory.token_a = Decimal::new(98, 2);
+
+        runtime.step_at(&snapshot_with_valid_row(anchor), anchor);
+        assert!(
+            runtime.state.risk_halt.is_some(),
+            "a real shortfall in the quoted units must still halt",
+        );
+
+        let resumed_at = anchor + Duration::seconds(12);
+        runtime.step_at(
+            &snapshot_with_valid_row_at_prices(resumed_at, "800", "100"),
+            resumed_at,
+        );
+        assert!(
+            runtime.state.risk_halt.is_some(),
+            "a halt is sticky; the resume does not clear it",
+        );
     }
 
     #[test]
