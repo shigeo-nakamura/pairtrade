@@ -870,6 +870,65 @@ def test_a_non_finite_number_never_reads_as_absence_of_movement():
         {"hold_secs": 600, "ts": "NaN"})
 
 
+def test_the_cross_day_marker_does_not_touch_an_equity_costed_day():
+    """An equity delta is measured between two daily closes.
+
+    It is therefore already aligned with this date's own volume and
+    points, whatever the PnL ledger's cycles did -- suppressing its rates
+    would withhold a number that is not mismatched at all.
+    """
+    close = 1788868800 + 3600  # 2026-09-08 13:00 UTC
+    with tempfile.TemporaryDirectory() as tmp:
+        # A cross-midnight cycle, *and* a placeholder that makes the PnL
+        # coverage incomplete, so the day falls back to the equity delta.
+        path = pnl_file(
+            Path(tmp),
+            [
+                {"ts": close, "source": "exit_fill", "pnl": -100.0,
+                 "hold_secs": 20 * 3600, "funding_carry_usd": 0.0},
+                {"ts": close, "source": "recovery_no_pnl", "pnl": 0.0,
+                 "pnl_available": False},
+            ],
+        )
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.cross_day_cycles == 1 and day.incomplete
+
+        row = build_rows(
+            {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
+            {("2026-09-08", "freq"): day},
+            {"freq": {"2026-09-08": 50.0}},
+            {("2026-09-08", "freq"): 1000.0},
+        )[0]
+        assert row.cost_source == "equity_delta"
+        assert row.cost_per_musd_volume == 100.0, row.cost_per_musd_volume
+        assert row.cost_per_point == 0.05, row.cost_per_point
+        arm = summarize([row])["arms"][0]
+        assert arm["cost_per_musd_volume"] == 100.0
+        assert arm["uncosted_points"] == 0.0
+
+
+def test_a_repeated_points_row_is_refused():
+    """Last-wins silently divided the day's cost by part of its points."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(Path(tmp) / "points.jsonl", [
+            {"date": "2026-09-08", "arm": "freq", "points": 1000.0},
+            {"date": "2026-09-08", "arm": "freq", "points": 500.0},
+        ])
+        try:
+            load_points(path)
+        except SubsidyLedgerError as error:
+            assert "more than once" in str(error), error
+        else:
+            raise AssertionError("a repeated (date, arm) should raise")
+
+        # Different arms on the same date are not duplicates.
+        fine = write(Path(tmp) / "ok.jsonl", [
+            {"date": "2026-09-08", "arm": "freq", "points": 1000.0},
+            {"date": "2026-09-08", "arm": "b", "points": 500.0},
+        ])
+        assert len(load_points(fine)) == 2
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

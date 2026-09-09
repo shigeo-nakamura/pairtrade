@@ -144,6 +144,16 @@ class Row:
     cross_day_cycles: int = 0
     slippage_unreadable: int = 0
 
+    def cost_spans_two_days(self) -> bool:
+        """Is this row's cost partly earned on a day it is not filed under?
+
+        Only when it came from the PnL ledger: that files a whole realized
+        cycle under its close date. An `equity_delta` is measured between
+        two daily closes, so it is already aligned with this date's own
+        volume and points and must not be suppressed (Codex, PR #297).
+        """
+        return bool(self.cross_day_cycles) and self.cost_source == "pnl_ledger"
+
     def as_json(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
 
@@ -616,6 +626,16 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
             raise SubsidyLedgerError(
                 f"{path}: points must be a finite, non-negative number; "
                 f"got {value!r} for {date}/{arm}")
+        # A repeated (date, arm) -- concatenated exports, or a correction
+        # appended after the original -- silently kept only the last
+        # value, dividing the day's cost by an order-dependent subset of
+        # its points. Whether the intent was "replace" or "add" cannot be
+        # read from the file, and both change the KPI, so it is refused
+        # (Codex, PR #297).
+        if (str(date), str(arm)) in points:
+            raise SubsidyLedgerError(
+                f"{path}: {date}/{arm} appears more than once; a day's points must be a single "
+                "row, since neither replacing nor summing can be inferred from the file")
         points[(str(date), str(arm))] = parsed
     return points
 
@@ -668,7 +688,7 @@ def build_rows(
         # re-attributed either -- they are supplied per day by an
         # operator, with no cycle to key them to (Codex, PR #297).
         if (row.points is not None and row.points > 0 and row.cost_usd is not None
-                and not row.cross_day_cycles):
+                and not row.cost_spans_two_days()):
             row.cost_per_point = round(row.cost_usd / row.points, 8)
         # Same rule as the aggregate, and it has to live here too: this row
         # is what `--out` writes and what the daily table prints, so a rate
@@ -679,7 +699,7 @@ def build_rows(
         # known-short denominator as an unvalued fill, and suppressed the
         # same way (Codex, PR #297).
         if (row.cost_usd is not None and row.volume_usd > 0
-                and not row.fills_without_value and not row.cross_day_cycles):
+                and not row.fills_without_value and not row.cost_spans_two_days()):
             row.cost_per_musd_volume = round(row.cost_usd / (row.volume_usd / 1e6), 4)
         rows.append(row)
     return rows
@@ -734,7 +754,7 @@ def summarize(rows: list[Row]) -> dict:
         arm["volume_usd"] += row.volume_usd
         arm["fills_without_value"] += row.fills_without_value or 0
         arm["cross_day_cycles"] += row.cross_day_cycles
-        if row.fills_without_value or row.cross_day_cycles:
+        if row.fills_without_value or row.cost_spans_two_days():
             arm["incomplete_volume_days"] += 1
         if row.cost_usd is None:
             arm["uncosted_volume_usd"] += row.volume_usd
@@ -744,7 +764,7 @@ def summarize(rows: list[Row]) -> dict:
             # Volume ratio: this cost counts only if this row measured the
             # volume it was spent on.
             if (row.volume_usd > 0 and not row.fills_without_value
-                    and not row.cross_day_cycles):
+                    and not row.cost_spans_two_days()):
                 arm["cost_usd_on_measured_volume"] += row.cost_usd
                 arm["costed_volume_usd"] += row.volume_usd
             else:
@@ -752,13 +772,13 @@ def summarize(rows: list[Row]) -> dict:
             # Points ratio: likewise, only if this row supplied points
             # *and* its cost belongs to the day those points were earned.
             if (row.points is not None and row.points > 0
-                    and not row.cross_day_cycles):
+                    and not row.cost_spans_two_days()):
                 arm["cost_usd_on_pointed_days"] += row.cost_usd
             else:
                 arm["cost_usd_without_points"] += row.cost_usd
         if row.points is not None:
             arm["points_seen"] = True
-            if row.cost_usd is None or row.cross_day_cycles:
+            if row.cost_usd is None or row.cost_spans_two_days():
                 # Points earned on a day whose cost is unknown, or one
                 # whose cost belongs partly to a cycle that opened
                 # yesterday. Counting them would divide a numerator and a
