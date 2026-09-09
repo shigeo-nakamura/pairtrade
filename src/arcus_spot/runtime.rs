@@ -3029,6 +3029,12 @@ impl ArcusSpotRuntime {
             // pre-event inventory (Codex P1, pairtrade#309).
             if self.state.corporate_action.is_none() && evaluation_time >= reused.entry_block_at {
                 self.record_corporate_action_progress(&reused, evaluation_time);
+                // The same tick must also apply the window's phases: after
+                // downtime this can be the only dispatchable observation in
+                // the reduce phase, and leaving it to the next tick strands
+                // an open rotation past the settlement cutoff (Codex P1,
+                // pairtrade#309).
+                return self.refused_declaration_gate(&reused, evaluation_time, price);
             }
             // Its effective phase is honoured here too, for the tick that
             // opens the record: once the cutoff is reached the venue may be
@@ -3101,7 +3107,7 @@ impl ArcusSpotRuntime {
                     })
                     .cloned()
                 {
-                    return self.refused_declaration_gate(&refused, evaluation_time);
+                    return self.refused_declaration_gate(&refused, evaluation_time, price);
                 }
                 return self.undeclared_progress_gate(
                     evaluation_time,
@@ -3517,6 +3523,7 @@ impl ArcusSpotRuntime {
         &mut self,
         event: &ArcusSpotCorporateActionEvent,
         evaluation_time: DateTime<Utc>,
+        price: &PriceContext,
     ) -> CorporateActionGate {
         if evaluation_time >= event.effective_at {
             let already = self
@@ -3529,6 +3536,38 @@ impl ArcusSpotRuntime {
                 if let Some(progress) = self.state.corporate_action.as_mut() {
                     progress.history_invalidated_at = Some(evaluation_time);
                 }
+            }
+        }
+        // The same identity gates the declared path applies: a refused
+        // declaration is still a window, and an exit sized from
+        // `rotated_quantity` must not be routed to a contract the symbol was
+        // repointed to -- nor submitted at all when there is no pinned
+        // identity to check it against (Codex P1 x2, pairtrade#309).
+        if let Some(hold) = self.corporate_action_identity_drift(event, price) {
+            return CorporateActionGate {
+                block_entry: Some(hold),
+                force_exit: false,
+                suppress_history: true,
+                suppress_exits: true,
+            };
+        }
+        if self.state.regime != ArcusSpotRegime::Neutral {
+            if let Some(symbol) = self.corporate_action_unpinned_symbol(event) {
+                return CorporateActionGate {
+                    block_entry: Some(ArcusSpotHold::new(
+                        ArcusSpotHoldCode::CorporateActionUnresolved,
+                        format!(
+                            "corporate action {} reuses a handled id and has no pre-event \
+                             identity for {symbol}, so an exit cannot be checked against the \
+                             instrument the tracked open quantity refers to; reconcile the \
+                             position",
+                            event.event_id,
+                        ),
+                    )),
+                    force_exit: false,
+                    suppress_history: evaluation_time >= event.effective_at,
+                    suppress_exits: true,
+                };
             }
         }
         let effective = evaluation_time >= event.effective_at;
@@ -8454,7 +8493,6 @@ mod tests {
         runtime.config.corporate_actions = vec![reused];
         seed_open_rotation(&mut runtime, anchor - Duration::hours(2));
         let later = anchor + Duration::seconds(18); // past effective_at (+17s)
-        let samples_before = runtime.state.relative_log_price_history.len();
         let outcome = runtime.step_at(&snapshot_with_valid_row(later), later);
         assert!(
             matches!(outcome.decision, ArcusSpotDecision::Observe { .. }),
@@ -8462,10 +8500,9 @@ mod tests {
             outcome.decision
         );
         assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
-        assert_eq!(
-            runtime.state.relative_log_price_history.len(),
-            samples_before,
-            "no post-event prints"
+        assert!(
+            runtime.state.relative_log_price_history.is_empty(),
+            "past its cutoff the refused window discards the pre-event window and adds nothing"
         );
     }
 
@@ -8563,6 +8600,71 @@ mod tests {
             Some(HandledMatch::ReusedId),
             "a frozen resolution must not be reconsidered",
         );
+    }
+
+    /// A runtime whose handled record names this window's id under a
+    /// *different* event's fingerprint: the declaration is refused, and the
+    /// window is still a window.
+    fn runtime_with_reused_id_window(anchor: DateTime<Utc>) -> ArcusSpotRuntime {
+        let mut runtime = ArcusSpotRuntime::new(cfg_with_window_at(anchor)).unwrap();
+        runtime.state.handled_corporate_action_ids =
+            vec![runtime.config.corporate_actions[0].event_id.clone()];
+        runtime.state.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        runtime.state.relative_log_price_history = vec![(200.0_f64 / 100.0_f64).ln(); 3];
+        runtime
+    }
+
+    #[test]
+    fn a_reused_id_window_unwinds_on_the_tick_that_opens_its_record() {
+        // After downtime the first observation can land in the reduce phase
+        // and be the only dispatchable one. The tick that creates the
+        // progress record must therefore apply the window's phases too.
+        let anchor = event_time();
+        let mut runtime = runtime_with_reused_id_window(anchor);
+        seed_open_rotation(&mut runtime, anchor);
+        assert_eq!(runtime.state.corporate_action, None);
+
+        // reduce_exit_at is +2s and effective_at +4s.
+        let reduce = anchor + Duration::seconds(3);
+        match runtime
+            .step_at(&snapshot_with_valid_row(reduce), reduce)
+            .decision
+        {
+            ArcusSpotDecision::SimulatedFill { plan } => {
+                assert_eq!(plan.trigger, ArcusSpotRotationTrigger::CorporateActionExit)
+            }
+            other => panic!("expected the reduce phase to unwind on this tick, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::Neutral);
+        assert!(
+            runtime.state.corporate_action.is_some(),
+            "the window is recorded"
+        );
+    }
+
+    #[test]
+    fn a_reused_id_window_will_not_exit_against_a_repointed_ticker() {
+        let anchor = event_time();
+        let mut runtime = runtime_with_reused_id_window(anchor);
+        // A pre-window observation pins the identity.
+        runtime.step_at(
+            &snapshot_with_valid_row(anchor - Duration::seconds(1)),
+            anchor - Duration::seconds(1),
+        );
+        seed_open_rotation(&mut runtime, anchor);
+
+        let reduce = anchor + Duration::seconds(3);
+        let outcome = runtime.step_at(&snapshot_with_relisted_token_a(reduce), reduce);
+        match outcome.decision {
+            ArcusSpotDecision::Observe { hold } => assert_eq!(
+                hold.code,
+                ArcusSpotHoldCode::CorporateActionUnresolved,
+                "{}",
+                hold.detail
+            ),
+            other => panic!("expected the relisting to hold, got {other:?}"),
+        }
+        assert_eq!(runtime.state.regime, ArcusSpotRegime::RotatedAToB);
     }
 
     #[test]
