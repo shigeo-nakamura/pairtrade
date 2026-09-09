@@ -19,6 +19,12 @@
 //! stranded position is worse). Paper fill, pre-send drift guard and live
 //! send now all read `slippage_bps` as the same number against the same
 //! mid.
+//!
+//! The two exit branches deliberately keep the *percentage* send, because
+//! their contract is "this gets flat" rather than "this respects the
+//! bound": only the connector, pricing off the book at submit time and
+//! adding its own tick, can guarantee an IOC crosses. An absolute price
+//! computed here is a snapshot, and a snapshot can be behind the book.
 
 use dex_connector::OrderSide;
 
@@ -39,10 +45,16 @@ pub enum SendLimit {
     /// absolute limit price. The venue may only round it *inward*.
     Bounded(f64),
     /// Reduce-only on a book whose touch sits outside the bound: cross at
-    /// the opposing touch. Still a bound -- the best offer, not the
-    /// venue's ±20 % protection price -- and a position left inside a tear
-    /// is the worse outcome.
-    AtTouch(f64),
+    /// the touch, and let the **connector** price that from its own live
+    /// read (`create_order_taker_ioc` at its 1 bp minimum) rather than
+    /// from the observation here. This branch has already given up the
+    /// mid bound -- its one job is that the position gets flat -- so it
+    /// wants the guarantee the percentage path carries and the absolute
+    /// one cannot: the venue prices off the book at submit time, and adds
+    /// its own tick, so the order always crosses. Still a bound (the best
+    /// offer, not the venue's ±20 % protection price), and a position
+    /// left inside a tear is the worse outcome.
+    AtTouch,
     /// Reduce-only with no usable book of our own: there is no observation
     /// to price against, so fall back to the touch-relative
     /// `create_order_taker_ioc` with the configured bound against the
@@ -115,7 +127,7 @@ pub fn send_limit_price(
         return Ok(SendLimit::Bounded(limit));
     }
     if reduce_only {
-        return Ok(SendLimit::AtTouch(cross));
+        return Ok(SendLimit::AtTouch);
     }
     Err(format!(
         "the {bound_bps}bps bound from mid={mid} stops at {limit} and does not reach the touch \
@@ -189,11 +201,11 @@ mod tests {
         assert!(e.contains("bid=90") && e.contains("ask=110"), "{e}");
         assert_eq!(
             send_limit_price(50, 100.0, Some((90.0, 110.0)), Long, true),
-            Ok(SendLimit::AtTouch(110.0))
+            Ok(SendLimit::AtTouch)
         );
         assert_eq!(
             send_limit_price(50, 100.0, Some((90.0, 110.0)), Short, true),
-            Ok(SendLimit::AtTouch(90.0))
+            Ok(SendLimit::AtTouch)
         );
         // Exactly at the touch is marketable: a limit resting on the
         // opposing touch still crosses, so it is sent rather than
@@ -272,8 +284,7 @@ mod tests {
                             };
                             assert!(inside, "{side:?} bound={bound} half={half_bps} p={p}");
                         }
-                        SendLimit::AtTouch(p) => {
-                            assert_eq!(p, cross);
+                        SendLimit::AtTouch => {
                             // AtTouch only where the bound genuinely does
                             // not reach; otherwise it would be a silent
                             // widening of every send.

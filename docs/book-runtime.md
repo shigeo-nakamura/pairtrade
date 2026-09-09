@@ -253,10 +253,14 @@ reduce_only }`.
   seen for the symbol (a ticker-priced adopted leg, or a crossed book),
   an **entry is not sent** — reported as a pre-send abort, no attempt
   spent, re-planned next tick — while a **reduce-only order still goes
-  out**: at the opposing touch on a torn book, or, with no book of our
-  own to price against, with the configured bps against the venue's own
-  touch (`create_order_taker_ioc`, the one remaining percentage path),
-  because a position left inside a tear is the worse outcome. The
+  out**, because a position left inside a tear is the worse outcome.
+  Both exit branches deliberately keep the *percentage* send
+  (`create_order_taker_ioc`), since their contract is "this gets flat"
+  rather than "this respects the bound", and only the connector — pricing
+  off the book at submit time and adding its own tick — can guarantee an
+  IOC crosses: **1 bp** (its minimum, i.e. at the venue's own touch) when
+  the bound does not reach a book we did see, the **configured bps** when
+  we saw no usable book at all. The
   absolute-limit path carries **no staleness gate inside the connector**
   (there is no reference price there to age-check), so freshness is the
   runtime's own: the quote must be a WS update under

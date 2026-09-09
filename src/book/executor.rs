@@ -17,7 +17,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use dex_connector::{DexConnector, OrderSide, PositionSnapshot};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -329,6 +329,10 @@ enum SendPrice {
     TouchRelative(u32),
 }
 
+/// The connector's minimum allowance, i.e. "cross at your own touch".
+/// What [`SendLimit::AtTouch`] asks for.
+const AT_TOUCH_BPS: u32 = 1;
+
 /// What to call the connector with for one intent, from the quote
 /// snapshot the drift guard judged (bot-strategy#978).
 ///
@@ -349,13 +353,13 @@ fn send_price(
 ) -> Result<SendPrice> {
     match send_limit_price(slippage_bps, mid, touch, side, intent.reduce_only) {
         Ok(SendLimit::Bounded(limit)) => Ok(SendPrice::At(price_decimal(limit, intent)?)),
-        Ok(SendLimit::AtTouch(limit)) => {
+        Ok(SendLimit::AtTouch) => {
             log::warn!(
-                "[EXEC] {} {}: the slippage_bps={slippage_bps} bound from mid={mid} does not reach the touch; reduce-only crosses at {limit} to get flat",
+                "[EXEC] {} {}: the slippage_bps={slippage_bps} bound from mid={mid} does not reach the touch {touch:?}; reduce-only crosses at the venue's own touch to get flat",
                 intent.side,
                 intent.symbol,
             );
-            Ok(SendPrice::At(price_decimal(limit, intent)?))
+            Ok(SendPrice::TouchRelative(AT_TOUCH_BPS))
         }
         Ok(SendLimit::Unchecked) => {
             log::warn!(
@@ -575,13 +579,19 @@ fn decimal(v: f64) -> Result<Decimal> {
     Decimal::from_f64_retain(v).ok_or_else(|| anyhow!("{v} is not representable as Decimal"))
 }
 
-/// A limit price as a `Decimal`, at full `f64` precision -- the connector
-/// is the one that rounds it to the venue tick, and it rounds *inward*, so
-/// rounding here first could only lose that guarantee. A price that cannot
-/// be represented aborts before the send rather than falling back to a
-/// wider one.
+/// A limit price as a `Decimal`, via `from_f64` (the shortest decimal the
+/// `f64` represents) and **not** `from_f64_retain` (its full binary
+/// expansion). The connector rounds the price *inward* to the venue tick,
+/// so a value that is an ULP under a tick boundary loses a whole tick:
+/// `from_f64_retain(1700.1)` is `1700.0999999999999090505298222`, which
+/// truncates to `1700.0` at one price decimal -- a tick below the ask, an
+/// order that rests instead of crossing (pairtrade#315 Codex round 2).
+/// `from_f64` recovers `1700.1`. Its own rounding is half an ULP,
+/// ~1e-16 relative, which the tick rounding then dominates. A price that
+/// cannot be represented aborts before the send rather than falling back
+/// to a wider one.
 fn price_decimal(v: f64, intent: &OrderIntent) -> Result<Decimal> {
-    Decimal::from_f64_retain(v).ok_or_else(|| {
+    Decimal::from_f64(v).ok_or_else(|| {
         anyhow!(PreSendAbort(format!(
             "{}: limit price {v} is not representable as Decimal",
             intent.symbol
@@ -1039,17 +1049,37 @@ mod tests {
     fn a_live_send_carries_the_mid_relative_bound_as_an_absolute_limit() {
         let buy = intent("SOL", Side::Buy, 1.0, false);
         // A 10 bps bound on a 100.0 mid is 100.1, whatever the venue's
-        // touch has become by the time it reads its own book.
+        // touch has become by the time it reads its own book -- and it is
+        // the decimal 100.1, not the f64's binary expansion
+        // 100.09999999999999431565811388, which the venue's inward tick
+        // rounding would truncate.
         assert_eq!(
             send_price(10, 100.0, Some((99.99, 100.01)), OrderSide::Long, &buy).unwrap(),
-            SendPrice::At(Decimal::from_f64_retain(100.1).unwrap())
+            SendPrice::At(Decimal::from_str_exact("100.1").unwrap())
         );
-        // Reduce-only on a book the bound does not reach: the opposing
-        // touch, still a price and still not the venue's protection band.
+        // A price that is not exactly representable in binary must still
+        // survive the connector's inward tick rounding: `from_f64_retain`
+        // would hand over 1700.0999999999999090505298222, which truncates
+        // a whole tick below the 1700.1 ask and never crosses
+        // (pairtrade#315 Codex round 2).
+        let fine = intent("SNDK", Side::Buy, 1.0, false);
+        let SendPrice::At(px) =
+            send_price(10, 1698.402, Some((1700.0, 1700.1)), OrderSide::Long, &fine).unwrap()
+        else {
+            panic!("expected an absolute limit")
+        };
+        assert_eq!(
+            px.round_dp_with_strategy(1, rust_decimal::RoundingStrategy::ToZero),
+            Decimal::from_str_exact("1700.1").unwrap(),
+            "the venue's inward tick rounding must not drop a tick: {px}"
+        );
+        // Reduce-only on a book the bound does not reach: the connector
+        // prices it from its own live touch at the minimum allowance,
+        // because only it can guarantee the exit crosses.
         let sell = intent("SOL", Side::Sell, 1.0, true);
         assert_eq!(
             send_price(10, 100.0, Some((90.0, 110.0)), OrderSide::Short, &sell).unwrap(),
-            SendPrice::At(Decimal::from_f64_retain(90.0).unwrap())
+            SendPrice::TouchRelative(AT_TOUCH_BPS)
         );
         // Reduce-only with no book at all is the one case that still
         // hands the venue a percentage, because there is nothing here to

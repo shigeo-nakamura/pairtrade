@@ -141,7 +141,10 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   fresh clock, within `ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS`, current
   feed generation, not future-dated. An entry priced off anything else is
   refused; an **exit** falls back to `create_order_taker_ioc` against the
-  connector's own live touch (logged as `[EXIT] no usable book ...`).
+  connector's own live touch (logged as `[EXIT] no usable book ...`), as
+  does the torn-book exit whose mid bound does not reach the book — at
+  the connector's 1 bp minimum there, since only a venue-priced IOC is
+  guaranteed to cross.
   That fallback is not cosmetic: `maybe_exit` deliberately closes on
   prices too stale to enter on, and an absolute limit off a dead quote
   does not re-anchor the way the old percentage did — a stopped feed
