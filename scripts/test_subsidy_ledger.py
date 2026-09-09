@@ -632,6 +632,84 @@ def test_an_equity_only_or_points_only_date_still_appears():
     assert arm["points"] == 0.0
 
 
+def test_a_non_finite_notional_is_a_gap_not_a_value():
+    """`float()` accepts "Infinity" and "NaN"; neither is a volume.
+
+    An infinite denominator reports a real cost as $0.00 per $1M, and a
+    NaN spreads into every total and leaves `--out` holding non-standard
+    JSON -- while the day still presents as fully covered.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(
+            Path(tmp) / "execution-debot-pair-robinhood-lighter_20260908.jsonl",
+            [
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": 10_000.0, "filled_qty": 1.0},
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": "Infinity", "filled_qty": 2.0},
+                {"event": "leg_fill", "ts_ms": TS * 1000, "variant": "freq",
+                 "fill_value": "NaN", "filled_qty": 3.0},
+            ],
+        )
+        day = load_execution([path])[("2026-09-08", "freq")]
+        assert day.volume_usd == 10_000.0, day.volume_usd
+        assert day.fills == 1
+        assert day.fills_without_value == 2
+
+
+def test_an_observed_funding_tick_beats_the_interval_test():
+    """The row's own tick count is evidence; the timestamps are inference.
+
+    A rounded or stale `hold_secs`/`ts` can make a row that met a tick
+    look like it stayed inside one funding hour, and the missing carry
+    would then be read as a real zero.
+    """
+    inside_the_hour = 1788868800 + 1800  # 12:30 UTC, 600s hold crosses nothing
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 600, "funding_ticks_observed": 2}],
+        )
+        day = load_pnl([path])[("2026-09-08", "freq")]
+        assert day.incomplete and day.incomplete_reasons == {"funding_gap"}, day.incomplete_reasons
+
+        # Zero observed ticks on a hold that met no boundary is still a
+        # real zero, not a gap.
+        clean = pnl_file(
+            Path(tmp),
+            [{"ts": inside_the_hour, "source": "exit_fill", "pnl": -5.0,
+              "hold_secs": 600, "funding_ticks_observed": 0}],
+            arm="b",
+        )
+        assert not load_pnl([clean])[("2026-09-08", "b")].incomplete
+
+
+def test_negative_points_are_refused_rather_than_mixed_into_the_denominator():
+    """A typo in the hand-written points file must not move the rate.
+
+    The numerator requires points > 0, so a negative row's cost is
+    excluded while its points still shrank the denominator: $100/1000
+    beside $100/-500 reported $0.20 per point, a number about neither day.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(Path(tmp) / "points.jsonl", [
+            {"date": "2026-09-08", "arm": "freq", "points": 1000.0},
+            {"date": "2026-09-07", "arm": "freq", "points": -500.0},
+        ])
+        try:
+            load_points(path)
+        except SubsidyLedgerError as error:
+            assert "non-negative" in str(error), error
+        else:
+            raise AssertionError("a negative points row should raise")
+
+        # Zero is legal: it means the day earned none.
+        zero = write(Path(tmp) / "zero.jsonl",
+                     [{"date": "2026-09-08", "arm": "freq", "points": 0.0}])
+        assert load_points(zero) == {("2026-09-08", "freq"): 0.0}
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

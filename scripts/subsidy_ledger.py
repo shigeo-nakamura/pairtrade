@@ -65,6 +65,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -225,7 +226,15 @@ def load_execution(paths: Iterable[Path]) -> dict[tuple[str, str], ExecDay]:
                     # and its value is missing. Counting it as a valued
                     # fill of $0 leaves the day marked complete on a
                     # denominator that is short by that fill.
-                    if value == 0.0 and quantity_moved(record):
+                    #
+                    # `float()` also accepts "Infinity" and "NaN", which
+                    # are not values either: an infinite denominator
+                    # reports a real cost as $0.00 per $1M, and a NaN
+                    # spreads into every total and out of `--out` as
+                    # non-standard JSON. Both are the same gap.
+                    if not math.isfinite(value):
+                        day.fills_without_value += 1
+                    elif value == 0.0 and quantity_moved(record):
                         day.fills_without_value += 1
                     else:
                         day.volume_usd += value
@@ -325,7 +334,13 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
             day.cycles += 1
             funding = record.get("funding_carry_usd")
             if funding is None:
-                if spans_a_funding_interval(record):
+                # A positive `funding_ticks_observed` is the row's own
+                # evidence that funding happened, and it beats any
+                # inference from timestamps: rounded or stale `hold_secs`
+                # / `ts` can make a row that met a tick look like it
+                # stayed inside one hour, and the missing carry would
+                # then be read as a real zero (Codex, PR #297).
+                if funding_ticks_seen(record) or spans_a_funding_interval(record):
                     day.incomplete = True
                     day.incomplete_reasons.add("funding_gap")
                 continue
@@ -340,6 +355,18 @@ def load_pnl(paths: Iterable[Path]) -> dict[tuple[str, str], PnlDay]:
                 day.incomplete = True
                 day.incomplete_reasons.add("funding_gap")
     return dict(days)
+
+
+def funding_ticks_seen(record: dict) -> bool:
+    """Does the row itself say a funding tick landed inside its life?"""
+    ticks = record.get("funding_ticks_observed")
+    if ticks is None:
+        return False
+    try:
+        return float(ticks) > 0
+    except (TypeError, ValueError):
+        # An unreadable tick count is not evidence of zero either.
+        return True
 
 
 def spans_a_funding_interval(record: dict) -> bool:
@@ -469,10 +496,22 @@ def load_points(path: Path | None) -> dict[tuple[str, str], float]:
             raise SubsidyLedgerError(
                 f"{path}: a points row needs date, arm and points; got {record!r}")
         try:
-            points[(str(date), str(arm))] = float(value)
+            parsed = float(value)
         except (TypeError, ValueError) as error:
             raise SubsidyLedgerError(
                 f"{path}: unreadable points value {value!r} for {date}/{arm}") from error
+        # A negative or non-finite count is a typo in a hand-written
+        # file, and a silent one: the row's cost is excluded from
+        # `cost_per_point` (the numerator requires points > 0) while its
+        # points still moved the denominator, so $100/1000 beside
+        # $100/-500 reported $0.20 per point -- a number about neither
+        # day. Zero stays legal: it means "no points that day"
+        # (Codex, PR #297).
+        if not math.isfinite(parsed) or parsed < 0:
+            raise SubsidyLedgerError(
+                f"{path}: points must be a finite, non-negative number; "
+                f"got {value!r} for {date}/{arm}")
+        points[(str(date), str(arm))] = parsed
     return points
 
 
