@@ -381,16 +381,25 @@ At `resume_not_before` the runtime resumes only when all three hold:
    `post_event_inventory` describes a wallet, and adopting it over an open
    position would overwrite the holding `rotated_quantity` refers to.
 
-   **Reconciling an open rotation.** The runtime has no command that
-   flattens *tracked* rotation state, so this is a two-step operator action:
-   (a) close the position on the venue by hand, in post-event units, and
-   record the fill in the execution ledger's terms; (b) restore the runtime
-   checkpoint to a backup taken before the rotation opened (or correct
-   `regime`/`rotated_quantity`/`last_rotation_at` to flat under
-   `state-verify-continuity`), then install the config with
-   `post_event_inventory` set to the wallet as read *after* (a). The next
-   tick at or after `resume_not_before` resumes normally. Never edit the
-   checkpoint to flat while the venue position is still open.
+   **Reconciling an open rotation -- read this before declaring a window.**
+   There is currently **no supported way to return the tracked state to
+   flat** once a rotation is caught by `effective_at`. Editing
+   `regime`/`rotated_quantity` at the same sequence is rejected by
+   continuity verification (a position change with no ledger attempt), and
+   restoring a pre-rotation checkpoint leaves its sequence behind the
+   event-stream tail, which the next append -- and `reset-window` -- refuse.
+   The runtime stays on `corporate_action_unresolved`, trading nothing,
+   until bot-strategy#977 lands: an atomic `reconcile-position` command that
+   records the operator's manual close in the ledger, appends the stream
+   event, moves the runtime to flat in post-event units and lets the
+   ordinary resume run. Until then the hold is a wedge that needs that
+   command, and it is still the correct outcome -- the alternative is an
+   exit sized in the wrong units. The mitigation is upstream of it: set
+   `reduce_exit_at` with **real margin** before `effective_at` for the venue
+   not quoting (the forced exit retries every tick through that phase), and
+   do not open a window with a rotation you cannot afford to have stuck. If
+   it happens anyway, close the position on the venue by hand, in post-event
+   units, keep the evidence, and wait for #977 rather than editing state.
 2. **Unchanged token identity.** Each affected symbol's contract address and
    decimals are compared against what they were on the last observation
    *before* the window opened. A mismatch holds on
@@ -403,13 +412,17 @@ At `resume_not_before` the runtime resumes only when all three hold:
    calendar installed mid-window on a runtime that kept ticking holds an
    identity from inside the event, and pinning that would compare the new
    contract against itself.
-3. **`post_event_inventory` supplied.** Otherwise it holds on
-   `corporate_action_resume_pending`. It must also sit at or above
-   `inventory_floors`: the resume persists it, and every later checkpoint
-   load re-checks it, so a reverse split or partial redemption that shrinks a
-   leg below its floor has to move the floor in the same config change. The
-   config is refused otherwise, which turns what would be a wedged
-   `live-tick` one tick later into a visible edit now.
+3. **`post_event_inventory` supplied, at or above `inventory_floors`.**
+   Otherwise it holds on `corporate_action_resume_pending` -- for a missing
+   holding, and equally for one below a floor. The floor comparison is made
+   **at the resume, not at install**: `hash-config` and deploy accept a
+   reconciliation under a floor (a completed event's historical holding must
+   not veto a later floor increase), and the runtime then declines to persist
+   it, naming both the holding and the floors in the hold. A reverse split or
+   partial redemption that shrinks a leg below its floor therefore needs the
+   floor lowered -- or the quantity corrected -- in a follow-up install; the
+   resume completes on the next tick after it. Watch the hold code after
+   installing a reconciliation rather than assuming the install validated it.
 
 On resume the reconciled holding replaces the tracked inventory **and both
 risk baskets are re-anchored to it**. They are buy-and-hold counterfactuals
