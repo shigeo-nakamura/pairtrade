@@ -1117,7 +1117,7 @@ def build_rows(
     return rows
 
 
-def summarize(rows: list[Row]) -> dict:
+def summarize(rows: list[Row], points_input: bool | None = None) -> dict:
     """Totals per arm, plus how much volume has no cost source at all.
 
     `uncosted_volume_usd` is the honest caveat on every ratio below it: a
@@ -1201,7 +1201,12 @@ def summarize(rows: list[Row]) -> dict:
         arm["volume_usd"] = add_or_none(arm["volume_usd"], row.volume_usd)
         arm["fills_without_value"] += row.fills_without_value or 0
         arm["cross_day_cycles"] += row.cross_day_cycles
-        if row.fills_without_value or row.cost_spans_two_days():
+        # Only days that actually reported an unvalued fill: the renderer
+        # says "N fill(s) across M day(s) reported no value", and a
+        # cross-day day's volume *is* measured. Sharing the counter made
+        # that sentence describe days it does not apply to
+        # (Codex, PR #297).
+        if row.fills_without_value:
             arm["incomplete_volume_days"] += 1
         if row.cost_usd is None:
             arm["uncosted_volume_usd"] = add_or_none(arm["uncosted_volume_usd"], row.volume_usd)
@@ -1306,12 +1311,26 @@ def summarize(rows: list[Row]) -> dict:
         # the ordinary `--points`-less run, and printed "unknown of cost
         # fell on days with no points supplied" under a known total cost
         # (Codex, PR #297).
-        arm["points_supplied"] = bool(arm["points_seen"])
+        # `points_input` is whether the *caller* gave a points file;
+        # `points_seen` is whether this arm had a row in it. They differ
+        # exactly when the export omits an arm, and that omission is
+        # something the operator needs told rather than hidden by
+        # suppressing the section (Codex, PR #297). `None` means the
+        # caller did not say, so fall back to the per-arm fact.
+        arm["points_supplied"] = (
+            bool(arm["points_seen"]) if points_input is None else points_input
+        )
         if not arm["points_seen"]:
+            # `points` and `uncosted_points` are genuinely absent for
+            # this arm, so `None` is the honest value. The *cost*
+            # subtotals are not absent -- they are real dollars that fell
+            # on days with no points -- and nulling them printed
+            # "unknown of cost fell on days with no points supplied"
+            # whenever the section was shown. Hiding them was a display
+            # concern, and `points_supplied` handles that now
+            # (Codex, PR #297).
             arm["points"] = None
             arm["uncosted_points"] = None
-            arm["cost_usd_without_points"] = None
-            arm["cost_usd_cross_day_points"] = None
         elif arm["uncosted_points"] is not None:
             arm["uncosted_points"] = round(arm["uncosted_points"], 6)
         del arm["points_seen"]
@@ -1480,7 +1499,14 @@ def render_table(rows: list[Row], summary: dict) -> str:
                 f"         no price per point: the day(s) that supplied points carry a "
                 f"cost earned against another day ({cross_day_reason(arm, 'points')})"
             )
-        elif arm["points"] is not None:
+        elif arm["points"] is None:
+            # A points file was given (or the section would have been
+            # skipped) and it holds nothing for this arm. Saying nothing
+            # would hide that the export omitted it (Codex, PR #297).
+            out.append(
+                "         no price per point: the points file supplied none for this arm"
+            )
+        else:
             # No rate is exactly when the reader most needs to be told
             # why: points and cost landing on different days is the
             # normal cause, and suppressing the diagnostics with the rate
@@ -1610,7 +1636,7 @@ def main(argv: list[str] | None = None) -> int:
         equity_costs[arm] = equity_daily_costs(read_jsonl(Path(path)))
 
     rows = build_rows(execution, pnl, equity_costs, load_points(args.points))
-    summary = summarize(rows)
+    summary = summarize(rows, points_input=args.points is not None)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with args.out.open("w", encoding="utf-8") as handle:

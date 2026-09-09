@@ -1540,6 +1540,15 @@ def test_a_run_without_points_says_nothing_about_points():
     assert "point" not in printed.split("money up):")[1], printed
     assert "unknown" not in printed, printed
 
+    # A points file that omits this arm is a third state, and it must
+    # NOT be silently hidden: the operator asked for the KPI and their
+    # export left this arm out (Codex, PR #297).
+    omitted = render_table(rows, summarize(rows, points_input=True))
+    assert "the points file supplied none for this arm" in omitted, omitted
+    # ... and the cost subtotal it prints is a real number, not "unknown".
+    assert "$40.00 of cost fell on days with no points supplied" in omitted, omitted
+    assert "unknown" not in omitted, omitted
+
     # With points supplied the section comes back.
     pointed = build_rows(
         {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=500_000.0)},
@@ -1711,6 +1720,22 @@ def test_a_total_that_overflows_is_a_gap_not_an_infinity():
     cross_rows = build_rows(cross, cross_pnl)
     cross_printed = render_table(cross_rows, summarize(cross_rows))
     assert "not aligned with the cost" in cross_printed, cross_printed
+    # The unvalued-fill sentence counts only days that had one. A
+    # cross-day day's volume is measured, so it must not be counted into
+    # "N fill(s) across M day(s) reported no value" (Codex, PR #297).
+    both = {("2026-09-08", "freq"): ExecDay(fills=1, volume_usd=100.0,
+                                            fills_without_value=1),
+            ("2026-09-09", "freq"): ExecDay(fills=1, volume_usd=100.0)}
+    both_pnl = {("2026-09-08", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                               funding_seen=True),
+                ("2026-09-09", "freq"): PnlDay(cycles=1, realized_pnl_usd=-1.0,
+                                               funding_seen=True, cross_day_cycles=1)}
+    both_arm = summarize(build_rows(both, both_pnl))["arms"][0]
+    assert both_arm["incomplete_volume_days"] == 1, both_arm
+    assert both_arm["days_cross_day_volume"] == 1, both_arm
+    both_printed = render_table(build_rows(both, both_pnl),
+                                summarize(build_rows(both, both_pnl)))
+    assert "1 fill(s) across 1 day(s) reported no value" in both_printed, both_printed
     assert "opened the day before" in cross_printed, cross_printed
     assert "no costed day has fully measured volume" not in cross_printed, cross_printed
     # The table must not call the same rows measured and unmeasured.
