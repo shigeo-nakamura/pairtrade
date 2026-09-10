@@ -13,7 +13,9 @@
 //! `BOOK_CONFIRM_LIVE=yes-i-mean-it` is set (two-variable rule, same as
 //! `engine_b_live`). Live execution is Lighter-only until dex-connector
 //! grows a perp IOC path for Hyperliquid (its `create_order_taker_ioc` is
-//! spot-only as of v4.7.20).
+//! spot-only as of v4.7.20, and `create_order_taker_ioc_at` -- the
+//! absolute-limit send this runtime uses, bot-strategy#978 -- is Lighter
+//! -only as of v4.7.24).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

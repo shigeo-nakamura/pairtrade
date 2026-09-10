@@ -150,10 +150,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
-use debot::trade::execution::slippage::mid_relative_slippage_bps;
+use debot::trade::execution::slippage::{send_limit_price, SendLimit};
 use dex_connector::{DexConnector, OrderSide, PositionSnapshot, PriceUpdate};
 use reqwest::Client;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -186,6 +186,10 @@ fn init_logger() {
         })
         .init();
 }
+
+/// The connector's minimum allowance, i.e. "cross at your own touch".
+/// What [`SendLimit::AtTouch`] asks for (bot-strategy#978).
+const AT_TOUCH_BPS: u32 = 1;
 
 fn now_us() -> i64 {
     SystemTime::now()
@@ -3145,93 +3149,155 @@ impl EngineBLiveEngine {
         self.persist_state();
     }
 
-    /// The touch-relative `slippage_bps` to send with, derived from the
-    /// configured mid-relative bound and the observed half-spread
-    /// (bot-strategy#918). Computed before the DRY_RUN branch so a
+    /// The price bound one send carries, from the configured mid-relative
+    /// `slippage_bps` and the book this process observed itself
+    /// (bot-strategy#918, #978). Computed before the DRY_RUN branch so a
     /// DRY_RUN session exercises the same refusal the live one would.
     ///
-    /// The book shape is read from this process's own feed, not the
-    /// connector's cache -- both are fed by the same Lighter WS, and a
-    /// small disagreement can only make the sent bound tighter than the
-    /// mid-relative budget, never wider.
-    fn send_bound_bps(&self, side: OrderSide, reduce_only: bool) -> Result<u32> {
-        let touch = self
-            .feed
-            .lock()
-            .unwrap()
-            .latest
-            .get(&self.cfg.us_primary_symbol)
-            .map(|o| (o.best_bid, o.best_ask));
-        let Some((best_bid, best_ask)) = touch else {
-            // An entry cannot reach this: `maybe_enter` requires fresh
-            // prices for the traded symbol before it sizes anything.
-            if !reduce_only {
-                anyhow::bail!(
-                    "no observed book for {} -- refusing to send an entry whose price bound \
-                     cannot be checked against the mid",
-                    self.cfg.us_primary_symbol
-                );
-            }
-            // An exit can: `maybe_exit` deliberately closes on prices too
-            // stale to enter on, and a missing observation must not
-            // strand a position. The connector still bounds from its own
-            // touch.
-            log::warn!(
-                "[EXIT] no observed book for {}; sending the configured {}bps against the \
-                 connector's own touch without a half-spread allowance",
-                self.cfg.us_primary_symbol,
-                self.cfg.slippage_bps
-            );
-            return Ok(self.cfg.slippage_bps);
+    /// The quote is read from this process's own feed, not the
+    /// connector's cache: this is the side that knows how fresh its
+    /// observation is, and an absolute limit derived from it is not
+    /// re-anchored on whatever the venue's touch has become by submit
+    /// time -- which is the window #918 had to leave open.
+    fn send_limit(&self, side: OrderSide, reduce_only: bool) -> Result<SendLimit> {
+        // A *fresh* clock, not the tick's start time: the eligibility
+        // fetch, the position read and the awaits before this can take
+        // seconds, and the question here is whether the observation is
+        // still good at the moment of the send.
+        let now_us = self.now();
+        // Usability is not optional on this path, and it is the whole of
+        // pairtrade#315's P1. `maybe_exit` deliberately closes on prices
+        // too stale to *enter* on -- but an absolute limit derived from a
+        // stale mid does not re-anchor the way the old percentage did: if
+        // the market has left it behind, every reduce-only IOC comes back
+        // unmarketable and the next tick reuses the same dead quote,
+        // because a stopped feed keeps handing out the same observation.
+        // So an observation that is stale, future-dated or from an older
+        // feed generation is treated as no book, which routes the exit to
+        // the connector's own live touch (`Unchecked`).
+        //
+        // Generation is read under the same lock as the observation
+        // (pairtrade#289 Codex round 6): taking them separately races the
+        // feed task.
+        let observed = {
+            let feed = self.feed.lock().expect("price feed mutex");
+            let generation = feed.generation;
+            feed.latest
+                .get(&self.cfg.us_primary_symbol)
+                .filter(|o| o.is_usable(now_us, generation, self.cfg.max_price_staleness_secs))
+                .map(|o| (o.mid, o.best_bid, o.best_ask))
         };
-        match mid_relative_slippage_bps(self.cfg.slippage_bps, best_bid, best_ask, side) {
-            Some(bps) => Ok(bps),
-            None if reduce_only => {
+        // Nothing usable: `mid` is absent alongside the touch, and the
+        // helper reads that as the no-usable-book case. An entry cannot
+        // normally reach it (`maybe_enter` requires fresh prices for the
+        // traded symbol before it sizes anything), and if the quote went
+        // stale between that sizing and this send, refusing is the point.
+        let (mid, touch) = match observed {
+            Some((mid, bid, ask)) => (mid, Some((bid, ask))),
+            None => (f64::NAN, None),
+        };
+        let limit = send_limit_price(self.cfg.slippage_bps, mid, touch, side, reduce_only)
+            .map_err(|reason| anyhow::anyhow!("{}: {reason}", self.cfg.us_primary_symbol))?;
+        match limit {
+            SendLimit::AtTouch => {
                 // Crossing at the touch is the true cost of immediacy on
                 // a torn book, and it is still a bound: the best offer,
                 // not the +/-20% the venue would have allowed. Holding an
-                // unclosed position through a tear is the worse outcome.
+                // unclosed position through a tear is the worse outcome,
+                // which is why the connector -- not this snapshot --
+                // prices it.
                 log::warn!(
-                    "[EXIT] {} half-spread exceeds the {}bps bound (bid={best_bid} ask={best_ask}); \
-                     crossing at the touch to get flat",
+                    "[EXIT] {} the {}bps bound from mid={mid} does not reach the touch \
+                     ({touch:?}); crossing at the venue's own touch to get flat",
                     self.cfg.us_primary_symbol,
                     self.cfg.slippage_bps
                 );
-                Ok(1)
             }
-            None => anyhow::bail!(
-                "{} half-spread exceeds the {}bps bound (bid={best_bid} ask={best_ask}): \
-                 no entry price within the bound",
-                self.cfg.us_primary_symbol,
-                self.cfg.slippage_bps
-            ),
+            SendLimit::Unchecked => {
+                log::warn!(
+                    "[EXIT] no usable book for {} ({}); sending the configured {}bps against \
+                     the connector's own live touch instead of an absolute limit",
+                    self.cfg.us_primary_symbol,
+                    self.freshness_debug(now_us),
+                    self.cfg.slippage_bps
+                );
+            }
+            SendLimit::Bounded(_) => {}
         }
+        Ok(limit)
     }
 
     async fn submit_order(&self, side: OrderSide, size: f64, reduce_only: bool) -> Result<Decimal> {
         let size_dec = Decimal::from_str(&format!("{size:.8}")).context("size to Decimal")?;
-        let bound_bps = self.send_bound_bps(side, reduce_only)?;
+        let bound = self.send_limit(side, reduce_only)?;
+        let described = match bound {
+            SendLimit::Bounded(p) => format!(
+                "as a taker IOC limited at {p} ({}bps from the mid)",
+                self.cfg.slippage_bps
+            ),
+            SendLimit::AtTouch => format!(
+                "as a taker IOC bounded {AT_TOUCH_BPS}bps from the connector's own touch \
+                 (the {}bps mid bound does not reach it)",
+                self.cfg.slippage_bps
+            ),
+            SendLimit::Unchecked => format!(
+                "as a taker IOC bounded {}bps from the connector's own touch",
+                self.cfg.slippage_bps
+            ),
+        };
         if self.cfg.dry_run {
             log::info!(
-                "[DRY_RUN] would submit {side} size={size_dec} reduce_only={reduce_only} symbol={} \
-                 as a taker IOC bounded {bound_bps}bps from the touch \
-                 ({}bps from the mid)",
+                "[DRY_RUN] would submit {side} size={size_dec} reduce_only={reduce_only} symbol={} {described}",
                 self.cfg.us_primary_symbol,
-                self.cfg.slippage_bps
             );
             return Ok(size_dec);
         }
-        let resp = self
-            .connector
-            .create_order_taker_ioc(
-                &self.cfg.us_primary_symbol,
-                size_dec,
-                side,
-                bound_bps,
-                reduce_only,
-            )
-            .await
-            .context("create_order_taker_ioc failed")?;
+        let resp = match bound {
+            SendLimit::Bounded(price) => {
+                // `from_f64`, not `from_f64_retain`: the latter hands over
+                // the f64's full binary expansion, and the connector's
+                // inward tick rounding then drops a whole tick off any
+                // value sitting an ULP under a tick boundary
+                // (`1700.0999999999999090505298222` -> `1700.0` at one
+                // price decimal), turning a marketable limit into a
+                // resting one (pairtrade#315 Codex round 2).
+                let limit = Decimal::from_f64(price).with_context(|| {
+                    format!("limit price {price} is not representable as Decimal")
+                })?;
+                self.connector
+                    .create_order_taker_ioc_at(
+                        &self.cfg.us_primary_symbol,
+                        size_dec,
+                        side,
+                        limit,
+                        reduce_only,
+                    )
+                    .await
+                    .context("create_order_taker_ioc_at failed")?
+            }
+            // Both remaining branches are percentage sends against the
+            // connector's own live touch: `AtTouch` at its minimum
+            // allowance because the mid bound does not reach the book,
+            // `Unchecked` at the configured one because there is no book
+            // here to price against at all.
+            SendLimit::AtTouch | SendLimit::Unchecked => {
+                let bps = if matches!(bound, SendLimit::AtTouch) {
+                    AT_TOUCH_BPS
+                } else {
+                    self.cfg.slippage_bps
+                };
+                self.connector
+                    .create_order_taker_ioc(
+                        &self.cfg.us_primary_symbol,
+                        size_dec,
+                        side,
+                        bps,
+                        reduce_only,
+                    )
+                    .await
+                    .context("create_order_taker_ioc failed")?
+            }
+        };
         resp.ordered_size
             .to_f64()
             .map(|f| Decimal::from_str(&format!("{f:.8}")).unwrap_or(size_dec))
@@ -6140,10 +6206,14 @@ mod tests {
     #[derive(Default)]
     struct StubConnector {
         orders: std::sync::Mutex<Vec<(String, Decimal, OrderSide, bool)>>,
-        /// The `slippage_bps` each send carried, in send order. Separate
-        /// from `orders` so the existing order assertions keep their
-        /// shape while bot-strategy#918's bound is asserted on its own.
+        /// The `slippage_bps` each touch-relative send carried, in send
+        /// order. Separate from `orders` so the existing order assertions
+        /// keep their shape while bot-strategy#918's bound is asserted on
+        /// its own. Only the no-usable-book exit path still uses it.
         taker_ioc_bps: std::sync::Mutex<Vec<u32>>,
+        /// The absolute limit price each send carried (bot-strategy#978),
+        /// which is every send that had a book to price against.
+        taker_ioc_limits: std::sync::Mutex<Vec<Decimal>>,
         positions: std::sync::Mutex<Vec<PositionSnapshot>>,
         /// Runs inside `get_positions`, standing in for whatever the
         /// feed task does to the shared `PriceFeed` while `maybe_enter`
@@ -6162,6 +6232,19 @@ mod tests {
 
         fn taker_ioc_bounds(&self) -> Vec<u32> {
             self.taker_ioc_bps.lock().unwrap().clone()
+        }
+
+        fn taker_ioc_limit_decimals(&self) -> Vec<Decimal> {
+            self.taker_ioc_limits.lock().unwrap().clone()
+        }
+
+        fn taker_ioc_limit_prices(&self) -> Vec<f64> {
+            self.taker_ioc_limits
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|d| d.to_f64().unwrap())
+                .collect()
         }
     }
 
@@ -6327,6 +6410,27 @@ mod tests {
                 order_id: "stub".to_string(),
                 exchange_order_id: None,
                 ordered_price: Decimal::ZERO,
+                ordered_size: size,
+                client_order_id: None,
+            })
+        }
+        async fn create_order_taker_ioc_at(
+            &self,
+            symbol: &str,
+            size: Decimal,
+            side: OrderSide,
+            limit_price: Decimal,
+            reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            self.orders
+                .lock()
+                .unwrap()
+                .push((symbol.to_string(), size, side, reduce_only));
+            self.taker_ioc_limits.lock().unwrap().push(limit_price);
+            Ok(dex_connector::CreateOrderResponse {
+                order_id: "stub".to_string(),
+                exchange_order_id: None,
+                ordered_price: limit_price,
                 ordered_size: size,
                 client_order_id: None,
             })
@@ -7112,15 +7216,47 @@ mod tests {
         h.engine.day.eligibility_confirmed = true;
         h.set_now(T1_US + 1_000_000);
         h.engine.maybe_enter(T1_US + 1_000_000).await;
-        // The fixture book is mid +/- 10 bps, so a 25 bps mid-relative
-        // budget leaves 14.985 bps against the ask, floored to 14. (The
-        // matching exit, a sell, gets 15: the multiplication that costs
-        // the buy side works for the sell side.)
+        // The bound is the mid-relative one outright now
+        // (bot-strategy#978): 1700 * 1.0025 = 1704.25, not a bps figure
+        // the venue would re-anchor on its own touch at submit time. The
+        // fixture ask is 1701.70, so the limit crosses.
+        let sent = h.connector.taker_ioc_limit_prices();
+        assert_eq!(sent.len(), 1, "one send");
+        assert!(
+            (sent[0] - 1704.25).abs() < 1e-6,
+            "the entry must cross as a marketable limit at the mid-relative \
+             bound itself, not an unbounded protection-price IOC: {}",
+            sent[0]
+        );
+        assert!(
+            h.connector.taker_ioc_bounds().is_empty(),
+            "and not through the touch-relative path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_limit_that_is_not_exactly_representable_survives_the_venue_tick() {
+        // pairtrade#315 Codex round 2. At 10 bps off a 1700 mid the bound
+        // is 1701.7, but the f64 is 1701.6999999999998181..., and
+        // `Decimal::from_f64_retain` hands that expansion straight to the
+        // connector -- whose *inward* tick rounding then truncates it to
+        // 1701.6, a whole tick below the ask, an order that rests instead
+        // of crossing. `from_f64` recovers the decimal the number means.
+        let mut h = harness();
+        h.engine.cfg.slippage_bps = 10;
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        let sent = h.connector.taker_ioc_limit_decimals();
+        assert_eq!(sent.len(), 1, "one send");
         assert_eq!(
-            h.connector.taker_ioc_bounds(),
-            vec![14],
-            "the entry must cross as a marketable limit bounded against \
-             the mid, not an unbounded protection-price IOC"
+            sent[0].round_dp_with_strategy(1, rust_decimal::RoundingStrategy::ToZero),
+            Decimal::from_str("1701.7").unwrap(),
+            "the venue's inward tick rounding must not drop a tick: {}",
+            sent[0]
         );
     }
 
@@ -7156,72 +7292,14 @@ mod tests {
         h.observe_at("SNDK", 1710.0, T2_US, 0);
         h.set_now(T2_US + 1_000_000);
         h.engine.maybe_exit(T2_US + 1_000_000).await;
-        // 15, not the entry's 14: this is the sell side of the same
-        // fixture book (see `an_entry_send_carries_the_configured_price_bound`).
-        assert_eq!(h.connector.taker_ioc_bounds(), vec![15]);
+        // The same 25 bps, against the t2 mid of 1710: 1710 * 0.9975 =
+        // 1705.725, inside the fixture bid of 1708.29 so it crosses.
+        let sent = h.connector.taker_ioc_limit_prices();
+        assert_eq!(sent.len(), 1, "one send");
+        assert!((sent[0] - 1705.725).abs() < 1e-6, "{}", sent[0]);
+        assert!(h.connector.taker_ioc_bounds().is_empty());
         let orders = h.connector.orders.lock().unwrap();
         assert!(orders[0].3, "and it is still the reduce-only close");
-    }
-
-    #[test]
-    fn the_touch_relative_bound_is_the_mid_relative_one_net_of_the_half_spread() {
-        use OrderSide::{Long, Short};
-        // Tight book (1 bp half-spread): nearly the whole budget
-        // survives. Long lands at 48.9951 bps and short at 49.0049 --
-        // the sell side gains from the same multiplication the buy side
-        // loses to, which is why the conversion is side-aware.
-        assert_eq!(mid_relative_slippage_bps(50, 99.99, 100.01, Long), Some(48));
-        assert_eq!(
-            mid_relative_slippage_bps(50, 99.99, 100.01, Short),
-            Some(49)
-        );
-        // Codex's case: a 90/110 book. Handing the connector 50 bps would
-        // cap a buy near 110.55 -- 10.5% above the 100 mid.
-        assert_eq!(mid_relative_slippage_bps(50, 90.0, 110.0, Long), None);
-        assert_eq!(mid_relative_slippage_bps(50, 90.0, 110.0, Short), None);
-        // Near the boundary: 48 bps of half-spread leaves ~2, and a
-        // half-spread that eats the whole budget leaves nothing. Both
-        // sides are checked because the f64 tolerance in the helper must
-        // not turn "no bound left" into a 1 bp send.
-        assert_eq!(mid_relative_slippage_bps(50, 99.52, 100.48, Long), Some(1));
-        assert_eq!(mid_relative_slippage_bps(50, 99.52, 100.48, Short), Some(2));
-        assert_eq!(mid_relative_slippage_bps(50, 99.5, 100.5, Long), None);
-        assert_eq!(mid_relative_slippage_bps(50, 99.5, 100.5, Short), None);
-        // Nonsense books are refusals, not silent full-budget sends.
-        assert_eq!(
-            mid_relative_slippage_bps(50, 101.0, 100.0, Long),
-            None,
-            "crossed"
-        );
-        assert_eq!(
-            mid_relative_slippage_bps(50, 0.0, 100.0, Long),
-            None,
-            "no bid"
-        );
-        assert_eq!(mid_relative_slippage_bps(50, f64::NAN, 100.0, Long), None);
-    }
-
-    #[test]
-    fn the_conversion_is_multiplicative_not_a_subtraction() {
-        // Codex's second case, and the reason this is not `bound -
-        // half_spread`: on a 1695.75/1704.25 book with a 50 bps budget,
-        // the half-spread is 25 bps, so a subtraction says 25. But the
-        // connector multiplies its collar onto the ask, and
-        // 1704.25 * 1.0025 = 1708.510625 is above the 1708.50 that 50 bps
-        // from the 1700 mid allows -- the `h * s` cross term. The exact
-        // ratio gives 24.9377 bps, which floors to 24.
-        assert_eq!(
-            mid_relative_slippage_bps(50, 1695.75, 1704.25, OrderSide::Long),
-            Some(24)
-        );
-        let mid = 1700.0_f64;
-        let sent =
-            f64::from(mid_relative_slippage_bps(50, 1695.75, 1704.25, OrderSide::Long).unwrap());
-        let realised_cap = 1704.25 * (1.0 + sent / 10_000.0);
-        assert!(
-            realised_cap <= mid * (1.0 + 50.0 / 10_000.0),
-            "realised cap {realised_cap} must stay inside the advertised bound"
-        );
     }
 
     #[tokio::test]
@@ -7258,7 +7336,8 @@ mod tests {
             "no entry price inside the bound means no entry"
         );
         assert!(
-            h.connector.taker_ioc_bounds().is_empty(),
+            h.connector.taker_ioc_bounds().is_empty()
+                && h.connector.taker_ioc_limit_prices().is_empty(),
             "and nothing was sent under a wider bound either"
         );
     }
@@ -7280,24 +7359,158 @@ mod tests {
                 generation: 0,
             },
         );
+        // Within the staleness bound, so the tear is what decides here
+        // and not the freshness gate (see
+        // `a_stale_or_lagged_quote_hands_the_exit_back_to_the_connector`).
+        h.set_now(T2_US + 1_000_000);
         assert!(
-            h.engine.send_bound_bps(OrderSide::Long, false).is_err(),
+            h.engine.send_limit(OrderSide::Long, false).is_err(),
             "an entry has no price inside the bound"
         );
         assert_eq!(
-            h.engine.send_bound_bps(OrderSide::Short, true).unwrap(),
-            1,
-            "the exit crosses at the touch rather than stranding the position"
+            h.engine.send_limit(OrderSide::Short, true).unwrap(),
+            SendLimit::AtTouch,
+            "the exit crosses at the venue's touch rather than stranding the position"
         );
+    }
+
+    #[tokio::test]
+    async fn a_torn_book_exit_goes_out_priced_by_the_connector() {
+        // The `AtTouch` branch end to end: the bound does not reach the
+        // book, so the send must be the *percentage* one at the
+        // connector's minimum allowance -- it prices off the venue's own
+        // book at submit time and adds its own tick, which is the only
+        // way an IOC is guaranteed to cross. An absolute limit built from
+        // this snapshot could rest one tick short of a touch that has
+        // moved, or of one that is not exactly representable in f64.
+        let mut h = harness();
+        h.engine.cfg.slippage_bps = 25;
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.058,
+            open_size: 0.058,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(PositionSnapshot {
+                symbol: "SNDK".to_string(),
+                size: Decimal::from_str("0.058").unwrap(),
+                sign: 1,
+                entry_price: Some(Decimal::from_str("1700").unwrap()),
+            });
+        let generation = h.engine.feed_generation();
+        h.engine.feed.lock().unwrap().latest.insert(
+            "SNDK".to_string(),
+            PriceObs {
+                mid: 1700.0,
+                best_bid: 1530.0,
+                best_ask: 1870.0,
+                received_at_us: T2_US,
+                exchange_ts_us: Some(T2_US),
+                generation,
+            },
+        );
+        h.set_now(T2_US + 1_000_000);
+        h.engine.maybe_exit(T2_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.taker_ioc_bounds(),
+            vec![AT_TOUCH_BPS],
+            "the torn-book exit must be priced by the connector, not from this snapshot"
+        );
+        assert!(
+            h.connector.taker_ioc_limit_prices().is_empty(),
+            "and not as an absolute limit"
+        );
+        assert!(
+            h.connector.orders.lock().unwrap()[0].3,
+            "still the reduce-only close"
+        );
+    }
+
+    #[test]
+    fn a_stale_or_lagged_quote_hands_the_exit_back_to_the_connector() {
+        // pairtrade#315 P1. `maybe_exit` deliberately closes on prices
+        // too stale to enter on, and an absolute limit off such a mid
+        // does not re-anchor: if the market has left it behind, every
+        // reduce-only IOC comes back unmarketable and the next tick
+        // reuses the same dead quote. The connector's own live touch is
+        // the only thing that still gets the position flat.
+        for (label, obs) in [
+            (
+                "stale",
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.9,
+                    best_ask: 1700.1,
+                    received_at_us: T2_US,
+                    exchange_ts_us: Some(T2_US),
+                    generation: 0,
+                },
+            ),
+            (
+                "older generation",
+                PriceObs {
+                    mid: 1700.0,
+                    best_bid: 1699.9,
+                    best_ask: 1700.1,
+                    received_at_us: T2_US + 60_000_000,
+                    exchange_ts_us: Some(T2_US + 60_000_000),
+                    generation: 0,
+                },
+            ),
+        ] {
+            let h = harness();
+            let lagged = label == "older generation";
+            if lagged {
+                h.engine.feed.lock().unwrap().note_lag();
+            }
+            h.engine
+                .feed
+                .lock()
+                .unwrap()
+                .latest
+                .insert("SNDK".to_string(), obs);
+            // A minute past the observation, i.e. past the 30 s
+            // `max_price_staleness_secs` for the stale case; the lagged
+            // case is unusable at any age.
+            h.set_now(T2_US + 60_000_000);
+            assert_eq!(
+                h.engine.send_limit(OrderSide::Short, true).unwrap(),
+                SendLimit::Unchecked,
+                "{label}: the exit must fall back to the connector's live touch"
+            );
+            assert!(
+                h.engine.send_limit(OrderSide::Long, false).is_err(),
+                "{label}: and an entry priced off it must not go out at all"
+            );
+        }
+        // The control: the same book, fresh and on the current
+        // generation, is priced here rather than by the connector.
+        let mut h = harness();
+        h.observe_at("SNDK", 1700.0, T2_US, h.engine.feed_generation());
+        h.set_now(T2_US + 1_000_000);
+        assert!(matches!(
+            h.engine.send_limit(OrderSide::Short, true).unwrap(),
+            SendLimit::Bounded(_)
+        ));
     }
 
     #[test]
     fn an_unobserved_book_refuses_an_entry_and_still_permits_an_exit() {
         let h = harness();
-        assert!(h.engine.send_bound_bps(OrderSide::Long, false).is_err());
+        assert!(h.engine.send_limit(OrderSide::Long, false).is_err());
         assert_eq!(
-            h.engine.send_bound_bps(OrderSide::Short, true).unwrap(),
-            h.engine.cfg.slippage_bps,
+            h.engine.send_limit(OrderSide::Short, true).unwrap(),
+            SendLimit::Unchecked,
             "with no book of our own the connector's touch is the only bound left"
         );
     }

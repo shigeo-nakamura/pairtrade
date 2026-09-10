@@ -243,10 +243,11 @@ Not a checklist to execute now; recorded so the path is explicit:
 3. Leave `execution.allow_venue_protection_fallback` at its default
    **false**. This step used to require setting it to `true`, because
    dex-connector had no price-capped IOC for Lighter and `send_capped`
-   refused rather than silently widening the cap. As of **v4.7.22**
-   (bot-strategy#918) `create_order_taker_ioc` is implemented for
-   Lighter — LIMIT + `TIF_IOC` bounded by the configured `slippage_bps`
-   — so the fallback is no longer a prerequisite for anything, and
+   refused rather than silently widening the cap. As of **v4.7.24**
+   (bot-strategy#978) `create_order_taker_ioc_at` is implemented for
+   Lighter — LIMIT + `TIF_IOC` at the absolute price
+   `mid * (1 ± slippage_bps)`, tick-rounded inward — so the fallback is
+   no longer a prerequisite for anything, and
    turning it on now only authorizes a ±20 % order for some future
    "not supported" error path. Fail closed instead: an order that cannot
    be sent under the configured cap should not be sent.
