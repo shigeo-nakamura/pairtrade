@@ -882,21 +882,13 @@ fn require_fresh_quote_matches_approved_plan(
             "fresh Arcus buy amount {fresh_buy_amount} undercuts approved plan floor {approved_floor} (approved target {approved_buy}, slippage_bps={slippage_bps})"
         );
     }
-    // Symmetric ceiling. The plan was approved against a quote that had
-    // passed the plausibility band; a fresh quote paying *more* than the
-    // approved target plus the same slippage is a different trade than the
-    // one approved -- and, live, the shape of the venue anomaly in
-    // bot-strategy#1001 (+212 bps over reference seconds apart). Refuse it
-    // here rather than sign a Permit2 for a price no one will honour.
-    let approved_ceiling = approved_buy
-        .checked_mul(U256::from(10_000_u32 + slippage_bps))
-        .context("Arcus approved plan ceiling calculation overflow")?
-        / U256::from(10_000_u32);
-    if fresh_buy_amount > approved_ceiling {
-        bail!(
-            "fresh Arcus buy amount {fresh_buy_amount} overshoots approved plan ceiling {approved_ceiling} (approved target {approved_buy}, slippage_bps={slippage_bps})"
-        );
-    }
+    // Deliberately no ceiling. A fresh quote paying more than the approved
+    // target is what a favourable move between plan and dispatch looks
+    // like, and refusing it would also refuse a max-hold or
+    // corporate-action exit that happens to land on one (Codex P2,
+    // pairtrade#323). Plausibility is judged where the plan is built, per
+    // venue against the router's reference; here the floor is the only
+    // thing that protects the approved economics.
     Ok(())
 }
 
@@ -1486,22 +1478,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_quote_cannot_overshoot_approved_plan_ceiling() {
+    fn fresh_quote_may_pay_more_than_the_approved_plan() {
+        // A favourable move between plan and dispatch is not a reason to
+        // refuse an approved trade -- least of all an exit.
         let plan = plan_with_buy_amount("1000");
-        // 50 bps over 1000 is 1005: the exact ceiling passes, one more
-        // wei is a different trade than the approved one.
-        require_fresh_quote_matches_approved_plan(&plan, U256::from(1005_u64), 50).unwrap();
-        let error = require_fresh_quote_matches_approved_plan(&plan, U256::from(1006_u64), 50)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("overshoots approved plan ceiling"),
-            "{error}"
-        );
-        // The live anomaly: +212 bps on a plan approved at the reference.
-        assert!(
-            require_fresh_quote_matches_approved_plan(&plan, U256::from(1021_u64), 50).is_err()
-        );
+        require_fresh_quote_matches_approved_plan(&plan, U256::from(1006_u64), 50).unwrap();
+        require_fresh_quote_matches_approved_plan(&plan, U256::from(1021_u64), 50).unwrap();
     }
 
     // bot-strategy#880: a fresh quote whose *target* buy amount exactly

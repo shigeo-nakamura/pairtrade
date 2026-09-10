@@ -7202,6 +7202,14 @@ mod tests {
                 orders: self.fills.lock().unwrap().clone(),
             })
         }
+        async fn get_funding_payments(
+            &self,
+            _since_secs: i64,
+        ) -> Result<Vec<dex_connector::FundingPayment>, dex_connector::DexError> {
+            Err(dex_connector::DexError::Permanent(
+                "stub connector keeps no funding history".to_string(),
+            ))
+        }
         async fn get_canceled_orders(
             &self,
             _symbol: &str,

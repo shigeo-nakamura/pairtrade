@@ -11,8 +11,8 @@ use dex_connector::{
 use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
 use dex_connector::{
     BalanceResponse, CanceledOrdersResponse, CreateOrderResponse, DexConnector, DexError,
-    FilledOrdersResponse, LastTradesResponse, OpenOrdersResponse, OrderBookSnapshot, OrderSide,
-    TickerResponse, TpSl, TriggerOrderStyle,
+    FilledOrdersResponse, FundingPayment, LastTradesResponse, OpenOrdersResponse,
+    OrderBookSnapshot, OrderSide, TickerResponse, TpSl, TriggerOrderStyle,
 };
 
 use rust_decimal::Decimal;
@@ -319,6 +319,17 @@ impl DexConnector for DexConnectorBox {
         let result = self.inner.get_filled_orders(symbol).await;
         if let Err(ref err) = result {
             self.report_rate_limit("get_filled_orders", symbol, err);
+        }
+        result
+    }
+
+    // Required by the trait since dex-connector v4.7.25 (bot-strategy#963,
+    // dex-connector#94): a box that forgot to forward it would not compile,
+    // which is the point of it having no default.
+    async fn get_funding_payments(&self, since_secs: i64) -> Result<Vec<FundingPayment>, DexError> {
+        let result = self.inner.get_funding_payments(since_secs).await;
+        if let Err(ref err) = result {
+            self.report_rate_limit("get_funding_payments", "account", err);
         }
         result
     }

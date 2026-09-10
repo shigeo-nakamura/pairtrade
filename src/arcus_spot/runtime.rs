@@ -3132,35 +3132,21 @@ fn verify_round_trip_linkage_and_loss(
             ),
         ));
     }
-    // With each leg at most `band` above its reference and the two
-    // references within `band` of reciprocal, a genuine round trip returns
-    // at most (1 + band)^3 of what it started with. The three checks above
-    // already imply this, so the bound is unreachable while they hold; it
-    // is kept so that relaxing any one of them can never silently make a
-    // favourable round trip free at the cost gate.
-    let band_ratio = Decimal::ONE
-        + max_favourable_quote_deviation_bps
-            .checked_div(Decimal::from(10_000))
-            .unwrap_or(Decimal::ZERO);
-    let most_favourable_credible = band_ratio
-        .checked_mul(band_ratio)
-        .and_then(|square| square.checked_mul(band_ratio))
-        .and_then(|cube| cube.checked_sub(Decimal::ONE))
-        .and_then(|gain| gain.checked_mul(Decimal::from(10_000)))
-        .ok_or_else(|| {
-            ArcusSpotHold::new(
-                ArcusSpotHoldCode::InvalidSnapshot,
-                "round-trip bound exceeds Decimal range",
-            )
-        })?;
-    if recomputed < -most_favourable_credible {
+    // A genuine round trip never pays the taker; a favourable one is the
+    // reference lagging a moving market between the two legs' quotes, and
+    // the reciprocity check above already caps how far the two references
+    // may disagree at one band. So one band is also the most a lag artefact
+    // can be worth: a gain beyond it is not lag but an inconsistency the
+    // per-leg checks cannot see, and it is refused rather than costed as
+    // free (Codex P1, pairtrade#323).
+    if recomputed < -max_favourable_quote_deviation_bps {
         return Err(ArcusSpotHold::new(
             ArcusSpotHoldCode::InvalidSnapshot,
             format!(
-                "round trip returns {} bps more than it started with, beyond the {} bps that \
-                 in-band quotes on both legs can explain",
+                "round trip returns {} bps more than it started with, beyond the {} bps a \
+                 lagging reference can explain",
                 (-recomputed).round_dp(3).normalize(),
-                most_favourable_credible.normalize()
+                max_favourable_quote_deviation_bps.normalize()
             ),
         ));
     }
@@ -5679,23 +5665,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_most_favourable_round_trip_in_band_quotes_can_explain_is_costed_at_zero() {
-        // Every check at its limit at once: forward quote exactly +band over
-        // its reference, reverse quote exactly +band over its reference, and
-        // the two references exactly +band apart from reciprocal. The chained
-        // amounts then return (1 + band)^3 of what they started with -- the
-        // most favourable round trip the per-leg and reciprocity checks
-        // admit -- and the cost gate sees zero, not a rejection. One more
-        // bps anywhere trips the check that owns it (the tests around this
-        // one), so nothing more favourable can reach the bound.
-        let band = Decimal::from(25);
-        let ratio = Decimal::ONE + band / Decimal::from(10_000);
+    /// A row whose legs sit `forward_bps` / `reverse_bps` above exactly
+    /// reciprocal references, so only the round-trip bound decides.
+    fn row_with_in_band_legs(forward_bps: i64, reverse_bps: i64) -> ArcusSpotRoundTripRecord {
         let forward_sell = Decimal::from_str("25000000000000000").unwrap();
         let forward_reference = Decimal::new(2, 0);
-        let forward_buy = (forward_sell * forward_reference * ratio).round();
-        let reverse_reference = ratio / forward_reference;
-        let reverse_buy = (forward_buy * reverse_reference * ratio).round();
+        let reverse_reference = Decimal::ONE / forward_reference;
+        let up = |bps: i64| Decimal::ONE + Decimal::new(bps, 4);
+        let forward_buy = (forward_sell * forward_reference * up(forward_bps)).round();
+        let reverse_buy = (forward_buy * reverse_reference * up(reverse_bps)).round();
         let loss = ((forward_sell - reverse_buy) / forward_sell * Decimal::from(10_000))
             .normalize()
             .to_string();
@@ -5714,38 +5692,36 @@ mod tests {
             "referencePrice".to_string(),
             json!(reverse_reference.normalize().to_string()),
         );
-        assert!(Decimal::from_str(&loss).unwrap() < -Decimal::from(75));
+        row
+    }
+
+    #[test]
+    fn a_favourable_round_trip_is_costed_at_zero_up_to_one_band_and_refused_beyond() {
+        let band = Decimal::from(25);
+        // Forward exactly one band over its reference, reverse on its
+        // reference: the chained amounts return 25 bps more than they
+        // started with -- the most a lagging reference can explain -- and
+        // the cost gate sees zero.
+        let row = row_with_in_band_legs(25, 0);
+        assert_eq!(
+            Decimal::from_str(row.optimistic_round_trip_loss_bps.as_deref().unwrap()).unwrap(),
+            Decimal::from(-25)
+        );
         assert_eq!(
             verify_round_trip_linkage_and_loss(&row, &nvda_token(), &amd_token(), band, 120)
                 .unwrap(),
             Decimal::ZERO
         );
-        // Push the reverse quote one bps past its band and the leg check,
-        // not the bound, refuses it.
-        let over = (reverse_buy * (Decimal::ONE + Decimal::new(1, 4))).round();
-        let mut row = round_trip_row(
-            &forward_buy.to_string(),
-            &forward_buy.to_string(),
-            &over.to_string(),
-            &over.to_string(),
-            &((forward_sell - over) / forward_sell * Decimal::from(10_000))
-                .normalize()
-                .to_string(),
-        );
-        row.forward.as_mut().unwrap().response.payload.extra.insert(
-            "referencePrice".to_string(),
-            json!(forward_reference.normalize().to_string()),
-        );
-        row.reverse.as_mut().unwrap().response.payload.extra.insert(
-            "referencePrice".to_string(),
-            json!(reverse_reference.normalize().to_string()),
-        );
+        // Both legs still inside their bands and the references still
+        // exactly reciprocal, yet together 26 bps favourable: nothing the
+        // per-leg checks can see, so the bound must be what refuses it.
+        let row = row_with_in_band_legs(25, 1);
         let error =
             verify_round_trip_linkage_and_loss(&row, &nvda_token(), &amd_token(), band, 120)
                 .unwrap_err();
-        assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(
-            error.detail.contains("no plausible venue quote"),
+            error.detail.contains("more than it started with"),
             "{error:?}"
         );
     }
