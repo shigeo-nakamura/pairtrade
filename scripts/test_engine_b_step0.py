@@ -216,9 +216,11 @@ class VerdictTest(unittest.TestCase):
         )
         stats = absorption.analyse(sessions)
         result = absorption.verdict(stats)
-        self.assertTrue(result["k0a"])
+        self.assertEqual(result["k0a"], "kill")
         self.assertTrue(result["killed"])
-        self.assertEqual(result["decision"], "KILL")
+        self.assertEqual(result["decision"], absorption.DECISION_KILL)
+        # A kill is only called when the whole interval is below the threshold.
+        self.assertLess(stats["sd_fwd_bps_ci90"][1], absorption.KILL_SD_BPS)
 
     def test_k0b_kills_when_the_us_leg_has_already_absorbed_the_kr_move(self):
         # r_kr is r_us_conc plus a sub-bp wobble: R^2 ~ 1 and no residual width.
@@ -231,13 +233,14 @@ class VerdictTest(unittest.TestCase):
         result = absorption.verdict(stats)
         self.assertGreaterEqual(stats["r2"], absorption.KILL_R2)
         self.assertLess(stats["sd_eps_bps"], absorption.KILL_SD_BPS)
-        self.assertTrue(result["k0b"])
+        self.assertEqual(result["k0b"], "kill")
         self.assertTrue(result["killed"])
+        self.assertTrue(result["k0b_beta_variants_agree"])
 
     def test_wide_residual_with_high_r2_does_not_kill(self):
         # Absorbed but still wide: K0-b needs *both* conditions.
         base = [0.02, -0.015, 0.01, -0.005, 0.03, -0.02]
-        wobble = [0.004, -0.004, 0.002, -0.002, 0.001, -0.001]
+        wobble = [0.008, -0.008, 0.004, -0.004, 0.002, -0.002]
         fwd = [0.012, -0.008, 0.02, -0.015, 0.01, -0.02]
         sessions = self.sessions_from(
             [(b + w, b, f) for b, w, f in zip(base, wobble, fwd)]
@@ -246,9 +249,9 @@ class VerdictTest(unittest.TestCase):
         result = absorption.verdict(stats)
         self.assertGreaterEqual(stats["r2"], absorption.KILL_R2)
         self.assertGreater(stats["sd_eps_bps"], absorption.KILL_SD_BPS)
-        self.assertFalse(result["k0b"])
+        self.assertEqual(result["k0b"], "cleared")
         self.assertFalse(result["killed"])
-        self.assertEqual(result["decision"], "PROCEED to Step 1 (#989)")
+        self.assertEqual(result["decision"], absorption.DECISION_PROCEED)
 
     def test_volatile_pair_proceeds_and_reports_the_ci_as_clear(self):
         sessions = self.sessions_from(
@@ -262,14 +265,67 @@ class VerdictTest(unittest.TestCase):
         stats = absorption.analyse(sessions)
         result = absorption.verdict(stats)
         self.assertFalse(result["killed"])
-        self.assertTrue(result["k0a_clear_of_threshold_at_ci_lower"])
+        self.assertEqual(result["k0a"], "cleared")
+        self.assertEqual(result["decision"], absorption.DECISION_PROCEED)
 
-    def test_missing_statistics_never_produce_a_kill(self):
-        stats = {"sd_fwd_bps": None, "sd_eps_bps": None, "sd_eps_issue_beta_bps": None, "r2": None}
-        result = absorption.verdict(stats)
+    def test_missing_statistics_are_unresolved_not_a_pass(self):
+        result = absorption.verdict(
+            {"sd_fwd_bps": None, "sd_eps_bps": None, "sd_eps_issue_beta_bps": None, "r2": None}
+        )
         self.assertFalse(result["killed"])
-        self.assertFalse(result["k0a"])
-        self.assertFalse(result["k0b"])
+        self.assertEqual(result["k0a"], "unresolved")
+        self.assertEqual(result["k0b"], "unresolved")
+        # No data must never read as "proceed".
+        self.assertEqual(result["decision"], absorption.DECISION_UNRESOLVED)
+
+    def test_interval_straddling_the_threshold_is_unresolved(self):
+        # Point estimate below the cutoff, interval spanning it: the sample
+        # cannot tell a dead strategy from a live one, and must say so.
+        stats = {
+            "sd_fwd_bps": 12.0,
+            "sd_fwd_bps_ci90": [6.0, 40.0],
+            "sd_eps_bps": 500.0,
+            "sd_eps_bps_ci90": [300.0, 900.0],
+            "sd_eps_issue_beta_bps": 500.0,
+            "r2": 0.2,
+        }
+        result = absorption.verdict(stats)
+        self.assertEqual(result["k0a"], "unresolved")
+        self.assertTrue(result["k0a_point_estimate_kills"])
+        self.assertFalse(result["killed"])
+        self.assertEqual(result["decision"], absorption.DECISION_UNRESOLVED)
+
+    def test_k0b_needs_both_beta_conventions_to_kill(self):
+        # Primary residual tiny, the issue's literal-beta residual wide: the
+        # ambiguity in the formula would be deciding, not the data.
+        stats = {
+            "sd_fwd_bps": 200.0,
+            "sd_fwd_bps_ci90": [150.0, 400.0],
+            "sd_eps_bps": 2.0,
+            "sd_eps_bps_ci90": [1.0, 6.0],
+            "sd_eps_issue_beta_bps": 90.0,
+            "r2": 0.95,
+        }
+        result = absorption.verdict(stats)
+        self.assertFalse(result["k0b_beta_variants_agree"])
+        self.assertNotEqual(result["k0b"], "kill")
+        self.assertFalse(result["killed"])
+        self.assertEqual(result["decision"], absorption.DECISION_UNRESOLVED)
+
+    def test_a_low_r2_alone_does_not_clear_k0b(self):
+        # R^2 has no interval here, so only the residual's width can rule the
+        # kill out; a point R^2 under the gate is not evidence at n=3.
+        stats = {
+            "sd_fwd_bps": 200.0,
+            "sd_fwd_bps_ci90": [150.0, 400.0],
+            "sd_eps_bps": 8.0,
+            "sd_eps_bps_ci90": [4.0, 30.0],
+            "sd_eps_issue_beta_bps": 8.0,
+            "r2": 0.1,
+        }
+        result = absorption.verdict(stats)
+        self.assertEqual(result["k0b"], "unresolved")
+        self.assertEqual(result["decision"], absorption.DECISION_UNRESOLVED)
 
     def test_residual_dispersion_uses_the_regression_degrees_of_freedom(self):
         sessions = self.sessions_from(
@@ -372,6 +428,49 @@ class ExtractTest(unittest.TestCase):
             self.assertEqual(row["venue"], "lighter")  # robinhood excluded
             self.assertAlmostEqual(row["lag_secs"], -1.0)
 
+    def test_a_busy_series_cannot_crowd_out_a_quiet_one(self):
+        # One 1 Hz series can fill any global row cap with quotes near the
+        # instant; the quiet series' only quote sits further out but well
+        # inside the tolerance, and must still come back.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "part.sqlite3")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                """CREATE TABLE price_observation (
+                     observed_ts_us INTEGER, ts_srv_us INTEGER, venue TEXT,
+                     market_id INTEGER, symbol TEXT, price_type TEXT,
+                     price TEXT, source TEXT)"""
+            )
+            target = 1789047000 * US
+            # 603 rows sit nearer to the instant than the quiet series' only
+            # quote, which is what a global row cap would spend itself on.
+            busy = [
+                (target + offset * US, None, "lighter", 1, "SNDK", ptype, "100.0", "ws")
+                for offset in range(-150, 151)
+                for ptype in ("mid", "mark", "index")
+            ]
+            conn.executemany("INSERT INTO price_observation VALUES (?,?,?,?,?,?,?,?)", busy)
+            conn.execute(
+                "INSERT INTO price_observation VALUES (?,?,?,?,?,?,?,?)",
+                (target + 100 * US, None, "lighter", 2, "SKHYNIXUSD", "mid", "55.5", "ws"),
+            )
+            conn.commit()
+            conn.close()
+
+            rows = extract.query_partition(
+                path,
+                [("2026-09-10", "t2", target)],
+                ["SNDK", "SKHYNIXUSD"],
+                ["mid", "mark", "index"],
+                ["lighter"],
+                300 * US,
+            )
+            quiet = [r for r in rows if r["symbol"] == "SKHYNIXUSD"]
+            self.assertEqual(len(quiet), 1)
+            self.assertEqual(quiet[0]["price"], "55.5")
+            self.assertAlmostEqual(quiet[0]["lag_secs"], 100.0)
+            self.assertEqual(len([r for r in rows if r["symbol"] == "SNDK"]), 3)
+
     def test_query_returns_nothing_outside_the_tolerance(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "part.sqlite3")
@@ -394,17 +493,65 @@ class ExtractTest(unittest.TestCase):
             )
             self.assertEqual(rows, [])
 
-    def test_done_partitions_make_a_rerun_idempotent(self):
+    def test_only_a_covered_completion_record_lets_a_rerun_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "prices.jsonl")
             with open(out, "w") as handle:
-                handle.write(json.dumps({"partition": "20260910_00", "status": "ok"}) + "\n")
+                # An observation row alone does not mean the partition finished.
+                handle.write(
+                    json.dumps(
+                        dict(price_row("2026-09-10", "t0", "SNDK", 1.0), partition="20260910_00")
+                    )
+                    + "\n"
+                )
                 handle.write("not json\n")
-                handle.write(json.dumps({"partition": "20260910_06", "status": "empty"}) + "\n")
+                handle.write(
+                    json.dumps({"partition": "20260910_06", "status": "missing"}) + "\n"
+                )
+                handle.write(
+                    json.dumps(
+                        {"partition": "20260910_13", "status": "done", "covered": False}
+                    )
+                    + "\n"
+                )
+                handle.write(
+                    json.dumps(
+                        {"partition": "20260909_13", "status": "done", "covered": True}
+                    )
+                    + "\n"
+                )
+            self.assertEqual(extract.load_done_partitions(out), {"20260909_13"})
             self.assertEqual(
-                extract.load_done_partitions(out), {"20260910_00", "20260910_06"}
+                extract.load_done_partitions(os.path.join(tmp, "gone.jsonl")), set()
             )
-        self.assertEqual(extract.load_done_partitions(os.path.join(tmp, "gone.jsonl")), set())
+
+    def test_a_live_partition_counts_as_done_only_when_every_series_answered(self):
+        targets = [("2026-09-10", "t2", 1789047000 * US)]
+        rows = [
+            {"date": "2026-09-10", "point": "t2", "symbol": "SNDK", "price_type": "mid"}
+        ]
+        partial = extract.completion_record(
+            "20260910_13", targets, ["SNDK", "SKHYNIXUSD"], ["mid"], rows, sealed=False
+        )
+        self.assertFalse(partial["covered"])
+        complete = extract.completion_record(
+            "20260910_13", targets, ["SNDK"], ["mid"], rows, sealed=False
+        )
+        self.assertTrue(complete["covered"])
+
+    def test_a_sealed_partition_is_done_even_when_it_answered_nothing(self):
+        # The archive object is immutable: an hour the feed was down will never
+        # answer differently, so re-fetching it forever buys nothing.
+        record = extract.completion_record(
+            "20260904_06",
+            [("2026-09-04", "t1", 1788503400 * US)],
+            ["SNDK"],
+            ["mid"],
+            [],
+            sealed=True,
+        )
+        self.assertTrue(record["covered"])
+        self.assertEqual(record["rows"], 0)
 
 
 class LoadPricesTest(unittest.TestCase):

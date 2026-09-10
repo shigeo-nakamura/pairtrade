@@ -144,50 +144,92 @@ def query_partition(
     rows = []
     conn = sqlite3.connect(uri, uri=True)
     try:
+        # One query per series. A single combined query with a row cap would
+        # let one busy series (12 symbols x 3 price types at 1 Hz) fill the cap
+        # with rows near the instant and silently drop a quieter series whose
+        # nearest quote is further out but still inside the tolerance.
         sql = (
-            "SELECT observed_ts_us, symbol, price_type, price, venue "
-            "FROM price_observation "
+            "SELECT observed_ts_us, price, venue FROM price_observation "
             "WHERE observed_ts_us BETWEEN ? AND ? "
-            "  AND symbol IN (%s) AND price_type IN (%s) AND venue IN (%s) "
-            "ORDER BY ABS(observed_ts_us - ?) LIMIT 400"
-            % (
-                ",".join("?" * len(symbols)),
-                ",".join("?" * len(price_types)),
-                ",".join("?" * len(venues)),
-            )
+            "  AND symbol = ? AND price_type = ? AND venue IN (%s) "
+            "ORDER BY ABS(observed_ts_us - ?) LIMIT 1"
+            % ",".join("?" * len(venues))
         )
         for day, point, ts_us in targets:
-            params = (
-                [ts_us - tolerance_us, ts_us + tolerance_us]
-                + symbols
-                + price_types
-                + venues
-                + [ts_us]
-            )
-            best = {}
-            for observed_us, symbol, price_type, price, venue in conn.execute(sql, params):
-                key = (symbol, price_type)
-                # ORDER BY ABS(...) means the first hit per key is the nearest.
-                if key in best:
-                    continue
-                best[key] = {
-                    "date": day,
-                    "point": point,
-                    "target_ts_us": ts_us,
-                    "observed_ts_us": observed_us,
-                    "lag_secs": (observed_us - ts_us) / US_PER_SEC,
-                    "symbol": symbol,
-                    "price_type": price_type,
-                    "price": price,
-                    "venue": venue,
-                }
-            rows.extend(best.values())
+            for symbol in symbols:
+                for price_type in price_types:
+                    params = (
+                        [ts_us - tolerance_us, ts_us + tolerance_us, symbol, price_type]
+                        + venues
+                        + [ts_us]
+                    )
+                    hit = conn.execute(sql, params).fetchone()
+                    if hit is None:
+                        continue
+                    observed_us, price, venue = hit
+                    rows.append(
+                        {
+                            "date": day,
+                            "point": point,
+                            "target_ts_us": ts_us,
+                            "observed_ts_us": observed_us,
+                            "lag_secs": (observed_us - ts_us) / US_PER_SEC,
+                            "symbol": symbol,
+                            "price_type": price_type,
+                            "price": price,
+                            "venue": venue,
+                        }
+                    )
     finally:
         conn.close()
     return rows
 
 
+def completion_record(
+    name: str,
+    targets: Iterable[tuple],
+    symbols: Iterable[str],
+    price_types: Iterable[str],
+    rows: Iterable[dict],
+    sealed: bool,
+) -> dict:
+    """The record that lets a rerun skip this partition, and why.
+
+    An archived partition is sealed and immutable, so whatever it answered is
+    final even when that answer is "nothing" -- the mainnet feed being down for
+    the whole hour, say. A partition read out of the live data directory is a
+    different matter: it may still be filling (today's t2 partition queried
+    before 13:30 is the documented case), so it only counts as done once every
+    requested series has answered.
+    """
+    targets = list(targets)
+    rows = list(rows)
+    wanted = {
+        (day, point, symbol, price_type)
+        for day, point, _ in targets
+        for symbol in symbols
+        for price_type in price_types
+    }
+    got = {(r["date"], r["point"], r["symbol"], r["price_type"]) for r in rows}
+    return {
+        "partition": name,
+        "status": "done",
+        "covered": bool(sealed or wanted <= got),
+        "sealed": bool(sealed),
+        "targets": len(targets),
+        "rows": len(rows),
+    }
+
+
 def load_done_partitions(out_path: str) -> set:
+    """Partitions a rerun may skip.
+
+    Only an explicit completion record counts, and only one that covered every
+    instant it was asked for. An interrupted write, a transient S3 failure, an
+    hour the archive has not uploaded yet, or the current day's t2 partition
+    queried before 13:30 all leave the partition eligible again — otherwise a
+    rerun of the documented command would paper over the hole for good.
+    """
     done = set()
     if not os.path.exists(out_path):
         return done
@@ -197,9 +239,12 @@ def load_done_partitions(out_path: str) -> set:
             if not line:
                 continue
             try:
-                done.add(json.loads(line)["partition"])
-            except (ValueError, KeyError):
+                record = json.loads(line)
+            except ValueError:
                 continue
+            if record.get("status") == "done" and record.get("covered") is True:
+                done.add(record.get("partition"))
+    done.discard(None)
     return done
 
 
@@ -223,7 +268,7 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="re-query partitions already present in --out",
+        help="re-query every partition, including ones already completed in --out",
     )
     parser.add_argument("--workdir", default="/var/tmp/engine-b-step0/work")
     args = parser.parse_args(argv)
@@ -296,13 +341,18 @@ def main(argv: Optional[list] = None) -> int:
                 row["status"] = "ok"
                 out.write(json.dumps(row, sort_keys=True) + "\n")
                 written += 1
-            if not rows:
-                out.write(
-                    json.dumps({"partition": name, "status": "empty", "targets": len(targets)})
-                    + "\n"
-                )
+            # The completion record is written last and on its own line, so a
+            # run killed mid-partition leaves that partition eligible again.
+            record = completion_record(
+                name, targets, symbols, price_types, rows, sealed=fetched is not None
+            )
+            covered = record["covered"]
+            out.write(json.dumps(record, sort_keys=True) + "\n")
             out.flush()
-            print("partition %s targets=%d rows=%d" % (name, len(targets), len(rows)))
+            print(
+                "partition %s targets=%d rows=%d%s"
+                % (name, len(targets), len(rows), "" if covered else " (incomplete, will retry)")
+            )
 
     print("wrote %d observation rows to %s" % (written, args.out))
     return 0

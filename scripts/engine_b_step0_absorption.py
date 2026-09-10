@@ -308,51 +308,106 @@ def analyse(sessions: Sequence[dict]) -> dict:
     return out
 
 
+DECISION_KILL = "KILL"
+DECISION_PROCEED = "PROCEED to Step 1 (#989)"
+DECISION_UNRESOLVED = "UNRESOLVED (sample cannot carry the rule)"
+
+
+def _rule_state(kill_on_point, ci, threshold, extra_kill_condition=True):
+    """Three-valued reading of one dispersion rule.
+
+    The rule is written on a standard deviation the sample only estimates, so
+    the estimate alone decides nothing: a kill needs the whole interval below
+    the threshold, a clearance needs the whole interval above it, and an
+    interval straddling the threshold is unresolved -- which is a distinct
+    answer from "not killed", and the one this sample size usually deserves.
+    """
+    if ci is None:
+        return "unresolved"
+    lower, upper = ci
+    if upper < threshold and kill_on_point and extra_kill_condition:
+        return "kill"
+    if lower >= threshold:
+        return "cleared"
+    return "unresolved"
+
+
 def verdict(stats: dict) -> dict:
-    """Apply the frozen kill rules, and say whether the sample can carry them."""
+    """Apply the frozen kill rules, three-valued: kill / cleared / unresolved."""
     sd_fwd = stats.get("sd_fwd_bps")
     sd_eps = stats.get("sd_eps_bps")
     sd_eps_alt = stats.get("sd_eps_issue_beta_bps")
     r2 = stats.get("r2")
 
-    k0a = sd_fwd is not None and sd_fwd < KILL_SD_BPS
-    k0b_primary = (
+    k0a_point = sd_fwd is not None and sd_fwd < KILL_SD_BPS
+    k0b_point_primary = (
         r2 is not None and sd_eps is not None and r2 >= KILL_R2 and sd_eps < KILL_SD_BPS
     )
-    k0b_alt = (
+    k0b_point_alt = (
         r2 is not None
         and sd_eps_alt is not None
         and r2 >= KILL_R2
         and sd_eps_alt < KILL_SD_BPS
     )
-    killed = k0a or k0b_primary or k0b_alt
+    # The issue's two beta conventions give different residuals. While they
+    # disagree, the formula ambiguity -- not the data -- would be deciding, so
+    # a kill needs both of them.
+    variants_agree = k0b_point_primary == k0b_point_alt
+
+    k0a = _rule_state(k0a_point, stats.get("sd_fwd_bps_ci90"), KILL_SD_BPS)
+    k0b = _rule_state(
+        k0b_point_primary and k0b_point_alt,
+        stats.get("sd_eps_bps_ci90"),
+        KILL_SD_BPS,
+        extra_kill_condition=(r2 is not None and r2 >= KILL_R2),
+    )
+
+    if "kill" in (k0a, k0b):
+        decision = DECISION_KILL
+    elif k0a == "cleared" and k0b == "cleared":
+        decision = DECISION_PROCEED
+    else:
+        decision = DECISION_UNRESOLVED
 
     reasons = []
-    if k0a:
-        reasons.append("K0-a: sd(fwd)=%.1f bps < %.0f bps" % (sd_fwd, KILL_SD_BPS))
-    if k0b_primary or k0b_alt:
+    if k0a == "kill":
         reasons.append(
-            "K0-b: R^2=%.3f >= %.1f and sd(eps)=%.1f bps < %.0f bps"
-            % (r2, KILL_R2, sd_eps if k0b_primary else sd_eps_alt, KILL_SD_BPS)
+            "K0-a: sd(fwd) CI upper %.1f bps < %.0f bps"
+            % (stats["sd_fwd_bps_ci90"][1], KILL_SD_BPS)
+        )
+    elif k0a == "cleared":
+        reasons.append(
+            "K0-a cleared: sd(fwd) CI lower %.1f bps >= %.0f bps"
+            % (stats["sd_fwd_bps_ci90"][0], KILL_SD_BPS)
+        )
+    else:
+        reasons.append("K0-a unresolved: the sd(fwd) interval straddles %.0f bps (or is absent)" % KILL_SD_BPS)
+    if k0b == "kill":
+        reasons.append(
+            "K0-b: R^2 %.3f >= %.1f and sd(eps) CI upper %.1f bps < %.0f bps, both beta conventions"
+            % (r2, KILL_R2, stats["sd_eps_bps_ci90"][1], KILL_SD_BPS)
+        )
+    elif k0b == "cleared":
+        reasons.append(
+            "K0-b cleared: sd(eps) CI lower %.1f bps >= %.0f bps, so no R^2 could trigger it"
+            % (stats["sd_eps_bps_ci90"][0], KILL_SD_BPS)
+        )
+    else:
+        reasons.append("K0-b unresolved: the sd(eps) interval straddles %.0f bps (or is absent)" % KILL_SD_BPS)
+    if not variants_agree:
+        reasons.append(
+            "the two beta conventions disagree on K0-b's point estimate; a kill needs both"
         )
 
-    # A "no kill" is only meaningful when the uncertainty band clears the
-    # threshold too: at n=3 a point estimate alone proves nothing.
-    ci_fwd = stats.get("sd_fwd_bps_ci90")
-    ci_eps = stats.get("sd_eps_bps_ci90")
-    k0a_ci_clear = bool(ci_fwd) and ci_fwd[0] >= KILL_SD_BPS
-    k0b_ci_clear = (r2 is not None and r2 < KILL_R2) or (
-        bool(ci_eps) and ci_eps[0] >= KILL_SD_BPS
-    )
     return {
-        "killed": killed,
+        "decision": decision,
+        "killed": decision == DECISION_KILL,
         "k0a": k0a,
-        "k0b": k0b_primary or k0b_alt,
-        "k0b_beta_variants_agree": k0b_primary == k0b_alt,
-        "k0a_clear_of_threshold_at_ci_lower": k0a_ci_clear,
-        "k0b_clear_of_threshold_at_ci_lower": k0b_ci_clear,
+        "k0b": k0b,
+        "k0a_point_estimate_kills": k0a_point,
+        "k0b_point_estimate_kills": k0b_point_primary or k0b_point_alt,
+        "k0b_beta_variants_agree": variants_agree,
         "reasons": reasons,
-        "decision": "KILL" if killed else "PROCEED to Step 1 (#989)",
     }
 
 
@@ -419,17 +474,6 @@ def report(label: str, stats: dict, decision: dict, notes: Sequence[dict]) -> st
     lines.append("decision: %s" % decision["decision"])
     for reason in decision["reasons"]:
         lines.append("  %s" % reason)
-    if not decision["killed"]:
-        if decision["k0a_clear_of_threshold_at_ci_lower"]:
-            lines.append("  K0-a: even the CI lower bound clears the threshold")
-        else:
-            lines.append("  K0-a: NOT clear at the CI lower bound -- underpowered, needs more sessions")
-        if decision["k0b_clear_of_threshold_at_ci_lower"]:
-            lines.append("  K0-b: clear (R^2 below the gate, or the eps CI clears it)")
-        else:
-            lines.append("  K0-b: NOT clear at the CI lower bound -- underpowered, needs more sessions")
-    if not decision["k0b_beta_variants_agree"]:
-        lines.append("  NOTE: the two beta conventions disagree on K0-b; treat as unresolved")
     return "\n".join(lines)
 
 

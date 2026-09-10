@@ -823,15 +823,26 @@ python3 scripts/engine_b_step0_absorption.py \
   --price-types mid,mark,index --json-out step0.json
 ```
 
-The extractor appends and skips partitions already recorded in `--out`, so an
-interrupted sweep is resumed by rerunning the same command; `--force` re-queries
-them. Rows carry the venue and the lag between the instant and the quote that
-stood for it, and the statistics step drops any leg further than
+The extractor appends, and a rerun skips a partition only when the file holds an
+explicit completion record for it that covered every instant it was asked for.
+An interrupted write, a transient S3 failure, an hour the archive has not
+uploaded yet, and today's t2 partition queried before 13:30 all stay eligible,
+so rerunning the same command each day fills the holes instead of freezing them.
+An archived partition is sealed and immutable, so whatever it answered is final
+even when that answer is "nothing" — it is not re-fetched. `--force` re-queries
+everything. Rows carry the venue and the lag between the instant and the quote
+that stood for it, and the statistics step drops any leg further than
 `--max-lag-secs` (default 120 s) from its instant.
 
 Each statistic uses every day that can support it: `fwd` needs only the US
 symbol at t1 and t2, the regression needs both symbols at t0 and t1, so a day
-with one hole still contributes where it can. Dispersions are reported with an
-exact chi-square interval — at n=3 the point estimate alone decides nothing, and
-a "no kill" only means something when the interval's lower bound also clears the
-threshold.
+with one hole still contributes where it can.
+
+The decision is three-valued — `KILL`, `PROCEED`, or `UNRESOLVED` — because the
+rules are written on standard deviations the sample only estimates. A kill needs
+the whole chi-square interval below 14 bps, a clearance needs the whole interval
+above it, and an interval straddling the threshold is unresolved, which is a
+different answer from "not killed". K0-b additionally needs both beta
+conventions to agree before it can kill, so the formula ambiguity above can
+never be what ends the experiment. No data reads as `UNRESOLVED`, never as a
+pass.
