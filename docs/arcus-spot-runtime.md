@@ -434,6 +434,22 @@ At `resume_not_before` the runtime resumes only when all three hold:
    pending plan, and a checkpoint in step with the event-stream tail. It is
    also refused when the checkpoint is already flat.
 
+   The amounts you pass are in the units the venue quotes **now**, which
+   for a split is not what the runtime tracked: across a 4-for-1, a tracked
+   `rotated_quantity` of 2 is 8 units sold. The report says both, labelled
+   -- `settled_sell_quantity`/`settled_buy_quantity` for what actually
+   changed hands, `tracked_pre_event_quantity` for the stale figure the
+   runtime was carrying. A leg that ends at exactly zero is accepted
+   (subject to its inventory floor).
+
+   **Re-running it is safe.** The ledger commits before the checkpoint, so
+   an interruption in between leaves the close recorded against a
+   checkpoint that still shows the rotation. Running the command again with
+   the same amounts finishes that transition -- it recognises its own
+   half-committed close and writes only the checkpoint, rather than
+   appending a second one and advancing the sequence again. The report says
+   `resumed_a_recorded_close: true` when that happened.
+
    **Take a fresh `state-backup` afterwards.** Like `reset-window`, this
    writes over the record that earlier backups verify against, so those no
    longer verify. Continuity verification compares a neutral, no-active
