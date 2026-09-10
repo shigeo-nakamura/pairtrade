@@ -4304,43 +4304,13 @@ impl EngineBLiveEngine {
     /// Shared tail of a successful (or adopted) entry: record the
     /// position, mark the day as acted on, persist, log, notify.
     fn record_entry(&mut self, pos: OpenPosition, epsilon: f64, notional_usd: f64, note: &str) {
-        // Normally already open, from the send. This covers the paths
-        // that reach a position without one -- DRY_RUN, where nothing is
-        // sent -- without discarding fills already accumulated for this
-        // very trade (bot-strategy#919, pairtrade#320 Codex review
-        // round 4).
-        if !self.fill_ledger_trade_open {
-            self.begin_fill_ledger(pos.side);
-        } else if self.fill_ledger_entry_side != Some(pos.side) {
-            // The exchange holds the opposite side from the one that was
-            // submitted, and its answer is the authoritative one -- the
-            // caller has already recorded it and halted. Everything
-            // harvested so far was sorted against the submitted side, so
-            // the two legs are simply the wrong way round: left alone,
-            // the entry fill would be counted as the close, the close as
-            // the entry, and `settled` would publish reversed VWAPs and
-            // a gross PnL with the wrong sign (pairtrade#320 Codex
-            // review round 5).
-            //
-            // Rows already in `fills.jsonl` keep a `leg` derived from
-            // the same mistaken side. Their `side` field is the venue's
-            // own and stays correct, so an offline reconstruction is
-            // unaffected; only the convenience label is wrong, and it
-            // cannot be rewritten in an append-only log.
-            log::warn!(
-                "[FILLS] confirmed side {} differs from the submitted {:?}; re-keying the fill \
-                 ledger and swapping its legs. Rows already written carry the pre-swap `leg` \
-                 label -- reconstruct from `side`.",
-                pos.side,
-                self.fill_ledger_entry_side
-            );
-            std::mem::swap(&mut self.entry_fills, &mut self.exit_fills);
-            self.fill_ledger_entry_side = Some(pos.side);
-        }
         let side = pos.side;
         let price = pos.entry_price;
         let size = pos.size;
         self.position = Some(pos);
+        // After the position is installed, so the ledger keys off the
+        // side the exchange confirmed rather than the one submitted.
+        self.align_fill_ledger_with_position();
         // Durable before anything else: from here on a restart resumes
         // this position for its scheduled exit (bot-strategy#917).
         self.persist_position();
@@ -5338,23 +5308,7 @@ impl EngineBLiveEngine {
     /// counted in neither leg -- it would otherwise land in whichever
     /// leg happened to be open and silently corrupt a VWAP.
     async fn harvest_fills(&mut self, now_us: i64) {
-        // A position this process did not open -- restored after a
-        // restart, or adopted from the exchange -- installs
-        // `self.position` without ever going through `record_entry`, so
-        // the ledger has no side and would sit idle for the rest of the
-        // position's life, recording nothing at all (pairtrade#320 Codex
-        // review round 3). Adopt it here, at the one place that would
-        // otherwise give up.
-        //
-        // The entry fills for such a position are from before this
-        // process and are not recoverable, so its settlement stays
-        // unknown -- which is correct. The exit fills still have to be
-        // recorded.
-        if !self.fill_ledger_trade_open {
-            if let Some(side) = self.position.as_ref().map(|p| p.side) {
-                self.begin_fill_ledger(side);
-            }
-        }
+        self.align_fill_ledger_with_position();
         let Some(entry_side) = self.fill_ledger_entry_side else {
             return;
         };
@@ -5478,6 +5432,54 @@ impl EngineBLiveEngine {
             // difference is the mark-versus-fill error and nothing else.
             "mid_estimate_error_usd": gross - mid_pnl,
         }))
+    }
+
+    /// Keep the ledger's key in step with the position it is recording.
+    ///
+    /// Enforced here, at the single point every fill passes through,
+    /// rather than at each site that installs a position. There are
+    /// four of those -- the confirmed entry, the unconfirmed-send
+    /// adoption, the exchange adoption, and the restart restore -- and
+    /// patching them one at a time is how the same defect kept coming
+    /// back in review (pairtrade#320 rounds 3, 5 and 6). While a
+    /// position exists its side *is* the entry side, so the invariant
+    /// is simply that the two agree.
+    ///
+    /// Two ways they can disagree:
+    ///
+    /// - **No key at all.** A position restored after a restart or
+    ///   adopted from the exchange never went through an entry. Its
+    ///   pre-existing fills are not recoverable, so that trade settles
+    ///   as unknown -- correct -- but everything from here on is
+    ///   recorded.
+    /// - **The wrong key.** The exchange confirmed the opposite side
+    ///   from the one submitted, and its answer is authoritative.
+    ///   Everything harvested so far was sorted against the submitted
+    ///   side, so the two legs are inverted, not lost: swapping them is
+    ///   the whole correction. Left alone, `settled` would publish
+    ///   reversed VWAPs and a gross PnL with the wrong sign -- the one
+    ///   number here that is meant to be more trustworthy than the mid.
+    ///
+    /// Rows already written keep a `leg` derived from the mistaken
+    /// side; an append-only log cannot be rewritten. Their `side` field
+    /// is the venue's own and stays correct, so reconstruct from that.
+    fn align_fill_ledger_with_position(&mut self) {
+        let Some(pos_side) = self.position.as_ref().map(|p| p.side) else {
+            return;
+        };
+        if !self.fill_ledger_trade_open {
+            self.begin_fill_ledger(pos_side);
+        } else if self.fill_ledger_entry_side != Some(pos_side) {
+            log::warn!(
+                "[FILLS] the position's side {} differs from the ledger's {:?}; re-keying and \
+                 swapping its legs. Rows already written carry the pre-swap `leg` label -- \
+                 reconstruct from `side`.",
+                pos_side,
+                self.fill_ledger_entry_side
+            );
+            std::mem::swap(&mut self.entry_fills, &mut self.exit_fills);
+            self.fill_ledger_entry_side = Some(pos_side);
+        }
     }
 
     /// Start a fresh settled account for a trade entering on `side`.
@@ -6091,6 +6093,14 @@ async fn main() -> Result<()> {
                 engine.tick().await;
             }
             Wake::Signal(signal) => {
+                // A fill can reach the connector's cache after the last
+                // tick and before the signal wins this select. Nothing
+                // else will ever write it: on restart the cache is gone
+                // and the row is unrecoverable, leaving that trade
+                // permanently unsettled (pairtrade#320 Codex review
+                // round 6). One last read of an in-memory cache, on a
+                // path that is already doing durable work.
+                engine.harvest_fills(engine.now()).await;
                 let _ = engine.note_shutdown_signal(signal);
                 break;
             }
@@ -9766,6 +9776,53 @@ mod tests {
             .as_f64()
             .unwrap();
         assert!((gross - 0.5).abs() < 1e-9, "gross {gross}");
+    }
+
+    /// pairtrade#320 Codex review round 6: the same inversion as the
+    /// confirmed-entry case, reached through a path that never touches
+    /// `record_entry` -- an adoption after the confirmation window
+    /// expired. Pinned here because the invariant is now enforced where
+    /// fills are classified, not at each site that installs a position.
+    #[tokio::test]
+    async fn a_position_adopted_on_the_other_side_re_keys_the_ledger_too() {
+        let mut h = harness();
+        // Submitted long; the venue filled a short and the confirmation
+        // window expired, so the position is installed directly.
+        h.engine.begin_fill_ledger(OrderSide::Long);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.05", "1700.00", None);
+        h.harvest(T1_US).await;
+        assert_eq!(
+            h.engine.exit_fills.fills, 1,
+            "sorted against the submitted side"
+        );
+
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            entry_price_estimated: true,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        h.connector
+            .push_fill("x1", OrderSide::Long, "0.05", "1690.00", None);
+        h.harvest(T2_US).await;
+        assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Short));
+        assert_eq!(h.engine.entry_fills.fills, 1, "legs swapped, not lost");
+
+        h.engine.on_exit(1690.0, T2_US).await;
+        let gross = last_pnl_record(&h)["settled"]["gross_pnl_usd"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (gross - 0.5).abs() < 1e-9,
+            "short 1700 -> 1690 on 0.05 is +$0.50, not -$0.50: {gross}"
+        );
     }
 
     #[tokio::test]

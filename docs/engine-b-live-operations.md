@@ -144,6 +144,10 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     dex-connector work; so is settled funding. Until then a `null` fee
     is the honest reading and reading it as zero would overstate every
     result.
+  - A final harvest runs on SIGTERM/SIGINT. A fill can reach the
+    connector's cache after the last tick and before the signal, and
+    nothing else would ever write it -- on restart the cache is gone and
+    the row is unrecoverable.
   - Harvesting costs nothing on the wire -- the Lighter connector
     serves `get_filled_orders` from its own WS-populated cache and
     issues no request -- and happens **twice, both of which earn their
@@ -163,9 +167,14 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     entry fill against the previous trade's still-open accumulators and
     mark it seen process-wide, leaving every second-and-later trade in a
     process permanently unsettled.
-  - If the exchange confirms the **opposite side** from the one
-    submitted, its answer is authoritative and the ledger is re-keyed to
-    it, swapping the two legs. Left alone it would file the entry fill
+  - The ledger's key is kept in step with the position **where fills
+    are classified**, not at each of the four sites that install one
+    (confirmed entry, unconfirmed-send adoption, exchange adoption,
+    restart restore). While a position exists its side is the entry
+    side, so the invariant is just that the two agree. If the exchange
+    holds the **opposite side** from the one submitted, its answer is
+    authoritative and the ledger is re-keyed to it, swapping the two
+    legs. Left alone it would file the entry fill
     as the close and publish a gross PnL with the wrong sign. Rows
     already in `fills.jsonl` keep the pre-swap `leg` label -- an
     append-only log cannot be rewritten -- but their `side` field is the
