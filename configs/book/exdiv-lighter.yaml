@@ -84,6 +84,9 @@ execution:
   # skipped anything wider than 30 bps. allow_venue_protection_fallback
   # stays at its default false -- Lighter no longer needs it, so enabling
   # it would only widen a fill. See docs/book-runtime-operations.md.
+  # Bound against the mid (bot-strategy#971): the runtime nets out the
+  # half-spread before the send, so a spread that opened past 30 bps
+  # between the producer's skip check and 13:29 refuses the entry.
   slippage_bps: 30
   max_attempts: 3
   fill_confirm_timeout_secs: 10

@@ -965,9 +965,32 @@ impl ArcusSpotRuntime {
         if actual_sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
             return Err("confirmed live fill quantities must be positive".to_string());
         }
-        if actual_sell_quantity != plan.sell_quantity {
+        // Not exactly the planned quantity, but within dust of it: a
+        // settlement transaction may take slightly less of the signed sell
+        // amount than it pulled and refund the remainder to the taker in the
+        // same transaction (bot-strategy#979). The caller has already
+        // required this figure to equal the settled input derived from that
+        // transaction's own transfers, so the shortfall is evidence-backed
+        // rather than asserted -- but this is the last seam before inventory
+        // moves, so it keeps its own bound rather than trusting the caller:
+        // anything more than dust short is a partial fill this design never
+        // performs, and more than planned remains impossible. Committing the
+        // planned quantity when a refund did occur would book inventory the
+        // wallet still holds (the bot-strategy#869 drift class).
+        let sell_shortfall_allowance = plan
+            .sell_quantity
+            .checked_mul(ROTATION_DUST_FRACTION)
+            .ok_or("confirmed sell dust allowance overflow")?;
+        let minimum_confirmed_sell = plan
+            .sell_quantity
+            .checked_sub(sell_shortfall_allowance)
+            .ok_or("confirmed sell dust allowance overflow")?;
+        if actual_sell_quantity > plan.sell_quantity
+            || actual_sell_quantity < minimum_confirmed_sell
+        {
             return Err(format!(
-                "confirmed sell quantity {} does not equal planned exact quantity {}",
+                "confirmed sell quantity {} is not within settlement dust of planned exact \
+                 quantity {}",
                 actual_sell_quantity, plan.sell_quantity
             ));
         }
@@ -1026,15 +1049,13 @@ impl ArcusSpotRuntime {
                 if actual_sell_quantity > open {
                     return Err("confirmed exit sold more than tracked open quantity".to_string());
                 }
-                let remaining = open
-                    .checked_sub(actual_sell_quantity)
-                    .ok_or("confirmed exit quantity subtraction overflow")?;
-                if remaining.is_zero() {
-                    next.regime = ArcusSpotRegime::Neutral;
-                    next.last_rotation_at = None;
-                    next.rotated_quantity = None;
-                } else {
-                    next.rotated_quantity = Some(remaining);
+                match rotation_remaining_after_exit(open, actual_sell_quantity)? {
+                    Some(remaining) => next.rotated_quantity = Some(remaining),
+                    None => {
+                        next.regime = ArcusSpotRegime::Neutral;
+                        next.last_rotation_at = None;
+                        next.rotated_quantity = None;
+                    }
                 }
             }
         }
@@ -1444,19 +1465,25 @@ impl ArcusSpotRuntime {
                         // clear the regime once the whole open amount has
                         // actually been unwound, otherwise stay rotated
                         // with the remaining open quantity so the next step
-                        // keeps trying to close it out.
-                        let remaining = self
-                            .state
-                            .rotated_quantity
-                            .and_then(|open| open.checked_sub(plan.sell_quantity))
-                            .unwrap_or(Decimal::ZERO)
-                            .max(Decimal::ZERO);
-                        if remaining.is_zero() {
-                            self.state.regime = ArcusSpotRegime::Neutral;
-                            self.state.last_rotation_at = None;
-                            self.state.rotated_quantity = None;
-                        } else {
-                            self.state.rotated_quantity = Some(remaining);
+                        // keeps trying to close it out. Shares the live
+                        // path's dust rule so replay and live cannot
+                        // disagree about when a rotation is closed.
+                        let remaining = match self.state.rotated_quantity {
+                            // `.min(open)` and the overflow-free subtraction
+                            // inside leave no reachable error here.
+                            Some(open) => {
+                                rotation_remaining_after_exit(open, plan.sell_quantity.min(open))
+                                    .unwrap_or(None)
+                            }
+                            None => None,
+                        };
+                        match remaining {
+                            Some(remaining) => self.state.rotated_quantity = Some(remaining),
+                            None => {
+                                self.state.regime = ArcusSpotRegime::Neutral;
+                                self.state.last_rotation_at = None;
+                                self.state.rotated_quantity = None;
+                            }
                         }
                     }
                 }
@@ -2567,6 +2594,36 @@ fn find_token(
 }
 
 /// Standalone form of `ArcusSpotRuntime::open_exit_fixed_sell_amount_row`
+/// One part per billion of the rotation being closed. What is left of an
+/// exit below this is settlement dust, not exposure.
+///
+/// A route may take slightly less of the signed sell amount than it pulled
+/// and refund the remainder inside the settlement transaction
+/// (bot-strategy#979) -- 16 wei of an 18-decimal token, in the live case
+/// that motivated this. Carrying that residue as a still-open rotation
+/// would strand the bot: exits are sized at exactly the tracked open
+/// quantity, so the next tick would ask the venue to quote a few wei
+/// forever. A billionth of a ~0.5-unit rotation is ~5e-10 units (well under
+/// a millionth of a cent at these prices), far below any position this
+/// strategy can hold deliberately and far above the wei-scale residue a
+/// refund leaves.
+const ROTATION_DUST_FRACTION: Decimal = Decimal::from_parts(1, 0, 0, false, 9);
+
+/// What remains open after an exit sold `sold` of a `open`-sized rotation:
+/// `None` once nothing but dust is left, so the caller closes the regime.
+fn rotation_remaining_after_exit(open: Decimal, sold: Decimal) -> Result<Option<Decimal>, String> {
+    if sold > open {
+        return Err("confirmed exit sold more than tracked open quantity".to_string());
+    }
+    let remaining = open
+        .checked_sub(sold)
+        .ok_or("confirmed exit quantity subtraction overflow")?;
+    let dust_ceiling = open
+        .checked_mul(ROTATION_DUST_FRACTION)
+        .ok_or("rotation dust ceiling overflow")?;
+    Ok((remaining > dust_ceiling).then_some(remaining))
+}
+
 /// for a caller that only has the checkpointed regime/rotated_quantity and
 /// the configured pair, not a full `ArcusSpotRuntime` -- e.g. live-tick's
 /// unlocked pre-fetch peek at the checkpoint (bot-strategy#906), which must
@@ -7112,6 +7169,119 @@ mod tests {
             .is_err());
         assert_eq!(runtime.state(), &before);
     }
+    /// bot-strategy#979: the live incident's shape. The settlement refunded
+    /// 16 wei of an 18-decimal sell, so the wallet parted with slightly less
+    /// than planned and the runtime has to commit exactly that -- otherwise
+    /// it books inventory the wallet still holds.
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn a_dust_short_confirmed_sell_commits_what_actually_moved() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        let before = runtime.state().inventory;
+        let refunded = Decimal::new(16, 18);
+        let sold = plan.sell_quantity - refunded;
+
+        runtime
+            .apply_confirmed_live_fill(&plan, sold, plan.buy_quantity, event_time())
+            .unwrap();
+
+        assert_eq!(runtime.state().inventory.token_a, before.token_a - sold);
+        assert_eq!(
+            runtime.state().inventory.token_a,
+            before.token_a - plan.sell_quantity + refunded
+        );
+    }
+
+    /// The dust that a refund leaves is not an open position: exits are
+    /// sized at exactly the tracked open quantity, so carrying a few wei
+    /// forward would leave the bot asking the venue to quote dust forever
+    /// (bot-strategy#979).
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn a_dust_short_confirmed_exit_closes_the_rotation() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let entry = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        runtime
+            .apply_confirmed_live_fill(
+                &entry,
+                entry.sell_quantity,
+                entry.buy_quantity,
+                event_time(),
+            )
+            .unwrap();
+        let open = runtime.state.rotated_quantity.unwrap();
+
+        let mut exit = entry;
+        exit.direction = ArcusSpotDirection::TokenBToTokenA;
+        exit.trigger = ArcusSpotRotationTrigger::MeanReversionExit;
+        exit.sell_quantity = open;
+        exit.buy_quantity = Decimal::new(1, 3);
+        runtime
+            .apply_confirmed_live_fill(
+                &exit,
+                open - Decimal::new(16, 18),
+                exit.buy_quantity,
+                event_time(),
+            )
+            .unwrap();
+
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+        assert_eq!(runtime.state().rotated_quantity, None);
+        assert_eq!(runtime.state().last_rotation_at, None);
+    }
+
+    /// The dust band is the whole licence: a shortfall bigger than that is a
+    /// partial fill this design never performs, and the last seam before
+    /// inventory moves refuses it on its own rather than trusting whatever
+    /// derived the quantity (bot-strategy#979).
+    #[cfg(feature = "arcus-spot-live")]
+    #[test]
+    fn a_materially_short_confirmed_sell_is_still_refused() {
+        let mut cfg = config();
+        cfg.mode = ArcusSpotRuntimeMode::Live;
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        let plan = runtime
+            .build_plan(
+                &context(event_time() - Duration::seconds(2), Decimal::from(20)),
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        let before = runtime.state().clone();
+        // One part per million short -- a thousand times the dust band.
+        let sold = plan.sell_quantity - plan.sell_quantity * Decimal::new(1, 6);
+
+        let error = runtime
+            .apply_confirmed_live_fill(&plan, sold, plan.buy_quantity, event_time())
+            .unwrap_err();
+
+        assert!(error.contains("settlement dust"));
+        assert_eq!(runtime.state(), &before);
+    }
+
     #[cfg(feature = "arcus-spot-live")]
     #[test]
     fn failed_live_exit_does_not_partially_mutate_inventory() {

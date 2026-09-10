@@ -653,3 +653,138 @@ sudo systemctl stop engine-b-phase0.service
 Before restart, inspect the last journal error, disk usage, the active SQLite
 WAL, and S3 archive continuity. A DB write failure or disk-full condition must
 remain fail-closed; do not bypass the archive verification to reclaim space.
+
+## Archive capacity monitoring (#915)
+
+`scripts/engine_b_archive_monitor.py` provides independent, read-only metrics on
+`127.0.0.1:9473/metrics`. It reads filesystem capacity, retained partition sizes,
+local seals, and the archive service/timer's systemd properties. It does not open
+SQLite databases, call an exchange, archive files, or change service state.
+`--once` prints the same observations plus errors as JSON and exits nonzero when
+any probe fails. Collection errors also emit `probe_success=0` over HTTP 200 so
+Prometheus can record partial observations; HTTP success alone is not health.
+
+The supplied unit uses the existing `engine-b-phase0` account. Install from a
+reviewed checkout (this monitor is separate from the observer runtime installer):
+
+```bash
+sudo install -o root -g engine-b-phase0 -m 0550 scripts/engine_b_archive_monitor.py /opt/engine-b-phase0/engine_b_archive_monitor.py
+sudo install -o root -g root -m 0644 deploy/engine-b-phase0-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now engine-b-phase0-monitor.service
+sudo -u engine-b-phase0 /usr/bin/python3 /opt/engine-b-phase0/engine_b_archive_monitor.py --once
+curl -fsS http://127.0.0.1:9473/metrics
+```
+
+Only the new monitoring service is started. Match its `--retention-hours` to the
+archive service's effective `ENGINE_B_PHASE0_RETENTION_HOURS` (the supplied unit
+assumes the approved 24-hour retention). These metrics and the stalled alert
+assume `DELETE_VERIFIED_LOCAL=true`; archive-only operation needs a separate
+completion marker and must not use the verified-removal metric as success.
+
+Add an Alloy scrape using the deployment's existing remote-write receiver:
+
+```alloy
+prometheus.scrape "engine_b_phase0_archive" {
+  targets = [{ "__address__" = "127.0.0.1:9473" }]
+  job_name = "engine-b-phase0-archive"
+  scrape_interval = "60s"
+  scrape_timeout = "30s"
+  forward_to = [prometheus.remote_write.EXISTING.receiver]
+}
+```
+
+Replace `EXISTING` with the actual configured component name. Import
+`grafana/alerts/engine-b-archive.rules.yml` into the connected Prometheus ruler
+and route warning alerts to the operator's existing contact point. The rules
+cover missing scrape/probe failure, less than 5 GiB or 15% available disk,
+archive failure/inactive timer, and eligible backlog without a verified removal
+for three hours. Warning thresholds are initial operational defaults, not a
+measured capacity guarantee. Confirm the job label in remote storage before
+loading the rules; the absent-series alert assumes this job should exist.
+
+`last_verified_removal_timestamp_seconds` is the latest local seal timestamp
+whose source DB no longer exists. The archiver writes a seal before it verifies
+remote sidecars, so a seal **with a retained source DB never counts as success**.
+No qualifying seal yields zero, even if systemd reports a successful no-op run.
+This is evidence of the normal verified-deletion path, not a fresh independent
+S3 integrity check, and assumes operators do not remove source DBs manually.
+The seal timestamp precedes completion by the sidecar-upload duration. Use the
+independent S3 restore procedure above for archive integrity verification.
+
+`retained_partition_bytes` and `eligible_partition_bytes` count DB file sizes,
+excluding WAL/SHM, seal indexes, and scratch files. Available disk includes all
+filesystem usage. Eligibility uses the partition **end** plus retention, never
+mtime. A retained-byte delta is not a write-rate estimate because archival
+removes files concurrently. Measure full weekday production separately from
+canonical archived DB lengths, grouped by partition hour, and retained complete
+hours; deduplicate by partition and report coverage before extrapolating.
+
+Deployment acceptance remains operational work: confirm a normal hourly cycle,
+exercise each rule using a test series/ruler test without stopping collection or
+filling the disk, verify delivery to the contact point, and record the result in
+#915. Do not mark persistent monitoring complete merely because this endpoint
+or the rule file exists. Weekday recovered-feed write-rate measurement is also
+still required before closing #915.
+## Reproducible boundary preflight (#872)
+
+`scripts/engine_b_boundary_quality.py` audits **closed offline SQLite copies**
+from the Phase 0 collector. Restore the canonical S3 DB archives and verify
+checksums first using the archive procedure above. Do not point this tool at the
+live data directory or remove WAL/SHM files to make a live DB pass its guard.
+
+```bash
+python3 scripts/engine_b_boundary_quality.py \
+  --data-dir /tmp/engine-b-offline \
+  --calendar configs/engine-b/trading_calendar.json \
+  --start 2026-09-08 --end 2026-09-09 \
+  --symbols SKHYNIXUSD SNDK SOXL NVDA EWY USDKRW \
+  --output /tmp/engine-b-boundary-quality.json
+```
+
+The required symbols are explicit. The example is an input set to inspect, not
+a primary-symbol/model freeze. Rerun candidate comparisons with the alternative
+KR/US inputs and preserve each report. The frozen calendar supplies t0 (KRX
+open), t1 (KRX close), and t2 (US cash open), including DST and delayed opens.
+Closed days are `market_closed`, never valid observations. Missing calendar days
+or malformed inputs fail the command with exit 2. A completed report exits 0
+even when boundaries fail: inspect the per-day/per-symbol status and reasons.
+
+Each boundary selects the latest stored complete snapshot **at or before** the
+boundary with receive age at most 30 seconds. It does not fill holes with later
+prices or fall back to an older good snapshot when the latest is malformed.
+It reports nonce presence, locked/crossed/missing-sided/zero-size/nonfinite book
+errors, contiguous level order, Decimal mid/spread/top-five depth, and available
+receive-minus-server timestamp diagnostics. Missing sequence numbers fail the
+preflight; their presence does not prove complete sequence continuity.
+
+The legacy `lighter_mainnet_context` and current `lighter` aliases are accepted
+only when `collector_manifest.config_json` identifies HTTPS/WSS mainnet
+endpoints and the event's symbol/market ID. Conflicting IDs or non-mainnet
+endpoints are rejected. Robinhood rows never substitute for missing mainnet
+inputs. Equal-time candidates from both aliases are ambiguous and fail.
+
+Provide hourly partitions covering each boundary plus/minus 15 minutes; t0
+requires the preceding day's final hour. Missing files fail the preflight and
+are listed explicitly. Connection/order-book `data_gap` and
+`sealed_gap_interval` rows in these partitions are checked for overlap with the
+whole boundary window, including gaps after the selected quote. Recovery rows
+stored **outside** these loaded partitions are not scanned by this preflight.
+The report does not sum missing durations or treat a file's presence as proof
+of continuous collection. Missing gap tables are reported as missing evidence.
+
+Every report includes the SHA-256 and size of each loaded DB, missing input
+names, calendar/code hashes, parameters and an `analysis_hash`. The analyzer
+opens DBs read-only with `immutable=1`, rejects WAL/SHM companions, and rehashes
+inputs after analysis to detect source mutation. Keep its input directory
+immutable for the entire run; there is no live-backup or repair functionality.
+Reports are atomically replaced after a successful analysis.
+
+`boundary_preflight_pass` is a necessary-input check only. **G0-2 remains
+`not_evaluated` in every report.** This tool does not determine full-session
+connection/sequence coverage, clock synchronization, freshness throughout the
+window, late recovery evidence in other partitions, eligibility, arrival-time
+execution VWAP, funding/fees, model selection, or Phase 0A/0B acceptance. A
+boundary passing this check must not be counted as a valid statistical session.
+Those remaining #872 checks need separate daily analysis over the complete
+archive and recovery evidence.

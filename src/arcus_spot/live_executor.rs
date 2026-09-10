@@ -569,19 +569,23 @@ where
         }
         require_intent_matches_plan_shape(&active, plan)?;
         let (sold_raw, bought_raw) = reconciled_balance_deltas(&active)?;
-        if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
-            bail!("reconciled Arcus sell delta no longer matches the signed intent");
-        }
+        require_sell_delta_matches_settled_input(&active, sold_raw)?;
         require_buy_delta_matches_settled_output(&active, bought_raw)?;
         if plan.sell_quantity <= Decimal::ZERO {
             bail!("approved Arcus plan has an invalid sell quantity");
         }
+        // Both quantities come from what the wallet actually moved, not
+        // from the plan's targets: a route that refunds part of the signed
+        // sell amount inside the settlement transaction (bot-strategy#979)
+        // would otherwise book inventory the wallet still holds, which is
+        // the drift bot-strategy#869 exists to prevent.
+        let actual_sell_quantity = reconciled_actual_sell_quantity(plan, sold_raw)?;
         let actual_buy_quantity = reconciled_actual_buy_quantity(plan, bought_raw)?;
-        if actual_buy_quantity <= Decimal::ZERO {
+        if actual_sell_quantity <= Decimal::ZERO || actual_buy_quantity <= Decimal::ZERO {
             bail!("reconciled Arcus runtime quantities must be positive");
         }
         Ok(ArcusSpotReconciledRuntimeFill {
-            actual_sell_quantity: plan.sell_quantity,
+            actual_sell_quantity,
             actual_buy_quantity,
             reconciled_at: reconciled_fill_time(&active)?,
             idempotency_key: active.idempotency_key,
@@ -746,8 +750,9 @@ where
         // to the confirmed block, its own `latest` is read instead. This
         // can no longer prove the returned balances reflect *only* this
         // swap -- `reconciled_runtime_fill` below closes that gap by
-        // requiring the computed sell delta to equal the dispatched
-        // plan's own sell_amount_raw exactly, and refusing (fail-closed)
+        // requiring each computed delta to equal what this transaction's
+        // own logs report (bot-strategy#883 for the buy leg,
+        // bot-strategy#979 for the sell leg), and refusing (fail-closed)
         // otherwise.
         let settlement = self
             .chain
@@ -827,6 +832,7 @@ fn persist_reconciliation_read(
     let mutation = ledger.reconcile_balances(
         settlement.balances,
         &settlement.settled_buy_amount_raw,
+        &settlement.settled_sell_amount_raw,
         Utc::now(),
     );
     store.persist(ledger)?;
@@ -1029,6 +1035,42 @@ fn reconciled_balance_deltas(active: &ArcusSpotExecutionAttempt) -> Result<(U256
 /// exactly the silent weakening the check exists to prevent. The error
 /// names the manual-reconcile path, which commits such an attempt against
 /// an operator-attested amount instead.
+/// Sell-side twin of `require_buy_delta_matches_settled_output`: the wallet
+/// delta must equal what this swap's own transfers took, not the signed
+/// intent, because a route may refund part of the signed amount inside the
+/// settlement transaction (bot-strategy#979).
+///
+/// `reconcile_balances` already required this equality before it let the
+/// attempt reach `Reconciled`; re-checking here keeps the committed runtime
+/// fill provably tied to the same evidence, and refuses a
+/// `settled_sell_amount_raw` that predates the check rather than falling
+/// back to the signed amount.
+fn require_sell_delta_matches_settled_input(
+    active: &ArcusSpotExecutionAttempt,
+    sold_raw: U256,
+) -> Result<()> {
+    let settled_sell_amount_raw = active.settled_sell_amount_raw.as_deref().context(
+        "reconciled Arcus attempt records no settled swap input -- it was reconciled before \
+         bot-strategy#979, so commit it through the manual-reconcile-report/-apply path with an \
+         independently verified sell amount instead",
+    )?;
+    let settled_sell = parse_amount("settled sell amount", settled_sell_amount_raw)?;
+    if sold_raw != settled_sell {
+        bail!(
+            "reconciled Arcus sell delta {sold_raw} no longer matches the settled swap input \
+             {settled_sell}"
+        );
+    }
+    let signed_sell = parse_amount("intent sell amount", &active.intent.sell_amount_raw)?;
+    if settled_sell > signed_sell {
+        bail!(
+            "reconciled Arcus settled swap input {settled_sell} exceeds the signed intent \
+             {signed_sell}"
+        );
+    }
+    Ok(())
+}
+
 fn require_buy_delta_matches_settled_output(
     active: &ArcusSpotExecutionAttempt,
     bought_raw: U256,
@@ -1057,6 +1099,25 @@ fn require_buy_delta_matches_settled_output(
 /// plan for the same buy token supplies `buy_quantity`/`buy_amount_raw` --
 /// it does not require `plan` to be the exact dispatched plan, only a
 /// same-buy-token one (bot-strategy#869 investigation).
+/// Mirror of `reconciled_actual_buy_quantity` for the sell leg: scale the
+/// approved plan's sell quantity by how much of its raw sell amount the
+/// wallet actually parted with (bot-strategy#979).
+fn reconciled_actual_sell_quantity(
+    plan: &ArcusSpotRotationPlan,
+    sold_raw: U256,
+) -> Result<Decimal> {
+    let planned_sell_raw = parse_amount("plan sell amount", &plan.sell_amount_raw)?;
+    if planned_sell_raw.is_zero() || plan.sell_quantity <= Decimal::ZERO {
+        bail!("approved Arcus plan has an invalid sell quantity");
+    }
+    let sold_decimal = u256_decimal("reconciled sell amount", sold_raw)?;
+    let planned_sell_decimal = u256_decimal("planned sell amount", planned_sell_raw)?;
+    plan.sell_quantity
+        .checked_mul(sold_decimal)
+        .and_then(|value| value.checked_div(planned_sell_decimal))
+        .context("reconciled Arcus sell quantity exceeds Decimal range")
+}
+
 fn reconciled_actual_buy_quantity(
     plan: &ArcusSpotRotationPlan,
     bought_raw: U256,
@@ -1135,8 +1196,16 @@ pub fn manual_reconciled_runtime_fill_for_attempt(
              refusing to proceed"
         );
     }
-    if sold_raw != parse_amount("intent sell amount", &active.intent.sell_amount_raw)? {
-        bail!("reconciled Arcus sell delta no longer matches the signed intent");
+    // Upper bound, not equality: a settlement transaction may refund part
+    // of the signed sell amount to the taker, so the wallet can legitimately
+    // part with less than was signed for (bot-strategy#979). More than the
+    // signed amount is still impossible under Permit2 and stays fatal. What
+    // pins the exact figure on this path is the operator's own attestation
+    // checked above -- this path exists precisely for attempts that carry no
+    // machine-checkable settled amount.
+    let signed_sell = parse_amount("intent sell amount", &active.intent.sell_amount_raw)?;
+    if sold_raw > signed_sell {
+        bail!("reconciled Arcus sell delta {sold_raw} exceeds the signed intent {signed_sell}");
     }
     let actual_sell_quantity =
         raw_amount_to_quantity(expected_sell_amount_raw, sell_token_decimals)
@@ -1607,7 +1676,7 @@ mod tests {
     fn reconciled_attempt(now: DateTime<Utc>) -> ArcusSpotExecutionAttempt {
         let mut ledger = confirmed_ledger(now);
         ledger
-            .reconcile_balances(execution_balances("4000", "3000", now), "1000", now)
+            .reconcile_balances(execution_balances("4000", "3000", now), "1000", "1000", now)
             .unwrap();
         ledger.active.unwrap()
     }
@@ -1643,6 +1712,103 @@ mod tests {
         let error =
             require_buy_delta_matches_settled_output(&active, U256::from(1000)).unwrap_err();
         assert!(error.to_string().contains("manual-reconcile"));
+    }
+
+    /// bot-strategy#979: the sell leg gets the same treatment as the buy
+    /// leg. `refunded_attempt` parts with 984 of a signed 1000 because the
+    /// settlement refunded 16 in the same transaction, and the settled
+    /// input says so.
+    #[test]
+    fn a_runtime_fill_requires_the_sell_delta_to_equal_the_settled_input() {
+        let now = Utc::now();
+        let active = refunded_attempt(now);
+        require_sell_delta_matches_settled_input(&active, U256::from(984)).unwrap();
+
+        // The signed amount is no longer the yardstick -- what the
+        // transaction actually took is.
+        let error =
+            require_sell_delta_matches_settled_input(&active, U256::from(1000)).unwrap_err();
+        assert!(error.to_string().contains("settled swap input"));
+    }
+
+    /// The signed intent still bounds the settled amount from above:
+    /// Permit2 cannot authorise more than it (bot-strategy#979).
+    #[test]
+    fn a_runtime_fill_refuses_a_settled_input_above_the_signed_intent() {
+        let now = Utc::now();
+        let mut active = refunded_attempt(now);
+        active.settled_sell_amount_raw = Some("1001".to_string());
+
+        let error =
+            require_sell_delta_matches_settled_input(&active, U256::from(1001)).unwrap_err();
+        assert!(error.to_string().contains("exceeds the signed intent"));
+    }
+
+    /// Same asymmetry as the buy side: an attempt reconciled before this
+    /// evidence existed is refused by the automated path and sent to the
+    /// manual one.
+    #[test]
+    fn a_runtime_fill_refuses_an_attempt_with_no_settled_input() {
+        let now = Utc::now();
+        let mut active = refunded_attempt(now);
+        active.settled_sell_amount_raw = None;
+
+        let error = require_sell_delta_matches_settled_input(&active, U256::from(984)).unwrap_err();
+        assert!(error.to_string().contains("manual-reconcile"));
+    }
+
+    /// The committed quantity has to follow the wallet, not the plan:
+    /// booking the planned 1.0 when only 0.984 left would leave the runtime
+    /// believing it sold inventory it still holds (bot-strategy#869 drift,
+    /// bot-strategy#979).
+    #[test]
+    fn a_runtime_fill_scales_the_sell_quantity_by_what_actually_left_the_wallet() {
+        let plan = plan_with_buy_amount("1000");
+
+        assert_eq!(
+            reconciled_actual_sell_quantity(&plan, U256::from(984)).unwrap(),
+            Decimal::from_str_exact("0.984").unwrap()
+        );
+        assert_eq!(
+            reconciled_actual_sell_quantity(&plan, U256::from(1000)).unwrap(),
+            Decimal::ONE
+        );
+    }
+
+    /// The manual path must also accept a refunded attempt -- it is the
+    /// path an operator reaches for when the automated one has nothing to
+    /// check against. The operator's own attestation (984) still has to
+    /// match the wallet delta exactly.
+    #[test]
+    fn the_manual_path_commits_a_refunded_attempt() {
+        let now = Utc::now();
+        let mut active = refunded_attempt(now);
+        active.settled_sell_amount_raw = None;
+        let plan = plan_with_buy_amount("1000");
+
+        let fill = manual_reconciled_runtime_fill_for_attempt(&active, &plan, "984", "1000", 3, 3)
+            .unwrap();
+        assert_eq!(
+            fill.actual_sell_quantity,
+            Decimal::from_str_exact("0.984").unwrap()
+        );
+
+        // An attestation that disagrees with the delta is still refused.
+        let error =
+            manual_reconciled_runtime_fill_for_attempt(&active, &plan, "1000", "1000", 3, 3)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("operator-attested sell amount"));
+    }
+
+    /// `confirmed_ledger` reconciled the bot-strategy#979 way: the wallet
+    /// parted with 984 of a signed 1000 because the settlement transaction
+    /// refunded the unused 16 to the taker.
+    fn refunded_attempt(now: DateTime<Utc>) -> ArcusSpotExecutionAttempt {
+        let mut ledger = confirmed_ledger(now);
+        ledger
+            .reconcile_balances(execution_balances("4016", "3000", now), "1000", "984", now)
+            .unwrap();
+        ledger.active.unwrap()
     }
 
     /// The deliberate asymmetry: the manual-recovery path exists for

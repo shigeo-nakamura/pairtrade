@@ -19,6 +19,7 @@ abigen!(
         function nonces(address owner) external view returns (uint256)
         function name() external view returns (string)
         function version() external view returns (string)
+        event Transfer(address indexed from, address indexed to, uint256 value)
     ]"#
 );
 
@@ -162,18 +163,32 @@ pub struct ArcusSpotSettlementReceiptExpectation {
 
 /// A reconciliation read whose confirmed transaction was additionally
 /// proven to carry the canonical SwapShell's own `SwapExecuted` event, and
-/// the exact settled buy amount that event reported.
+/// the exact settled amounts that transaction's own logs reported.
 ///
-/// The balances and the settled amount come from two structurally different
-/// sources: `balances` is a `latest` snapshot read after confirmation (so it
-/// reflects everything that has touched the wallet since, not only this
-/// swap), while `settled_buy_amount_raw` is a field of the swap's own log
-/// entry and can never include anything else. Reconciliation requires them
-/// to agree exactly (bot-strategy#883).
+/// The balances and the settled amounts come from two structurally
+/// different sources: `balances` is a `latest` snapshot read after
+/// confirmation (so it reflects everything that has touched the wallet
+/// since, not only this swap), while the settled amounts are derived from
+/// the swap transaction's own log entries and can never include anything
+/// else. Reconciliation requires them to agree exactly (bot-strategy#883
+/// for the buy side, bot-strategy#979 for the sell side).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArcusSpotSettlementRead {
     pub balances: ArcusSpotBalanceSnapshot,
     pub settled_buy_amount_raw: String,
+    /// Sell tokens that actually left the taker: everything this
+    /// transaction moved out of the taker's wallet, minus anything the
+    /// same transaction refunded back to it. Not simply the signed amount
+    /// -- see `settled_sell_amount` (bot-strategy#979).
+    pub settled_sell_amount_raw: String,
+}
+
+/// The two amounts a settlement transaction's own logs prove, always read
+/// from the same receipt so reconciliation compares one consistent view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedSettlementAmounts {
+    settled_buy_amount: U256,
+    settled_sell_amount: U256,
 }
 
 #[derive(Clone, Copy)]
@@ -328,17 +343,19 @@ fn redact_rpc_url(rpc_url: &str) -> String {
     }
 }
 
-/// Returns the event's own `amount_out` -- the exact settled buy amount,
-/// reported atomically inside the same transaction as the swap. The caller
-/// carries it through to reconciliation, which requires the balance-derived
-/// buy delta to equal it exactly (bot-strategy#883); a `latest` balance
+/// Returns the amounts this transaction's own logs prove: the
+/// `SwapExecuted` event's `amount_out` (the exact settled buy amount) and
+/// the net sell-token outflow from the taker. Both are reported atomically
+/// inside the same transaction as the swap. The caller carries them through
+/// to reconciliation, which requires the balance-derived deltas to equal
+/// them exactly (bot-strategy#883, bot-strategy#979); a `latest` balance
 /// snapshot taken any distance in time after confirmation cannot show that
 /// on its own.
 fn validate_settlement_receipt(
     receipt: &TransactionReceipt,
     confirmed_tx_hash: H256,
     expected: ValidatedSettlementReceiptExpectation,
-) -> Result<U256> {
+) -> Result<ValidatedSettlementAmounts> {
     if receipt.transaction_hash != confirmed_tx_hash {
         bail!("Arcus Spot receipt transaction hash does not match confirmed transaction");
     }
@@ -393,7 +410,72 @@ fn validate_settlement_receipt(
     {
         bail!("Arcus Spot SwapExecuted output is below the signed minimum");
     }
-    Ok(event.amount_out)
+    Ok(ValidatedSettlementAmounts {
+        settled_buy_amount: event.amount_out,
+        settled_sell_amount: settled_sell_amount(receipt, expected)?,
+    })
+}
+
+/// The sell-token amount this transaction actually took from the taker:
+/// everything its own ERC-20 `Transfer` logs moved out of the taker, minus
+/// anything the same transaction moved back in.
+///
+/// `SwapExecuted.amount_in` cannot stand in for this. On 2026-09-09 an
+/// arcus-venue route pulled the full signed amount under Permit2, used 16
+/// wei less of it, and refunded the remainder to the taker inside the same
+/// transaction -- while still reporting the full signed amount as
+/// `amount_in` (bot-strategy#979). A pre/post `latest` balance delta nets
+/// that refund out, so requiring the delta to equal the signed amount
+/// turned an economically clean swap into sticky UNKNOWN and halted the
+/// bot. The transaction's own transfers are the only view that describes
+/// both legs, so reconciliation compares the balance delta against this.
+///
+/// Fail-closed on anything that is not a plain refund: no outflow at all,
+/// more leaving the taker than was signed for, or more refunded than left.
+fn settled_sell_amount(
+    receipt: &TransactionReceipt,
+    expected: ValidatedSettlementReceiptExpectation,
+) -> Result<U256> {
+    let mut sent = U256::zero();
+    let mut refunded = U256::zero();
+    for log in receipt
+        .logs
+        .iter()
+        .filter(|log| log.address == expected.sell_token)
+    {
+        let Ok(transfer) = TransferFilter::decode_log(&RawLog {
+            topics: log.topics.clone(),
+            data: log.data.to_vec(),
+        }) else {
+            continue;
+        };
+        if transfer.from == expected.taker {
+            sent = sent
+                .checked_add(transfer.value)
+                .context("Arcus Spot settlement sell-token outflow overflowed")?;
+        }
+        if transfer.to == expected.taker {
+            refunded = refunded
+                .checked_add(transfer.value)
+                .context("Arcus Spot settlement sell-token refund overflowed")?;
+        }
+    }
+    if sent.is_zero() {
+        bail!("Arcus Spot settlement receipt contains no sell-token transfer out of the taker");
+    }
+    if sent > expected.sell_amount {
+        bail!(
+            "Arcus Spot settlement moved {sent} sell tokens out of the taker, more than the signed {}",
+            expected.sell_amount
+        );
+    }
+    let settled = sent
+        .checked_sub(refunded)
+        .context("Arcus Spot settlement refunded more sell tokens than it took")?;
+    if settled.is_zero() {
+        bail!("Arcus Spot settlement refunded the entire sell amount");
+    }
+    Ok(settled)
 }
 
 impl ArcusSpotChainClient {
@@ -792,7 +874,7 @@ impl ArcusSpotChainClient {
         confirmed_tx_hash: H256,
     ) -> Result<ArcusSpotSettlementRead> {
         let expected = expectation.validate()?;
-        let (balances, settled_buy_amount) = self
+        let (balances, settled) = self
             .balances_requiring_receipt(
                 expected.taker,
                 expected.sell_token,
@@ -803,15 +885,15 @@ impl ArcusSpotChainClient {
             .await?;
         // `Some` by construction: a settlement expectation was passed in, so
         // the read either validated exactly one matching `SwapExecuted`
-        // event and carried its `amount_out` back, or failed before
-        // returning at all. Refusing here rather than defaulting keeps that
-        // an assertion instead of a silently skipped check if the
-        // relationship ever changes.
-        let settled_buy_amount =
-            settled_buy_amount.context("Arcus settlement read returned no settled buy amount")?;
+        // event and carried its amounts back, or failed before returning at
+        // all. Refusing here rather than defaulting keeps that an assertion
+        // instead of a silently skipped check if the relationship ever
+        // changes.
+        let settled = settled.context("Arcus settlement read returned no settled amounts")?;
         Ok(ArcusSpotSettlementRead {
             balances,
-            settled_buy_amount_raw: settled_buy_amount.to_string(),
+            settled_buy_amount_raw: settled.settled_buy_amount.to_string(),
+            settled_sell_amount_raw: settled.settled_sell_amount.to_string(),
         })
     }
 
@@ -822,7 +904,7 @@ impl ArcusSpotChainClient {
         buy_token: Address,
         confirmed_tx_hash: H256,
         settlement: Option<ValidatedSettlementReceiptExpectation>,
-    ) -> Result<(ArcusSpotBalanceSnapshot, Option<U256>)> {
+    ) -> Result<(ArcusSpotBalanceSnapshot, Option<ValidatedSettlementAmounts>)> {
         if taker == Address::zero()
             || sell_token == Address::zero()
             || buy_token == Address::zero()
@@ -831,7 +913,7 @@ impl ArcusSpotChainClient {
             bail!("invalid Arcus balance request addresses");
         }
         let chain_id = self.config.chain_id;
-        let ((raw, settled_buy_amount), _provider) = self
+        let ((raw, settled), _provider) = self
             .try_providers(|provider| async move {
                 // Neither read depends on the other's *result* (only on
                 // each having answered before the freshness check below),
@@ -849,7 +931,7 @@ impl ArcusSpotChainClient {
                         "Arcus provider has not yet indexed confirmed tx {confirmed_tx_hash:#x}"
                     )));
                 };
-                let settled_buy_amount = match settlement {
+                let settled = match settlement {
                     Some(expected) => Some(
                         validate_settlement_receipt(&receipt, confirmed_tx_hash, expected)
                             .map_err(ProviderAttemptError::Fatal)?,
@@ -887,11 +969,13 @@ impl ArcusSpotChainClient {
                 // touched the wallet in between -- unlike the retired
                 // pinned-block read, which isolated exactly one block.
                 // `reconciled_runtime_fill` (live_executor.rs) closes that
-                // gap on the consumer side: it requires the computed sell
-                // delta to equal the dispatched plan's own
-                // `sell_amount_raw` exactly, and refuses (fail-closed, the
-                // existing manual-recovery path takes over) rather than
-                // commit a reconciliation that doesn't match.
+                // gap on the consumer side: it requires each computed delta
+                // to equal what this transaction's own logs report -- the
+                // `SwapExecuted` output for the buy leg, the net transfer
+                // out of the taker for the sell leg -- and refuses
+                // (fail-closed, the existing manual-recovery path takes
+                // over) rather than commit a reconciliation that doesn't
+                // match.
                 let receipt_block_number = receipt
                     .block_number
                     .context("Arcus confirmed-transaction receipt is missing its block number")?;
@@ -918,12 +1002,12 @@ impl ArcusSpotChainClient {
                     provider, chain_id, taker, sell_token, buy_token,
                 )
                 .await?;
-                // Pairing the settled amount with the balances *this same
+                // Pairing the settled amounts with the balances *this same
                 // provider attempt* returned matters: try_providers can fall
                 // through to a later provider, and the two must always
-                // describe the same read for the exact-match check
+                // describe the same read for the exact-match checks
                 // downstream to mean anything.
-                Ok((raw, settled_buy_amount))
+                Ok((raw, settled))
             })
             .await?;
         Ok((
@@ -935,7 +1019,7 @@ impl ArcusSpotChainClient {
                 raw.buy_balance,
                 raw.gas_balance,
             ),
-            settled_buy_amount,
+            settled,
         ))
     }
 }
@@ -1274,6 +1358,57 @@ mod tests {
         success: bool,
         amount_out: u64,
     ) -> TransactionReceipt {
+        settlement_receipt_with_sell_transfers(route_tag, router, success, amount_out, 1000, 0)
+    }
+
+    /// `sent`/`refunded` are the sell-token ERC-20 `Transfer` legs the
+    /// settlement's sell side is derived from (bot-strategy#979): how much
+    /// left the taker, and how much the same transaction handed back.
+    fn settlement_receipt_with_sell_transfers(
+        route_tag: &str,
+        router: Address,
+        success: bool,
+        amount_out: u64,
+        sent: u64,
+        refunded: u64,
+    ) -> TransactionReceipt {
+        let (taker, sell_token, _buy_token) = test_addresses();
+        let mut receipt =
+            settlement_receipt_without_transfers(route_tag, router, success, amount_out);
+        let spender = Address::from_str("0x006102b16A04c20306A28b652745D3973D7D24fa").unwrap();
+        if sent > 0 {
+            receipt
+                .logs
+                .push(erc20_transfer_log(sell_token, taker, spender, sent));
+        }
+        if refunded > 0 {
+            receipt
+                .logs
+                .push(erc20_transfer_log(sell_token, spender, taker, refunded));
+        }
+        receipt
+    }
+
+    fn erc20_transfer_log(token: Address, from: Address, to: Address, value: u64) -> Log {
+        Log {
+            address: token,
+            topics: vec![
+                H256::from(keccak256("Transfer(address,address,uint256)")),
+                indexed_address(from),
+                indexed_address(to),
+            ],
+            data: Bytes::from(encode(&[Token::Uint(U256::from(value))])),
+            transaction_hash: Some(H256::from_low_u64_be(0x818)),
+            ..Default::default()
+        }
+    }
+
+    fn settlement_receipt_without_transfers(
+        route_tag: &str,
+        router: Address,
+        success: bool,
+        amount_out: u64,
+    ) -> TransactionReceipt {
         let (taker, sell_token, buy_token) = test_addresses();
         let swap_shell = Address::from_str("0x4262efBd176F02824af27010bEa218429c33c7E8").unwrap();
         let tx_hash = H256::from_low_u64_be(0x818);
@@ -1472,11 +1607,98 @@ mod tests {
             validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
                 .unwrap();
 
-        assert_eq!(settled, U256::from(985));
+        assert_eq!(settled.settled_buy_amount, U256::from(985));
         // The fixture's signed minimum and quoted output, neither of which
         // is the settled amount.
-        assert_ne!(settled, U256::from(980));
-        assert_ne!(settled, U256::from(990));
+        assert_ne!(settled.settled_buy_amount, U256::from(980));
+        assert_ne!(settled.settled_buy_amount, U256::from(990));
+        // No refund leg in this fixture, so the sell side is the full
+        // signed amount.
+        assert_eq!(settled.settled_sell_amount, U256::from(1000));
+    }
+
+    /// bot-strategy#979: the live failure. An arcus-venue route pulled the
+    /// full signed amount under Permit2 and refunded 16 unused wei in the
+    /// same transaction, so the wallet only parted with `signed - 16`. The
+    /// settled sell amount has to describe that, not the signed amount --
+    /// otherwise reconciliation compares the balance delta against a figure
+    /// the chain never moved and halts the bot.
+    #[test]
+    fn settlement_validation_nets_a_same_transaction_sell_refund() {
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let expectation = settlement_expectation("rialto", rialto_router)
+            .validate()
+            .unwrap();
+        let receipt =
+            settlement_receipt_with_sell_transfers("RIALTO", rialto_router, true, 985, 1000, 16);
+
+        let settled =
+            validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
+                .unwrap();
+
+        assert_eq!(settled.settled_sell_amount, U256::from(984));
+        assert_eq!(settled.settled_buy_amount, U256::from(985));
+    }
+
+    /// Everything that is not a plain refund still fails closed: no
+    /// sell-token outflow to reason about, more leaving the taker than was
+    /// signed for, or a refund that cancels the whole swap
+    /// (bot-strategy#979).
+    #[test]
+    fn settlement_validation_refuses_impossible_sell_transfer_shapes() {
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let no_transfers = settlement_receipt_without_transfers("RIALTO", rialto_router, true, 985);
+        let over_signed =
+            settlement_receipt_with_sell_transfers("RIALTO", rialto_router, true, 985, 1001, 0);
+        let fully_refunded =
+            settlement_receipt_with_sell_transfers("RIALTO", rialto_router, true, 985, 1000, 1000);
+        let over_refunded =
+            settlement_receipt_with_sell_transfers("RIALTO", rialto_router, true, 985, 1000, 1001);
+
+        for (receipt, expected) in [
+            (no_transfers, "no sell-token transfer out of the taker"),
+            (over_signed, "more than the signed"),
+            (fully_refunded, "refunded the entire sell amount"),
+            (over_refunded, "refunded more sell tokens than it took"),
+        ] {
+            let expectation = settlement_expectation("rialto", rialto_router)
+                .validate()
+                .unwrap();
+            let error =
+                validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
+                    .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
+    }
+
+    /// Transfers of some *other* token in the same transaction (the buy
+    /// leg, a fee leg) must not be mistaken for the sell leg
+    /// (bot-strategy#979).
+    #[test]
+    fn settlement_validation_ignores_transfers_of_other_tokens() {
+        let (taker, _sell_token, buy_token) = test_addresses();
+        let rialto_router =
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let expectation = settlement_expectation("rialto", rialto_router)
+            .validate()
+            .unwrap();
+        let mut receipt =
+            settlement_receipt_with_sell_transfers("RIALTO", rialto_router, true, 985, 1000, 16);
+        let spender = Address::from_str("0x006102b16A04c20306A28b652745D3973D7D24fa").unwrap();
+        receipt
+            .logs
+            .push(erc20_transfer_log(buy_token, spender, taker, 985));
+
+        let settled =
+            validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
+                .unwrap();
+
+        assert_eq!(settled.settled_sell_amount, U256::from(984));
     }
 
     /// The settled amount has to survive from inside `try_providers`'
@@ -1513,6 +1735,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(read.settled_buy_amount_raw, "985");
+        assert_eq!(read.settled_sell_amount_raw, "1000");
         assert_eq!(read.balances.buy_balance_raw, "500");
         assert_eq!(read.balances.sell_balance_raw, "1499");
     }

@@ -114,19 +114,42 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
-- **Both legs are bounded taker IOCs** (bot-strategy#918, dex-connector
-  v4.7.22): `submit_order` sends `create_order_taker_ioc` at a marketable
-  limit `ENGINE_B_LIVE_SLIPPAGE_BPS` (default **50**) from the touch,
-  tick-rounded inward, remainder cancelled. This replaces
-  `create_order(price = None)`, whose ±20 % protection price bounded a
-  $100 lot at $20 per leg. The value is validated at startup against the
-  connector's accepted `1..=1000`: the process refuses to start outside
-  it rather than losing a session day to a rejected send (only one entry
-  `sendTx` is allowed per day, G-4). Two consequences at the first live
-  cycle: a book the connector considers stale now **fails the send**
-  instead of pricing off a stale ticker, and a size that truncates to
-  zero at the market's size decimals is rejected instead of being forced
-  up to one size tick. If a live send is ever rejected for crossing the
+- **Both legs are bounded taker IOCs** (bot-strategy#918, #978;
+  dex-connector v4.7.24): `submit_order` sends
+  `create_order_taker_ioc_at` at the marketable limit
+  `mid * (1 ± ENGINE_B_LIVE_SLIPPAGE_BPS)` (default **50**) computed from
+  this process's own observation, tick-rounded inward by the connector,
+  remainder cancelled. `ENGINE_B_LIVE_SLIPPAGE_BPS` is therefore a bound
+  against the **mid** and the venue does not re-anchor it on its own
+  touch at submit time (which the earlier touch-relative bps send could,
+  #918's residual). This replaces `create_order(price = None)`, whose
+  ±20 % protection price bounded a $100 lot at $20 per leg. The value is
+  still validated at startup against the connector's accepted `1..=1000`,
+  because the one path left without a book of its own to price against --
+  a reduce-only exit with no observed quote -- still sends it as a
+  percentage: the process refuses to start outside it rather than losing
+  a session day to a rejected send (only one entry `sendTx` is allowed
+  per day, G-4). Two consequences at the first live
+  cycle: a size that truncates to zero at the market's size decimals is
+  rejected instead of being forced up to one size tick, and **freshness
+  is now entirely this process's job** — the absolute-limit path
+  deliberately carries no staleness gate of its own (there is no
+  reference price in the connector to age-check), where the older
+  percentage path failed the send on a book the connector considered
+  stale. The engine's own gates stand in for it, on **both** legs: the
+  observation the limit is priced from must be usable at send time --
+  fresh clock, within `ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS`, current
+  feed generation, not future-dated. An entry priced off anything else is
+  refused; an **exit** falls back to `create_order_taker_ioc` against the
+  connector's own live touch (logged as `[EXIT] no usable book ...`), as
+  does the torn-book exit whose mid bound does not reach the book — at
+  the connector's 1 bp minimum there, since only a venue-priced IOC is
+  guaranteed to cross.
+  That fallback is not cosmetic: `maybe_exit` deliberately closes on
+  prices too stale to enter on, and an absolute limit off a dead quote
+  does not re-anchor the way the old percentage did — a stopped feed
+  keeps handing out the same observation, so every reduce-only IOC would
+  come back unmarketable and the position would stay open. If a live send is ever rejected for crossing the
   bound, widen `ENGINE_B_LIVE_SLIPPAGE_BPS` deliberately with the
   observed book in hand — never back to an unbounded market order.
 - **Fill confirmation against the exchange** (bot-strategy#875 G-2/G-4,
@@ -188,6 +211,11 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
   position is not reduce-only-closed on service stop/restart. Before any
   planned restart, check `status.json`'s `has_position` field and either
   wait for the scheduled exit window or manually close the position first.
+  Since bot-strategy#917 the restart is at least no longer *blind*: the
+  position is persisted and the next start reconciles it against the
+  exchange before it is allowed to enter anything (see Stop and recovery).
+  That is recovery, not graceful shutdown -- the position still rides
+  through the restart unhedged.
 
 ## Host and service
 
@@ -324,10 +352,36 @@ make the service fail to start (fail-closed, not a silent bad default).
 
 - `sudo systemctl stop engine-b-live.service` does not close an open
   position (see Safety boundary above) -- check `status.json` first.
-- A crash mid-day loses in-memory `t0`/`t1` price snapshots and any
-  not-yet-persisted entry state; `RiskState.last_session_date` prevents
-  re-entering a day already acted on before the crash, but does not
-  recover an in-flight entry/exit decision. This prototype does not persist
-  `OpenPosition` to disk -- after a restart mid-position, check the real
-  Lighter account balance/position via the exchange directly, not this
-  service's own state file, before assuming no position is open.
+  SIGTERM/SIGINT are handled only to make the state durable and to log and
+  notify exactly what stays open (`[SHUTDOWN] SIGTERM: ... is STILL OPEN
+  and is NOT being closed here`); no reduce-only is sent on the way out,
+  deliberately -- a close this process cannot confirm is worse than a
+  documented open position (bot-strategy#917).
+- The open position **is** persisted, as `RiskState.open_position` in
+  `risk_state.json`, and reconciled against the exchange on the first tick
+  after a start (`[RECONCILE]` lines, bot-strategy#917). No entry is sent
+  before that comparison succeeds, and a `get_positions()` that keeps
+  failing keeps entries blocked rather than letting one through blind.
+  What the reconciliation does, live:
+
+  | risk_state.json | exchange | outcome |
+  |---|---|---|
+  | no position | flat | clean start |
+  | matching position | same side and size | resumed; exits at its own `t2`, or at once if that window has already passed |
+  | position | *different* side or size, same symbol | the exchange's position is adopted for immediate close **and** the session halts |
+  | position on a symbol `us_primary` no longer names | that symbol still open | **not** closed here: this engine only ever submits orders for `us_primary`. The record is parked in `unmanaged_positions`, the session halts, and **an operator must flatten it by hand**. It stays in `status.json`'s position list and in the shutdown alert, refreshed from the venue on every start, until the venue reports it gone |
+  | position | flat | halt: it was closed at a price this process never saw, so its PnL is unbooked |
+  | no position | holds one | adopted for immediate close **and** the session halts |
+
+  Every halt above clears only via `RISK_ACK` (see the risk runbook), so
+  an operator sees it before any new entry goes out.
+- Under `DRY_RUN` the exchange is not the authority: the simulated
+  position is resumed from `risk_state.json`, and a real position on the
+  account is reported (`[RECONCILE] DRY_RUN, but the exchange holds ...`)
+  but never adopted or closed by this process.
+- A crash mid-day still loses the in-memory `t0`/`t1` price snapshots
+  beyond what `RiskState.t0_prices` recovers, and
+  `RiskState.last_session_date` remains what prevents re-entering a day
+  already acted on. After a restart mid-position, the `[RECONCILE]` line
+  in the journal is the record of what the account actually held -- read
+  it rather than assuming the state file alone was right.

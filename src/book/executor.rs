@@ -4,9 +4,11 @@
 //! - [`PaperExecutor`]: in-memory positions, fills at `mid * (1 ± slippage)`,
 //!   prices pushed in by the caller (WS feed or replay bars).
 //! - [`LiveExecutor`]: `DexConnector`-backed. Orders go out as
-//!   `create_order(price=None)` (venue-native market/IOC with protection
-//!   price); the fill is what the venue position says it is, never the
-//!   HTTP acknowledgement (bot-strategy#875 G-2).
+//!   `create_order_taker_ioc_at` -- a marketable limit at `mid * (1 ±
+//!   slippage_bps)` off the snapshot the drift guard judged, which the
+//!   venue rounds inward and never re-anchors (bot-strategy#978); the
+//!   fill is what the venue position says it is, never the HTTP
+//!   acknowledgement (bot-strategy#875 G-2).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -15,13 +17,14 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use dex_connector::{DexConnector, OrderSide, PositionSnapshot};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use rust_decimal::Decimal;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
 use super::rebalance::{LotMeta, OrderIntent, Side};
+use crate::trade::execution::slippage::{send_limit_price, SendLimit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
 pub struct VenuePosition {
@@ -271,7 +274,7 @@ pub struct LiveExecutor {
     /// same number to both sizing and the send-time drift guard, so an
     /// entry older than `WS_PRICE_MAX_AGE_SECS` is ignored and the
     /// timestamped ticker fallback is used instead.
-    prices: RwLock<HashMap<String, (f64, Instant)>>,
+    prices: RwLock<HashMap<String, WsQuote>>,
     /// Ticker-sourced prices for symbols the WS feed does not carry (a leg
     /// adopted from the venue outside the configured universe), with the
     /// instant they were fetched; refreshed at most every
@@ -281,6 +284,18 @@ pub struct LiveExecutor {
     fill_confirm_timeout_secs: i64,
     slippage_bps: u32,
     allow_venue_protection_fallback: bool,
+}
+
+/// One WS observation: the feed's mid, the touch when the update carried
+/// one, and when it arrived. The touch is what turns the mid-relative
+/// `slippage_bps` into the touch-relative allowance the venue takes
+/// (bot-strategy#971); a `set_price` without a touch keeps the mid usable
+/// for sizing and the drift guard but leaves an entry unsendable.
+#[derive(Debug, Clone, Copy)]
+struct WsQuote {
+    mid: f64,
+    touch: Option<(f64, f64)>,
+    at: Instant,
 }
 
 const FALLBACK_PRICE_TTL_SECS: u64 = 60;
@@ -302,6 +317,64 @@ impl std::fmt::Display for PreSendAbort {
 }
 
 impl std::error::Error for PreSendAbort {}
+
+/// What one send carries as its price bound: the absolute limit the
+/// executor computed from its own mid (`create_order_taker_ioc_at`,
+/// bot-strategy#978), or -- only where there is no usable book to compute
+/// one from, which is the reduce-only [`SendLimit::Unchecked`] case -- the
+/// configured bound against the connector's own touch.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SendPrice {
+    At(Decimal),
+    TouchRelative(u32),
+}
+
+/// The connector's minimum allowance, i.e. "cross at your own touch".
+/// What [`SendLimit::AtTouch`] asks for.
+const AT_TOUCH_BPS: u32 = 1;
+
+/// What to call the connector with for one intent, from the quote
+/// snapshot the drift guard judged (bot-strategy#978).
+///
+/// `slippage_bps` is a bound against the mid -- the same basis the paper
+/// fill and the drift guard read it on -- so the limit price is
+/// `mid * (1 +/- slippage_bps)` off this very snapshot and the venue
+/// never re-anchors it. An entry that cannot be bounded is refused (and
+/// costs no attempt, since nothing was sent); an exit always goes out.
+///
+/// Free-standing rather than a method so the mapping from the price
+/// decision to the actual connector call is testable without a venue.
+fn send_price(
+    slippage_bps: u32,
+    mid: f64,
+    touch: Option<(f64, f64)>,
+    side: OrderSide,
+    intent: &OrderIntent,
+) -> Result<SendPrice> {
+    match send_limit_price(slippage_bps, mid, touch, side, intent.reduce_only) {
+        Ok(SendLimit::Bounded(limit)) => Ok(SendPrice::At(price_decimal(limit, intent)?)),
+        Ok(SendLimit::AtTouch) => {
+            log::warn!(
+                "[EXEC] {} {}: the slippage_bps={slippage_bps} bound from mid={mid} does not reach the touch {touch:?}; reduce-only crosses at the venue's own touch to get flat",
+                intent.side,
+                intent.symbol,
+            );
+            Ok(SendPrice::TouchRelative(AT_TOUCH_BPS))
+        }
+        Ok(SendLimit::Unchecked) => {
+            log::warn!(
+                "[EXEC] {} {}: no usable book; reduce-only sends slippage_bps={slippage_bps} against the venue's own touch",
+                intent.side,
+                intent.symbol,
+            );
+            Ok(SendPrice::TouchRelative(slippage_bps))
+        }
+        Err(reason) => Err(anyhow!(PreSendAbort(format!(
+            "{}: {reason} (slippage_bps={slippage_bps})",
+            intent.symbol
+        )))),
+    }
+}
 
 /// Whether `mid` is still within `slippage_bps` of the price the intent
 /// was sized at, in the adverse direction for `side` (a favourable move
@@ -334,9 +407,10 @@ impl LiveExecutor {
         }
     }
 
-    /// Send the order with the configured slippage cap: the venue's
-    /// price-capped IOC when it has one, otherwise (only if the operator
-    /// opted in) the venue-native market/IOC with its own protection price.
+    /// Send the order under `bound`, decided in `execute` from the same
+    /// snapshot the drift guard judged: the venue's price-capped IOC when
+    /// it has one, otherwise (only if the operator opted in) the
+    /// venue-native market/IOC with its own protection price.
     /// `Err((message, submitted))`: `submitted` is false only when the
     /// order provably never reached the venue, which lets the caller
     /// report a `PreSendAbort` instead of confirming a phantom fill.
@@ -345,18 +419,27 @@ impl LiveExecutor {
         intent: &OrderIntent,
         size: Decimal,
         side: OrderSide,
+        bound: SendPrice,
     ) -> Result<dex_connector::CreateOrderResponse, (String, bool)> {
-        match self
-            .connector
-            .create_order_taker_ioc(
-                &intent.symbol,
-                size,
-                side,
-                self.slippage_bps,
-                intent.reduce_only,
-            )
-            .await
-        {
+        let sent = match bound {
+            SendPrice::At(limit) => {
+                self.connector
+                    .create_order_taker_ioc_at(
+                        &intent.symbol,
+                        size,
+                        side,
+                        limit,
+                        intent.reduce_only,
+                    )
+                    .await
+            }
+            SendPrice::TouchRelative(bps) => {
+                self.connector
+                    .create_order_taker_ioc(&intent.symbol, size, side, bps, intent.reduce_only)
+                    .await
+            }
+        };
+        match sent {
             Ok(r) => Ok(r),
             Err(dex_connector::DexError::Permanent(msg))
                 if msg.to_ascii_lowercase().contains("not implemented")
@@ -393,33 +476,64 @@ impl LiveExecutor {
         }
     }
 
+    /// A WS mid without its touch. Sizing and the drift guard can use it;
+    /// an entry cannot be sent off it (no half-spread to check the bound
+    /// against), an exit goes out against the connector's own touch.
     pub async fn set_price(&self, symbol: &str, mid: f64) {
         if mid.is_finite() && mid > 0.0 {
-            self.prices
-                .write()
-                .await
-                .insert(symbol.to_string(), (mid, Instant::now()));
+            self.prices.write().await.insert(
+                symbol.to_string(),
+                WsQuote {
+                    mid,
+                    touch: None,
+                    at: Instant::now(),
+                },
+            );
         }
     }
 
-    /// Current price for `symbol`: the WS mid when the feed carries it,
-    /// otherwise the ticker fallback (cached `FALLBACK_PRICE_TTL_SECS`).
-    /// Used both by the planner (`prices`) and at send time (`execute`) so
-    /// an adopted out-of-universe leg can be planned *and* sent.
-    async fn price_for(&self, symbol: &str) -> Option<f64> {
-        if let Some((px, at)) = self.prices.read().await.get(symbol).copied() {
-            if at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
-                return Some(px);
+    /// A WS update with its touch. A touch that is not a book (`bid <= 0`
+    /// or `ask < bid`) is stored as absent rather than dropped, so the mid
+    /// still refreshes and the send path sees "no book", not a stale one.
+    pub async fn set_quote(&self, symbol: &str, mid: f64, best_bid: f64, best_ask: f64) {
+        if !(mid.is_finite() && mid > 0.0) {
+            return;
+        }
+        let touch = (best_bid.is_finite()
+            && best_ask.is_finite()
+            && best_bid > 0.0
+            && best_ask >= best_bid)
+            .then_some((best_bid, best_ask));
+        self.prices.write().await.insert(
+            symbol.to_string(),
+            WsQuote {
+                mid,
+                touch,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// One send-time snapshot of `symbol`: the fresh WS quote (mid and
+    /// touch, read together so the drift guard and the bound conversion
+    /// see the same book), otherwise the ticker fallback (cached
+    /// `FALLBACK_PRICE_TTL_SECS`) as a mid with no touch -- so an adopted
+    /// out-of-universe leg can be sized and closed but never opened, which
+    /// is the rule anyway.
+    async fn quote_for(&self, symbol: &str) -> Option<(f64, Option<(f64, f64)>)> {
+        if let Some(q) = self.prices.read().await.get(symbol).copied() {
+            if q.at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
+                return Some((q.mid, q.touch));
             }
             log::warn!(
                 "[PRICE] WS mid for {symbol} is {}s old; falling back to the ticker",
-                at.elapsed().as_secs()
+                q.at.elapsed().as_secs()
             );
         }
         let cached = self.fallback_prices.read().await.get(symbol).copied();
         if let Some((px, at)) = cached {
             if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS {
-                return Some(px);
+                return Some((px, None));
             }
         }
         match self.connector.get_ticker(symbol, None).await {
@@ -429,7 +543,7 @@ impl LiveExecutor {
                     .write()
                     .await
                     .insert(symbol.to_string(), (px, Instant::now()));
-                Some(px)
+                Some((px, None))
             }
             Err(e) => {
                 log::warn!("[PRICE] no WS mid for {symbol} and ticker fallback failed: {e:?}");
@@ -465,6 +579,26 @@ fn decimal(v: f64) -> Result<Decimal> {
     Decimal::from_f64_retain(v).ok_or_else(|| anyhow!("{v} is not representable as Decimal"))
 }
 
+/// A limit price as a `Decimal`, via `from_f64` (the shortest decimal the
+/// `f64` represents) and **not** `from_f64_retain` (its full binary
+/// expansion). The connector rounds the price *inward* to the venue tick,
+/// so a value that is an ULP under a tick boundary loses a whole tick:
+/// `from_f64_retain(1700.1)` is `1700.0999999999999090505298222`, which
+/// truncates to `1700.0` at one price decimal -- a tick below the ask, an
+/// order that rests instead of crossing (pairtrade#315 Codex round 2).
+/// `from_f64` recovers `1700.1`. Its own rounding is half an ULP,
+/// ~1e-16 relative, which the tick rounding then dominates. A price that
+/// cannot be represented aborts before the send rather than falling back
+/// to a wider one.
+fn price_decimal(v: f64, intent: &OrderIntent) -> Result<Decimal> {
+    Decimal::from_f64(v).ok_or_else(|| {
+        anyhow!(PreSendAbort(format!(
+            "{}: limit price {v} is not representable as Decimal",
+            intent.symbol
+        )))
+    })
+}
+
 #[async_trait]
 impl Executor for LiveExecutor {
     fn is_paper(&self) -> bool {
@@ -485,14 +619,14 @@ impl Executor for LiveExecutor {
             let ws = self.prices.read().await;
             let fallback = self.fallback_prices.read().await;
             for s in symbols {
-                if let Some((px, at)) = ws.get(s) {
-                    if at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
-                        out.insert(s.clone(), *px);
+                if let Some(q) = ws.get(s) {
+                    if q.at.elapsed().as_secs() < WS_PRICE_MAX_AGE_SECS {
+                        out.insert(s.clone(), q.mid);
                         continue;
                     }
                     log::warn!(
                         "[PRICE] WS mid for {s} is {}s old; falling back to the ticker",
-                        at.elapsed().as_secs()
+                        q.at.elapsed().as_secs()
                     );
                 }
                 if let Some((px, at)) = fallback.get(s) {
@@ -587,35 +721,40 @@ impl Executor for LiveExecutor {
 
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport> {
         let started = Instant::now();
-        // Drift guard: the plan was sized at `reference_price`; if the book
-        // has already moved past the slippage budget the order is not sent
-        // (the engine re-plans on the next tick with fresh prices).
-        let mid = self.price_for(&intent.symbol).await.ok_or_else(|| {
-            anyhow!(PreSendAbort(format!(
-                "live: no price for {}",
-                intent.symbol
-            )))
-        })?;
-        if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
-            return Err(anyhow!(PreSendAbort(format!(
-                "price moved beyond slippage_bps={} before send (reference={} mid={})",
-                self.slippage_bps, intent.reference_price, mid
-            ))));
-        }
         // The preflight read happens before any submission, so a
         // transient account-read outage here must not spend an attempt.
+        // It also happens before the quote is read: the feed task keeps
+        // replacing the quote while this awaits, and the drift guard and
+        // the bound conversion below must judge the *same* book, taken as
+        // late as possible before the send.
         let before = self
             .venue_position(&intent.symbol)
             .await
             .map_err(|e| anyhow!(PreSendAbort(format!("preflight position read: {e}"))))?
             .map(|p| p.qty)
             .unwrap_or(0.0);
+        let (mid, touch) = self.quote_for(&intent.symbol).await.ok_or_else(|| {
+            anyhow!(PreSendAbort(format!(
+                "live: no price for {}",
+                intent.symbol
+            )))
+        })?;
+        // Drift guard: the plan was sized at `reference_price`; if the book
+        // has already moved past the slippage budget the order is not sent
+        // (the engine re-plans on the next tick with fresh prices).
+        if !within_slippage(intent.reference_price, mid, intent.side, self.slippage_bps) {
+            return Err(anyhow!(PreSendAbort(format!(
+                "price moved beyond slippage_bps={} before send (reference={} mid={})",
+                self.slippage_bps, intent.reference_price, mid
+            ))));
+        }
         let side = match intent.side {
             Side::Buy => OrderSide::Long,
             Side::Sell => OrderSide::Short,
         };
+        let bound = send_price(self.slippage_bps, mid, touch, side, intent)?;
         let size = decimal(intent.qty)?;
-        let (order_id, venue_error) = match self.send_capped(intent, size, side).await {
+        let (order_id, venue_error) = match self.send_capped(intent, size, side, bound).await {
             Ok(r) => (Some(r.order_id), None),
             // Provably never submitted: report it as a pre-send abort so
             // the engine does not spend an attempt confirming a fill that
@@ -898,6 +1037,67 @@ mod tests {
         assert!(!within_slippage(100.0, 99.4, Side::Sell, 50));
         assert!(within_slippage(100.0, 101.0, Side::Sell, 50)); // favourable
         assert!(!within_slippage(0.0, 100.0, Side::Buy, 50));
+    }
+
+    /// The bound the connector is actually called with, per branch
+    /// (bot-strategy#978). The price decision itself is covered in
+    /// `trade::execution::slippage`; what is asserted here is that the
+    /// live path sends it as an absolute limit, and only ever falls back
+    /// to the touch-relative call where there is no book to price
+    /// against.
+    #[test]
+    fn a_live_send_carries_the_mid_relative_bound_as_an_absolute_limit() {
+        let buy = intent("SOL", Side::Buy, 1.0, false);
+        // A 10 bps bound on a 100.0 mid is 100.1, whatever the venue's
+        // touch has become by the time it reads its own book -- and it is
+        // the decimal 100.1, not the f64's binary expansion
+        // 100.09999999999999431565811388, which the venue's inward tick
+        // rounding would truncate.
+        assert_eq!(
+            send_price(10, 100.0, Some((99.99, 100.01)), OrderSide::Long, &buy).unwrap(),
+            SendPrice::At(Decimal::from_str_exact("100.1").unwrap())
+        );
+        // A price that is not exactly representable in binary must still
+        // survive the connector's inward tick rounding: `from_f64_retain`
+        // would hand over 1700.0999999999999090505298222, which truncates
+        // a whole tick below the 1700.1 ask and never crosses
+        // (pairtrade#315 Codex round 2).
+        let fine = intent("SNDK", Side::Buy, 1.0, false);
+        let SendPrice::At(px) =
+            send_price(10, 1698.402, Some((1700.0, 1700.1)), OrderSide::Long, &fine).unwrap()
+        else {
+            panic!("expected an absolute limit")
+        };
+        assert_eq!(
+            px.round_dp_with_strategy(1, rust_decimal::RoundingStrategy::ToZero),
+            Decimal::from_str_exact("1700.1").unwrap(),
+            "the venue's inward tick rounding must not drop a tick: {px}"
+        );
+        // Reduce-only on a book the bound does not reach: the connector
+        // prices it from its own live touch at the minimum allowance,
+        // because only it can guarantee the exit crosses.
+        let sell = intent("SOL", Side::Sell, 1.0, true);
+        assert_eq!(
+            send_price(10, 100.0, Some((90.0, 110.0)), OrderSide::Short, &sell).unwrap(),
+            SendPrice::TouchRelative(AT_TOUCH_BPS)
+        );
+        // Reduce-only with no book at all is the one case that still
+        // hands the venue a percentage, because there is nothing here to
+        // form a price from.
+        assert_eq!(
+            send_price(10, 100.0, None, OrderSide::Short, &sell).unwrap(),
+            SendPrice::TouchRelative(10)
+        );
+        // An entry in either of those states is a pre-send abort: it
+        // never reaches the connector, so it costs no attempt.
+        for touch in [Some((90.0, 110.0)), None] {
+            let e = send_price(10, 100.0, touch, OrderSide::Long, &buy).unwrap_err();
+            assert!(
+                e.downcast_ref::<PreSendAbort>().is_some(),
+                "{touch:?}: {e:?}"
+            );
+            assert!(e.to_string().contains("slippage_bps=10"), "{e:?}");
+        }
     }
 
     #[test]
