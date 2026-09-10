@@ -127,13 +127,32 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     reference that does not match the funded account makes the halt
     threshold mean something other than it appears to. Reconcile the two
     by hand; this feature reports the gap, it does not close it.
+  - **`venue_solvency_reported` is how a consumer knows the field exists
+    at all.** It is always true from this build. A consumer cannot use
+    JSON key presence for that -- debot-dashboard decodes and re-encodes
+    this document on its `/api/status` path, where a nil pointer and an
+    absent key are the same thing, so an explicit `null` would reach the
+    browser as a missing field and hide the row instead of flagging
+    unknown solvency (PR #46 Codex review). Presence travels as data.
   - **The read never runs on the trading tick.** It is spawned, not
     awaited: an uncached REST read that hangs during a venue outage
     would otherwise hold the tick that drives `poll_pending_confirm`,
     `maybe_exit` and the shutdown path, so an observational read could
     stop an open position from being confirmed or closed (pairtrade#316
     Codex review, P1). One read is in flight at a time, so a venue that
-    hangs cannot accumulate a task per interval behind it.
+    hangs cannot accumulate a task per interval behind it, and each
+    read is bounded by a 30 s timeout. Without that timeout a read that
+    never returns would never release the in-flight guard: every later
+    refresh refused, `venue_equity_stale` false forever, and the last
+    reading published as trustworthy during exactly the outage it should
+    be reporting (pairtrade#316 Codex review round 2).
+  - **A fill forces the next read.** dex-connector drops its
+    `get_balance` cache on a WS fill, but that only helps if somebody
+    asks; with the engine throttle at the connector's own TTL, an entry
+    landing just after a refresh would otherwise keep publishing
+    pre-fill equity for up to a full interval. A change in the account's
+    shape (side, open size, or the number of unmanaged exposures) clears
+    the throttle so the next tick re-reads.
   - **`venue_equity_stale` is the failure signal, not the age.** It is
     true whenever the most recent attempt failed. A failed refresh keeps
     the last value and lets its age grow rather than blanking it or
@@ -146,10 +165,10 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     from its cache, and a cache hit is indistinguishable here from a
     fresh REST read (pairtrade#316 Codex review, P2). The refresh
     interval defaults to that same TTL so the gap stays small in the
-    steady state, and a WS fill invalidates the cache so the reading
-    after an entry or exit is genuinely fresh. Use it as a rough "how
-    current is this"; use `venue_equity_stale` for "is this
-    trustworthy".
+    steady state, and a fill both invalidates the connector's cache and
+    clears the engine's throttle, so the reading after an entry or exit
+    is genuinely fresh. Use it as a rough "how current is this"; use
+    `venue_equity_stale` for "is this trustworthy".
   - **`unrealized_pnl_usd_mid_estimate` is a mid mark, not a settled
     figure**: no fees, no funding, computed against the recorded entry
     price (itself an estimate whenever `entry_price_estimated` is set),

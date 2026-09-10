@@ -1669,6 +1669,12 @@ struct VenueEquity {
     fetched_at_us: i64,
 }
 
+/// How long a single venue equity read may take before it is treated as
+/// failed. Comfortably longer than a healthy REST round trip and far
+/// shorter than the refresh interval, so a slow venue degrades to
+/// "stale" rather than to "silently wedged".
+const VENUE_EQUITY_READ_TIMEOUT_SECS: u64 = 30;
+
 /// Shared cell the off-tick equity reader publishes into and the status
 /// writer samples (bot-strategy#919, pairtrade#316 Codex P1).
 #[derive(Default)]
@@ -1747,6 +1753,14 @@ struct HanBridgeStatus {
     /// pills that blinding already exempts. Publishing it here lets the
     /// dashboard render solvency without reopening the performance
     /// fields (see debot-dashboard `deploy/alpha-gate.md`).
+    /// This build reports venue solvency at all. Always `true` here --
+    /// it exists so a consumer can tell "producer has no such concept"
+    /// from "producer has not read the account yet" **without relying
+    /// on JSON key presence**, which does not survive a round trip
+    /// through a consumer that re-encodes with `omitempty` (the
+    /// debot-dashboard `/api/status` path does exactly that, PR #46
+    /// Codex review). Presence has to be data, not schema.
+    venue_solvency_reported: bool,
     venue_equity_usd: Option<f64>,
     venue_available_usd: Option<f64>,
     /// How long ago *this process* last obtained the reading above. It
@@ -1844,6 +1858,13 @@ struct EngineBLiveEngine {
     /// failing venue cannot turn into a retry-every-tick REST loop
     /// against a 60 req/min account.
     last_venue_equity_attempt_us: i64,
+    /// What the account looked like at the last equity refresh
+    /// decision. A change means a fill landed, which is exactly when
+    /// the published balance is most wrong and when dex-connector's own
+    /// cache has just been invalidated -- so the engine-level throttle
+    /// must not sit on the next read for up to a full interval
+    /// (pairtrade#316 Codex review round 2).
+    last_position_fingerprint: Option<(bool, f64, usize)>,
 }
 
 impl EngineBLiveEngine {
@@ -4969,6 +4990,7 @@ impl EngineBLiveEngine {
         // Observational only (bot-strategy#919). Spawned, never
         // awaited: a hung venue read must not hold the tick that drives
         // confirmation, exit and shutdown (pairtrade#316 Codex P1).
+        self.force_venue_equity_refresh_after_a_fill();
         self.spawn_venue_equity_refresh(now);
         self.write_status_if_due(now);
     }
@@ -5006,6 +5028,37 @@ impl EngineBLiveEngine {
     ///
     /// At most one read is in flight at a time: a venue that hangs must
     /// not accumulate a task per interval behind it.
+    /// One `(side, open size, unmanaged count)` triple describing what
+    /// this process believes the account holds. Compared, never
+    /// published: only its *changing* matters.
+    fn position_fingerprint(&self) -> Option<(bool, f64, usize)> {
+        let unmanaged = self.state.unmanaged_positions.len();
+        match self.position.as_ref() {
+            Some(p) => Some((matches!(p.side, OrderSide::Short), p.open_size, unmanaged)),
+            None if unmanaged > 0 => Some((false, 0.0, unmanaged)),
+            None => None,
+        }
+    }
+
+    /// Clear the refresh throttle when the account has changed shape.
+    ///
+    /// dex-connector invalidates its `get_balance` cache on a WS fill,
+    /// but that only helps if somebody asks. With the engine-level
+    /// throttle at the connector's own TTL, an entry landing just after
+    /// a refresh would keep publishing pre-fill equity for up to a full
+    /// interval -- while the docs promised the reading right after an
+    /// entry or exit is fresh (pairtrade#316 Codex review round 2).
+    fn force_venue_equity_refresh_after_a_fill(&mut self) {
+        let fingerprint = self.position_fingerprint();
+        if fingerprint == self.last_position_fingerprint {
+            return;
+        }
+        self.last_position_fingerprint = fingerprint;
+        // 0 is the "never attempted" sentinel the throttle already
+        // treats as due.
+        self.last_venue_equity_attempt_us = 0;
+    }
+
     fn spawn_venue_equity_refresh(&mut self, now_us: i64) {
         let interval_us = self
             .cfg
@@ -5036,9 +5089,27 @@ impl EngineBLiveEngine {
         // the same synthetic source.
         let clock = Arc::clone(&self.clock);
         tokio::spawn(async move {
-            let result = connector.get_balance(None).await;
+            // Bounded, because "the read never returns" is the shape of
+            // the outage this row exists to surface. Without it the task
+            // never reaches the line that clears `in_flight`, every
+            // later refresh is refused by the guard, and the last
+            // reading keeps publishing `venue_equity_stale=false` --
+            // trustworthy-looking, forever, during precisely the failure
+            // it should be reporting (pairtrade#316 Codex review round
+            // 2). A timeout is a failed read like any other.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(VENUE_EQUITY_READ_TIMEOUT_SECS),
+                connector.get_balance(None),
+            )
+            .await;
             let mut cell = cell.lock().expect("venue equity mutex");
             cell.in_flight = false;
+            let Ok(result) = result else {
+                cell.note_failure(&format!(
+                    "no answer within {VENUE_EQUITY_READ_TIMEOUT_SECS}s"
+                ));
+                return;
+            };
             match result {
                 Ok(balance) => {
                     // A venue that answers with an unrepresentable
@@ -5221,6 +5292,7 @@ impl EngineBLiveEngine {
             skip_reason: self.day.skip_reason.clone(),
             stale_or_missing_symbols,
             price_feed_generation: self.feed_generation(),
+            venue_solvency_reported: true,
             venue_equity_usd: venue_equity.map(|v| v.equity_usd),
             venue_available_usd: venue_equity.map(|v| v.available_usd),
             // Clamped at zero: the reader stamps its own wall clock
@@ -5479,6 +5551,7 @@ async fn main() -> Result<()> {
         status_s3_mirror: S3Mirror::from_env(),
         venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
         last_venue_equity_attempt_us: 0,
+        last_position_fingerprint: None,
     };
     if let Some(p) = engine.state.open_position.as_ref() {
         log::warn!(
@@ -6097,6 +6170,7 @@ mod tests {
                 skip_reason: None,
                 stale_or_missing_symbols: Vec::new(),
                 price_feed_generation: 0,
+                venue_solvency_reported: true,
                 venue_equity_usd: None,
                 venue_available_usd: None,
                 venue_equity_age_secs: None,
@@ -6902,6 +6976,7 @@ mod tests {
             status_s3_mirror: None,
             venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
             last_venue_equity_attempt_us: 0,
+            last_position_fingerprint: None,
         };
         Harness {
             engine,
@@ -8358,6 +8433,12 @@ mod tests {
         h.engine.write_status_if_due(T1_US + 30_000_000);
         let status = read_status(&h);
         assert_eq!(
+            status["han_bridge"]["venue_solvency_reported"],
+            serde_json::json!(true),
+            "presence must be data: a consumer that re-encodes with omitempty \
+             drops a null field, and key presence stops being readable"
+        );
+        assert_eq!(
             status["han_bridge"]["venue_equity_usd"],
             serde_json::json!(5000.5)
         );
@@ -8482,6 +8563,108 @@ mod tests {
             h.connector.balance_call_count(),
             1,
             "one read in flight at a time, however long the venue takes"
+        );
+    }
+
+    /// pairtrade#316 Codex review round 2. Surviving the tick is not
+    /// enough: a read that never returns also never releases the
+    /// in-flight guard, so every later refresh is refused and the last
+    /// reading keeps publishing itself as trustworthy -- during exactly
+    /// the outage it should be reporting.
+    #[tokio::test(start_paused = true)]
+    async fn a_venue_read_that_never_returns_is_a_failed_read() {
+        let mut h = harness();
+        h.connector.set_balance("5000", "5000");
+        h.refresh_equity(T1_US).await;
+        assert!(!equity_failing(&h), "a good reading first");
+
+        h.connector.hang_balance();
+        h.set_now(T1_US + 3_600_000_000);
+        h.engine.spawn_venue_equity_refresh(T1_US + 3_600_000_000);
+        // Paused clock: this advances time rather than sleeping, so the
+        // reader's own timeout fires. Deliberately an absolute duration
+        // and not `VENUE_EQUITY_READ_TIMEOUT_SECS + n` -- a bound
+        // expressed in terms of the constant it is testing passes for
+        // any value of that constant, including a useless one (caught by
+        // mutating the constant to 24 h, which this test did not notice
+        // until it stopped referring to it).
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+        let cell = h.engine.venue_equity.lock().expect("venue equity mutex");
+        assert!(!cell.in_flight, "the guard must be released, not wedged");
+        assert!(
+            cell.failing,
+            "and the row must say so instead of looking current"
+        );
+        assert!(
+            cell.reading.is_some(),
+            "the last good reading is still shown -- with its age"
+        );
+    }
+
+    /// The timeout is only useful between those two bounds: long enough
+    /// that a healthy REST round trip is never cut off, short enough
+    /// that a stuck read cannot outlive the interval that would have
+    /// replaced it.
+    #[test]
+    fn the_venue_read_timeout_is_bounded_by_its_own_refresh_interval() {
+        assert!(VENUE_EQUITY_READ_TIMEOUT_SECS >= 5);
+        assert!(
+            (VENUE_EQUITY_READ_TIMEOUT_SECS as i64) < fixture_config().venue_equity_refresh_secs,
+            "a read that outlives its refresh interval wedges the schedule"
+        );
+    }
+
+    /// pairtrade#316 Codex review round 2: a fill is when the published
+    /// balance is most wrong, and it is also when dex-connector drops
+    /// its own cache. The engine-level throttle must not sit on the next
+    /// read for a full interval.
+    #[tokio::test]
+    async fn a_fill_bypasses_the_refresh_throttle() {
+        let mut h = harness();
+        h.connector.set_balance("5000", "5000");
+        h.engine.cfg.venue_equity_refresh_secs = 300;
+        h.refresh_equity(T1_US).await;
+        assert_eq!(h.connector.balance_call_count(), 1);
+
+        // Well inside the throttle window: nothing changed, no read.
+        h.refresh_equity(T1_US + 10_000_000).await;
+        assert_eq!(h.connector.balance_call_count(), 1);
+
+        // A fill lands.
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.engine.force_venue_equity_refresh_after_a_fill();
+        h.refresh_equity(T1_US + 20_000_000).await;
+        assert_eq!(
+            h.connector.balance_call_count(),
+            2,
+            "the balance after an entry must not be the one from before it"
+        );
+
+        // And a partial exit is a change too.
+        h.engine.position.as_mut().unwrap().open_size = 0.02;
+        h.engine.force_venue_equity_refresh_after_a_fill();
+        h.refresh_equity(T1_US + 30_000_000).await;
+        assert_eq!(h.connector.balance_call_count(), 3);
+
+        // A tick that changed nothing still respects the throttle.
+        h.engine.force_venue_equity_refresh_after_a_fill();
+        h.refresh_equity(T1_US + 40_000_000).await;
+        assert_eq!(
+            h.connector.balance_call_count(),
+            3,
+            "an unchanged account is not a reason to re-read"
         );
     }
 
