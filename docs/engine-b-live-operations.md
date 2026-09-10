@@ -146,13 +146,22 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     result.
   - Harvesting costs nothing on the wire -- the Lighter connector
     serves `get_filled_orders` from its own WS-populated cache and
-    issues no request -- and runs **immediately before a close is
-    summarised**, not merely once per tick. The exit fill is routinely
-    visible on the very tick that observes the account flat (the account
-    is flat *because* of it), so a harvest that ran after the decisions
-    would miss the closing fill entirely and leave every trade
-    unsettled. (The venue *equity* read does go to REST and is
-    deliberately off-tick -- see below.)
+    issues no request -- and happens **twice, both of which earn their
+    place**: once per tick before the decisions, so the durable ledger
+    stays current through the holding period and a crash mid-hold does
+    not lose the entry fill; and again immediately before a close is
+    summarised, because the exit fill is routinely visible on the very
+    tick that observes the account flat (the account is flat *because*
+    of it) and would otherwise be summarised before it was ever seen.
+    (The venue *equity* read does go to REST and is deliberately
+    off-tick -- see below.)
+  - A fill is counted only once its ledger row is on disk. If the append
+    fails the fill is left unmarked and untotalled, and the connector's
+    next re-serve retries it -- a transient filesystem error must not
+    turn into a permanently missing row while the totals move anyway.
+  - A leg whose fee is unknown **stays** unknown. One fee-less fill
+    makes the leg's total unknowable, and a later fill that does report
+    a fee must not resurrect a total missing the first one's cost.
   - The set of already-counted `trade_id`s **outlives every trade in
     the process**. Nothing prunes the connector's fill cache, so
     forgetting them between trades would make yesterday's fills look new

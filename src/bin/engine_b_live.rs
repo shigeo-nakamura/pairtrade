@@ -862,16 +862,27 @@ fn atomic_write_json_checked(path: &Path, value: &impl Serialize) -> std::io::Re
     atomic_write_bytes_checked(path, json.as_bytes())
 }
 
-fn append_pnl_log(path: &Path, record: &serde_json::Value) {
+/// Append one JSON line. Returns whether the whole line reached the
+/// file: a caller that treats a fill as counted only once it is durable
+/// needs to know, and a best-effort write that silently drops a row is
+/// how a "durable ledger" quietly stops being one (pairtrade#320 Codex
+/// review round 2).
+fn append_pnl_log(path: &Path, record: &serde_json::Value) -> bool {
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     else {
         log::warn!("[PNL_LOG] open failed: {}", path.display());
-        return;
+        return false;
     };
-    let _ = writeln!(f, "{record}");
+    match writeln!(f, "{record}") {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("[PNL_LOG] write failed for {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1706,18 +1717,30 @@ struct LegFills {
     /// `value / size` is the true quantity-weighted average price
     /// rather than an average of prices.
     value: f64,
-    /// Fees, when the venue reports them per fill. `None` -- never 0.0
-    /// -- while any observed fill did not carry one, which on Lighter
-    /// is every fill today: `FilledOrder::filled_fee` is hard-coded
-    /// `None` in the connector's WS and REST parsers alike. Reading a
-    /// missing fee as zero would quietly overstate every settled
-    /// result. Getting the real number needs Lighter's authenticated
-    /// `/api/v1/trades`, which is dex-connector work.
-    fee_usd: Option<f64>,
+    /// Fees the venue reported, summed. Meaningful only while
+    /// `fee_unknown` is false.
+    fee_reported_usd: f64,
+    /// Some observed fill did not carry a fee, so this leg's total is
+    /// unknowable -- and stays that way. **Sticky on purpose**: a
+    /// fee-less fill followed by one that does report a fee must not
+    /// resurrect a total that is missing the first fill's cost
+    /// (pairtrade#320 Codex review round 2). Today it is set by every
+    /// Lighter fill, since `FilledOrder::filled_fee` is hard-coded
+    /// `None` in the connector's WS and REST parsers alike; it will
+    /// start mattering the moment that stops being true for only some
+    /// fills.
+    fee_unknown: bool,
     fills: u32,
 }
 
 impl LegFills {
+    /// The leg's total fee, or `None` when any observed fill did not
+    /// report one. Never 0.0 for "unknown": reading a missing fee as
+    /// zero would quietly overstate every settled result.
+    fn fee_usd(&self) -> Option<f64> {
+        (!self.fee_unknown).then_some(self.fee_reported_usd)
+    }
+
     /// Quantity-weighted average price, or `None` when nothing has been
     /// observed yet.
     fn vwap(&self) -> Option<f64> {
@@ -5064,7 +5087,9 @@ impl EngineBLiveEngine {
         // reads `settled`. When coverage is incomplete the whole block
         // is null rather than a partial number wearing a settled label.
         let settled = self.settled_trade_record(&pos, sign, pnl);
-        append_pnl_log(
+        // Best-effort here: the close has already been booked into the
+        // durable state, and nothing re-derives it from this line.
+        let _ = append_pnl_log(
             &self.cfg.pnl_log_path,
             &serde_json::json!({
                 "ts_us": now_us,
@@ -5110,6 +5135,17 @@ impl EngineBLiveEngine {
         if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
             self.try_adopt_unconfirmed(now).await;
         }
+        // Fold in whatever the venue has reported so far, *before* the
+        // decisions that may close the position (pairtrade#320 Codex
+        // review round 2). Two harvests, and both earn their place: this
+        // one keeps the durable ledger current through the holding
+        // period, so a crash mid-hold does not lose the entry fill; the
+        // one inside `on_exit` catches the closing fill, which lands on
+        // the very tick that observes the account flat and would
+        // otherwise be summarised before it was ever seen. Neither
+        // subsumes the other. Costs nothing on the wire -- the connector
+        // serves this from its WS-populated cache.
+        self.harvest_fills(now).await;
         self.poll_unresolved_claims(now).await;
         if self.pending.is_some() {
             // One exchange read per tick until the in-flight entry/exit is
@@ -5270,23 +5306,15 @@ impl EngineBLiveEngine {
                 continue;
             };
             let leg_name = if side == entry_side { "entry" } else { "exit" };
-            let leg = if side == entry_side {
-                &mut self.entry_fills
-            } else {
-                &mut self.exit_fills
-            };
-            leg.size += size;
-            leg.value += value;
-            leg.fills += 1;
-            // A fee the venue did not report leaves the leg's fee
-            // unknown for good: one missing fee makes the leg's total
-            // unknowable, and `None + Some(x)` must not read as `x`.
-            match fill.filled_fee.and_then(|f| f.to_f64()) {
-                Some(fee) => leg.fee_usd = Some(leg.fee_usd.unwrap_or(0.0) + fee),
-                None => leg.fee_usd = None,
-            }
-            self.seen_trade_ids.insert(fill.trade_id.clone());
-            append_pnl_log(
+            let fee = fill.filled_fee.and_then(|f| f.to_f64());
+            // Durable first, counted second. The connector keeps
+            // re-serving this fill, so a row that failed to reach the
+            // ledger can still be retried on a later harvest -- but only
+            // if it was never marked seen, and only if it was not
+            // already folded into a total (pairtrade#320 Codex review
+            // round 2). Marking it seen before the write turned a
+            // transient filesystem error into a permanently missing row.
+            if !append_pnl_log(
                 &self.cfg.fills_log_path,
                 &serde_json::json!({
                     "ts_us": now_us,
@@ -5299,10 +5327,28 @@ impl EngineBLiveEngine {
                     "size": size,
                     "value": value,
                     "price": if size > 0.0 { Some(value / size) } else { None },
-                    "fee_usd": fill.filled_fee.and_then(|f| f.to_f64()),
+                    "fee_usd": fee,
                     "dry_run": self.cfg.dry_run,
                 }),
-            );
+            ) {
+                continue;
+            }
+            let leg = if side == entry_side {
+                &mut self.entry_fills
+            } else {
+                &mut self.exit_fills
+            };
+            leg.size += size;
+            leg.value += value;
+            leg.fills += 1;
+            match fee {
+                Some(fee) => leg.fee_reported_usd += fee,
+                // Sticky: once a fill arrives without a fee this leg's
+                // total is unknowable, and a later fill that does report
+                // one must not resurrect a total missing this cost.
+                None => leg.fee_unknown = true,
+            }
+            self.seen_trade_ids.insert(fill.trade_id.clone());
         }
     }
 
@@ -5346,8 +5392,8 @@ impl EngineBLiveEngine {
             "gross_pnl_usd": gross,
             // Null, not zero: see the doc comment. A reader must be able
             // to tell "no fees" from "fees unknown".
-            "entry_fee_usd": self.entry_fills.fee_usd,
-            "exit_fee_usd": self.exit_fills.fee_usd,
+            "entry_fee_usd": self.entry_fills.fee_usd(),
+            "exit_fee_usd": self.exit_fills.fee_usd(),
             // The gap this record exists to make visible: how far the
             // mid-based figure the engine actually booked sits from what
             // the account did. Both describe the same round trip -- the
@@ -9193,13 +9239,13 @@ mod tests {
         h.connector
             .push_fill("e1", OrderSide::Short, "0.5", "100.0", Some("0.02"));
         h.harvest(T1_US).await;
-        assert_eq!(h.engine.entry_fills.fee_usd, Some(0.02));
+        assert_eq!(h.engine.entry_fills.fee_usd(), Some(0.02));
         // A second fill with no fee makes the leg total unknowable --
         // it must not read as the 0.02 already seen.
         h.connector
             .push_fill("e2", OrderSide::Short, "0.5", "100.0", None);
         h.harvest(T1_US + 1_000_000).await;
-        assert_eq!(h.engine.entry_fills.fee_usd, None);
+        assert_eq!(h.engine.entry_fills.fee_usd(), None);
     }
 
     #[tokio::test]
@@ -9313,6 +9359,93 @@ mod tests {
             (gross - 0.5).abs() < 1e-9,
             "short 1700 -> 1690 on 0.05: {gross}"
         );
+    }
+
+    /// pairtrade#320 Codex review round 2. The pre-close harvest is not
+    /// a substitute for a periodic one: a ledger that only gets written
+    /// when a trade closes loses the entry fill to any crash during the
+    /// holding period, which is most of the day.
+    #[tokio::test]
+    async fn the_entry_fill_is_durable_before_the_close() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+
+        // A plain tick during the holding period -- no close, no
+        // confirmation pending.
+        h.set_now(T1_US + 60_000_000);
+        h.engine.tick().await;
+
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path)
+            .expect("the entry fill must be on disk long before the exit");
+        assert_eq!(raw.lines().count(), 1);
+        assert!(h.engine.position.is_some(), "still holding");
+    }
+
+    /// pairtrade#320 Codex review round 2: one missing fee makes the
+    /// leg unknown *for good*. A later fill that does report one must
+    /// not resurrect a total that is missing the first fill's cost.
+    #[tokio::test]
+    async fn an_unknown_fee_stays_unknown_when_a_later_fill_reports_one() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.5", "100.0", None);
+        h.harvest(T1_US).await;
+        assert_eq!(h.engine.entry_fills.fee_usd(), None);
+
+        h.connector
+            .push_fill("e2", OrderSide::Short, "0.5", "100.0", Some("0.02"));
+        h.harvest(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.engine.entry_fills.fee_usd(),
+            None,
+            "$0.02 is not this leg's fee total -- the first fill's is still unknown"
+        );
+    }
+
+    /// pairtrade#320 Codex review round 2: a fill counts only once it is
+    /// durable. Marking it seen before the write turned a transient
+    /// filesystem error into a permanently missing ledger row, while the
+    /// totals moved anyway.
+    #[tokio::test]
+    async fn a_fill_that_could_not_be_written_is_retried_not_lost() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        // An unwritable path: the directory does not exist.
+        h.engine.cfg.fills_log_path = h
+            .engine
+            .cfg
+            .state_path
+            .parent()
+            .unwrap()
+            .join("no-such-dir")
+            .join("fills.jsonl");
+        h.connector
+            .push_fill("e1", OrderSide::Short, "1.0", "100.0", None);
+        h.harvest(T1_US).await;
+        assert_eq!(
+            h.engine.entry_fills.fills, 0,
+            "a fill that never reached the ledger must not be counted either"
+        );
+        assert!(!h.engine.seen_trade_ids.contains("e1"));
+
+        // The connector still serves it; once the path works the fill
+        // lands exactly once.
+        h.engine.cfg.fills_log_path = h
+            .engine
+            .cfg
+            .state_path
+            .parent()
+            .unwrap()
+            .join("fills.jsonl");
+        h.harvest(T1_US + 1_000_000).await;
+        h.harvest(T1_US + 2_000_000).await;
+        assert_eq!(h.engine.entry_fills.fills, 1);
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
     }
 
     #[tokio::test]
