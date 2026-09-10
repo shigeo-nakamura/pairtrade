@@ -114,6 +114,40 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
+- **Every fill is recorded, and the settled result is kept apart from
+  the mid-based one** (bot-strategy#919). `fills.jsonl`
+  (`ENGINE_B_LIVE_FILLS_LOG_PATH`) gets one line per exchange fill the
+  moment it is seen, deduped by the venue's own `trade_id`, and
+  `pnl.jsonl` gains a `settled` block beside the existing `pnl_usd`:
+  - `pnl_usd` means exactly what it always did -- the WS-mid figure the
+    engine books, sizes and halts on -- and now says so via
+    `pnl_source: "ws_mid_estimate"`. Nothing about the trading path
+    changed.
+  - `settled` carries `entry_vwap` / `exit_vwap` (quantity-weighted, so
+    partial fills at different prices are averaged correctly),
+    `gross_pnl_usd`, and `mid_estimate_error_usd` -- how far the booked
+    figure sits from what the account did. On the first live cycle
+    (2026-09-10) that error was **$0.07 on a $2.5 result, 2.8%**,
+    entirely because the close was booked at a mid of 1717.855 while the
+    fill was 1719.14.
+  - `settled` is **null**, not a partial number, whenever the venue's
+    fills do not cover both legs -- after a restart mid-position, for an
+    adopted position, or while the fill stream is still catching up. A
+    settled PnL computed from half an exit is a wrong number with an
+    authoritative name. `fills.jsonl` still holds the raw rows for
+    offline reconstruction.
+  - The figures are **gross**: `entry_fee_usd` / `exit_fee_usd` are
+    `null` rather than `0.0`, because Lighter surfaces no per-fill fee
+    through the connector (`FilledOrder::filled_fee` is hard-coded
+    `None` in both its WS and REST parsers). Getting the real number
+    needs Lighter's authenticated `/api/v1/trades`, which is
+    dex-connector work; so is settled funding. Until then a `null` fee
+    is the honest reading and reading it as zero would overstate every
+    result.
+  - Harvesting runs on the tick and costs nothing on the wire: the
+    Lighter connector serves `get_filled_orders` from its own
+    WS-populated cache and issues no request. (The venue *equity* read
+    does go to REST and is deliberately off-tick -- see below.)
 - **Venue equity is published, never traded on** (bot-strategy#919).
   `status.json`'s `han_bridge` block carries `venue_equity_usd`
   (`total_asset_value`), `venue_available_usd` (`available_balance`),
