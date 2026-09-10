@@ -219,6 +219,34 @@ jobs:
     secrets:
       DEX_CONNECTOR_PAT: ${{ secrets.DEX_CONNECTOR_PAT }}
 
+  # bot-strategy#984: the same shape as the job above, one step worse.
+  # `bull-holder` carries `required-features = ["lighter-sdk",
+  # "hyperliquid-sdk"]`, and build-test builds default features only, so
+  # `--all-targets` skips the binary and every `hyperliquid-sdk` arm in
+  # src/config.rs, src/trade/execution/dex_connector_box.rs and
+  # src/book/config.rs with it. Unlike the Arcus executor, this code was not
+  # compiled on master push either -- deploy-bull-holder.yml, which owned
+  # these commands, is `workflow_dispatch:` only. `debot-bull-holder` has
+  # been running DRY_RUN on Frankfurt since bot-strategy#893 with the live
+  # decision due at its 2026-09-21 checkpoint, so a regression here needs to
+  # be visible before then, not at the moment someone dispatches the deploy.
+  #
+  # A separate job rather than a step in build-test: adding hyperliquid-sdk
+  # there changes that job's feature unification, which recompiles the whole
+  # dependency tree serially on the pipeline's critical path.
+  #
+  # Deliberately NOT in `deploy`'s needs: this repo's deploy job builds
+  # engine_b_live and book-runtime, neither of which is gated on the
+  # hyperliquid-sdk feature, and the bull-holder binary has its own deploy
+  # workflow that calls the same reusable tests before its arm64 build.
+  test-bull-holder:
+    needs: resolve-ref
+    uses: ./.github/workflows/_test-bull-holder.yml
+    with:
+      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}
+    secrets:
+      DEX_CONNECTOR_PAT: ${{ secrets.DEX_CONNECTOR_PAT }}
+
   deploy:
     runs-on: ubuntu-24.04-arm
     # Builds the Lighter-linked binaries this repo still ships from master
