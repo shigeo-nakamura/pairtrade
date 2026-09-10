@@ -788,3 +788,50 @@ execution VWAP, funding/fees, model selection, or Phase 0A/0B acceptance. A
 boundary passing this check must not be counted as a valid statistical session.
 Those remaining #872 checks need separate daily analysis over the complete
 archive and recovery evidence.
+
+## Step 0 absorption test (#988)
+
+`scripts/engine_b_step0_extract.py` + `scripts/engine_b_step0_absorption.py`
+answer one question: over the KRX session, has the US perp already made the move
+the KR name made, and is what is left bigger than the round trip? The kill rules
+are frozen in bot-strategy#988 — `sd(fwd) < 14 bps`, or `R^2 >= 0.8` together
+with `sd(eps) < 14 bps`.
+
+This pair is deliberately cheap. It reads the 1 Hz `price_observation` mid
+(`market_stats`) at t0/t1/t2 only, so it can sweep weeks of archive by pulling
+one hourly partition at a time and deleting it again — the 15 GB corpus is never
+materialised, and the host's free space is not put at risk (#915).
+
+It is **not** a session-validity gate. `scripts/engine_b_boundary_quality.py`
+above is the tool that decides whether a boundary is a usable statistical
+observation (book snapshots, sequence/gap evidence, mainnet-alias provenance).
+Step 0 numbers are dispersion scale, not validated Phase 0A sessions.
+
+Run the extractor on the observer host (SSH does not reach it; use
+`aws ssm send-command`), then the statistics anywhere:
+
+```bash
+# on i-0095af4fe0efbc5dd (ap-northeast-1), as root
+python3 engine_b_step0_extract.py \
+  --start 2026-09-01 --end 2026-09-10 \
+  --out /var/tmp/engine-b-step0/prices.jsonl
+# add --venues robinhood for the pre-pivot (#244) rows; never mix venues in one file
+
+# anywhere, on the JSONL
+python3 scripts/engine_b_step0_absorption.py \
+  --prices prices.jsonl --kr-symbol SKHYNIXUSD --us-symbol SNDK \
+  --price-types mid,mark,index --json-out step0.json
+```
+
+The extractor appends and skips partitions already recorded in `--out`, so an
+interrupted sweep is resumed by rerunning the same command; `--force` re-queries
+them. Rows carry the venue and the lag between the instant and the quote that
+stood for it, and the statistics step drops any leg further than
+`--max-lag-secs` (default 120 s) from its instant.
+
+Each statistic uses every day that can support it: `fwd` needs only the US
+symbol at t1 and t2, the regression needs both symbols at t0 and t1, so a day
+with one hole still contributes where it can. Dispersions are reported with an
+exact chi-square interval — at n=3 the point estimate alone decides nothing, and
+a "no kill" only means something when the interval's lower bound also clears the
+threshold.
