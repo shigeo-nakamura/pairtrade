@@ -1789,6 +1789,18 @@ struct HanBridgeStatus {
     /// excluded: this engine has no cost basis for exposure it did not
     /// open.
     unrealized_pnl_usd_mid_estimate: Option<f64>,
+    /// When today's exit stops being retried and the day is abandoned
+    /// with the position still open (`t2 + exit_deadline_secs`), or
+    /// `None` when nothing is open.
+    ///
+    /// Published so a dashboard can say a scheduled exit is *late*.
+    /// bot-strategy#917 closes an unconfirmable exit by leaving the
+    /// position open on purpose -- a documented open position beats a
+    /// close nobody can verify -- and until now that outcome had no
+    /// signal anywhere but an e-mail and the journal. A card that knows
+    /// when the exit was due can show it as overdue instead of going on
+    /// reading "Entered, holding" indefinitely.
+    exit_deadline_us: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -5326,6 +5338,7 @@ impl EngineBLiveEngine {
                 .map(|v| ((now_us - v.fetched_at_us) / 1_000_000).max(0)),
             venue_equity_stale,
             unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
+            exit_deadline_us: self.position.as_ref().and_then(|p| p.exit_deadline_us),
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -6199,6 +6212,7 @@ mod tests {
                 venue_equity_age_secs: None,
                 venue_equity_stale: false,
                 unrealized_pnl_usd_mid_estimate: None,
+                exit_deadline_us: None,
             },
         }
     }
@@ -8544,6 +8558,38 @@ mod tests {
     /// "the refresh is slow" but "a slow refresh stops the engine from
     /// closing a position", so the assertion is on the tick completing
     /// while the venue read is still outstanding.
+    /// The exit deadline is what lets a card say a scheduled exit is
+    /// late rather than reading "Entered, holding" forever after an
+    /// unconfirmable close (bot-strategy#917).
+    #[tokio::test]
+    async fn the_exit_deadline_is_published_only_while_something_is_open() {
+        let mut h = harness();
+        h.engine.write_status_if_due(T1_US);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(null),
+            "flat: there is no exit to be late for"
+        );
+
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(T2_US + 900_000_000)
+        );
+    }
+
     #[tokio::test]
     async fn a_hung_venue_read_does_not_hold_the_trading_tick() {
         let mut h = harness();

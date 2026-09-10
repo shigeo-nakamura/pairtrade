@@ -127,6 +127,13 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     reference that does not match the funded account makes the halt
     threshold mean something other than it appears to. Reconcile the two
     by hand; this feature reports the gap, it does not close it.
+  - **`exit_deadline_us` says when today's exit stops being retried**
+    (`t2 + exit_deadline_secs`), or `None` when nothing is open. It is
+    published so a dashboard can call a scheduled exit *late*: #917
+    closes an unconfirmable exit by leaving the position open on
+    purpose, and that outcome had no signal anywhere but an e-mail and
+    the journal. The session boundaries themselves are already in
+    `status.json`'s top-level `window` (t0, t1, t2).
   - **`venue_solvency_reported` is how a consumer knows the field exists
     at all.** It is always true from this build. A consumer cannot use
     JSON key presence for that -- debot-dashboard decodes and re-encodes
