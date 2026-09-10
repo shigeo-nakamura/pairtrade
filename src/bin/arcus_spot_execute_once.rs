@@ -24,9 +24,9 @@ use debot::arcus_spot::{
     ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig, ArcusSpotKmsSigner,
     ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig, ArcusSpotLiveTickEventPublisher,
     ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream, ArcusSpotQuoteUnavailable,
-    ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan, ArcusSpotRotationTrigger,
-    ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore, ArcusSpotRuntimeConfig,
-    ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotRegime, ArcusSpotRejectionOrigin, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
+    ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
+    ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 // Test-only since bot-strategy#853's cutoff rule moved to a shared helper:
 // nothing outside the tests names these types here any more.
@@ -427,19 +427,20 @@ const MAX_CONSECUTIVE_AUTO_ARCHIVED_REJECTIONS: usize = 3;
 /// Count the *router* rejections at the tail of `history`: how many
 /// attempts the venue refused in a row, with nothing succeeding since.
 ///
-/// `Rejected` is also what `cancel_prepared` writes when a submit guard or
-/// plan-age check stops an attempt before it is dispatched. Those are this
-/// bot declining to send, not a venue refusing to take -- counting them
-/// would let two local cancellations plus one real 422 read as three venue
-/// failures and stop the bot (Codex, pairtrade#317). `dispatched_at` is the
-/// durable marker that submission actually began, so it is what separates
-/// them; a cancellation in the run neither counts nor ends it.
+/// `Rejected` is also what this bot writes when it declines to send --
+/// `cancel_prepared` for a submit guard or plan-age check, and a
+/// client-side preflight failure, which lands *after* `mark_dispatching`
+/// and so cannot be told apart by timestamps. Counting those would let two
+/// of this bot's own refusals plus one real 422 read as three venue
+/// failures and stop it (Codex, pairtrade#317). `rejection_origin` is the
+/// durable answer; one of this bot's own refusals in the run neither counts
+/// nor ends it.
 fn consecutive_tail_rejections(history: &[ArcusSpotExecutionAttempt]) -> usize {
     history
         .iter()
         .rev()
         .take_while(|attempt| attempt.phase == ArcusSpotExecutionPhase::Rejected)
-        .filter(|attempt| attempt.dispatched_at.is_some())
+        .filter(|attempt| attempt.rejection_origin == Some(ArcusSpotRejectionOrigin::Venue))
         .count()
 }
 
@@ -469,12 +470,16 @@ fn auto_archive_router_rejection(
     if active.phase != ArcusSpotExecutionPhase::Rejected || active.tx_hash.is_some() {
         return Ok(None);
     }
-    // Only a rejection the venue gave us. `cancel_prepared` also writes
-    // `Rejected` with no `tx_hash` when a submit guard or plan-age check
-    // stops an attempt before dispatch, and clearing one of those would
-    // report a router refusal that never happened -- and, worse, hide
-    // whatever made the guard fire (Codex, pairtrade#317).
-    if active.dispatched_at.is_none() {
+    // Only a rejection the venue gave us. This bot also writes `Rejected`
+    // when it declines to send -- a submit guard, a plan-age check, a
+    // client-side preflight -- and clearing one of those would report a
+    // router refusal that never happened and hide whatever made the check
+    // fire. A preflight failure lands after `mark_dispatching`, so the
+    // timestamps cannot say; `rejection_origin` is recorded at the moment
+    // it is known. An attempt written before that field existed says
+    // nothing, and is left for an operator rather than assumed benign
+    // (Codex, pairtrade#317).
+    if active.rejection_origin != Some(ArcusSpotRejectionOrigin::Venue) {
         return Ok(None);
     }
     let sequence = active.sequence;
@@ -6573,6 +6578,8 @@ runtime:
             // transaction's own transfers would have reported it, with no
             // refund leg (bot-strategy#979).
             settled_sell_amount_raw: Some("50000000000000000".to_string()),
+            // A reconciled attempt was never rejected by anyone.
+            rejection_origin: None,
         }
     }
 
@@ -9037,6 +9044,7 @@ runtime:
     ) -> ArcusSpotExecutionAttempt {
         let mut attempt = reconciled_entry_attempt(config, plan, sequence);
         attempt.phase = ArcusSpotExecutionPhase::Rejected;
+        attempt.rejection_origin = Some(ArcusSpotRejectionOrigin::Venue);
         attempt.tx_hash = None;
         attempt.post_balances = None;
         attempt.settled_buy_amount_raw = None;
@@ -9212,6 +9220,7 @@ runtime:
         let plan = rotation_plan("entry_signal");
         let mut cancelled = rejected_attempt(&config, &plan, 1);
         cancelled.dispatched_at = None;
+        cancelled.rejection_origin = Some(ArcusSpotRejectionOrigin::Client);
         cancelled.detail = Some("submit guard refused the plan".to_string());
         let mut ledger = ledger_with(Some(cancelled.clone()), vec![]);
 
@@ -9220,8 +9229,35 @@ runtime:
             .is_none());
         assert!(ledger.active.is_some(), "left for an operator to look at");
 
-        // Nor does it count toward the cap, or break the run it sits in.
+        // A client-side preflight failure is the same story with the
+        // dispatch marker set -- the timestamps cannot tell them apart, so
+        // the recorded origin is what does (Codex, pairtrade#317).
+        let mut preflight = rejected_attempt(&config, &plan, 2);
+        preflight.rejection_origin = Some(ArcusSpotRejectionOrigin::Client);
+        preflight.detail = Some("client preflight failed after dispatch marker".to_string());
+        assert!(preflight.dispatched_at.is_some(), "past mark_dispatching");
+        let mut ledger = ledger_with(Some(preflight.clone()), vec![]);
+        assert!(auto_archive_router_rejection(&mut ledger)
+            .unwrap()
+            .is_none());
+        assert!(
+            ledger.active.is_some(),
+            "a preflight failure is not the venue's"
+        );
+
+        // An attempt written before the field existed says nothing, so it
+        // is left alone rather than assumed benign.
+        let mut legacy = rejected_attempt(&config, &plan, 3);
+        legacy.rejection_origin = None;
+        let mut ledger = ledger_with(Some(legacy.clone()), vec![]);
+        assert!(auto_archive_router_rejection(&mut ledger)
+            .unwrap()
+            .is_none());
+
+        // Nor do any of them count toward the cap, or break the run.
         assert_eq!(consecutive_tail_rejections(&[cancelled.clone()]), 0);
+        assert_eq!(consecutive_tail_rejections(&[preflight.clone()]), 0);
+        assert_eq!(consecutive_tail_rejections(&[legacy]), 0);
         let dispatched = rejected_attempt(&config, &plan, 2);
         assert_eq!(
             consecutive_tail_rejections(&[dispatched.clone(), cancelled, dispatched.clone()]),
@@ -9599,6 +9635,7 @@ runtime:
             detail: None,
             settled_buy_amount_raw: None,
             settled_sell_amount_raw: None,
+            rejection_origin: None,
         }
     }
 

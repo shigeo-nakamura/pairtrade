@@ -715,11 +715,16 @@ Still held for an operator, unchanged:
 - a `Rejected` attempt **with** a `tx_hash` -- it may have reached the
   chain, so it needs `repair-report` / `manual-reconcile-apply`, not a
   plain archive (the same boundary `archive-rejected-report` draws),
-- a `Rejected` attempt with **no `dispatched_at`** -- that is
-  `cancel_prepared`, i.e. a submit guard or plan-age check stopping this
-  bot from sending, not a venue refusing to take. Clearing one would report
-  a router refusal that never happened and hide whatever made the guard
-  fire. It is skipped when counting the run below, and does not break it,
+- a `Rejected` attempt whose recorded `rejection_origin` is not the venue
+  -- a submit guard or plan-age check (`cancel_prepared`), or a
+  client-side preflight failure, which lands *after* the dispatch marker
+  and so cannot be told apart by timestamps. Those are this bot declining
+  to send, not a venue refusing to take: clearing one would report a router
+  refusal that never happened and hide whatever made the check fire. They
+  are skipped when counting the run below, and do not break it,
+- a `Rejected` attempt written before `rejection_origin` existed. It says
+  nothing about who refused, and "cannot say" is left for an operator
+  rather than assumed benign,
 - `Unknown`, `OperatorHold`, `Failed`,
 - **three router rejections in a row** with nothing succeeding in between.
   A venue refusing everything is not the cheap case: clearing forever would

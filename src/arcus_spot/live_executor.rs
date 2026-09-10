@@ -2,8 +2,8 @@ use super::{
     raw_amount_to_quantity, ArcusSpotChainClient, ArcusSpotChainPreflightRequest,
     ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionIntent,
     ArcusSpotExecutionLedger, ArcusSpotExecutionLedgerLock, ArcusSpotExecutionLedgerStore,
-    ArcusSpotExecutionPhase, ArcusSpotRotationPlan, ArcusSpotSettlementRead,
-    ArcusSpotSettlementReceiptExpectation,
+    ArcusSpotExecutionPhase, ArcusSpotRejectionOrigin, ArcusSpotRotationPlan,
+    ArcusSpotSettlementRead, ArcusSpotSettlementReceiptExpectation,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -486,9 +486,21 @@ where
             }
             Err(error) => {
                 match &error {
-                    ArcusSpotSubmitError::Preflight(_) | ArcusSpotSubmitError::Rejected { .. } => {
-                        self.ledger
-                            .record_submit_rejected(format!("{error}"), Utc::now())?;
+                    ArcusSpotSubmitError::Preflight(_) => {
+                        // This bot's own check, after the dispatch marker:
+                        // the venue was never asked (Codex, pairtrade#317).
+                        self.ledger.record_submit_rejected(
+                            format!("{error}"),
+                            Utc::now(),
+                            ArcusSpotRejectionOrigin::Client,
+                        )?;
+                    }
+                    ArcusSpotSubmitError::Rejected { .. } => {
+                        self.ledger.record_submit_rejected(
+                            format!("{error}"),
+                            Utc::now(),
+                            ArcusSpotRejectionOrigin::Venue,
+                        )?;
                     }
                     ArcusSpotSubmitError::Unknown { .. } => {
                         self.ledger
