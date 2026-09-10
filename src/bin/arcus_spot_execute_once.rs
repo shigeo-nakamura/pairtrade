@@ -6048,11 +6048,18 @@ async fn main() -> Result<()> {
 
             // The optimistic check before the public snapshot fetch is not
             // sufficient by itself: another live-tick can dispatch while
-            // this invocation is collecting that snapshot. Re-read the
-            // ledger under the same lock that guards the checkpoint before
-            // advancing the runtime or replacing pending-plan evidence.
+            // this invocation is collecting that snapshot, and
+            // `reconcile-position` can take the lock in that same gap,
+            // commit its ledger half, and crash before the checkpoint --
+            // leaving no active attempt and a still-rotated checkpoint for
+            // this tick to evaluate from (Codex P1, pairtrade#318). Re-read
+            // the ledger under the same lock that guards the checkpoint and
+            // re-apply *both* checks before advancing the runtime or
+            // replacing pending-plan evidence.
+            let rechecked_ledger = ledger_store_for_checkpoint.load_or_create(Utc::now())?;
+            require_no_half_committed_manual_close(&config, &rechecked_ledger)?;
             if let Some((plan, plan_config_digest)) =
-                load_live_tick_active_recovery_plan(&config, &ledger_store_for_checkpoint)?
+                live_tick_active_recovery_plan(&config, &rechecked_ledger)?
             {
                 drop(checkpoint_lock);
                 let attempt = resume_live_tick_attempt(&config, plan, plan_config_digest).await?;
