@@ -4,7 +4,7 @@ use super::{
 use chrono::{DateTime, Duration, Utc};
 use dex_connector::{
     ArcusSpotCapture, ArcusSpotOverviewEntry, ArcusSpotRecorderSnapshot, ArcusSpotRoundTripRecord,
-    ArcusSpotRouteObservation, ArcusSpotToken,
+    ArcusSpotRouteObservation, ArcusSpotSelectedQuote, ArcusSpotToken,
 };
 use dex_connector::{ArcusSpotFixedSellAmountRow, ArcusSpotPair, ArcusSpotRecorderStage};
 use rust_decimal::{prelude::ToPrimitive, Decimal, RoundingStrategy};
@@ -1798,6 +1798,7 @@ impl ArcusSpotRuntime {
                 cycle_sell_token,
                 evaluation_time,
                 self.config.max_quote_age_secs,
+                self.config.max_favourable_quote_deviation_bps,
             )?;
             verify_reverse_notional_bound(
                 reverse_route,
@@ -1805,7 +1806,7 @@ impl ArcusSpotRuntime {
                 cycle_buy_price_usd,
                 cycle_buy_token,
             )?;
-            parse_positive_or_zero(
+            parse_round_trip_loss_bps(
                 "optimistic_round_trip_loss_bps",
                 row.optimistic_round_trip_loss_bps.as_deref(),
             )?
@@ -1818,6 +1819,7 @@ impl ArcusSpotRuntime {
                 cycle_buy_token,
                 evaluation_time,
                 self.config.max_quote_age_secs,
+                self.config.max_favourable_quote_deviation_bps,
             )?;
             validate_route_leg(
                 reverse_route,
@@ -1825,6 +1827,7 @@ impl ArcusSpotRuntime {
                 cycle_sell_token,
                 evaluation_time,
                 self.config.max_quote_age_secs,
+                self.config.max_favourable_quote_deviation_bps,
             )?;
             verify_requested_notional_amount(
                 row,
@@ -1839,7 +1842,12 @@ impl ArcusSpotRuntime {
                 cycle_buy_price_usd,
                 cycle_buy_token,
             )?;
-            verify_round_trip_linkage_and_loss(row)?
+            verify_round_trip_linkage_and_loss(
+                row,
+                cycle_sell_token,
+                cycle_buy_token,
+                self.config.max_favourable_quote_deviation_bps,
+            )?
         };
 
         Ok(SnapshotContext {
@@ -1989,6 +1997,7 @@ impl ArcusSpotRuntime {
             buy_token,
             evaluation_time,
             self.config.max_quote_age_secs,
+            self.config.max_favourable_quote_deviation_bps,
         )?;
         if row.requested_sell_amount.as_deref() != Some(open_raw.as_str())
             || forward_route.sell_amount != open_raw
@@ -2008,7 +2017,7 @@ impl ArcusSpotRuntime {
         let verified_round_trip_loss_bps = row
             .optimistic_round_trip_loss_bps
             .as_deref()
-            .map(|value| parse_positive_or_zero("optimistic_round_trip_loss_bps", Some(value)))
+            .map(|value| parse_round_trip_loss_bps("optimistic_round_trip_loss_bps", Some(value)))
             .transpose()?
             .unwrap_or(Decimal::ZERO);
         Ok(Some(SnapshotContext {
@@ -2172,14 +2181,15 @@ impl ArcusSpotRuntime {
             buy_token,
             evaluation_time,
             self.config.max_quote_age_secs,
+            self.config.max_favourable_quote_deviation_bps,
         )?;
-        let quote = route
-            .response
-            .payload
-            .recommended_quote()
-            .map_err(|error| {
-                ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
-            })?;
+        let quote = select_route_quote(
+            route,
+            sell_token,
+            buy_token,
+            self.config.max_favourable_quote_deviation_bps,
+        )?
+        .quote;
 
         let sell_quantity = raw_amount_to_quantity(&route.sell_amount, sell_token.decimals)
             .map_err(|detail| ArcusSpotHold::new(ArcusSpotHoldCode::InvalidSnapshot, detail))?;
@@ -2718,6 +2728,36 @@ fn validate_recorded_reference(
     Ok(())
 }
 
+/// The one place a leg's venue quote is chosen for planning, costing and
+/// dispatch: `plausible_best_quote` against the router's own referencePrice,
+/// never the router's bare `recommended` (bot-strategy#1001). A leg with no
+/// usable reference, or no venue inside the band, is a route this tick
+/// cannot use -- a hold, not an invalid snapshot.
+fn select_route_quote<'a>(
+    route: &'a ArcusSpotRouteObservation,
+    sell_token: &ArcusSpotToken,
+    buy_token: &ArcusSpotToken,
+    max_favourable_quote_deviation_bps: Decimal,
+) -> Result<ArcusSpotSelectedQuote<'a>, ArcusSpotHold> {
+    route
+        .response
+        .payload
+        .plausible_best_quote(
+            sell_token.decimals,
+            buy_token.decimals,
+            max_favourable_quote_deviation_bps,
+        )
+        .map_err(|error| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::RouteUnavailable,
+                format!(
+                    "{}->{} leg has no plausible venue quote: {error}",
+                    sell_token.symbol, buy_token.symbol
+                ),
+            )
+        })
+}
+
 fn validate_route(
     route: &ArcusSpotRouteObservation,
     sell_token: &ArcusSpotToken,
@@ -2748,19 +2788,19 @@ fn validate_route_leg(
     buy_token: &ArcusSpotToken,
     evaluation_time: DateTime<Utc>,
     max_quote_age_secs: i64,
+    max_favourable_quote_deviation_bps: Decimal,
 ) -> Result<(), ArcusSpotHold> {
     validate_route(route, sell_token, buy_token)?;
-    let quote = route
-        .response
-        .payload
-        .recommended_quote()
-        .map_err(|error| {
-            ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
-        })?;
-    if quote.sell_amount != route.sell_amount {
+    let selected = select_route_quote(
+        route,
+        sell_token,
+        buy_token,
+        max_favourable_quote_deviation_bps,
+    )?;
+    if selected.quote.sell_amount != route.sell_amount {
         return Err(ArcusSpotHold::new(
             ArcusSpotHoldCode::RouteUnavailable,
-            "recommended quote sell amount does not match route request",
+            "selected quote sell amount does not match route request",
         ));
     }
     let quote_age_ms = evaluation_time
@@ -2940,6 +2980,9 @@ fn verify_reverse_notional_bound(
 /// fills pass the cost gate on incorrect risk numbers.
 fn verify_round_trip_linkage_and_loss(
     row: &ArcusSpotRoundTripRecord,
+    sell_token: &ArcusSpotToken,
+    buy_token: &ArcusSpotToken,
+    max_favourable_quote_deviation_bps: Decimal,
 ) -> Result<Decimal, ArcusSpotHold> {
     let forward = row
         .forward
@@ -2949,31 +2992,57 @@ fn verify_round_trip_linkage_and_loss(
         .reverse
         .as_ref()
         .expect("caller has already verified reverse is present");
-    let forward_quote = forward
-        .response
-        .payload
-        .recommended_quote()
-        .map_err(|error| {
-            ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
-        })?;
-    let reverse_quote = reverse
-        .response
-        .payload
-        .recommended_quote()
-        .map_err(|error| {
-            ArcusSpotHold::new(ArcusSpotHoldCode::RouteUnavailable, error.to_string())
-        })?;
-    if forward_quote.buy_amount != reverse.sell_amount {
+    let forward_quote = select_route_quote(
+        forward,
+        sell_token,
+        buy_token,
+        max_favourable_quote_deviation_bps,
+    )?;
+    let reverse_quote = select_route_quote(
+        reverse,
+        buy_token,
+        sell_token,
+        max_favourable_quote_deviation_bps,
+    )?;
+    // The recorder chained the reverse leg off the venue *it* selected. If
+    // this runtime's band selects a different venue for the same payload,
+    // the row's return amount and loss describe a different round trip than
+    // the one about to be costed.
+    for (leg, recorded, selected) in [
+        (
+            "forward",
+            row.forward_venue.as_deref(),
+            forward_quote.quote.venue.as_str(),
+        ),
+        (
+            "reverse",
+            row.reverse_venue.as_deref(),
+            reverse_quote.quote.venue.as_str(),
+        ),
+    ] {
+        if let Some(recorded) = recorded {
+            if !recorded.eq_ignore_ascii_case(selected) {
+                return Err(ArcusSpotHold::new(
+                    ArcusSpotHoldCode::InvalidSnapshot,
+                    format!(
+                        "recorder selected {recorded} for the {leg} leg but this runtime selects \
+                         {selected}; the plausibility bands disagree"
+                    ),
+                ));
+            }
+        }
+    }
+    if forward_quote.quote.buy_amount != reverse.sell_amount {
         return Err(ArcusSpotHold::new(
             ArcusSpotHoldCode::InvalidSnapshot,
-            "reverse route sellAmount does not match the forward recommended buyAmount",
+            "reverse route sellAmount does not match the forward selected buyAmount",
         ));
     }
     if let Some(recorded_return) = row.optimistic_return_amount.as_deref() {
-        if recorded_return != reverse_quote.buy_amount {
+        if recorded_return != reverse_quote.quote.buy_amount {
             return Err(ArcusSpotHold::new(
                 ArcusSpotHoldCode::InvalidSnapshot,
-                "recorded optimistic return amount does not match the reverse recommended buyAmount",
+                "recorded optimistic return amount does not match the reverse selected buyAmount",
             ));
         }
     }
@@ -2989,10 +3058,10 @@ fn verify_round_trip_linkage_and_loss(
             "forward sellAmount must be positive",
         ));
     }
-    let returned = Decimal::from_str(&reverse_quote.buy_amount).map_err(|error| {
+    let returned = Decimal::from_str(&reverse_quote.quote.buy_amount).map_err(|error| {
         ArcusSpotHold::new(
             ArcusSpotHoldCode::InvalidSnapshot,
-            format!("reverse recommended buyAmount is invalid: {error}"),
+            format!("reverse selected buyAmount is invalid: {error}"),
         )
     })?;
     let recomputed = start
@@ -3005,7 +3074,7 @@ fn verify_round_trip_linkage_and_loss(
                 "round-trip loss exceeds Decimal range",
             )
         })?;
-    let recorded = parse_positive_or_zero(
+    let recorded = parse_signed_round_trip_loss_bps(
         "optimistic_round_trip_loss_bps",
         row.optimistic_round_trip_loss_bps.as_deref(),
     )?;
@@ -3018,7 +3087,9 @@ fn verify_round_trip_linkage_and_loss(
             ),
         ));
     }
-    Ok(recomputed)
+    // Signed agreement is what proves the legs chain; the cost gate itself
+    // never credits a favourable round trip (see parse_round_trip_loss_bps).
+    Ok(recomputed.max(Decimal::ZERO))
 }
 
 /// Shared by `apply_confirmed_live_fill` (post-fill commit) and
@@ -4203,26 +4274,40 @@ fn require_fill_consistent_with_regime(
     }
 }
 
-fn parse_positive_or_zero(field: &str, value: Option<&str>) -> Result<Decimal, ArcusSpotHold> {
+/// A recorder row's `optimistic_round_trip_loss_bps` as recorded, sign
+/// included. The recorder reports exactly what its two legs imply, and a
+/// round trip can come out slightly favourable when the reference the
+/// router prices against lags a moving market by a tick.
+fn parse_signed_round_trip_loss_bps(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Decimal, ArcusSpotHold> {
     let value = value.ok_or_else(|| {
         ArcusSpotHold::new(
             ArcusSpotHoldCode::InvalidSnapshot,
             format!("{field} is absent"),
         )
     })?;
-    let parsed = Decimal::from_str(value).map_err(|error| {
+    Decimal::from_str(value).map_err(|error| {
         ArcusSpotHold::new(
             ArcusSpotHoldCode::InvalidSnapshot,
             format!("{field} is invalid: {error}"),
         )
-    })?;
-    if parsed < Decimal::ZERO {
-        return Err(ArcusSpotHold::new(
-            ArcusSpotHoldCode::InvalidSnapshot,
-            format!("{field} cannot be negative"),
-        ));
-    }
-    Ok(parsed)
+    })
+}
+
+/// The same value as the cost gate consumes it: a favourable round trip is
+/// costed at zero, never credited and never rejected.
+///
+/// Before bot-strategy#1001 a negative value here rejected the whole row as
+/// an invalid snapshot. The sign was standing in for "one leg's quote is
+/// not believable", and one venue's +212 bps quote made it discard 62% of
+/// a day's ticks -- including the honest quote in the same response. That
+/// judgement now happens per venue, against the router's own reference,
+/// in `select_route_quote`, and the linkage check proves the legs chain; a
+/// residual negative is the bounded lag artefact described above.
+fn parse_round_trip_loss_bps(field: &str, value: Option<&str>) -> Result<Decimal, ArcusSpotHold> {
+    Ok(parse_signed_round_trip_loss_bps(field, value)?.max(Decimal::ZERO))
 }
 
 pub fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
@@ -4436,6 +4521,7 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::ONE,
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
+            max_favourable_quote_deviation_bps: Decimal::from(25),
             corporate_actions: Vec::new(),
             // The corporate-action fixtures use second-scale windows, so
             // the 300s production default would leave no dispatchable reduce
@@ -4488,6 +4574,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price("49000000000000000", "25000000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "49000000000000000",
@@ -4512,6 +4599,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price("24800000000000000", "49000000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "24800000000000000",
@@ -4563,6 +4651,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price("24500000000000000", "50000000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "24500000000000000",
@@ -4587,6 +4676,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price("49600000000000000", "24500000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "49600000000000000",
@@ -5158,6 +5248,30 @@ mod tests {
         );
     }
 
+    /// A referencePrice 5 bps *above* the quote's implied price, i.e. the
+    /// quote sits an honest 5 bps below the reference (both tokens are
+    /// 18-decimal in these fixtures, so raw ratio == human ratio).
+    fn reference_price(buy_amount: &str, sell_amount: &str) -> String {
+        let implied =
+            Decimal::from_str(buy_amount).unwrap() / Decimal::from_str(sell_amount).unwrap();
+        (implied / Decimal::new(9995, 4)).normalize().to_string()
+    }
+
+    fn with_implausible_rialto_recommended(route: &mut ArcusSpotRouteObservation) {
+        // The live 2026-09-10 shape: rialto's buyAmount is ~2.1% larger
+        // than arcus's, the router recommends it on that alone, and it
+        // sits ~+206 bps over the router's own referencePrice.
+        let arcus = route.response.payload.quotes[0].clone();
+        let inflated = (Decimal::from_str(&arcus.buy_amount).unwrap() * Decimal::new(10212, 4))
+            .round()
+            .to_string();
+        let mut rialto = arcus.clone();
+        rialto.venue = "rialto".to_string();
+        rialto.buy_amount = inflated;
+        route.response.payload.quotes.push(rialto);
+        route.response.payload.recommended = "rialto".to_string();
+    }
+
     fn round_trip_row(
         forward_buy_amount: &str,
         reverse_sell_amount: &str,
@@ -5181,6 +5295,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price(forward_buy_amount, "25000000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": forward_buy_amount,
@@ -5205,6 +5320,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price(reverse_buy_amount, reverse_sell_amount),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": reverse_buy_amount,
@@ -5236,7 +5352,13 @@ mod tests {
             "80",
         );
         assert_eq!(
-            verify_round_trip_linkage_and_loss(&row).unwrap(),
+            verify_round_trip_linkage_and_loss(
+                &row,
+                &nvda_token(),
+                &amd_token(),
+                Decimal::from(25)
+            )
+            .unwrap(),
             Decimal::from(80)
         );
     }
@@ -5253,7 +5375,13 @@ mod tests {
             "24800000000000000",
             "80",
         );
-        let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+        )
+        .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("reverse route sellAmount"));
     }
@@ -5267,7 +5395,13 @@ mod tests {
             "24900000000000000",
             "80",
         );
-        let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+        )
+        .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("optimistic return amount"));
     }
@@ -5284,9 +5418,163 @@ mod tests {
             "24800000000000000",
             "20",
         );
-        let error = verify_round_trip_linkage_and_loss(&row).unwrap_err();
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+        )
+        .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
         assert!(error.detail.contains("does not match"));
+    }
+
+    #[test]
+    fn round_trip_linkage_selects_the_plausible_venue_over_the_recommended_one() {
+        // bot-strategy#1001: the forward payload recommends an implausibly
+        // rich rialto quote; the reverse leg and the recorded loss were
+        // built off arcus. The row must cost as the arcus round trip (80
+        // bps), not be rejected for a negative one.
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        with_implausible_rialto_recommended(row.forward.as_mut().unwrap());
+        row.forward_venue = Some("arcus".to_string());
+        assert_eq!(
+            verify_round_trip_linkage_and_loss(
+                &row,
+                &nvda_token(),
+                &amd_token(),
+                Decimal::from(25)
+            )
+            .unwrap(),
+            Decimal::from(80)
+        );
+        // A band wide enough to admit rialto selects it, and then the
+        // reverse leg (sized off arcus) no longer chains: the row is
+        // refused as inconsistent rather than costed on the wrong venue.
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(300),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(
+            error.detail.contains("recorder selected arcus"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn round_trip_linkage_rejects_a_row_whose_recorded_venue_disagrees_with_the_selection() {
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        row.reverse_venue = Some("rialto".to_string());
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(error.detail.contains("reverse leg"), "{error:?}");
+    }
+
+    #[test]
+    fn a_slightly_favourable_round_trip_within_the_band_is_costed_at_zero() {
+        // Both legs sit honestly below their references (the fixture
+        // helper places every quote 5 bps under), yet the chained amounts
+        // return 4 bps more than they started with -- the reference-lag
+        // case. Signed agreement with the recorder still holds, and the
+        // cost gate sees zero, not a rejection and not a credit.
+        let row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "25010000000000000",
+            "25010000000000000",
+            "-4",
+        );
+        assert_eq!(
+            verify_round_trip_linkage_and_loss(
+                &row,
+                &nvda_token(),
+                &amd_token(),
+                Decimal::from(25)
+            )
+            .unwrap(),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            parse_round_trip_loss_bps("x", Some("-4")).unwrap(),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            parse_round_trip_loss_bps("x", Some("4")).unwrap(),
+            Decimal::from(4)
+        );
+        assert!(parse_round_trip_loss_bps("x", None).is_err());
+    }
+
+    #[test]
+    fn a_leg_with_no_plausible_venue_holds_as_route_unavailable() {
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        // A reference far below every quote makes all of them implausible.
+        row.forward
+            .as_mut()
+            .unwrap()
+            .response
+            .payload
+            .extra
+            .insert("referencePrice".to_string(), json!("0.5"));
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+        assert!(
+            error
+                .detail
+                .contains("NVDA->AMD leg has no plausible venue quote"),
+            "{error:?}"
+        );
+        // And without any reference the leg fails closed the same way.
+        row.forward
+            .as_mut()
+            .unwrap()
+            .response
+            .payload
+            .extra
+            .remove("referencePrice");
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+        assert!(error.detail.contains("referencePrice"), "{error:?}");
     }
 
     fn nvda_token() -> ArcusSpotToken {
@@ -6320,6 +6608,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price("49000000000000000", "25000000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "49000000000000000",
@@ -6344,6 +6633,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price("24800000000000000", "49000000000000000"),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "24800000000000000",
@@ -6487,6 +6777,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price(forward_buy_amount, sell_amount),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": forward_buy_amount,
@@ -6511,6 +6802,7 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
+                        "referencePrice": reference_price(reverse_buy_amount, forward_buy_amount),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": reverse_buy_amount,
@@ -7170,6 +7462,46 @@ mod tests {
         assert!(runtime
             .validate_plan_consistent_with_state(&plan, event_time())
             .is_err());
+    }
+
+    #[test]
+    fn build_plan_dispatches_on_the_plausible_venue_not_the_router_recommendation() {
+        let runtime = ArcusSpotRuntime::new(config()).unwrap();
+        let mut context = context(event_time() - Duration::seconds(2), Decimal::from(20));
+        let arcus_buy_amount = context
+            .row
+            .forward
+            .as_ref()
+            .unwrap()
+            .response
+            .payload
+            .quotes[0]
+            .buy_amount
+            .clone();
+        with_implausible_rialto_recommended(context.row.forward.as_mut().unwrap());
+        let plan = runtime
+            .build_plan(
+                &context,
+                ArcusSpotDirection::TokenAToTokenB,
+                ArcusSpotRotationTrigger::EntrySignal,
+                event_time(),
+                runtime.state.inventory,
+            )
+            .unwrap();
+        assert_eq!(plan.venue, "arcus");
+        assert_eq!(plan.buy_amount_raw, arcus_buy_amount);
+        assert_ne!(
+            context
+                .row
+                .forward
+                .as_ref()
+                .unwrap()
+                .response
+                .payload
+                .recommended,
+            plan.venue,
+            "the router's recommendation was rialto and must not have been dispatched"
+        );
     }
 
     #[cfg(feature = "arcus-spot-live")]

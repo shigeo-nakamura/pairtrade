@@ -458,6 +458,8 @@ async fn propose(config_path: &str, out_path: Option<&str>) -> Result<()> {
             recorder_config = recorder_config.with_fixed_sell_amount_row(row);
         }
     }
+    let recorder_config = recorder_config
+        .with_max_favourable_quote_deviation_bps(config.runtime.max_favourable_quote_deviation_bps);
     let recorder = ArcusSpotRecorder::new(client, recorder_config)
         .context("invalid Arcus recorder configuration")?;
 
