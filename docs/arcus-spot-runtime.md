@@ -454,11 +454,15 @@ At `resume_not_before` the runtime resumes only when all three hold:
    leaves the close recorded against a checkpoint that still shows the
    rotation. Two things follow:
 
-   - **`live-tick` refuses to evaluate** while the ledger's tail is a
-     `ManuallyClosed` entry and the checkpoint is not flat. Without that,
-     the next scheduled tick would load the stale checkpoint and could
-     dispatch the window's forced exit for inventory that is already sold.
-     It exits non-zero naming the ledger sequence to finish.
+   - **Nothing quotes or dispatches** while the ledger's tail is a
+     `ManuallyClosed` entry and the checkpoint is not flat. The check runs
+     wherever an executor is built -- `live-tick`, `execute`,
+     `auto-execute`, the resumes -- and again under the checkpoint lock
+     after live-tick's snapshot fetch, since the gap in between is exactly
+     when this command can commit its ledger half. Without it the stale
+     checkpoint would still show the rotation, and the window's forced exit
+     could be dispatched for inventory that is already sold. It exits
+     non-zero naming the ledger sequence to finish.
    - **Running the command again finishes the transition.** It recognises
      its own half-committed close -- every persisted input must match, down
      to the DETAIL text -- and writes only the checkpoint, rather than

@@ -5304,7 +5304,7 @@ async fn executor_from_config(
     // otherwise both dispatch against, while ledger_path is only where this
     // particular invocation happens to persist its own attempt history
     // (Codex P1 follow-up, pairtrade#181).
-    ArcusSpotLiveExecutor::new(
+    let executor = ArcusSpotLiveExecutor::new(
         config.executor.clone(),
         config.runtime.pair.clone(),
         client,
@@ -5312,7 +5312,16 @@ async fn executor_from_config(
         signer,
         store,
         &config.runtime_state_path,
-    )
+    )?;
+    // Every path that can quote or dispatch comes through here, and by this
+    // point the executor holds the lock -- so this is the one place the
+    // guard covers `execute`, `auto-execute`, the resumes and live-tick
+    // alike. A manual close committed to the ledger but not yet to the
+    // checkpoint leaves `active` empty, so `prepare` would accept a fresh
+    // attempt planned from the stale rotated checkpoint and sell the
+    // already-closed leg again (Codex P1, pairtrade#318).
+    require_no_half_committed_manual_close(config, executor.ledger())?;
+    Ok(executor)
 }
 
 fn finalize_reconciled_attempt(
@@ -9751,6 +9760,22 @@ runtime:
         // never blocks.
         require_no_half_committed_manual_close(&config, &ArcusSpotExecutionLedger::default())
             .unwrap();
+
+        // The guard is not live-tick's alone: `executor_from_config` runs it
+        // under the executor's own lock, so `execute`/`auto-execute` cannot
+        // plan an exit from the stale checkpoint either (Codex P1,
+        // pairtrade#318). Asserting the wiring rather than the network path:
+        // building a real executor needs KMS.
+        let source = std::fs::read_to_string(file!()).unwrap();
+        let wiring = source
+            .split("async fn executor_from_config(")
+            .nth(1)
+            .expect("executor_from_config is defined here");
+        let body = &wiring[..wiring.find("\nfn ").unwrap_or(wiring.len())];
+        assert!(
+            body.contains("require_no_half_committed_manual_close(config, executor.ledger())"),
+            "every quoting/dispatching path must run the guard under the executor's lock",
+        );
     }
 
     #[test]
