@@ -690,7 +690,12 @@ corporate_action:
         assert!(error.contains("corporate_action"), "{error}");
     }
 
-    const LIVE_SHAPED_RUNTIME_YAML: &str = r#"mode: live
+    // The deployed 2026-09-10 runtime YAML, field for field, except `mode`:
+    // `live` only exists under the `arcus-spot-live` feature and the
+    // `arcus-spot-sdk`-only CI job (`cargo test --lib --features
+    // arcus-spot-sdk arcus_spot`) compiles this module without it. The
+    // defaulting under test is per-field and mode-independent.
+    const LIVE_SHAPED_RUNTIME_YAML: &str = r#"mode: read_only
 chain_id: 4663
 pair:
   sell_symbol: SPY
