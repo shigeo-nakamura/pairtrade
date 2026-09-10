@@ -169,7 +169,13 @@ def correlation(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
 
 
 def load_prices(path: str) -> dict:
-    """{(date, point, symbol, price_type): row} from the extractor's JSONL."""
+    """{(date, point, symbol, price_type): row} from the extractor's JSONL.
+
+    An instant's tolerance window can straddle an hourly partition boundary --
+    t0 is 00:00:00 UTC exactly -- so the extractor emits one candidate per
+    partition it looked in. The nearest of them is the quote that stood for the
+    instant; ties go to the earlier one so a rerun is deterministic.
+    """
     prices = {}
     with open(path) as handle:
         for line in handle:
@@ -180,7 +186,12 @@ def load_prices(path: str) -> dict:
             if row.get("status") != "ok" or "price" not in row:
                 continue
             key = (row["date"], row["point"], row["symbol"], row["price_type"])
-            prices[key] = row
+            best = prices.get(key)
+            if best is None or (abs(row["lag_secs"]), row["observed_ts_us"]) < (
+                abs(best["lag_secs"]),
+                best["observed_ts_us"],
+            ):
+                prices[key] = row
     return prices
 
 
@@ -257,6 +268,7 @@ def analyse(sessions: Sequence[dict]) -> dict:
         "sd_eps_bps": None,
         "sd_eps_bps_ci90": None,
         "sd_eps_issue_beta_bps": None,
+        "sd_eps_issue_beta_bps_ci90": None,
         "corr_eps_fwd": None,
         "n_corr": 0,
         "corr_r_kr_r_us": correlation(r_kr, r_us),
@@ -305,6 +317,10 @@ def analyse(sessions: Sequence[dict]) -> dict:
         ]
         sd_issue = stdev(eps_issue, ddof=2)
         out["sd_eps_issue_beta_bps"] = sd_issue / BPS if sd_issue is not None else None
+        ci_issue = sd_ci(sd_issue, len(eps_issue) - 2)
+        out["sd_eps_issue_beta_bps_ci90"] = (
+            [c / BPS for c in ci_issue] if ci_issue else None
+        )
     return out
 
 
@@ -338,29 +354,29 @@ def verdict(stats: dict) -> dict:
     sd_eps = stats.get("sd_eps_bps")
     sd_eps_alt = stats.get("sd_eps_issue_beta_bps")
     r2 = stats.get("r2")
+    r2_gate_open = r2 is not None and r2 >= KILL_R2
 
     k0a_point = sd_fwd is not None and sd_fwd < KILL_SD_BPS
-    k0b_point_primary = (
-        r2 is not None and sd_eps is not None and r2 >= KILL_R2 and sd_eps < KILL_SD_BPS
-    )
-    k0b_point_alt = (
-        r2 is not None
-        and sd_eps_alt is not None
-        and r2 >= KILL_R2
-        and sd_eps_alt < KILL_SD_BPS
-    )
-    # The issue's two beta conventions give different residuals. While they
-    # disagree, the formula ambiguity -- not the data -- would be deciding, so
-    # a kill needs both of them.
-    variants_agree = k0b_point_primary == k0b_point_alt
+    k0b_point_primary = r2_gate_open and sd_eps is not None and sd_eps < KILL_SD_BPS
+    k0b_point_alt = r2_gate_open and sd_eps_alt is not None and sd_eps_alt < KILL_SD_BPS
 
     k0a = _rule_state(k0a_point, stats.get("sd_fwd_bps_ci90"), KILL_SD_BPS)
-    k0b = _rule_state(
-        k0b_point_primary and k0b_point_alt,
-        stats.get("sd_eps_bps_ci90"),
-        KILL_SD_BPS,
-        extra_kill_condition=(r2 is not None and r2 >= KILL_R2),
+
+    # The issue's two beta conventions give different residuals, so each gets
+    # its own confidence-aware reading and K0-b is only definitive -- in either
+    # direction -- when they land on the same one. Otherwise the formula
+    # ambiguity, not the data, would be deciding.
+    k0b_primary = _rule_state(
+        k0b_point_primary, stats.get("sd_eps_bps_ci90"), KILL_SD_BPS, r2_gate_open
     )
+    k0b_alt = _rule_state(
+        k0b_point_alt,
+        stats.get("sd_eps_issue_beta_bps_ci90"),
+        KILL_SD_BPS,
+        r2_gate_open,
+    )
+    variants_agree = k0b_primary == k0b_alt
+    k0b = k0b_primary if variants_agree else "unresolved"
 
     if "kill" in (k0a, k0b):
         decision = DECISION_KILL
@@ -381,22 +397,23 @@ def verdict(stats: dict) -> dict:
             % (stats["sd_fwd_bps_ci90"][0], KILL_SD_BPS)
         )
     else:
-        reasons.append("K0-a unresolved: the sd(fwd) interval straddles %.0f bps (or is absent)" % KILL_SD_BPS)
+        reasons.append(
+            "K0-a unresolved: the sd(fwd) interval straddles %.0f bps (or is absent)"
+            % KILL_SD_BPS
+        )
     if k0b == "kill":
         reasons.append(
-            "K0-b: R^2 %.3f >= %.1f and sd(eps) CI upper %.1f bps < %.0f bps, both beta conventions"
-            % (r2, KILL_R2, stats["sd_eps_bps_ci90"][1], KILL_SD_BPS)
+            "K0-b: R^2 %.3f >= %.1f and both beta conventions' sd(eps) intervals sit below %.0f bps"
+            % (r2, KILL_R2, KILL_SD_BPS)
         )
     elif k0b == "cleared":
         reasons.append(
-            "K0-b cleared: sd(eps) CI lower %.1f bps >= %.0f bps, so no R^2 could trigger it"
-            % (stats["sd_eps_bps_ci90"][0], KILL_SD_BPS)
+            "K0-b cleared: both beta conventions' sd(eps) intervals sit above %.0f bps, so no R^2 could trigger it"
+            % KILL_SD_BPS
         )
     else:
-        reasons.append("K0-b unresolved: the sd(eps) interval straddles %.0f bps (or is absent)" % KILL_SD_BPS)
-    if not variants_agree:
         reasons.append(
-            "the two beta conventions disagree on K0-b's point estimate; a kill needs both"
+            "K0-b unresolved: primary=%s, issue-literal beta=%s" % (k0b_primary, k0b_alt)
         )
 
     return {
@@ -404,6 +421,8 @@ def verdict(stats: dict) -> dict:
         "killed": decision == DECISION_KILL,
         "k0a": k0a,
         "k0b": k0b,
+        "k0b_primary": k0b_primary,
+        "k0b_issue_beta": k0b_alt,
         "k0a_point_estimate_kills": k0a_point,
         "k0b_point_estimate_kills": k0b_point_primary or k0b_point_alt,
         "k0b_beta_variants_agree": variants_agree,
@@ -448,8 +467,11 @@ def report(label: str, stats: dict, decision: dict, notes: Sequence[dict]) -> st
         )
     )
     lines.append(
-        "sd(eps) under the issue's literal beta = %s bps"
-        % fmt(stats["sd_eps_issue_beta_bps"])
+        "sd(eps) under the issue's literal beta = %s bps%s"
+        % (
+            fmt(stats["sd_eps_issue_beta_bps"]),
+            fmt_ci(stats.get("sd_eps_issue_beta_bps_ci90")),
+        )
     )
     lines.append(
         "R^2 = %s   (beta r_KR~r_US = %s, beta r_US~r_KR = %s)"

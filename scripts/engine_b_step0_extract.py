@@ -56,6 +56,7 @@ DEFAULT_S3_PREFIX = (
 )
 POINTS = ("t0", "t1", "t2")
 US_PER_SEC = 1_000_000
+HOUR_US = 3600 * US_PER_SEC
 
 
 def parse_date(value: str) -> dt.date:
@@ -73,6 +74,33 @@ def partition_name(ts_us: int) -> str:
     """Hourly partition key (UTC) a timestamp belongs to."""
     moment = dt.datetime.fromtimestamp(ts_us / US_PER_SEC, dt.timezone.utc)
     return moment.strftime("%Y%m%d_%H")
+
+
+def partitions_for_window(ts_us: int, tolerance_us: int) -> list:
+    """Every hourly partition a target's tolerance window reaches into.
+
+    t0 is 00:00:00 UTC exactly, so with any tolerance at all the nearest quote
+    may be the previous hour's last one, in the previous partition -- and on a
+    day boundary, the previous day's. Querying only the partition containing
+    the instant would take a later, further quote instead, or report the series
+    missing while a valid one sits seconds away on the other side.
+    """
+    names, cursor = [], ts_us - tolerance_us
+    end = ts_us + tolerance_us
+    while True:
+        name = partition_name(cursor)
+        if name not in names:
+            names.append(name)
+        # Step to the start of the next hour rather than by the tolerance, so
+        # no intervening partition can be skipped.
+        hour_start = (cursor // HOUR_US) * HOUR_US
+        cursor = hour_start + HOUR_US
+        if cursor > end:
+            break
+    last = partition_name(end)
+    if last not in names:
+        names.append(last)
+    return names
 
 
 def session_points(calendar: dict, day: dt.date) -> Optional[dict]:
@@ -281,8 +309,11 @@ def main(argv: Optional[list] = None) -> int:
     venues = [v for v in args.venues.split(",") if v]
     tolerance_us = int(args.tolerance_secs * US_PER_SEC)
 
-    # Group every needed instant by the hourly partition that holds it, so a
-    # partition is fetched and decompressed at most once.
+    # Group every needed instant by the hourly partitions its tolerance window
+    # touches, so a partition is fetched and decompressed at most once and no
+    # candidate on the far side of an hour boundary is missed. A target can
+    # therefore appear in two or three partitions; each emits its own nearest
+    # candidate and the statistics step keeps the nearest of them.
     by_partition = {}
     skipped_days = []
     for day in daterange(args.start, args.end):
@@ -292,9 +323,10 @@ def main(argv: Optional[list] = None) -> int:
             continue
         for point in POINTS:
             ts_us = points[point]
-            by_partition.setdefault(partition_name(ts_us), []).append(
-                (day.isoformat(), point, ts_us)
-            )
+            for name in partitions_for_window(ts_us, tolerance_us):
+                by_partition.setdefault(name, []).append(
+                    (day.isoformat(), point, ts_us)
+                )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     os.makedirs(args.workdir, exist_ok=True)

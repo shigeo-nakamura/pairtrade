@@ -312,6 +312,26 @@ class VerdictTest(unittest.TestCase):
         self.assertFalse(result["killed"])
         self.assertEqual(result["decision"], absorption.DECISION_UNRESOLVED)
 
+    def test_k0b_clearance_also_needs_both_beta_conventions(self):
+        # Primary residual interval wholly above the cutoff, the alternate
+        # convention's wholly below it: the two disagree about the *direction*,
+        # so neither answer is the data's.
+        stats = {
+            "sd_fwd_bps": 200.0,
+            "sd_fwd_bps_ci90": [150.0, 400.0],
+            "sd_eps_bps": 90.0,
+            "sd_eps_bps_ci90": [40.0, 200.0],
+            "sd_eps_issue_beta_bps": 3.0,
+            "sd_eps_issue_beta_bps_ci90": [1.0, 8.0],
+            "r2": 0.95,
+        }
+        result = absorption.verdict(stats)
+        self.assertEqual(result["k0b_primary"], "cleared")
+        self.assertEqual(result["k0b_issue_beta"], "kill")
+        self.assertEqual(result["k0b"], "unresolved")
+        self.assertFalse(result["killed"])
+        self.assertEqual(result["decision"], absorption.DECISION_UNRESOLVED)
+
     def test_a_low_r2_alone_does_not_clear_k0b(self):
         # R^2 has no interval here, so only the residual's width can rule the
         # kill out; a point R^2 under the gate is not evidence at n=3.
@@ -344,6 +364,22 @@ class ExtractTest(unittest.TestCase):
         # 2026-09-10 13:30:00 UTC -> the 13:00 partition.
         self.assertEqual(extract.partition_name(1789047000 * US), "20260910_13")
         self.assertEqual(extract.partition_name(1788998400 * US), "20260910_00")
+
+    def test_a_windows_partitions_include_the_hour_before_the_instant(self):
+        t0 = 1788998400 * US  # 2026-09-10 00:00:00 UTC, an hour *and* day edge
+        self.assertEqual(
+            extract.partitions_for_window(t0, 300 * US),
+            ["20260909_23", "20260910_00"],
+        )
+        # Mid-hour instants stay in one partition.
+        self.assertEqual(
+            extract.partitions_for_window(1789021800 * US, 300 * US), ["20260910_06"]
+        )
+        # A tolerance wider than an hour cannot skip an intervening partition.
+        self.assertEqual(
+            extract.partitions_for_window(1789021800 * US, 3600 * US),
+            ["20260910_05", "20260910_06", "20260910_07"],
+        )
 
     def test_session_points_require_both_markets_open(self):
         calendar = {
@@ -552,6 +588,54 @@ class ExtractTest(unittest.TestCase):
         )
         self.assertTrue(record["covered"])
         self.assertEqual(record["rows"], 0)
+
+
+class BoundaryCandidateTest(unittest.TestCase):
+    def test_the_nearest_candidate_wins_across_partitions(self):
+        # t0 is 00:00:00 exactly: the quote that stood for it can be the
+        # previous hour's last one, emitted from the previous partition.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "prices.jsonl")
+            with open(path, "w") as handle:
+                far = dict(
+                    price_row("2026-09-10", "t0", "SNDK", 200.0, lag=45.0),
+                    partition="20260910_00",
+                    observed_ts_us=1788998445 * US,
+                )
+                near = dict(
+                    price_row("2026-09-10", "t0", "SNDK", 199.0, lag=-1.0),
+                    partition="20260909_23",
+                    observed_ts_us=1788998399 * US,
+                )
+                handle.write(json.dumps(far) + "\n")
+                handle.write(json.dumps(near) + "\n")
+            prices = absorption.load_prices(path)
+            chosen = prices[("2026-09-10", "t0", "SNDK", "mid")]
+            self.assertEqual(chosen["price"], "199.0")
+            self.assertEqual(chosen["partition"], "20260909_23")
+
+    def test_equal_distance_candidates_resolve_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "prices.jsonl")
+            with open(path, "w") as handle:
+                for lag, ts, price in ((5.0, 1788998405 * US, 1.0), (-5.0, 1788998395 * US, 2.0)):
+                    handle.write(
+                        json.dumps(
+                            dict(
+                                price_row("2026-09-10", "t0", "SNDK", price, lag=lag),
+                                observed_ts_us=ts,
+                            )
+                        )
+                        + "\n"
+                    )
+            first = absorption.load_prices(path)[("2026-09-10", "t0", "SNDK", "mid")]
+            # Order in the file must not change the answer.
+            lines = open(path).read().strip().split("\n")
+            with open(path, "w") as handle:
+                handle.write("\n".join(reversed(lines)) + "\n")
+            second = absorption.load_prices(path)[("2026-09-10", "t0", "SNDK", "mid")]
+            self.assertEqual(first["observed_ts_us"], second["observed_ts_us"])
+            self.assertEqual(first["price"], "2.0")  # the earlier of the two
 
 
 class LoadPricesTest(unittest.TestCase):

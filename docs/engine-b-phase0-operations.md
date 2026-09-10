@@ -838,11 +838,17 @@ Each statistic uses every day that can support it: `fwd` needs only the US
 symbol at t1 and t2, the regression needs both symbols at t0 and t1, so a day
 with one hole still contributes where it can.
 
+An instant's tolerance window can reach into the neighbouring hour — t0 is
+00:00:00 UTC exactly, so its window also covers the previous day's last
+partition — and every partition the window touches is queried. Each emits its
+own nearest candidate; the statistics step keeps the nearest of them, ties going
+to the earlier one so a rerun is deterministic.
+
 The decision is three-valued — `KILL`, `PROCEED`, or `UNRESOLVED` — because the
 rules are written on standard deviations the sample only estimates. A kill needs
 the whole chi-square interval below 14 bps, a clearance needs the whole interval
 above it, and an interval straddling the threshold is unresolved, which is a
 different answer from "not killed". K0-b additionally needs both beta
-conventions to agree before it can kill, so the formula ambiguity above can
-never be what ends the experiment. No data reads as `UNRESOLVED`, never as a
+conventions to land on the same state — in either direction — so the formula
+ambiguity above can never be what ends the experiment or what waves it through. No data reads as `UNRESOLVED`, never as a
 pass.
