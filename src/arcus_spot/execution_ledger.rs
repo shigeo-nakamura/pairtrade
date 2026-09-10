@@ -46,6 +46,23 @@ impl ArcusSpotExecutionPhase {
     }
 }
 
+/// Who refused a `Rejected` attempt (bot-strategy#986).
+///
+/// `Rejected` alone does not say. The venue refusing a submission is a
+/// market outcome with nothing on-chain to reconcile; this bot refusing to
+/// send -- a submit guard, a plan-age check, a client-side preflight -- is
+/// a fault whose reason an operator needs to see. Only the first is safe to
+/// clear automatically, and `dispatched_at` cannot tell them apart because
+/// a client preflight failure happens after the dispatch marker is written.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArcusSpotRejectionOrigin {
+    /// The router answered, and the answer was no.
+    Venue,
+    /// This bot stopped before or during submission.
+    Client,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArcusSpotExecutionIntent {
     pub venue: String,
@@ -176,6 +193,13 @@ pub struct ArcusSpotExecutionAttempt {
     /// yet -- `Option` carries schema compatibility with ledgers already on
     /// disk, exactly like `settled_buy_amount_raw` above.
     pub settled_sell_amount_raw: Option<String>,
+    /// Set on a `Rejected` attempt to say who refused it
+    /// (bot-strategy#986). `None` on attempts written before this existed,
+    /// and read as "cannot say" -- which is why `live-tick`'s automatic
+    /// clearance requires `Some(Venue)` rather than treating an absent
+    /// value as a venue rejection.
+    #[serde(default)]
+    pub rejection_origin: Option<ArcusSpotRejectionOrigin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,6 +360,7 @@ impl ArcusSpotExecutionLedger {
             detail: None,
             settled_buy_amount_raw: None,
             settled_sell_amount_raw: None,
+            rejection_origin: None,
         });
         Ok(self.active.as_ref().expect("active set above"))
     }
@@ -444,6 +469,8 @@ impl ArcusSpotExecutionLedger {
             detail: Some(detail),
             settled_buy_amount_raw: Some(settled_buy_amount_raw),
             settled_sell_amount_raw: Some(settled_sell_amount_raw),
+            // Nobody refused this: the operator closed it at the venue.
+            rejection_origin: None,
         });
         Ok(self.history.last().expect("pushed above"))
     }
@@ -481,6 +508,8 @@ impl ArcusSpotExecutionLedger {
         active.phase = ArcusSpotExecutionPhase::Rejected;
         active.updated_at = now;
         active.detail = Some(detail.into());
+        // This bot declined to send; nothing was asked of the venue.
+        active.rejection_origin = Some(ArcusSpotRejectionOrigin::Client);
         Ok(())
     }
 
@@ -516,6 +545,7 @@ impl ArcusSpotExecutionLedger {
         &mut self,
         detail: impl Into<String>,
         now: DateTime<Utc>,
+        origin: ArcusSpotRejectionOrigin,
     ) -> Result<()> {
         let active = self.active_mut()?;
         if active.phase != ArcusSpotExecutionPhase::Dispatching {
@@ -524,6 +554,11 @@ impl ArcusSpotExecutionLedger {
         active.phase = ArcusSpotExecutionPhase::Rejected;
         active.updated_at = now;
         active.detail = Some(detail.into());
+        // Recorded durably rather than inferred later: a client preflight
+        // failure lands here too, after `mark_dispatching`, so nothing about
+        // the attempt's timestamps distinguishes it from a venue refusal
+        // (Codex, pairtrade#317).
+        active.rejection_origin = Some(origin);
         Ok(())
     }
 
@@ -1035,6 +1070,63 @@ mod tests {
     }
 
     #[test]
+    fn cancel_prepared_marks_the_refusal_as_this_bots_own() {
+        // bot-strategy#986's automatic clearance keys off this: a rejection
+        // this bot wrote is not one the venue gave us.
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.cancel_prepared("submit guard refused", now).unwrap();
+        let active = ledger.active.as_ref().unwrap();
+        assert_eq!(active.phase, ArcusSpotExecutionPhase::Rejected);
+        assert_eq!(
+            active.rejection_origin,
+            Some(ArcusSpotRejectionOrigin::Client)
+        );
+        assert_eq!(active.dispatched_at, None);
+    }
+
+    #[test]
+    fn a_recorded_submit_rejection_keeps_the_origin_it_was_given() {
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        ledger
+            .record_submit_rejected(
+                "client preflight failed",
+                now,
+                ArcusSpotRejectionOrigin::Client,
+            )
+            .unwrap();
+        let active = ledger.active.as_ref().unwrap();
+        // The marker is set -- this is the case timestamps cannot separate.
+        assert!(active.dispatched_at.is_some());
+        assert_eq!(
+            active.rejection_origin,
+            Some(ArcusSpotRejectionOrigin::Client)
+        );
+    }
+
+    #[test]
     fn cancel_prepared_rejects_without_dispatching() {
         let now = Utc::now();
         let mut ledger = ArcusSpotExecutionLedger::default();
@@ -1119,7 +1211,11 @@ mod tests {
             .unwrap();
         ledger.mark_dispatching(now).unwrap();
         ledger
-            .record_submit_rejected("HTTP 422 SHELL_SUBMIT_FAILED", now)
+            .record_submit_rejected(
+                "HTTP 422 SHELL_SUBMIT_FAILED",
+                now,
+                ArcusSpotRejectionOrigin::Venue,
+            )
             .unwrap();
 
         ledger.archive_rejected().unwrap();

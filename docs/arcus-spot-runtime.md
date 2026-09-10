@@ -746,6 +746,58 @@ just-reconciled fill with stale state); only when the tick genuinely decides
 policy-gated path as `auto-execute`. Most ticks decide `Observe` and never
 touch the KMS signer or the submission network.
 
+### Clearing a router rejection (bot-strategy#986)
+
+A submission the router refuses (`HTTP 422 SHELL_SUBMIT_FAILED`) leaves the
+ledger's active attempt in phase `Rejected`. Nothing reached the chain --
+the refusal happens before a transaction exists -- but the single `active`
+slot stays occupied, and every later tick used to exit 1 on
+
+    Error: Arcus status resume is not allowed in phase Some(Rejected)
+
+until an operator ran `archive-rejected-apply`. That is a deliberate
+fail-safe (a rejected outcome must never be silently retried), but the wait
+for a human was not: on 2026-09-10 it cost seven hours of downtime
+(bot-strategy#985) for a rejection with no transaction at all.
+
+`live-tick` now clears that exact case itself, before it evaluates
+anything: phase `Rejected` **and** no `tx_hash`. It archives the attempt --
+the same `archive_rejected` the manual command calls, so this path can
+never be looser than that one -- logs a line, and goes on to an ordinary
+evaluation. It is not a retry: the refused plan is discarded, and the tick
+that follows builds a new one from a fresh observation or decides not to
+trade.
+
+    [arcus-rejected] sequence=20 run=1 cleared automatically: the router
+    refused the submission and no transaction was sent, ...
+
+Still held for an operator, unchanged:
+
+- a `Rejected` attempt **with** a `tx_hash` -- it may have reached the
+  chain, so it needs `repair-report` / `manual-reconcile-apply`, not a
+  plain archive (the same boundary `archive-rejected-report` draws),
+- a `Rejected` attempt whose recorded `rejection_origin` is not the venue
+  -- a submit guard or plan-age check (`cancel_prepared`), or a
+  client-side preflight failure, which lands *after* the dispatch marker
+  and so cannot be told apart by timestamps. Those are this bot declining
+  to send, not a venue refusing to take: clearing one would report a router
+  refusal that never happened and hide whatever made the check fire. They
+  are skipped when counting the run below, and do not break it,
+- a `Rejected` attempt written before `rejection_origin` existed. It says
+  nothing about who refused, and "cannot say" is left for an operator
+  rather than assumed benign,
+- `Unknown`, `OperatorHold`, `Failed`,
+- **three router rejections in a row** with nothing succeeding in between.
+  A venue refusing everything is not the cheap case: clearing forever would
+  re-plan and re-sign against a router that is saying no, with nobody told.
+  The run resets on any reconciled attempt. The cap is
+  `MAX_CONSECUTIVE_AUTO_ARCHIVED_REJECTIONS`, and reaching it logs
+  `not cleared: ... reached the cap`.
+
+Every cleared rejection stays in the ledger's `history`, so the record of
+what the router refused is not lost -- `archive-rejected-report` remains
+the way to inspect one before acting on it manually.
+
 ### Exit sizing: the open-quantity row (bot-strategy#906)
 
 While the checkpoint is rotated, `live-tick` requests one extra recorder

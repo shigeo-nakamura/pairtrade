@@ -114,6 +114,110 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
+- **Venue equity is published, never traded on** (bot-strategy#919).
+  `status.json`'s `han_bridge` block carries `venue_equity_usd`
+  (`total_asset_value`), `venue_available_usd` (`available_balance`),
+  `venue_equity_age_secs`, `venue_equity_stale` and
+  `unrealized_pnl_usd_mid_estimate`, refreshed every
+  `ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS` (default 300, matching
+  dex-connector's own `get_balance` cache TTL). Read them as operator
+  visibility only:
+  - **Nothing gates on them.** Sizing and the session-loss halt still run
+    off `ENGINE_B_LIVE_EQUITY_USD_REFERENCE`, a config constant, so a
+    reference that does not match the funded account makes the halt
+    threshold mean something other than it appears to. Reconcile the two
+    by hand; this feature reports the gap, it does not close it.
+  - **`exit_deadline_us` is the emergency-close threshold**
+    (`t2 + exit_deadline_secs`), or `None` when nothing is open.
+    Explicitly *not* "when retrying stops": past it `maybe_exit` stops
+    waiting for the scheduled boundary and forces a close, and
+    `poll_pending_confirm` clears an expired attempt so the next tick
+    sends another -- the engine tries harder here, not less. A consumer
+    that rendered it as "abandoned" would report an active close loop as
+    a stopped one. It is published so a dashboard can call a scheduled
+    exit *late*, and tell "still inside its window" from "past it and
+    force-closing": #917 leaves an unconfirmable close open on purpose,
+    and that outcome had no signal anywhere but an e-mail and the
+    journal. The session boundaries themselves are already in
+    `status.json`'s top-level `window` (t0, t1, t2).
+  - **`managed_position_open` is not the document's `has_position`.**
+    The top-level flag counts `unmanaged_positions` too -- an exposure
+    adopted from the exchange, or left behind by a former `us_primary`,
+    makes it true on a day Engine B opened nothing. Anything asking "is
+    Engine B holding" (an exit countdown, the unrealized mark) must read
+    the `han_bridge` flag; the top-level one answers a different
+    question. Both it and `exit_deadline_us` fall back to the persisted
+    claim while reconciliation has not completed **and** that claim is
+    for the symbol this instance trades -- a `get_positions()` failure
+    at startup is not evidence of a flat account, and the same document
+    already lists that exposure in `positions`. The uncertainty is
+    carried by `positions_ready=false`, not by pretending to be flat.
+    Both conditions matter: reconciliation having run and still left the
+    slot empty is a decision rather than an outage, and a record kept on
+    the *previous* `us_primary` is retained on purpose while explicitly
+    not being managed -- publishing either as a managed hold would put
+    the old symbol's deadline beside the new primary.
+  - **`venue_solvency_reported` is how a consumer knows the field exists
+    at all.** It is always true from this build. A consumer cannot use
+    JSON key presence for that -- debot-dashboard decodes and re-encodes
+    this document on its `/api/status` path, where a nil pointer and an
+    absent key are the same thing, so an explicit `null` would reach the
+    browser as a missing field and hide the row instead of flagging
+    unknown solvency (PR #46 Codex review). Presence travels as data.
+  - **The read never runs on the trading tick.** It is spawned, not
+    awaited: an uncached REST read that hangs during a venue outage
+    would otherwise hold the tick that drives `poll_pending_confirm`,
+    `maybe_exit` and the shutdown path, so an observational read could
+    stop an open position from being confirmed or closed (pairtrade#316
+    Codex review, P1). One read is in flight at a time, so a venue that
+    hangs cannot accumulate a task per interval behind it, and each
+    read is bounded by a 30 s timeout. Without that timeout a read that
+    never returns would never release the in-flight guard: every later
+    refresh refused, `venue_equity_stale` false forever, and the last
+    reading published as trustworthy during exactly the outage it should
+    be reporting (pairtrade#316 Codex review round 2).
+  - **A fill forces the next read.** dex-connector drops its
+    `get_balance` cache on a WS fill, but that only helps if somebody
+    asks; with the engine throttle at the connector's own TTL, an entry
+    landing just after a refresh would otherwise keep publishing
+    pre-fill equity for up to a full interval. A change in the account's
+    shape clears the throttle so the next tick re-reads. "Shape" is the
+    managed position's side and open size plus every unmanaged record's
+    symbol, side and open size -- counting the unmanaged records instead
+    of describing them missed a partial flatten or a side flip, which
+    `reconcile_unmanaged` performs by rewriting a record in place.
+  - **`venue_equity_stale` is the failure signal, not the age.** It is
+    true whenever the most recent attempt failed. A failed refresh keeps
+    the last value and lets its age grow rather than blanking it or
+    restamping it; only the ok -> failed and failed -> ok edges are
+    logged (`[EQUITY]`), so a venue down for an hour does not WARN
+    sixty times about a number nothing trades on.
+  - **`venue_equity_age_secs` is an approximation, deliberately.** It
+    measures how long ago *this process* obtained the reading, not how
+    long ago the venue sampled it: dex-connector may serve `get_balance`
+    from its cache, and a cache hit is indistinguishable here from a
+    fresh REST read (pairtrade#316 Codex review, P2). The refresh
+    interval defaults to that same TTL so the gap stays small in the
+    steady state, and a fill both invalidates the connector's cache and
+    clears the engine's throttle, so the reading after an entry or exit
+    is genuinely fresh. Use it as a rough "how current is this"; use
+    `venue_equity_stale` for "is this trustworthy".
+  - **`unrealized_pnl_usd_mid_estimate` is a mid mark, not a settled
+    figure**: no fees, no funding, computed against the recorded entry
+    price (itself an estimate whenever `entry_price_estimated` is set),
+    and only for the position this engine manages -- `unmanaged_positions`
+    have no cost basis here. It is `null` when flat, when the basis is
+    unknown, or when no fresh US primary price is available, because a
+    dashboard can render `null` as "-" but cannot tell a real zero from a
+    fabricated one. The settled ledger is #919's remaining work.
+  - On the wire this is at most one REST call per five minutes, so it
+    adds no meaningful steady-state load to a Standard-tier 60 req/min
+    account.
+  - debot-dashboard renders these in the Han Bridge panel even though
+    Engine B is an `alpha_candidate` whose performance fields are
+    blinded. Solvency is not performance -- it answers "can this place
+    its next order", the class of question the halt pills are already
+    exempt for. See debot-dashboard `deploy/alpha-gate.md`.
 - **Both legs are bounded taker IOCs** (bot-strategy#918, #978;
   dex-connector v4.7.24): `submit_order` sends
   `create_order_taker_ioc_at` at the marketable limit
