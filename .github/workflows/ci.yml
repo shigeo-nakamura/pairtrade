@@ -90,23 +90,25 @@ jobs:
       # "bump three files by hand" trap documented in CLAUDE.md: ci.yml
       # follows Cargo.lock and stays green while a deploy workflow's static
       # pin silently ships a binary built against an older dex-connector
-      # (bot-strategy#865 hit exactly this). Lint it here rather than trust
-      # the next deploy workflow's author to remember.
+      # (bot-strategy#865 hit exactly this). bot-strategy#973 added a second
+      # shape: a reusable workflow does the checkout for its caller and takes
+      # the ref as an input, so `dex-connector-ref: v4.7.20` in a `with:`
+      # block is the same pin wearing a different hat.
+      #
+      # The check lives in a script rather than a grep pipeline here because
+      # a file-wide text search cannot tell which block a match came from --
+      # Codex found two ways past the grep version (pairtrade#314): the
+      # resolver filename matched the explanatory comment every caller
+      # carries, and `.outputs.ref` matched any job's output. The script
+      # walks the parsed workflows and resolves each ref expression back to
+      # the job that produced it. Its own regression tests run in
+      # test-scripts.yml, which is also what re-checks the committed
+      # workflows when the script changes: scripts/** is deliberately not in
+      # this workflow's path filter (see the comment on `on:` above).
+      - name: Install the workflow lint's YAML parser
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
       - name: Forbid per-workflow dex-connector ref pins
-        run: |
-          rc=0
-          for f in .github/workflows/*.yml; do
-            if grep -qE '^\s*DEX_CONNECTOR_REF:\s*v[0-9]' "$f"; then
-              echo "::error file=${f}::hardcoded DEX_CONNECTOR_REF pin — resolve the ref from Cargo.lock via _resolve-dex-connector-ref.yml instead (bot-strategy#899)."
-              rc=1
-            fi
-            grep -q 'repository: shigeo-nakamura/dex-connector' "$f" || continue
-            if ! grep -q '_resolve-dex-connector-ref\.yml' "$f"; then
-              echo "::error file=${f}::checks out dex-connector without calling ./.github/workflows/_resolve-dex-connector-ref.yml (bot-strategy#899)."
-              rc=1
-            fi
-          done
-          exit $rc
+        run: python3 scripts/lint_workflow_dex_connector_refs.py
 
   resolve-ref:
     # bot-strategy#899: the resolution logic lives in one place now
@@ -189,6 +191,33 @@ jobs:
       # actually ran in CI (Codex P2 follow-up, pairtrade#177).
       - name: Arcus Spot runtime binary tests
         run: cargo test --bin arcus-spot-runtime --no-default-features --features arcus-spot-sdk --locked
+
+  # bot-strategy#973: none of the passes in build-test above ever compiles
+  # the `arcus-spot-live` feature -- the live executor that signs with KMS
+  # and moves real inventory. Its two binaries carry
+  # `required-features = ["arcus-spot-live"]`, which excludes them from
+  # `--all-targets`, and the `arcus-spot-sdk` passes stop short of the
+  # feature that pulls in dex-connector/arcus-spot-execution, ethers and
+  # rusoto (379 lib tests with it against 109 without). Before this job the
+  # only run of these tests was deploy-arcus-spot-executor.yml, on master
+  # push -- verification strictly after merge, where a break also blocks the
+  # executor deploy (pairtrade#309 shipped six failing tests past a fully
+  # green ci.yml). It is a separate job, not a step in build-test, so the
+  # extra compile runs in parallel and does not extend the pipeline's
+  # wall-clock.
+  #
+  # Deliberately NOT in `deploy`'s needs: this repo's deploy job builds
+  # engine_b_live and book-runtime, which share no code with the Arcus
+  # executor, and the Arcus binary has its own deploy workflow that gates on
+  # the same tests in release profile.
+  test-arcus-spot-live:
+    needs: resolve-ref
+    uses: ./.github/workflows/_test-arcus-spot-live.yml
+    with:
+      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}
+      cargo-profile: debug
+    secrets:
+      DEX_CONNECTOR_PAT: ${{ secrets.DEX_CONNECTOR_PAT }}
 
   deploy:
     runs-on: ubuntu-24.04-arm

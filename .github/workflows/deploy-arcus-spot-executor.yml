@@ -9,6 +9,14 @@ on:
       - master
     paths:
       - ".github/workflows/deploy-arcus-spot-executor.yml"
+      # bot-strategy#973: the test job lives in a reusable workflow now, and
+      # this workflow is its only release-profile caller. Without this entry
+      # a change to the shared file would be exercised by ci.yml in debug
+      # only, and a release-only mistake in it would stay green until the
+      # next executor source change hit it -- blocking that deploy instead
+      # of the one that introduced it.
+      - ".github/workflows/_test-arcus-spot-live.yml"
+      - ".github/workflows/_resolve-dex-connector-ref.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "build.rs"
@@ -60,50 +68,20 @@ jobs:
     with:
       input-ref: ${{ inputs.dex_connector_ref || '' }}
 
+  # bot-strategy#973: these commands used to live here only, and this
+  # workflow only runs on master push -- so the live executor's tests were a
+  # post-merge gate on the deploy rather than a PR-time check. ci.yml now
+  # calls the same reusable workflow in debug profile on every push; this
+  # call keeps the release-profile run that gates the binary actually
+  # shipped, and both read one definition so the two can no longer drift.
   test:
-    name: Test Arcus Spot executor (x86_64)
     needs: resolve-ref
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      DEX_CONNECTOR_REF: ${{ needs.resolve-ref.outputs.ref }}
-    steps:
-      - name: Checkout pairtrade
-        uses: actions/checkout@v5
-        with:
-          path: debot
-
-      - name: Checkout pinned dex-connector
-        uses: actions/checkout@v5
-        with:
-          repository: shigeo-nakamura/dex-connector
-          ref: ${{ env.DEX_CONNECTOR_REF }}
-          path: dex-connector
-          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-
-      - name: Cache cargo tests
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            debot/target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ env.DEX_CONNECTOR_REF }}-${{ hashFiles('debot/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-${{ env.DEX_CONNECTOR_REF }}-
-            ${{ runner.os }}-${{ runner.arch }}-cargo-test-arcus-live-${{ env.RUST_TOOLCHAIN }}-
-
-      - name: Run Arcus Spot executor tests
-        working-directory: debot
-        run: |
-          cargo test --release --locked --no-default-features --features arcus-spot-live --lib arcus_spot
-          cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-execute-once
-          cargo test --release --locked --no-default-features --features arcus-spot-live --bin arcus-spot-propose-plan
+    uses: ./.github/workflows/_test-arcus-spot-live.yml
+    with:
+      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}
+      cargo-profile: release
+    secrets:
+      DEX_CONNECTOR_PAT: ${{ secrets.DEX_CONNECTOR_PAT }}
 
   build-deploy:
     name: Build Arcus Spot executor (native arm64)

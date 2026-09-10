@@ -17,6 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # bot-strategy#973: this is what re-checks the committed workflows when
+      # the lint script itself changes -- ci.yml runs the lint but does not
+      # fire on scripts/**.
+      - name: Run workflow dex-connector ref lint tests
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 scripts/test_lint_workflow_dex_connector_refs.py -v
       - name: Run subsidy KPI ledger tests
         run: python3 scripts/test_subsidy_ledger.py
       - name: Install Engine B Phase 0 test dependency
