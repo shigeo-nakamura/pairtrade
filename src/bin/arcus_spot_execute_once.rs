@@ -11,6 +11,7 @@ use aes_gcm::{
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, NaiveDate, Utc};
+use debot::arcus_spot::corporate_action_effective_cutoff;
 #[cfg(test)]
 use debot::arcus_spot::event_record;
 use debot::arcus_spot::resolve_handled_corporate_action_fingerprints;
@@ -2797,17 +2798,11 @@ fn corporate_action_units_are_stale(
     // checkpoint predating the field cannot say, and keeps the old
     // stamp-only reading.
     if let Some(priced_at) = current.last_reference_price_at {
-        let cutoff = progress.effective_at.or_else(|| {
-            config
-                .corporate_actions
-                .iter()
-                .find(|event| {
-                    (!progress.fingerprint.is_empty()
-                        && progress.fingerprint == event.fingerprint())
-                        || event.event_id.eq_ignore_ascii_case(&progress.event_id)
-                })
-                .map(|event| event.effective_at)
-        });
+        // Shared with the runtime's own stale-unit predicate: an amendment
+        // that moved the cutoff earlier is the one that counts, and the two
+        // must not disagree about a window that has been amended (Codex P1,
+        // pairtrade#309).
+        let cutoff = corporate_action_effective_cutoff(progress, config);
         if cutoff.is_some_and(|cutoff| priced_at < cutoff) {
             return false;
         }
@@ -4076,17 +4071,11 @@ fn require_corporate_action_progress_transition(
     // pairtrade#309).
     let stamp_within_bounds = |progress: &ArcusSpotCorporateActionProgress,
                                stamped_at: DateTime<Utc>| {
-        let cutoff = progress.effective_at.or_else(|| {
-            config
-                .corporate_actions
-                .iter()
-                .find(|event| {
-                    (!progress.fingerprint.is_empty()
-                        && progress.fingerprint == event.fingerprint())
-                        || event.event_id.eq_ignore_ascii_case(&progress.event_id)
-                })
-                .map(|event| event.effective_at)
-        });
+        // Shared with the runtime's own stale-unit predicate: an amendment
+        // that moved the cutoff earlier is the one that counts, and the two
+        // must not disagree about a window that has been amended (Codex P1,
+        // pairtrade#309).
+        let cutoff = corporate_action_effective_cutoff(progress, config);
         // Lower bound: the cutoff it claims to mark. Upper bound: the clock
         // this verification runs at -- *not* `last_observation_at`. The
         // runtime stamps with `evaluation_time`, which `live-tick` takes

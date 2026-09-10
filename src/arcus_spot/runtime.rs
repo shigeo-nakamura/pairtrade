@@ -3502,8 +3502,7 @@ impl ArcusSpotRuntime {
                 // otherwise drop a genuine breach for good, and disagree
                 // with the continuity verifier, which already applies this
                 // escape (independent review, pairtrade#309).
-                return progress
-                    .effective_at
+                return corporate_action_effective_cutoff(progress, &self.config)
                     .is_none_or(|effective_at| evaluation_time >= effective_at);
             }
             // An orphaned record (its declaration deleted or replaced) past
@@ -3530,17 +3529,7 @@ impl ArcusSpotRuntime {
                 // clearance both refuse it. Take the earliest cutoff any
                 // surviving declaration of this window names (Codex P1,
                 // pairtrade#309).
-                let amended_cutoff = self
-                    .config
-                    .corporate_actions
-                    .iter()
-                    .filter(|event| progress.event_id.eq_ignore_ascii_case(&event.event_id))
-                    .map(|event| event.effective_at)
-                    .min();
-                return [progress.effective_at, amended_cutoff]
-                    .into_iter()
-                    .flatten()
-                    .min()
+                return corporate_action_effective_cutoff(progress, &self.config)
                     .is_none_or(|effective_at| evaluation_time >= effective_at);
             }
         }
@@ -3994,6 +3983,36 @@ impl ArcusSpotRuntime {
 /// the flaw in judging that by the evaluation clock, which flips back to
 /// "handled" the moment the clock passes the new action's resume time
 /// (Codex P1 x2, pairtrade#309).
+/// The instant past which the venue re-denominates this window's units.
+///
+/// The stamped `progress.effective_at` is the durable half -- it survives
+/// the declaration being deleted -- but it is a copy of the cutoff as it
+/// stood when the window opened, and an amendment may since have moved the
+/// cutoff *earlier* (a widening the checkpoint's removal scan accepts). The
+/// venue changes the units when the calendar says so, not when the copy
+/// says, so the answer is the earliest instant any surviving declaration of
+/// this window names. Every reader of "is this mark pre- or post-event?"
+/// goes through here, so the runtime and the continuity verifier cannot
+/// disagree about a window that has been amended (Codex P1, pairtrade#309).
+pub fn corporate_action_effective_cutoff(
+    progress: &ArcusSpotCorporateActionProgress,
+    config: &ArcusSpotRuntimeConfig,
+) -> Option<DateTime<Utc>> {
+    let declared = config
+        .corporate_actions
+        .iter()
+        .filter(|event| {
+            (!progress.fingerprint.is_empty() && progress.fingerprint == event.fingerprint())
+                || event.event_id.eq_ignore_ascii_case(&progress.event_id)
+        })
+        .map(|event| event.effective_at)
+        .min();
+    [progress.effective_at, declared]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
 pub(crate) fn backfill_handled_corporate_action_fingerprints(
     state: &mut ArcusSpotRuntimeState,
     config: &ArcusSpotRuntimeConfig,
@@ -9327,6 +9346,28 @@ mod tests {
         assert!(runtime.corporate_action_units_are_stale(amended));
         assert!(runtime.corporate_action_units_are_stale(anchor + Duration::seconds(4)));
         // Before it, they are still the old ones.
+        assert!(!runtime.corporate_action_units_are_stale(anchor + Duration::seconds(2)));
+
+        // ...and the same holds once the discard has been stamped. The
+        // stamp is written when a tick reaches the *stored* cutoff, so a
+        // later mark priced between the amended and stored instants would
+        // otherwise read as a pre-event mark and let a halt engage from
+        // post-amendment prices applied to pre-event quantities (Codex P1,
+        // pairtrade#309).
+        let past_stored = anchor + Duration::seconds(5);
+        runtime.step_at(&snapshot_with_valid_row(past_stored), past_stored);
+        let stamped = runtime
+            .state
+            .corporate_action
+            .clone()
+            .expect("the window is still open");
+        assert!(stamped.history_invalidated_at.is_some(), "discard stamped");
+        assert_eq!(
+            stamped.effective_at,
+            Some(anchor + Duration::seconds(4)),
+            "the record still carries the superseded cutoff",
+        );
+        assert!(runtime.corporate_action_units_are_stale(amended));
         assert!(!runtime.corporate_action_units_are_stale(anchor + Duration::seconds(2)));
     }
 
