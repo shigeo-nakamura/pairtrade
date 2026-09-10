@@ -163,6 +163,15 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     entry fill against the previous trade's still-open accumulators and
     mark it seen process-wide, leaving every second-and-later trade in a
     process permanently unsettled.
+  - If the exchange confirms the **opposite side** from the one
+    submitted, its answer is authoritative and the ledger is re-keyed to
+    it, swapping the two legs. Left alone it would file the entry fill
+    as the close and publish a gross PnL with the wrong sign. Rows
+    already in `fills.jsonl` keep the pre-swap `leg` label -- an
+    append-only log cannot be rewritten -- but their `side` field is the
+    venue's own and stays correct, so reconstruct from `side`, not
+    `leg`, if this warning (`[FILLS] confirmed side ... differs`) ever
+    appears.
   - Between close and the next open the side and totals are kept, so a
     fill that straggles in after the close still reaches the durable
     ledger with the right leg. A position that appears without an entry

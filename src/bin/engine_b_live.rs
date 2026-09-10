@@ -4311,6 +4311,31 @@ impl EngineBLiveEngine {
         // round 4).
         if !self.fill_ledger_trade_open {
             self.begin_fill_ledger(pos.side);
+        } else if self.fill_ledger_entry_side != Some(pos.side) {
+            // The exchange holds the opposite side from the one that was
+            // submitted, and its answer is the authoritative one -- the
+            // caller has already recorded it and halted. Everything
+            // harvested so far was sorted against the submitted side, so
+            // the two legs are simply the wrong way round: left alone,
+            // the entry fill would be counted as the close, the close as
+            // the entry, and `settled` would publish reversed VWAPs and
+            // a gross PnL with the wrong sign (pairtrade#320 Codex
+            // review round 5).
+            //
+            // Rows already in `fills.jsonl` keep a `leg` derived from
+            // the same mistaken side. Their `side` field is the venue's
+            // own and stays correct, so an offline reconstruction is
+            // unaffected; only the convenience label is wrong, and it
+            // cannot be rewritten in an append-only log.
+            log::warn!(
+                "[FILLS] confirmed side {} differs from the submitted {:?}; re-keying the fill \
+                 ledger and swapping its legs. Rows already written carry the pre-swap `leg` \
+                 label -- reconstruct from `side`.",
+                pos.side,
+                self.fill_ledger_entry_side
+            );
+            std::mem::swap(&mut self.entry_fills, &mut self.exit_fills);
+            self.fill_ledger_entry_side = Some(pos.side);
         }
         let side = pos.side;
         let price = pos.entry_price;
@@ -9686,6 +9711,61 @@ mod tests {
         );
         assert_eq!(h.engine.exit_fills.fills, 0);
         assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Long));
+    }
+
+    /// pairtrade#320 Codex review round 5: when the exchange holds the
+    /// opposite side from the one submitted, its answer is
+    /// authoritative -- and a ledger still keyed to the submitted side
+    /// files the entry fill as the close and the close as the entry,
+    /// publishing reversed VWAPs and a gross PnL with the wrong sign.
+    #[tokio::test]
+    async fn a_confirmed_side_mismatch_re_keys_the_ledger() {
+        let mut h = harness();
+        // Submitted long; the fill that came back is a short.
+        h.engine.begin_fill_ledger(OrderSide::Long);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.05", "1700.00", None);
+        h.harvest(T1_US).await;
+        assert_eq!(
+            h.engine.exit_fills.fills, 1,
+            "sorted against the submitted side, it lands in the wrong leg"
+        );
+
+        // The exchange's side is what gets recorded.
+        h.engine.record_entry(
+            OpenPosition {
+                side: OrderSide::Short,
+                entry_price: 1700.0,
+                entry_price_estimated: false,
+                entry_price_unknown: false,
+                size: 0.05,
+                open_size: 0.05,
+                realized_partial_pnl: 0.0,
+                entered_at_us: T1_US,
+                flatten_asap: false,
+                exit_deadline_us: Some(T2_US + 900_000_000),
+            },
+            -0.01,
+            100.0,
+            "side_mismatch=true",
+        );
+        assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Short));
+        assert_eq!(
+            h.engine.entry_fills.fills, 1,
+            "the legs are swapped, not lost"
+        );
+        assert_eq!(h.engine.exit_fills.fills, 0);
+
+        // And the settled result now has the right sign: short
+        // 1700 -> 1690 on 0.05 is +$0.50, not -$0.50.
+        h.connector
+            .push_fill("x1", OrderSide::Long, "0.05", "1690.00", None);
+        h.harvest(T2_US).await;
+        h.engine.on_exit(1690.0, T2_US).await;
+        let gross = last_pnl_record(&h)["settled"]["gross_pnl_usd"]
+            .as_f64()
+            .unwrap();
+        assert!((gross - 0.5).abs() < 1e-9, "gross {gross}");
     }
 
     #[tokio::test]
