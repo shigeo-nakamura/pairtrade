@@ -687,7 +687,18 @@ impl DexConnector for DexConnectorBox {
         &self,
         since_secs: i64,
     ) -> Result<Vec<dex_connector::FundingPayment>, DexError> {
-        self.inner.get_funding_payments(since_secs).await
+        // Same shape as the other fallible REST forwards above: a 429 /
+        // `RateLimited` on this read must feed the shared cooldown
+        // notification, not just surface to the caller.
+        let result = self.inner.get_funding_payments(since_secs).await;
+        if let Err(ref err) = result {
+            self.report_rate_limit(
+                "get_funding_payments",
+                &format!("since_secs={since_secs}"),
+                err,
+            );
+        }
+        result
     }
 
     fn subscribe_price_updates(
