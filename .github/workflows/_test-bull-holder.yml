@@ -1,0 +1,115 @@
+name: Test bull-holder
+
+# Reusable workflow (bot-strategy#984). Single source of truth for the test
+# commands that cover the `bull-holder` binary and the `hyperliquid-sdk`
+# feature gate it needs.
+#
+# Why this is not just a step in ci.yml's build-test job: `bull-holder`
+# carries `required-features = ["lighter-sdk", "hyperliquid-sdk"]`, and
+# ci.yml builds default features (`lighter-sdk`) only, so
+# `cargo check/test --all-targets` silently skips the target -- along with
+# every `#[cfg(feature = "hyperliquid-sdk")]` arm in src/config.rs,
+# src/trade/execution/dex_connector_box.rs and src/book/config.rs. Adding
+# `hyperliquid-sdk` to that job would change its feature unification and
+# recompile the whole tree serially inside the pipeline's critical path, so
+# the extra feature set gets its own job that runs in parallel instead.
+#
+# Before this workflow existed the commands below lived only in
+# deploy-bull-holder.yml, which is `workflow_dispatch:` only -- so
+# `src/bin/bull_holder.rs` and the `hyperliquid-sdk` lib code were compiled
+# for the first time whenever someone happened to dispatch a deploy. That is
+# a wider hole than bot-strategy#973's (the Arcus executor at least ran on
+# master push), and `dex_connector_box.rs` is the file CLAUDE.md names as the
+# silent-fallback trap: a missing forwarding override there falls through to
+# a default `Err` impl rather than failing to build.
+#
+# Both callers now run the same commands from here, so PR-time and
+# deploy-time coverage cannot drift the way ci.yml and the deploy workflows
+# drifted over the dex-connector ref in bot-strategy#899.
+
+on:
+  workflow_call:
+    inputs:
+      dex-connector-ref:
+        description: >
+          The dex-connector ref to check out. Callers must resolve this
+          through _resolve-dex-connector-ref.yml (bot-strategy#899): this
+          workflow deliberately has no ref of its own to keep in sync, and
+          ci.yml's lint job rejects a caller that passes a static pin.
+        required: true
+        type: string
+    secrets:
+      DEX_CONNECTOR_PAT:
+        description: PAT with read access to the private dex-connector repo.
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: 1.94.1
+  LIGHTER_GO_REF: v1.0.2
+
+jobs:
+  test:
+    name: Test bull-holder (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LIGHTER_GO_PATH: ${{ github.workspace }}/lighter-go
+      LD_LIBRARY_PATH: ${{ github.workspace }}/lighter-go
+    defaults:
+      run:
+        working-directory: debot
+    steps:
+      - name: Checkout debot
+        uses: actions/checkout@v5
+        with:
+          path: debot
+
+      - name: Checkout dex-connector
+        uses: actions/checkout@v5
+        with:
+          repository: shigeo-nakamura/dex-connector
+          ref: ${{ inputs.dex-connector-ref }}
+          path: dex-connector
+          token: ${{ secrets.DEX_CONNECTOR_PAT || github.token }}
+
+      - name: Checkout lighter-go
+        uses: actions/checkout@v5
+        with:
+          repository: elliottech/lighter-go
+          ref: ${{ env.LIGHTER_GO_REF }}
+          path: lighter-go
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.23.x"
+          cache: true
+          cache-dependency-path: lighter-go/go.sum
+
+      - name: Build libsigner
+        run: go build -buildmode=c-shared -trimpath -o libsigner.so ./sharedlib
+        working-directory: ${{ github.workspace }}/lighter-go
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            debot -> target
+          key: bull-holder
+
+      - name: Cargo check (bull-holder, lib + bin)
+        run: cargo check --locked --features hyperliquid-sdk --lib --bin bull-holder
+
+      - name: Cargo test (lib)
+        run: cargo test --locked --features hyperliquid-sdk --lib
+
+      - name: Cargo test (bull-holder)
+        run: cargo test --locked --features hyperliquid-sdk --bin bull-holder
