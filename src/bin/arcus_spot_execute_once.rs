@@ -424,13 +424,22 @@ async fn resume_live_tick_attempt(
 /// that is refusing them, and the operator would never see it.
 const MAX_CONSECUTIVE_AUTO_ARCHIVED_REJECTIONS: usize = 3;
 
-/// Count the rejections at the tail of `history`, i.e. how many attempts in
-/// a row ended rejected with nothing succeeding since.
+/// Count the *router* rejections at the tail of `history`: how many
+/// attempts the venue refused in a row, with nothing succeeding since.
+///
+/// `Rejected` is also what `cancel_prepared` writes when a submit guard or
+/// plan-age check stops an attempt before it is dispatched. Those are this
+/// bot declining to send, not a venue refusing to take -- counting them
+/// would let two local cancellations plus one real 422 read as three venue
+/// failures and stop the bot (Codex, pairtrade#317). `dispatched_at` is the
+/// durable marker that submission actually began, so it is what separates
+/// them; a cancellation in the run neither counts nor ends it.
 fn consecutive_tail_rejections(history: &[ArcusSpotExecutionAttempt]) -> usize {
     history
         .iter()
         .rev()
         .take_while(|attempt| attempt.phase == ArcusSpotExecutionPhase::Rejected)
+        .filter(|attempt| attempt.dispatched_at.is_some())
         .count()
 }
 
@@ -456,6 +465,14 @@ fn auto_archive_router_rejection(ledger: &mut ArcusSpotExecutionLedger) -> Resul
         return Ok(None);
     };
     if active.phase != ArcusSpotExecutionPhase::Rejected || active.tx_hash.is_some() {
+        return Ok(None);
+    }
+    // Only a rejection the venue gave us. `cancel_prepared` also writes
+    // `Rejected` with no `tx_hash` when a submit guard or plan-age check
+    // stops an attempt before dispatch, and clearing one of those would
+    // report a router refusal that never happened -- and, worse, hide
+    // whatever made the guard fire (Codex, pairtrade#317).
+    if active.dispatched_at.is_none() {
         return Ok(None);
     }
     let sequence = active.sequence;
@@ -9051,6 +9068,36 @@ runtime:
             );
             assert!(ledger.active.is_some(), "{phase:?} stays active");
         }
+    }
+
+    #[test]
+    fn a_locally_cancelled_attempt_is_not_a_router_rejection() {
+        // cancel_prepared writes Rejected with no tx_hash *and* no
+        // dispatched_at: this bot declined to send, which is not something
+        // to clear silently, and not a venue failure to count.
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let plan = rotation_plan("entry_signal");
+        let mut cancelled = rejected_attempt(&config, &plan, 1);
+        cancelled.dispatched_at = None;
+        cancelled.detail = Some("submit guard refused the plan".to_string());
+        let mut ledger = ledger_with(Some(cancelled.clone()), vec![]);
+
+        assert_eq!(auto_archive_router_rejection(&mut ledger).unwrap(), None);
+        assert!(ledger.active.is_some(), "left for an operator to look at");
+
+        // Nor does it count toward the cap, or break the run it sits in.
+        assert_eq!(consecutive_tail_rejections(&[cancelled.clone()]), 0);
+        let dispatched = rejected_attempt(&config, &plan, 2);
+        assert_eq!(
+            consecutive_tail_rejections(&[dispatched.clone(), cancelled, dispatched.clone()]),
+            2,
+            "the cancellation is skipped, not a divider"
+        );
     }
 
     #[test]

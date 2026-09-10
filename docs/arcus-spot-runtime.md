@@ -715,6 +715,11 @@ Still held for an operator, unchanged:
 - a `Rejected` attempt **with** a `tx_hash` -- it may have reached the
   chain, so it needs `repair-report` / `manual-reconcile-apply`, not a
   plain archive (the same boundary `archive-rejected-report` draws),
+- a `Rejected` attempt with **no `dispatched_at`** -- that is
+  `cancel_prepared`, i.e. a submit guard or plan-age check stopping this
+  bot from sending, not a venue refusing to take. Clearing one would report
+  a router refusal that never happened and hide whatever made the guard
+  fire. It is skipped when counting the run below, and does not break it,
 - `Unknown`, `OperatorHold`, `Failed`,
 - **three router rejections in a row** with nothing succeeding in between.
   A venue refusing everything is not the cheap case: clearing forever would
