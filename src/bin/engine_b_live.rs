@@ -468,7 +468,7 @@ impl EngineBLiveConfig {
             min_daily_volume_usd: env_f64("ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD", 100_000.0),
             equity_usd_reference: env_f64("ENGINE_B_LIVE_EQUITY_USD_REFERENCE", 1000.0),
             max_session_loss_bps: env_f64("ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS", 500.0),
-            venue_equity_refresh_secs: env_i64("ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS", 60),
+            venue_equity_refresh_secs: env_i64("ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS", 300),
             trading_calendar_path: PathBuf::from(env_string(
                 "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
                 &format!("{code_dir}/trading_calendar.json"),
@@ -1657,7 +1657,47 @@ struct VenueEquity {
     /// zero while equity holds is the shape of an account that cannot
     /// open the next lot.
     available_usd: f64,
+    /// When *this process* obtained the reading -- not when the venue
+    /// sampled it. dex-connector serves `get_balance` from a cache with
+    /// its own TTL, so a successful call can return a value the venue
+    /// produced up to that TTL earlier and this timestamp does not know
+    /// it (pairtrade#316 Codex review, P2). The refresh interval
+    /// defaults to that same TTL to keep the gap small in the steady
+    /// state, and `VenueEquityCell::failing` carries the "reads are
+    /// failing" signal exactly, so nothing has to infer it from an
+    /// approximate age.
     fetched_at_us: i64,
+}
+
+/// Shared cell the off-tick equity reader publishes into and the status
+/// writer samples (bot-strategy#919, pairtrade#316 Codex P1).
+#[derive(Default)]
+struct VenueEquityCell {
+    reading: Option<VenueEquity>,
+    /// The most recent attempt failed. This -- not the reading's age --
+    /// is the failure signal a reader should key on. The age is an
+    /// approximation (see `VenueEquity::fetched_at_us`); whether the
+    /// last read succeeded is exact.
+    failing: bool,
+    /// A read is out and has not come back. One at a time, so a venue
+    /// that hangs cannot accumulate a task per refresh interval.
+    in_flight: bool,
+}
+
+impl VenueEquityCell {
+    /// WARN once on the ok -> failed edge, then stay quiet. The previous
+    /// reading, its age and the `failing` flag are what a reader should
+    /// be looking at; repeating the same line every interval would only
+    /// bury the lines that matter.
+    fn note_failure(&mut self, why: &str) {
+        if !self.failing {
+            log::warn!(
+                "[EQUITY] venue equity unreadable ({why}); status.json keeps the last reading, \
+                 its age, and venue_equity_stale=true. Nothing gates on this value."
+            );
+            self.failing = true;
+        }
+    }
 }
 
 /// Engine-B-specific dashboard block, nested under a named `han_bridge`
@@ -1709,7 +1749,17 @@ struct HanBridgeStatus {
     /// fields (see debot-dashboard `deploy/alpha-gate.md`).
     venue_equity_usd: Option<f64>,
     venue_available_usd: Option<f64>,
+    /// How long ago *this process* last obtained the reading above. It
+    /// is an approximation of the venue sample's own age -- the
+    /// connector may have served a cached value -- so it is a rough
+    /// "how current is this", never the failure signal. That is
+    /// `venue_equity_stale`, which is exact (pairtrade#316 Codex P2).
     venue_equity_age_secs: Option<i64>,
+    /// The most recent read attempt failed, so the figures above are
+    /// the last known ones rather than current. A reader that wants one
+    /// bit for "is this trustworthy right now" wants this bit, not a
+    /// threshold on the age.
+    venue_equity_stale: bool,
     /// Mark-to-mid PnL of the position this engine manages, or `None`
     /// when flat, when the cost basis was never known
     /// (`entry_price_unknown`), or when no fresh US primary price is
@@ -1784,21 +1834,16 @@ struct EngineBLiveEngine {
     state_writes: u64,
     last_status_write_us: i64,
     status_s3_mirror: Option<Arc<S3Mirror>>,
-    /// Last successful venue equity reading (bot-strategy#919). Kept
-    /// across a failed refresh so the dashboard can show the last known
-    /// figure *with its age* rather than dropping to "-" on one
-    /// transient REST error; the age is what stops a frozen reading
-    /// from passing as current.
-    venue_equity: Option<VenueEquity>,
+    /// Venue equity, published by an off-tick reader (bot-strategy#919).
+    /// Shared rather than owned because the read must not run on the
+    /// trading tick (pairtrade#316 Codex P1). The last good reading is
+    /// kept across a failure so the dashboard can show it with its age
+    /// rather than dropping to "-" on one transient REST error.
+    venue_equity: Arc<std::sync::Mutex<VenueEquityCell>>,
     /// When the last refresh was *attempted*, successful or not, so a
     /// failing venue cannot turn into a retry-every-tick REST loop
     /// against a 60 req/min account.
     last_venue_equity_attempt_us: i64,
-    /// True while the most recent attempt failed. Only the ok -> failed
-    /// and failed -> ok transitions are logged; a venue that is down for
-    /// an hour would otherwise WARN once a minute for an hour about a
-    /// value nothing trades on.
-    venue_equity_failing: bool,
 }
 
 impl EngineBLiveEngine {
@@ -4921,10 +4966,10 @@ impl EngineBLiveEngine {
         // persisting it itself (bot-strategy#917); a no-op when nothing
         // changed.
         self.persist_position();
-        // Observational only (bot-strategy#919): refreshed before the
-        // status write so a fresh reading lands in the same document,
-        // and after every trading decision so it can never delay one.
-        self.refresh_venue_equity(now).await;
+        // Observational only (bot-strategy#919). Spawned, never
+        // awaited: a hung venue read must not hold the tick that drives
+        // confirmation, exit and shutdown (pairtrade#316 Codex P1).
+        self.spawn_venue_equity_refresh(now);
         self.write_status_if_due(now);
     }
 
@@ -4946,7 +4991,22 @@ impl EngineBLiveEngine {
     /// invalidates eagerly -- so this is at most one REST call per five
     /// minutes in the steady state, and refreshes promptly right after
     /// an entry or exit fill.
-    async fn refresh_venue_equity(&mut self, now_us: i64) {
+    /// Kick off a venue equity read for `status.json` (bot-strategy#919)
+    /// **without awaiting it on the trading tick**.
+    ///
+    /// The first cut of this awaited `get_balance` inline. That was
+    /// wrong in a way that only shows up during a venue outage: an
+    /// uncached REST read that hangs holds the tick, and the tick is
+    /// what drives `poll_pending_confirm`, `maybe_exit` and the
+    /// shutdown path. A purely observational read could then stop an
+    /// open position from being confirmed or closed (pairtrade#316
+    /// Codex review, P1). Nothing observational may sit on that path,
+    /// so the read runs in its own task and publishes into a shared
+    /// cell the status writer samples.
+    ///
+    /// At most one read is in flight at a time: a venue that hangs must
+    /// not accumulate a task per interval behind it.
+    fn spawn_venue_equity_refresh(&mut self, now_us: i64) {
         let interval_us = self
             .cfg
             .venue_equity_refresh_secs
@@ -4957,49 +5017,58 @@ impl EngineBLiveEngine {
         {
             return;
         }
-        self.last_venue_equity_attempt_us = now_us;
-        match self.connector.get_balance(None).await {
-            Ok(balance) => {
-                // A venue that answers with an unrepresentable number is
-                // not a venue that answered. Treat it as a failure
-                // rather than publishing 0.0 as if the account were
-                // empty -- an equity row reading $0.00 is exactly the
-                // alarm an operator must be able to trust.
-                let (Some(equity_usd), Some(available_usd)) =
-                    (balance.equity.to_f64(), balance.balance.to_f64())
-                else {
-                    self.note_venue_equity_failure("balance was not representable as f64");
-                    return;
-                };
-                if self.venue_equity_failing {
-                    log::info!(
-                        "[EQUITY] venue equity readable again: equity=${equity_usd:.2} \
-                         available=${available_usd:.2}"
-                    );
-                    self.venue_equity_failing = false;
-                }
-                self.venue_equity = Some(VenueEquity {
-                    equity_usd,
-                    available_usd,
-                    fetched_at_us: now_us,
-                });
+        {
+            let mut cell = self.venue_equity.lock().expect("venue equity mutex");
+            if cell.in_flight {
+                // The previous read has not come back. Leave the
+                // throttle timestamp alone so the next tick re-checks
+                // rather than silently skipping a whole interval.
+                return;
             }
-            Err(e) => self.note_venue_equity_failure(&format!("{e:?}")),
+            cell.in_flight = true;
         }
-    }
-
-    /// WARN once on the ok -> failed edge, then stay quiet. The previous
-    /// reading and its growing age are what a reader should be looking
-    /// at; repeating the same line every minute would only bury the
-    /// lines that matter.
-    fn note_venue_equity_failure(&mut self, why: &str) {
-        if !self.venue_equity_failing {
-            log::warn!(
-                "[EQUITY] venue equity unreadable ({why}); status.json keeps the last reading \
-                 and its age. Nothing gates on this value."
-            );
-            self.venue_equity_failing = true;
-        }
+        self.last_venue_equity_attempt_us = now_us;
+        let connector = Arc::clone(&self.connector);
+        let cell = Arc::clone(&self.venue_equity);
+        // The injectable clock, not `Utc::now()`: the reader stamps the
+        // moment the answer arrived, which is after the await and so
+        // later than the tick's `now_us`, and the tests drive both from
+        // the same synthetic source.
+        let clock = Arc::clone(&self.clock);
+        tokio::spawn(async move {
+            let result = connector.get_balance(None).await;
+            let mut cell = cell.lock().expect("venue equity mutex");
+            cell.in_flight = false;
+            match result {
+                Ok(balance) => {
+                    // A venue that answers with an unrepresentable
+                    // number is not a venue that answered. Treat it as a
+                    // failure rather than publishing 0.0 as if the
+                    // account were empty -- an equity row reading $0.00
+                    // is exactly the alarm an operator must be able to
+                    // trust.
+                    let (Some(equity_usd), Some(available_usd)) =
+                        (balance.equity.to_f64(), balance.balance.to_f64())
+                    else {
+                        cell.note_failure("balance was not representable as f64");
+                        return;
+                    };
+                    if cell.failing {
+                        log::info!(
+                            "[EQUITY] venue equity readable again: equity=${equity_usd:.2} \
+                             available=${available_usd:.2}"
+                        );
+                        cell.failing = false;
+                    }
+                    cell.reading = Some(VenueEquity {
+                        equity_usd,
+                        available_usd,
+                        fetched_at_us: clock(),
+                    });
+                }
+                Err(e) => cell.note_failure(&format!("{e:?}")),
+            }
+        });
     }
 
     /// Mark-to-mid PnL of the position this engine manages, or `None`
@@ -5134,6 +5203,13 @@ impl EngineBLiveEngine {
             calendar_version: self.calendar.calendar_version.clone(),
         };
         let stale_or_missing_symbols = self.stale_or_missing_symbols(now_us);
+        // One lock for both fields so a refresh landing between two
+        // reads cannot publish a reading against the wrong staleness
+        // verdict.
+        let (venue_equity, venue_equity_stale) = {
+            let cell = self.venue_equity.lock().expect("venue equity mutex");
+            (cell.reading, cell.failing)
+        };
         let han_bridge = HanBridgeStatus {
             kr_primary_symbol: self.cfg.kr_primary_symbol.clone(),
             us_primary_symbol: self.cfg.us_primary_symbol.clone(),
@@ -5145,11 +5221,15 @@ impl EngineBLiveEngine {
             skip_reason: self.day.skip_reason.clone(),
             stale_or_missing_symbols,
             price_feed_generation: self.feed_generation(),
-            venue_equity_usd: self.venue_equity.map(|v| v.equity_usd),
-            venue_available_usd: self.venue_equity.map(|v| v.available_usd),
-            venue_equity_age_secs: self
-                .venue_equity
-                .map(|v| (now_us - v.fetched_at_us) / 1_000_000),
+            venue_equity_usd: venue_equity.map(|v| v.equity_usd),
+            venue_available_usd: venue_equity.map(|v| v.available_usd),
+            // Clamped at zero: the reader stamps its own wall clock
+            // while the tick carries `now_us`, so a reading taken
+            // microseconds after this tick's timestamp must not publish
+            // a negative age.
+            venue_equity_age_secs: venue_equity
+                .map(|v| ((now_us - v.fetched_at_us) / 1_000_000).max(0)),
+            venue_equity_stale,
             unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
         };
         let status = FullStatus {
@@ -5397,9 +5477,8 @@ async fn main() -> Result<()> {
         state_writes: 0,
         last_status_write_us: 0,
         status_s3_mirror: S3Mirror::from_env(),
-        venue_equity: None,
+        venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
         last_venue_equity_attempt_us: 0,
-        venue_equity_failing: false,
     };
     if let Some(p) = engine.state.open_position.as_ref() {
         log::warn!(
@@ -6021,6 +6100,7 @@ mod tests {
                 venue_equity_usd: None,
                 venue_available_usd: None,
                 venue_equity_age_secs: None,
+                venue_equity_stale: false,
                 unrealized_pnl_usd_mid_estimate: None,
             },
         }
@@ -6431,6 +6511,10 @@ mod tests {
         /// `(equity, available)` the stub reports, and whether the call
         /// fails instead.
         balance: std::sync::Mutex<Option<(Decimal, Decimal)>>,
+        /// Makes `get_balance` never return, standing in for a venue
+        /// outage where the REST read hangs. The tick must survive it
+        /// (pairtrade#316 Codex P1).
+        hang_balance: std::sync::atomic::AtomicBool,
     }
 
     impl StubConnector {
@@ -6468,6 +6552,11 @@ mod tests {
 
         fn fail_balance(&self) {
             *self.balance.lock().unwrap() = None;
+        }
+
+        fn hang_balance(&self) {
+            self.hang_balance
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -6520,6 +6609,9 @@ mod tests {
         ) -> Result<dex_connector::BalanceResponse, dex_connector::DexError> {
             self.balance_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hang_balance.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             match *self.balance.lock().unwrap() {
                 Some((equity, balance)) => Ok(dex_connector::BalanceResponse {
                     equity,
@@ -6808,9 +6900,8 @@ mod tests {
             state_writes: 0,
             last_status_write_us: 0,
             status_s3_mirror: None,
-            venue_equity: None,
+            venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
             last_venue_equity_attempt_us: 0,
-            venue_equity_failing: false,
         };
         Harness {
             engine,
@@ -6840,6 +6931,32 @@ mod tests {
                     generation,
                 },
             );
+        }
+
+        /// Spawn an equity refresh and wait for the spawned task to
+        /// publish. The production path deliberately never awaits it
+        /// (pairtrade#316 Codex P1), so a test that wants to assert on
+        /// the result has to wait here instead. Bounded: a refresh that
+        /// never lands is a hang, and the test should fail rather than
+        /// spin forever.
+        async fn refresh_equity(&mut self, now_us: i64) {
+            // The reader stamps the clock when the answer lands, so the
+            // harness clock has to be where the test says it is.
+            self.set_now(now_us);
+            self.engine.spawn_venue_equity_refresh(now_us);
+            for _ in 0..1000 {
+                if !self
+                    .engine
+                    .venue_equity
+                    .lock()
+                    .expect("venue equity mutex")
+                    .in_flight
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("venue equity refresh never completed");
         }
 
         /// Every subscribed symbol observed at `received_at_us` on the
@@ -8219,6 +8336,14 @@ mod tests {
     // is a bug, not a feature.
     // -------------------------------------------------------------
 
+    fn equity_failing(h: &Harness) -> bool {
+        h.engine
+            .venue_equity
+            .lock()
+            .expect("venue equity mutex")
+            .failing
+    }
+
     fn read_status(h: &Harness) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap()).unwrap()
     }
@@ -8227,7 +8352,7 @@ mod tests {
     async fn venue_equity_reaches_status_with_its_age() {
         let mut h = harness();
         h.connector.set_balance("5000.5", "4900.25");
-        h.engine.refresh_venue_equity(T1_US).await;
+        h.refresh_equity(T1_US).await;
         // 30 s later the value has not been re-read (the throttle), so
         // the published age must have grown rather than reset.
         h.engine.write_status_if_due(T1_US + 30_000_000);
@@ -8252,7 +8377,7 @@ mod tests {
     async fn venue_equity_is_null_until_the_first_successful_read() {
         let mut h = harness();
         h.connector.fail_balance();
-        h.engine.refresh_venue_equity(T1_US).await;
+        h.refresh_equity(T1_US).await;
         h.engine.write_status_if_due(T1_US);
         let status = read_status(&h);
         assert_eq!(
@@ -8260,16 +8385,21 @@ mod tests {
             serde_json::json!(null),
             "never publish 0.0 for an account that was never read"
         );
-        assert!(h.engine.venue_equity_failing);
+        assert_eq!(
+            status["han_bridge"]["venue_equity_stale"],
+            serde_json::json!(true),
+            "the exact failure signal, not a threshold on the age"
+        );
+        assert!(equity_failing(&h));
     }
 
     #[tokio::test]
     async fn a_failed_refresh_keeps_the_last_reading_and_lets_its_age_grow() {
         let mut h = harness();
         h.connector.set_balance("5000", "5000");
-        h.engine.refresh_venue_equity(T1_US).await;
+        h.refresh_equity(T1_US).await;
         h.connector.fail_balance();
-        h.engine.refresh_venue_equity(T1_US + 600_000_000).await;
+        h.refresh_equity(T1_US + 600_000_000).await;
         h.engine.write_status_if_due(T1_US + 600_000_000);
         let status = read_status(&h);
         assert_eq!(
@@ -8282,7 +8412,12 @@ mod tests {
             serde_json::json!(600),
             "but it must be visibly 10 minutes old"
         );
-        assert!(h.engine.venue_equity_failing);
+        assert_eq!(
+            status["han_bridge"]["venue_equity_stale"],
+            serde_json::json!(true),
+            "and flagged as not current, independent of any age threshold"
+        );
+        assert!(equity_failing(&h));
     }
 
     #[tokio::test]
@@ -8290,15 +8425,64 @@ mod tests {
         let mut h = harness();
         h.connector.set_balance("5000", "5000");
         h.engine.cfg.venue_equity_refresh_secs = 60;
-        h.engine.refresh_venue_equity(T1_US).await;
-        h.engine.refresh_venue_equity(T1_US + 59_000_000).await;
+        h.refresh_equity(T1_US).await;
+        h.refresh_equity(T1_US + 59_000_000).await;
         assert_eq!(
             h.connector.balance_call_count(),
             1,
             "a 5 s tick must not turn into a 12/min REST loop"
         );
-        h.engine.refresh_venue_equity(T1_US + 60_000_000).await;
+        h.refresh_equity(T1_US + 60_000_000).await;
         assert_eq!(h.connector.balance_call_count(), 2);
+    }
+
+    /// pairtrade#316 Codex review, P1. The failure this pins is not
+    /// "the refresh is slow" but "a slow refresh stops the engine from
+    /// closing a position", so the assertion is on the tick completing
+    /// while the venue read is still outstanding.
+    #[tokio::test]
+    async fn a_hung_venue_read_does_not_hold_the_trading_tick() {
+        let mut h = harness();
+        h.connector.hang_balance();
+        h.set_now(T1_US);
+        // Would hang forever if the tick awaited the balance read.
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.engine.tick())
+            .await
+            .expect("tick must not wait on an observational venue read");
+        assert!(
+            h.engine
+                .venue_equity
+                .lock()
+                .expect("venue equity mutex")
+                .in_flight,
+            "the read was claimed before the tick returned"
+        );
+        // The tick finished without ever polling the spawned reader --
+        // on a current-thread runtime the task has not even started. A
+        // yield lets it reach the (hanging) venue call, which is what
+        // the in-flight guard below is about.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            h.connector.balance_call_count(),
+            1,
+            "the read was started, just not awaited"
+        );
+        // Later ticks keep working, and do not pile a second read up
+        // behind the stuck one.
+        h.set_now(T1_US + 3_600_000_000);
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.engine.tick())
+            .await
+            .expect("a stuck read must not wedge every later tick");
+        // Same reason as above: without this, a second reader that *was*
+        // spawned would not have run yet and the count below would pass
+        // for the wrong reason. (Removing the in-flight guard must fail
+        // this test; it did not until this yield was added.)
+        tokio::task::yield_now().await;
+        assert_eq!(
+            h.connector.balance_call_count(),
+            1,
+            "one read in flight at a time, however long the venue takes"
+        );
     }
 
     #[tokio::test]
