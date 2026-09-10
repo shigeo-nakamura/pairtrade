@@ -1789,6 +1789,35 @@ struct HanBridgeStatus {
     /// excluded: this engine has no cost basis for exposure it did not
     /// open.
     unrealized_pnl_usd_mid_estimate: Option<f64>,
+    /// The **emergency-close threshold** for the open position
+    /// (`t2 + exit_deadline_secs`), or `None` when nothing is open or
+    /// the position carries no scheduled boundary.
+    ///
+    /// Explicitly *not* "when retrying stops". Past this point
+    /// `maybe_exit` stops waiting for the scheduled boundary and forces
+    /// a close, and `poll_pending_confirm` clears an expired attempt so
+    /// the next tick sends another -- the engine tries harder here, not
+    /// less (pairtrade#319 Codex review). A consumer that renders this
+    /// as "abandoned" would report an active close loop as a stopped
+    /// one.
+    ///
+    /// Published so a dashboard can say a scheduled exit is late, and
+    /// distinguish "still inside its window" from "past it and
+    /// force-closing". bot-strategy#917 leaves an unconfirmable close
+    /// open on purpose -- a documented open position beats a close
+    /// nobody can verify -- and that outcome had no signal anywhere but
+    /// an e-mail and the journal.
+    exit_deadline_us: Option<i64>,
+    /// A position **this engine opened and manages** is open.
+    ///
+    /// Not the same question as the document's top-level
+    /// `has_position`, which counts `unmanaged_positions` too: an
+    /// exposure adopted from the exchange, or left behind by a former
+    /// `us_primary`, makes that flag true on a day Engine B opened
+    /// nothing. A consumer that read it as "Engine B is holding" would
+    /// announce an exit for a position Engine B never took
+    /// (debot-dashboard#47 Codex review).
+    managed_position_open: bool,
 }
 
 #[derive(Serialize)]
@@ -5297,6 +5326,35 @@ impl EngineBLiveEngine {
             calendar_version: self.calendar.calendar_version.clone(),
         };
         let stale_or_missing_symbols = self.stale_or_missing_symbols(now_us);
+        // Mirrors the `positions` fallback above, and for the same
+        // reason: a saved claim this process has not yet reconciled --
+        // `get_positions()` failed at startup, say -- is not evidence of
+        // a flat account. Reporting `managed_position_open=false` and no
+        // deadline through a venue outage would hide the hold exactly
+        // when it matters most, while the same document is still listing
+        // that exposure in `positions` (pairtrade#319 Codex review
+        // round 2). `positions_ready` stays false throughout, which is
+        // where the uncertainty belongs.
+        let (managed_claim_open, managed_claim_exit_deadline_us) = match self.position.as_ref() {
+            Some(p) => (true, p.exit_deadline_us),
+            // Both conditions earn their place. `!reconciled` keeps
+            // this to the window where the account genuinely could not
+            // be read: once reconciliation has run and still left the
+            // slot empty, that is a decision, not an outage. And the
+            // symbol must be the one this instance trades -- when
+            // `us_primary` changes with a saved position on the old
+            // symbol, DRY_RUN deliberately retains the record while
+            // refusing to manage it, and publishing it here would
+            // present an intentionally unmanaged exposure as a current
+            // hold, complete with the old symbol's deadline
+            // (pairtrade#319 Codex review round 3).
+            None => match self.state.open_position.as_ref() {
+                Some(p) if !self.reconciled && p.symbol == self.cfg.us_primary_symbol => {
+                    (true, p.exit_deadline_us)
+                }
+                _ => (false, None),
+            },
+        };
         // One lock for both fields so a refresh landing between two
         // reads cannot publish a reading against the wrong staleness
         // verdict.
@@ -5326,6 +5384,8 @@ impl EngineBLiveEngine {
                 .map(|v| ((now_us - v.fetched_at_us) / 1_000_000).max(0)),
             venue_equity_stale,
             unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
+            exit_deadline_us: managed_claim_exit_deadline_us,
+            managed_position_open: managed_claim_open,
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -6199,6 +6259,8 @@ mod tests {
                 venue_equity_age_secs: None,
                 venue_equity_stale: false,
                 unrealized_pnl_usd_mid_estimate: None,
+                exit_deadline_us: None,
+                managed_position_open: false,
             },
         }
     }
@@ -8544,6 +8606,165 @@ mod tests {
     /// "the refresh is slow" but "a slow refresh stops the engine from
     /// closing a position", so the assertion is on the tick completing
     /// while the venue read is still outstanding.
+    /// `has_position` counts unmanaged exposures, so it cannot answer
+    /// "is Engine B holding" -- a consumer that read it that way would
+    /// announce an exit for a position Engine B never took
+    /// (debot-dashboard#47 Codex review).
+    #[tokio::test]
+    async fn managed_and_account_wide_position_flags_are_not_the_same_question() {
+        let mut h = harness();
+        h.engine
+            .state
+            .unmanaged_positions
+            .push(persisted_long(0.04, TODAY));
+        h.engine.write_status_if_due(T1_US);
+        let status = read_status(&h);
+        assert_eq!(
+            status["has_position"],
+            serde_json::json!(true),
+            "the account does hold something"
+        );
+        assert_eq!(
+            status["han_bridge"]["managed_position_open"],
+            serde_json::json!(false),
+            "but this engine opened nothing, so it has no exit to announce"
+        );
+    }
+
+    /// pairtrade#319 Codex review round 2: a venue outage at startup is
+    /// exactly when the persisted claim must not read as flat. The
+    /// `positions` list already falls back to it; these fields have to
+    /// agree with the document they sit in.
+    #[tokio::test]
+    async fn an_unreconciled_claim_still_reports_a_managed_hold_and_its_deadline() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.position = None;
+        h.engine.state.open_position = Some(PersistedPosition {
+            exit_deadline_us: Some(T2_US + 900_000_000),
+            ..persisted_long(0.05, TODAY)
+        });
+        h.engine.write_status_if_due(T1_US);
+        let status = read_status(&h);
+        assert_eq!(
+            status["han_bridge"]["managed_position_open"],
+            serde_json::json!(true),
+            "the account could not be read; that is not evidence of flat"
+        );
+        assert_eq!(
+            status["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(T2_US + 900_000_000),
+            "and the saved exit must not vanish for the outage"
+        );
+        assert_eq!(
+            status["positions_ready"],
+            serde_json::json!(false),
+            "the uncertainty belongs here, not in a claim of flatness"
+        );
+        assert_eq!(
+            status["positions"].as_array().map(|a| a.len()),
+            Some(1),
+            "consistent with the list the same document publishes"
+        );
+    }
+
+    /// pairtrade#319 Codex review round 3: the fallback is for an
+    /// outage, not for every empty slot. A record kept on purpose while
+    /// refusing to manage it is not a managed hold.
+    #[tokio::test]
+    async fn a_retained_foreign_symbol_record_is_not_a_managed_hold() {
+        let mut h = harness();
+        h.engine.position = None;
+        h.engine.state.open_position = Some(PersistedPosition {
+            symbol: "MU".to_string(),
+            exit_deadline_us: Some(T2_US + 900_000_000),
+            ..persisted_long(0.05, TODAY)
+        });
+
+        // Reconciliation ran and left the slot empty on purpose.
+        h.engine.reconciled = true;
+        h.engine.write_status_if_due(T1_US);
+        let settled = read_status(&h);
+        assert_eq!(
+            settled["han_bridge"]["managed_position_open"],
+            serde_json::json!(false),
+            "a decision to not manage it is not an outage"
+        );
+        assert_eq!(
+            settled["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(null),
+            "and the old symbol's deadline must not surface beside the new primary"
+        );
+
+        // Even mid-outage, a record for a symbol this instance does not
+        // trade is not this instance's hold.
+        h.engine.reconciled = false;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["managed_position_open"],
+            serde_json::json!(false)
+        );
+
+        // The two conditions are independent, so the matching-symbol
+        // half is pinned too: reconciliation having *run* and still
+        // left the slot empty is a decision about this exposure, and
+        // the fallback exists for the case where the account could not
+        // be read at all.
+        h.engine.reconciled = true;
+        h.engine.state.open_position = Some(PersistedPosition {
+            exit_deadline_us: Some(T2_US + 900_000_000),
+            ..persisted_long(0.05, TODAY)
+        });
+        assert_eq!(
+            h.engine.state.open_position.as_ref().unwrap().symbol,
+            h.engine.cfg.us_primary_symbol,
+            "this case is only meaningful with the symbol matching"
+        );
+        h.engine.write_status_if_due(T1_US + 120_000_000);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["managed_position_open"],
+            serde_json::json!(false),
+            "reconciled and still empty is not an outage"
+        );
+    }
+
+    /// The exit deadline is what lets a card say a scheduled exit is
+    /// late rather than reading "Entered, holding" forever after an
+    /// unconfirmable close (bot-strategy#917).
+    #[tokio::test]
+    async fn the_exit_deadline_is_published_only_while_something_is_open() {
+        let mut h = harness();
+        h.engine.write_status_if_due(T1_US);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(null),
+            "flat: there is no exit to be late for"
+        );
+
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status = read_status(&h);
+        assert_eq!(
+            status["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(T2_US + 900_000_000)
+        );
+        assert_eq!(
+            status["han_bridge"]["managed_position_open"],
+            serde_json::json!(true)
+        );
+    }
+
     #[tokio::test]
     async fn a_hung_venue_read_does_not_hold_the_trading_tick() {
         let mut h = harness();

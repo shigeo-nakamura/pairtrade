@@ -127,6 +127,36 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     reference that does not match the funded account makes the halt
     threshold mean something other than it appears to. Reconcile the two
     by hand; this feature reports the gap, it does not close it.
+  - **`exit_deadline_us` is the emergency-close threshold**
+    (`t2 + exit_deadline_secs`), or `None` when nothing is open.
+    Explicitly *not* "when retrying stops": past it `maybe_exit` stops
+    waiting for the scheduled boundary and forces a close, and
+    `poll_pending_confirm` clears an expired attempt so the next tick
+    sends another -- the engine tries harder here, not less. A consumer
+    that rendered it as "abandoned" would report an active close loop as
+    a stopped one. It is published so a dashboard can call a scheduled
+    exit *late*, and tell "still inside its window" from "past it and
+    force-closing": #917 leaves an unconfirmable close open on purpose,
+    and that outcome had no signal anywhere but an e-mail and the
+    journal. The session boundaries themselves are already in
+    `status.json`'s top-level `window` (t0, t1, t2).
+  - **`managed_position_open` is not the document's `has_position`.**
+    The top-level flag counts `unmanaged_positions` too -- an exposure
+    adopted from the exchange, or left behind by a former `us_primary`,
+    makes it true on a day Engine B opened nothing. Anything asking "is
+    Engine B holding" (an exit countdown, the unrealized mark) must read
+    the `han_bridge` flag; the top-level one answers a different
+    question. Both it and `exit_deadline_us` fall back to the persisted
+    claim while reconciliation has not completed **and** that claim is
+    for the symbol this instance trades -- a `get_positions()` failure
+    at startup is not evidence of a flat account, and the same document
+    already lists that exposure in `positions`. The uncertainty is
+    carried by `positions_ready=false`, not by pretending to be flat.
+    Both conditions matter: reconciliation having run and still left the
+    slot empty is a decision rather than an outage, and a record kept on
+    the *previous* `us_primary` is retained on purpose while explicitly
+    not being managed -- publishing either as a managed hold would put
+    the old symbol's deadline beside the new primary.
   - **`venue_solvency_reported` is how a consumer knows the field exists
     at all.** It is always true from this build. A consumer cannot use
     JSON key presence for that -- debot-dashboard decodes and re-encodes
