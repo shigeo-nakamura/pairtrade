@@ -2263,6 +2263,13 @@ fn commit_reconcile_position(
                     "observed gas balance",
                 ),
                 (attempt.tx_hash != tx_hash, "tx hash"),
+                // `record_manual_close` persists this too, so a re-run that
+                // "corrects" it would commit the checkpoint while the ledger
+                // silently kept the earlier explanation -- and nothing would
+                // tell the operator their correction was dropped (Codex,
+                // pairtrade#318). It is the operator's account of why the
+                // close happened; the ledger is where it has to be right.
+                (attempt.detail.as_deref() != Some(detail.trim()), "detail"),
                 // Identities, not just amounts: a deployment between the
                 // two runs may have moved `executor.taker` or a trusted
                 // token address, and reusing a close recorded against the
@@ -9572,6 +9579,27 @@ runtime:
             assert_eq!(ledger.history.len(), 1, "{label}: no second close appended");
             assert_eq!(ledger.next_sequence, 2, "{label}: sequence did not advance");
         }
+
+        // The operator's own account of the close is persisted too, so a
+        // "corrected" one is a different declaration, not a free-text note
+        // the ledger may quietly disagree with.
+        let error = commit_reconcile_position(
+            &config,
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            "actually closed it the following morning",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("detail"), "{error}");
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert_eq!(ledger.history.len(), 1, "detail: no second close appended");
     }
 
     #[test]
