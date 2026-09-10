@@ -413,12 +413,58 @@ async fn resume_live_tick_attempt(
     finalize_reconciled_attempt(config, &mut executor, &plan, &plan_config_digest, attempt)
 }
 
+/// Refuse to evaluate anything while a manual close is recorded in the
+/// ledger but not yet in the checkpoint (bot-strategy#977/#318).
+///
+/// `reconcile-position` writes the ledger first and the checkpoint second,
+/// so a crash between them leaves no active attempt and a checkpoint that
+/// still shows the rotation. Nothing else notices: the tick would load that
+/// stale checkpoint, and inside a corporate-action window it can produce
+/// the forced exit -- selling inventory the operator has already sold at
+/// the venue, or stranding a failed attempt trying to. Ticking is the wrong
+/// move until the operator re-runs the command and the two halves agree.
+///
+/// A completed close is invisible here: the checkpoint is flat, so the tail
+/// entry stays until the next rotation replaces it without ever blocking.
+fn require_no_half_committed_manual_close(
+    config: &ArcusSpotExecuteOnceConfig,
+    ledger: &ArcusSpotExecutionLedger,
+) -> Result<()> {
+    let Some(tail) = ledger.history.last() else {
+        return Ok(());
+    };
+    if tail.phase != ArcusSpotExecutionPhase::ManuallyClosed {
+        return Ok(());
+    }
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let Some((regime, rotated_quantity)) = store.peek_regime_and_rotated_quantity()? else {
+        return Ok(());
+    };
+    if regime == ArcusSpotRegime::Neutral && rotated_quantity.is_none() {
+        return Ok(());
+    }
+    bail!(
+        "Arcus ledger sequence {} records a manual close, but the runtime checkpoint still holds \
+         the rotation it closed (regime {:?}, rotated quantity {}). A `reconcile-position` run \
+         committed the ledger and did not reach the checkpoint; evaluating from that checkpoint \
+         could dispatch an exit for inventory that is already sold. Re-run `reconcile-position` \
+         with exactly the values that entry records to finish it",
+        tail.sequence,
+        regime,
+        rotated_quantity
+            .map(|quantity| quantity.normalize().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    )
+}
+
 async fn resume_active_live_tick_attempt(
     config: &ArcusSpotExecuteOnceConfig,
 ) -> Result<Option<ArcusSpotExecutionAttempt>> {
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let lock = ledger_store.acquire_exclusive_lock(&config.runtime_state_path)?;
-    let recovery = load_live_tick_active_recovery_plan(config, &ledger_store)?;
+    let ledger = ledger_store.load_or_create(Utc::now())?;
+    require_no_half_committed_manual_close(config, &ledger)?;
+    let recovery = live_tick_active_recovery_plan(config, &ledger)?;
     drop(lock);
 
     let Some((plan, plan_config_digest)) = recovery else {
@@ -9650,6 +9696,54 @@ runtime:
             "closed at the venue",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_half_committed_manual_close_stops_the_next_tick() {
+        // The dangerous half of the ledger-first order: no active attempt,
+        // a checkpoint that still shows the rotation, and inside a window
+        // the tick can dispatch the forced exit for inventory the operator
+        // has already sold (Codex P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let args = (
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        );
+        commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        // Completed: the checkpoint is flat, so nothing blocks.
+        require_no_half_committed_manual_close(&config, &ledger).unwrap();
+
+        // Now roll the checkpoint back to the pre-command state, which is
+        // exactly what a crash between the two persists leaves behind.
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+        let error = require_no_half_committed_manual_close(&config, &ledger)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("still holds the rotation it closed"),
+            "{error}"
+        );
+        assert!(error.contains("already sold"), "{error}");
+
+        // And an empty ledger, or one whose tail is an ordinary attempt,
+        // never blocks.
+        require_no_half_committed_manual_close(&config, &ArcusSpotExecutionLedger::default())
+            .unwrap();
     }
 
     #[test]

@@ -449,13 +449,23 @@ At `resume_not_before` the runtime resumes only when all three hold:
    runtime was carrying. A leg that ends at exactly zero is accepted
    (subject to its inventory floor).
 
-   **Re-running it is safe.** The ledger commits before the checkpoint, so
-   an interruption in between leaves the close recorded against a
-   checkpoint that still shows the rotation. Running the command again with
-   the same amounts finishes that transition -- it recognises its own
-   half-committed close and writes only the checkpoint, rather than
-   appending a second one and advancing the sequence again. The report says
-   `resumed_a_recorded_close: true` when that happened.
+   **Re-running it is safe, and nothing trades in the meantime.** The
+   ledger commits before the checkpoint, so an interruption in between
+   leaves the close recorded against a checkpoint that still shows the
+   rotation. Two things follow:
+
+   - **`live-tick` refuses to evaluate** while the ledger's tail is a
+     `ManuallyClosed` entry and the checkpoint is not flat. Without that,
+     the next scheduled tick would load the stale checkpoint and could
+     dispatch the window's forced exit for inventory that is already sold.
+     It exits non-zero naming the ledger sequence to finish.
+   - **Running the command again finishes the transition.** It recognises
+     its own half-committed close -- every persisted input must match, down
+     to the DETAIL text -- and writes only the checkpoint, rather than
+     appending a second close and advancing the sequence again. The report
+     says `resumed_a_recorded_close: true` when that happened. If any input
+     differs it refuses and names the field, rather than finishing someone
+     else's declaration under new numbers.
 
    **Take a fresh `state-backup` afterwards.** Like `reset-window`, this
    writes over the record that earlier backups verify against, so those no
