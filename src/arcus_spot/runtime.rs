@@ -4214,7 +4214,7 @@ fn parse_positive_or_zero(field: &str, value: Option<&str>) -> Result<Decimal, A
     Ok(parsed)
 }
 
-pub(crate) fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
+pub fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
     let raw = raw.trim();
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!(

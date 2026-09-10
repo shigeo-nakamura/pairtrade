@@ -403,20 +403,43 @@ At `resume_not_before` the runtime resumes only when all three hold:
    `post_event_inventory` describes a wallet, and adopting it over an open
    position would overwrite the holding `rotated_quantity` refers to.
 
-   **Reconciling an open rotation -- read this before declaring a window.**
-   There is currently **no supported way to return the tracked state to
-   flat** once a rotation is caught by `effective_at`. Editing
-   `regime`/`rotated_quantity` at the same sequence is rejected by
-   continuity verification (a position change with no ledger attempt), and
-   restoring a pre-rotation checkpoint leaves its sequence behind the
-   event-stream tail, which the next append -- and `reset-window` -- refuse.
-   The runtime stays on `corporate_action_unresolved`, trading nothing,
-   until bot-strategy#977 lands: an atomic `reconcile-position` command that
-   records the operator's manual close in the ledger, appends the stream
-   event, moves the runtime to flat in post-event units and lets the
-   ordinary resume run. Until then the hold is a wedge that needs that
-   command, and it is still the correct outcome -- the alternative is an
-   exit sized in the wrong units. The mitigation is upstream of it: set
+   **Reconciling an open rotation.** Close it at the venue yourself, then
+   tell the bot with `reconcile-position` (bot-strategy#977):
+
+       arcus-spot-execute-once reconcile-position CONFIG_YAML \
+           SETTLED_SELL_AMOUNT_RAW SETTLED_BUY_AMOUNT_RAW \
+           OBSERVED_SELL_BALANCE_RAW OBSERVED_BUY_BALANCE_RAW \
+           OBSERVED_GAS_BALANCE_WEI TX_HASH_OR_none DETAIL
+
+   One transition, under the same administrator policy digest and exclusive
+   lock as `clear-risk-halt`/`reset-window`: it writes an execution-ledger
+   entry for the close (phase `ManuallyClosed`, never `Reconciled` --
+   nothing about a manual close can be reproduced from recorder evidence,
+   and every check that consumes a reconciled attempt is entitled to assume
+   it can), and a checkpoint that is flat with the wallet's post-close
+   holdings. The balances you pass are read the same way the resume's are
+   (`eth_call balanceOf` against `chain.rpc_urls[0]`), **after** the close,
+   in whatever units the venue quotes now -- nothing recomputes them from
+   the pre-event quantities, which is the whole reason the rotation could
+   not be exited normally.
+
+   The corporate-action progress is left in place: the window is not over,
+   and the ordinary resume (flat, identity intact, `post_event_inventory`
+   declared) is what ends it on a later tick. So this is step 1 of
+   "Completing the resume", not a replacement for it.
+
+   It refuses unless a corporate-action window is open -- it is not a
+   general position editor -- and, like `reset-window`, unless the bot is
+   idle: no pending durable event, no active ledger attempt, no on-disk
+   pending plan, and a checkpoint in step with the event-stream tail. It is
+   also refused when the checkpoint is already flat.
+
+   **Take a fresh `state-backup` afterwards.** Like `reset-window`, this
+   writes over the record that earlier backups verify against, so those no
+   longer verify. Continuity verification compares a neutral, no-active
+   baseline against one later tick; the new backup is that baseline.
+
+   The mitigation is still upstream of all this: set
    `reduce_exit_at` with **real margin** before `effective_at` for the venue
    not quoting (the forced exit retries every tick through that phase, and
    stops `corporate_action_settlement_margin_secs` -- 300s by default --
