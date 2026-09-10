@@ -27,7 +27,8 @@ It then enforces:
 - optimistic round-trip loss plus explicit gas and settlement buffers;
 - sticky daily and cumulative loss halts, measured against the strategy
   rather than the market (see below);
-- maximum hold and mean-reversion exit behavior.
+- maximum hold and mean-reversion exit behavior;
+- declared corporate-action and token-lifecycle windows (see below).
 
 ### What the loss stops measure
 
@@ -270,7 +271,8 @@ be what vouched for that underlying strategy decision, and `auto-execute`
 has nothing in its place. Only `execute` (signed) or `live-tick` (which
 builds its own entry plan from `step_at` under the checkpoint lock,
 immediately before dispatch, so provenance is inherent rather than merely
-asserted) may dispatch an entry. A `mean_reversion_exit`/`max_hold_exit`
+asserted) may dispatch an entry. A
+`mean_reversion_exit`/`max_hold_exit`/`corporate_action_exit`
 plan is still accepted through `auto-execute` -- it is risk-reducing and
 already bounded by the runtime checkpoint's own genuinely-open rotated
 quantity.
@@ -322,6 +324,196 @@ inclusive -- `build_plan` rejects on `all_in_cost > cap` -- so a quote
 landing exactly on the residual budget passes. That matters most when the
 buffers equal the cap: the residual is then 0 bps, and a zero-loss quote
 still clears.
+
+## Corporate actions and token lifecycle (bot-strategy#853)
+
+A split, merger, symbol change or redemption in an underlying equity
+invalidates the relative-price history and can rewrite the wallet balance
+with no swap. The recorder payload carries token identity, `addedTimestamp`,
+prices and financial fields, but **no corporate-action calendar, effective
+time, halt flag or settlement status**, so the runtime cannot infer any of
+this. A price-jump threshold is not a substitute either: it cannot separate a
+split from a legitimate gap, and it sees nothing at all for the lifecycle
+events that leave price untouched.
+
+So the calendar is operator-supplied, under `runtime.corporate_actions`, and
+the runtime only ever applies it. Empty (the default) is exactly the previous
+behaviour.
+
+```yaml
+runtime:
+  # ... every existing field ...
+  corporate_actions:
+    - event_id: SPY-2026-11-SPLIT        # stable; recorded once handled
+      symbols: [SPY]                     # must be in the configured pair
+      entry_block_at:   2026-11-20T00:00:00Z
+      reduce_exit_at:   2026-11-20T20:00:00Z
+      effective_at:     2026-11-21T13:30:00Z
+      resume_not_before: 2026-11-24T14:30:00Z
+      source: "issuer notice 2026-11-05, <url>"   # required
+      # Added by the operator *after* effective_at, from the wallet:
+      # post_event_inventory: {token_a: "7.748102027952155828", token_b: "2.087371762778876145"}
+```
+
+### The four phases
+
+| From | Entries | Open rotation | Signal window |
+|---|---|---|---|
+| `entry_block_at` | blocked (`corporate_action_block`) | held; mean-reversion and max-hold exits still fire | still accumulating |
+| `reduce_exit_at` | blocked | **forced unwind** (`corporate_action_exit`), stopping `corporate_action_settlement_margin_secs` before `effective_at` | still accumulating |
+| `effective_at` | blocked | **no exit of any kind** -- holds `corporate_action_unresolved`; operator reconciles | discarded **once**; nothing accumulates |
+| `resume_not_before` | blocked until the resume completes | must be flat | empty; warm-up gates the first new entry |
+
+Before `effective_at`, exits are never blocked by a window: a guard that could
+trap an open position through the event it exists to protect against would be
+worse than no guard. The forced exit in the reduce phase clears **every**
+ordinary gate -- quote freshness, venue, cost, token floor, gas, signing,
+reconciliation. If it cannot be quoted it holds (`route_unavailable`, etc.)
+and the position stays open; it never bypasses a gate and never pretends to
+have closed.
+
+It also stops early: exit dispatch is refused within
+`corporate_action_settlement_margin_secs` (300s by default) of
+`effective_at`, because submission is not execution -- an order sent just
+before the cutoff can still be mined after it, selling the pre-event
+quantity at the post-event denomination, and no in-process check covers the
+venue round trip. Size `reduce_exit_at` to leave room for that margin as
+well as for the venue not quoting -- `hash-config` refuses a window whose
+reduce phase begins inside the margin, since its forced unwind could never
+be submitted.
+
+**From `effective_at` the opposite holds: the runtime submits no exit at
+all** -- not the forced one, not max-hold, not mean-reversion. The venue is
+quoting the post-event instrument while `rotated_quantity` is still in
+pre-event units, so any exit sized from it is wrong in a direction that
+depends on the event: after a 4-for-1 split it sells one old unit as one new
+unit and marks the rotation flat with three split-adjusted units still held;
+after a reverse split it submits an unfillable oversized order every tick. A
+rotation still open at `effective_at` therefore holds
+`corporate_action_unresolved` and stays there. **Do not wait for an exit that
+will not come**; see "Reconciling an open rotation" below.
+
+### Completing the resume
+
+At `resume_not_before` the runtime resumes only when all three hold:
+
+1. **Flat.** A rotation still open at `effective_at` is not unwound by the
+   runtime (see above); it holds `corporate_action_unresolved` until the
+   operator has reconciled both the position and the runtime state.
+   `post_event_inventory` describes a wallet, and adopting it over an open
+   position would overwrite the holding `rotated_quantity` refers to.
+
+   **Reconciling an open rotation -- read this before declaring a window.**
+   There is currently **no supported way to return the tracked state to
+   flat** once a rotation is caught by `effective_at`. Editing
+   `regime`/`rotated_quantity` at the same sequence is rejected by
+   continuity verification (a position change with no ledger attempt), and
+   restoring a pre-rotation checkpoint leaves its sequence behind the
+   event-stream tail, which the next append -- and `reset-window` -- refuse.
+   The runtime stays on `corporate_action_unresolved`, trading nothing,
+   until bot-strategy#977 lands: an atomic `reconcile-position` command that
+   records the operator's manual close in the ledger, appends the stream
+   event, moves the runtime to flat in post-event units and lets the
+   ordinary resume run. Until then the hold is a wedge that needs that
+   command, and it is still the correct outcome -- the alternative is an
+   exit sized in the wrong units. The mitigation is upstream of it: set
+   `reduce_exit_at` with **real margin** before `effective_at` for the venue
+   not quoting (the forced exit retries every tick through that phase, and
+   stops `corporate_action_settlement_margin_secs` -- 300s by default --
+   before the cutoff, because a submitted swap can still be mined after it),
+   and
+   do not open a window with a rotation you cannot afford to have stuck. If
+   it happens anyway, close the position on the venue by hand, in post-event
+   units, keep the evidence, and wait for #977 rather than editing state.
+2. **Unchanged token identity.** Each affected symbol's contract address and
+   decimals are compared against what they were on the last observation
+   *before* the window opened. A mismatch holds on
+   `corporate_action_unresolved` -- a relisted ticker is a different
+   instrument and needs a new `pair`, i.e. a config change and
+   `reset-window`, not a resume. If the runtime never observed the pre-event
+   side (it was down, or the window was declared after the fact) there is
+   nothing to compare and it says so rather than inventing a comparison.
+   **With no pinned identity an open rotation is not unwound either**: the
+   ticker may already have been repointed, and an exit sized from
+   `rotated_quantity` would route the old instrument's quantity to whatever
+   the symbol now resolves to. Declaring a window a runtime never observed
+   the other side of therefore hands an open position to the operator
+   (bot-strategy#977) -- declare windows before `entry_block_at`. Only
+   an observation taken **strictly before** `entry_block_at` counts: a
+   calendar installed mid-window on a runtime that kept ticking holds an
+   identity from inside the event, and pinning that would compare the new
+   contract against itself.
+3. **`post_event_inventory` supplied, at or above `inventory_floors`.**
+   Otherwise it holds on `corporate_action_resume_pending` -- for a missing
+   holding, and equally for one below a floor. The floor comparison is made
+   **at the resume, not at install**: `hash-config` and deploy accept a
+   reconciliation under a floor (a completed event's historical holding must
+   not veto a later floor increase), and the runtime then declines to persist
+   it, naming both the holding and the floors in the hold. A reverse split or
+   partial redemption that shrinks a leg below its floor therefore needs the
+   floor lowered -- or the quantity corrected -- in a follow-up install; the
+   resume completes on the next tick after it. Watch the hold code after
+   installing a reconciliation rather than assuming the install validated it.
+
+On resume the reconciled holding replaces the tracked inventory **and both
+risk baskets are re-anchored to it**. They are buy-and-hold counterfactuals
+(see "What the loss stops measure"), so leaving them on a basket that no
+longer exists would report the corporate action itself as a rotation loss and
+engage the sticky stop on it -- bot-strategy#813's failure mode reached by a
+different road.
+
+Entries are then gated by the ordinary warm-up: the window was emptied at
+`effective_at`, so `min_signal_samples` fresh post-resume observations must
+accumulate first. There is no second counter that could disagree with it.
+
+### Operator runbook
+
+1. **Learn of the event** from an authoritative source -- the issuer's
+   notice, the exchange calendar, or the token issuer's announcement. Never
+   from a price move. Record the URL in `source`; the config is refused
+   without one.
+2. **Add the window** to `runtime.corporate_actions`, leaving
+   `post_event_inventory` unset. Windows must be ordered by `entry_block_at`
+   and must not overlap; two simultaneous events are declared as one window
+   naming both symbols.
+3. **Install it** the ordinary way (`hash-config` -> policy digest -> deploy
+   config -> restart). `corporate_actions` is **state-preserving**: no window
+   reset, the signal history and regime survive, and the runtime keeps
+   marking and risk-accounting throughout. `hash-config` echoes every
+   declared window to stderr -- check the list matches what you intended.
+4. **Watch the window open.** The hold code becomes `corporate_action_block`.
+   If a rotation is open, confirm it unwinds at `reduce_exit_at`
+   (`corporate_action_exit` in the ledger); if the venue cannot quote it,
+   that is the ordinary hold code and the position stays open. **The reduce
+   phase is the only time the runtime will exit** -- if it is still open
+   when `effective_at` arrives, the hold becomes
+   `corporate_action_unresolved` and the position is yours to reconcile
+   (step 1 under "Completing the resume"). Size `reduce_exit_at` with a
+   realistic margin for the venue not quoting.
+5. **After `effective_at`, read the wallet.** Use the same `eth_call
+   balanceOf` path the cut-over used (`chain.rpc_urls[0]`), for both tokens,
+   and put the raw human quantities in `post_event_inventory`.
+6. **Install again.** The next tick at or after `resume_not_before` adopts
+   the holding, re-anchors the baselines, records the `event_id` as handled,
+   and returns to warm-up. The event can stay in the config forever; it is
+   never applied twice.
+
+### state-verify-continuity across a window
+
+Both no-swap transitions a window makes -- the discard at `effective_at` and
+the resume -- are recognised by `state-verify-continuity`, so a backup taken
+on either side of one still verifies. They are not exemptions: the checker
+re-derives the transition from the **approved config** and requires the
+checkpoint to have landed on exactly what it implies. A resume must name an
+event the config declares, with a `post_event_inventory`; the tracked
+inventory and both risk baskets must equal that holding; the regime must be
+flat; and the cumulative, daily and last equity marks must all be that
+holding priced at the tick's own reference marks. A discard must have
+actually emptied the window. Anything else is still a continuity violation.
+
+If the token was relisted at a different contract, stop: that is a new
+instrument. Change `pair` and use `reset-window` (see below) rather than
+trying to resume the old window onto it.
 
 ## Changing `runtime:` under a live checkpoint
 
@@ -501,7 +693,8 @@ direction (held token -> other token) quoted at **exactly the tracked open
 rotation quantity** in raw units (`ArcusSpotRecorderConfig::
 fixed_sell_amount_rows`, `ArcusSpotRoundTripRecord::fixed_sell_amount`).
 `step_at` selects that row by exact raw amount and executes its forward
-leg, so a `mean_reversion_exit`/`max_hold_exit` plan always sells the
+leg, so a `mean_reversion_exit`/`max_hold_exit`/`corporate_action_exit`
+plan always sells the
 whole open quantity and the regime returns to `neutral` on fill. The
 row's chained reverse leg only supplies the informational round-trip cost
 figure; as with every exit, only the leg actually executed is checked for

@@ -265,10 +265,18 @@ where
         &self.ledger
     }
 
+    /// `submit_guard` is evaluated with the wall clock immediately before
+    /// the signed submission goes out -- after the fresh quote, the chain
+    /// preflight and the KMS signing have all been awaited. A check run
+    /// before those awaits can be true when it runs and false by the time
+    /// the order is sent; the corporate-action cutoff is exactly such a
+    /// check (Codex P1 x2, pairtrade#309). On `Err` the prepared attempt is
+    /// cancelled the same way an expired plan is, and nothing is submitted.
     pub async fn execute_plan_once(
         &mut self,
         plan: &ArcusSpotRotationPlan,
         plan_config_digest: &str,
+        submit_guard: &(dyn Fn(DateTime<Utc>) -> std::result::Result<(), String> + Send + Sync),
     ) -> Result<ArcusSpotExecutionAttempt> {
         if plan_config_digest.trim().is_empty() {
             bail!("Arcus execute_plan_once requires a non-empty plan_config_digest");
@@ -441,6 +449,14 @@ where
                 .persist(&self.ledger)
                 .context("failed to persist Arcus prepared-attempt cancellation")?;
             return Err(error).context("Arcus strategy plan expired before dispatch");
+        }
+        if let Err(reason) = submit_guard(Utc::now()) {
+            self.ledger
+                .cancel_prepared(format!("refused at the submit seam: {reason}"), Utc::now())?;
+            self.store
+                .persist(&self.ledger)
+                .context("failed to persist Arcus prepared-attempt cancellation")?;
+            bail!("Arcus strategy plan refused immediately before submission: {reason}");
         }
         self.ledger.mark_dispatching(Utc::now())?;
         self.store

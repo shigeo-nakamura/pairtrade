@@ -11,19 +11,23 @@ use aes_gcm::{
 use anyhow::{bail, Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::{DateTime, NaiveDate, Utc};
+use debot::arcus_spot::corporate_action_effective_cutoff;
 #[cfg(test)]
 use debot::arcus_spot::event_record;
+use debot::arcus_spot::resolve_handled_corporate_action_fingerprints;
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, is_supported_live_route,
     manual_reconciled_runtime_fill_for_attempt, open_exit_fixed_sell_amount_row_for,
     verify_archive_events, verify_record, ArcusSpotChainClient, ArcusSpotChainConfig,
-    ArcusSpotDecision, ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
+    ArcusSpotCorporateActionEvent, ArcusSpotCorporateActionProgress, ArcusSpotDecision,
+    ArcusSpotDirection, ArcusSpotExecutionAttempt, ArcusSpotExecutionLedger,
     ArcusSpotExecutionLedgerStore, ArcusSpotExecutionPhase, ArcusSpotInventory, ArcusSpotKmsConfig,
     ArcusSpotKmsSigner, ArcusSpotLiveExecutor, ArcusSpotLiveExecutorConfig,
     ArcusSpotLiveTickEventPublisher, ArcusSpotLiveTickEventRecord, ArcusSpotLiveTickEventStream,
     ArcusSpotQuoteUnavailable, ArcusSpotRegime, ArcusSpotRiskHaltKind, ArcusSpotRotationPlan,
     ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotTokenIdentity,
 };
 #[cfg(test)]
 use debot::arcus_spot::{
@@ -232,9 +236,10 @@ fn require_config_within_auto_execute_policy(
 /// `live-tick` does not go through this path: it builds its own plan from
 /// `step_at` under the checkpoint lock immediately before dispatch, so that
 /// provenance is inherent rather than merely asserted. A `MeanReversionExit`/
-/// `MaxHoldExit` plan supplied here is still risk-reducing and already
-/// bounded by `validate_plan_consistent_with_state` (cannot exceed the
-/// genuinely open rotated quantity), so only entries are refused.
+/// `MaxHoldExit`/`CorporateActionExit` plan supplied here is still
+/// risk-reducing and already bounded by `validate_plan_consistent_with_state`
+/// (cannot exceed the genuinely open rotated quantity), so only entries are
+/// refused.
 fn require_auto_execute_plan_is_not_a_fresh_entry(plan: &ArcusSpotRotationPlan) -> Result<()> {
     if plan.trigger == ArcusSpotRotationTrigger::EntrySignal {
         bail!(
@@ -2196,10 +2201,54 @@ fn commit_runtime_window_reset(config: &ArcusSpotExecuteOnceConfig) -> Result<se
         );
     }
 
+    // The handled corporate-action record outlives the window: the
+    // completed declarations may still be in the config, and a fresh state
+    // that had forgotten them would treat each as unhandled on the next
+    // tick and resume it again -- clearing the new window and replacing the
+    // newly declared initial_inventory with the old post_event_inventory
+    // (Codex P1, pairtrade#309).
+    // An open corporate-action window is state this reset would silently
+    // discard: the fresh runtime has no progress record, so the next tick
+    // trades without the fail-closed guard while the inventory may still be
+    // in pre-event units. Refused -- unless the change *is* the instrument
+    // being replaced (`pair`), which is the documented recovery for a
+    // relisted ticker and makes the old window moot (Codex P1, pairtrade#309).
+    if let Some(event_id) = &previous.corporate_action_event_id {
+        // "The instrument is being replaced" means the affected symbol is
+        // gone from the new pair -- not merely that `pair` changed. Swapping
+        // the legs, or changing only the other leg, keeps the affected token
+        // and its unreconciled pre-event inventory in play (Codex P1,
+        // pairtrade#309). A record that predates `symbols` cannot say what
+        // it is about and is refused too.
+        let new_pair = [
+            config.runtime.pair.sell_symbol.as_str(),
+            config.runtime.pair.buy_symbol.as_str(),
+        ];
+        let affected_still_traded = previous.corporate_action_symbols.is_empty()
+            || previous
+                .corporate_action_symbols
+                .iter()
+                .any(|symbol| new_pair.iter().any(|leg| leg.eq_ignore_ascii_case(symbol)));
+        if !changed.contains(&"pair") || affected_still_traded {
+            bail!(
+                "Arcus runtime checkpoint is inside corporate action {event_id}'s window \
+                 (symbols {:?}); a reset would discard that progress and the next tick would \
+                 trade without the guard. Resolve the window first (restore its declaration \
+                 and let it resume, or reconcile per the runbook), or replace the affected \
+                 instrument with a `pair` that no longer names it",
+                previous.corporate_action_symbols,
+            );
+        }
+    }
     let runtime =
         ArcusSpotRuntime::new_continuing_event_sequence(config.runtime.clone(), tail_sequence)
             .map_err(anyhow::Error::msg)
-            .context("the configuration being reset to is itself invalid")?;
+            .context("the configuration being reset to is itself invalid")?
+            .with_handled_corporate_actions(
+                previous.handled_corporate_action_ids.clone(),
+                previous.handled_corporate_action_fingerprints.clone(),
+                previous.last_observation_at,
+            );
 
     // The evidence sidecar describes the state being discarded, so it is
     // retired before the checkpoint is replaced: the reverse order could
@@ -2605,6 +2654,179 @@ fn positive_loss_from_mark(reference: Option<Decimal>, equity: Option<Decimal>) 
     }
 }
 
+/// The single equity number a corporate-action resume writes to all three
+/// marks, re-derived from the reconciled holding and this tick's reference
+/// prices. Requiring the marks to *be* it is what keeps the resume from
+/// being an exemption: a checkpoint that moved them anywhere else fails.
+fn require_corporate_action_rebase_marks(
+    current: &ArcusSpotRuntimeState,
+    inventory: ArcusSpotInventory,
+) -> Result<Decimal> {
+    let (price_a, price_b) = current
+        .last_token_a_reference_price_usd
+        .zip(current.last_token_b_reference_price_usd)
+        .context("resumed without the reference marks it valued the holding at")?;
+    let equity = inventory
+        .checked_value_usd(price_a, price_b)
+        .context("reconciled holding valuation exceeds Decimal range")?;
+    if current.initial_equity_usd != Some(equity)
+        || current.daily_baseline_equity_usd != Some(equity)
+        || current.last_equity_usd != Some(equity)
+    {
+        bail!(
+            "cumulative, daily and last equity marks must all be the reconciled holding priced at \
+             this tick ({equity}); found {:?} / {:?} / {:?}",
+            current.initial_equity_usd,
+            current.daily_baseline_equity_usd,
+            current.last_equity_usd,
+        );
+    }
+    Ok(equity)
+}
+
+/// True when the checkpoint sits inside a declared corporate action's
+/// stale-unit phase: past its `effective_at`, resume not yet committed.
+///
+/// The runtime deliberately declines to engage a loss halt there -- the
+/// venue quotes the post-event instrument while the tracked inventory and
+/// its buy-and-hold basket are still in pre-event units, so the gap between
+/// them is priced in the wrong denomination and a reverse split multiplies
+/// an otherwise sub-limit shortfall (see `corporate_action_units_are_stale`
+/// in the runtime). This verifier re-derives that same loss, so without the
+/// matching exception it demands a halt the runtime was right not to engage
+/// and rejects every valid backup spanning such a tick.
+///
+/// The stamp alone is not enough to earn the exception: the progress record
+/// must name an event the *approved config* declares and that the runtime
+/// has not yet handled, so a checkpoint cannot mint the exemption for
+/// itself (bot-strategy#853).
+fn corporate_action_units_are_stale(
+    config: &ArcusSpotRuntimeConfig,
+    current: &ArcusSpotRuntimeState,
+) -> bool {
+    // A distinct later action reusing a handled id never gets a progress
+    // record, yet the runtime treats its units as stale from its cutoff and
+    // declines to engage a halt there. Without the same case here, a valid
+    // checkpoint from that phase is rejected for "omitting" the halt (Codex
+    // P2, pairtrade#309).
+    // Judged on the price clock, like the progress-record path: on the tick
+    // that first crosses the cutoff the runtime may have engaged a genuine
+    // halt from pre-cutoff prices, and classifying the units stale from the
+    // later observation watermark would let that halt be removed and still
+    // verify (Codex P1, pairtrade#309). A checkpoint predating the field
+    // keeps the observation watermark.
+    let priced_at = current
+        .last_reference_price_at
+        .or(current.last_observation_at);
+    if let Some(priced_at) = priced_at {
+        let reused_and_effective = config.corporate_actions.iter().any(|event| {
+            priced_at >= event.effective_at
+                && current
+                    .handled_corporate_action_ids
+                    .iter()
+                    .position(|handled| handled.eq_ignore_ascii_case(&event.event_id))
+                    // An empty or missing slot is an unresolved legacy
+                    // record, which the runtime classifies as a reused label
+                    // -- so it must read the same way here (Codex P2,
+                    // pairtrade#309).
+                    .is_some_and(|index| {
+                        current
+                            .handled_corporate_action_fingerprints
+                            .get(index)
+                            .is_none_or(|recorded| *recorded != event.fingerprint())
+                    })
+        });
+        if reused_and_effective {
+            return true;
+        }
+    }
+    let Some(progress) = current.corporate_action.as_ref() else {
+        return false;
+    };
+    // Identity drift makes the mark mixed-unit even before the cutoff -- old
+    // quantity, replacement's price -- and the runtime declines to halt on
+    // it, so a checkpoint from that tick must not be required to carry one
+    // (Codex P1, pairtrade#309).
+    let declared = config
+        .corporate_actions
+        .iter()
+        .find(|event| {
+            (!progress.fingerprint.is_empty() && progress.fingerprint == event.fingerprint())
+                || event.event_id.eq_ignore_ascii_case(&progress.event_id)
+        })
+        .cloned();
+    if let Some(event) = declared.as_ref() {
+        let drifted = event.symbols.iter().any(|symbol| {
+            let (pinned, observed) = if symbol.eq_ignore_ascii_case(&config.pair.sell_symbol) {
+                (
+                    progress.pre_event_token_a.as_ref(),
+                    current.last_token_a_identity.as_ref(),
+                )
+            } else {
+                (
+                    progress.pre_event_token_b.as_ref(),
+                    current.last_token_b_identity.as_ref(),
+                )
+            };
+            match (pinned, observed) {
+                // The runtime's rule: address case-insensitive, decimals
+                // exact, symbol irrelevant. A derived `!=` disagreed with it
+                // on checksum casing (verifier says drift, runtime halts)
+                // and on a missing pin (runtime suppresses, verifier demanded
+                // a halt) -- both let a rollback drop a genuine sticky halt
+                // (Codex P1, pairtrade#309).
+                (Some(pinned), Some(observed)) => !pinned.same_contract(observed),
+                // No pin: the runtime cannot verify the mark and does not
+                // engage, so neither may this demand one.
+                (None, _) => true,
+                (Some(_), None) => false,
+            }
+        });
+        if drifted {
+            return true;
+        }
+    }
+    let Some(stamped_at) = progress.history_invalidated_at else {
+        return false;
+    };
+    // The stamp is written with the evaluation clock, but the runtime
+    // decides halt suppression from the *price* clock -- so on the tick that
+    // first crosses the cutoff a genuine halt may have engaged from
+    // pre-cutoff prices. Granting the exemption on the stamp alone would let
+    // that halt be removed and still verify. Re-derive the decision from the
+    // clock the runtime actually used (Codex P1, pairtrade#309); a
+    // checkpoint predating the field cannot say, and keeps the old
+    // stamp-only reading.
+    if let Some(priced_at) = current.last_reference_price_at {
+        // Shared with the runtime's own stale-unit predicate: an amendment
+        // that moved the cutoff earlier is the one that counts, and the two
+        // must not disagree about a window that has been amended (Codex P1,
+        // pairtrade#309).
+        let cutoff = corporate_action_effective_cutoff(progress, config);
+        if cutoff.is_some_and(|cutoff| priced_at < cutoff) {
+            return false;
+        }
+    }
+    if current
+        .handled_corporate_action_ids
+        .iter()
+        .any(|handled| handled.eq_ignore_ascii_case(&progress.event_id))
+    {
+        return false;
+    }
+    // Declared, or an orphaned record that carries its own cutoff and was
+    // stamped at or after it -- the runtime stamps those itself when the
+    // declaration is gone (Codex P1, pairtrade#309). A stamp with neither
+    // is not something the runtime writes.
+    config
+        .corporate_actions
+        .iter()
+        .any(|event| event.event_id.eq_ignore_ascii_case(&progress.event_id))
+        || progress
+            .effective_at
+            .is_some_and(|effective_at| stamped_at >= effective_at)
+}
+
 fn require_risk_state_continuity(
     config: &ArcusSpotRuntimeConfig,
     baseline: &ArcusSpotRuntimeState,
@@ -2612,9 +2834,24 @@ fn require_risk_state_continuity(
     sequence_advance: u64,
     acceptance_not_before: DateTime<Utc>,
     acceptance_not_after: DateTime<Utc>,
+    corporate_action: &ArcusSpotCorporateActionContinuity,
 ) -> Result<()> {
+    // A resume re-anchors both risk baskets and the cumulative baseline onto
+    // the reconciled holding, because they are buy-and-hold counterfactuals
+    // and the old basket no longer exists (bot-strategy#813/#853). The three
+    // equity marks it writes are all the same number -- that holding priced
+    // at this tick's reference marks -- so rather than exempting the fields,
+    // this re-derives the number and requires them to be it.
+    let rebased_equity = match corporate_action.resumed_inventory {
+        Some(inventory) => Some(
+            require_corporate_action_rebase_marks(current, inventory)
+                .context("Arcus corporate-action resume marks are inconsistent")?,
+        ),
+        None => None,
+    };
     let baseline_daily = daily_risk_baseline(baseline, "backup")?;
-    if baseline.initial_equity_usd.is_some()
+    if rebased_equity.is_none()
+        && baseline.initial_equity_usd.is_some()
         && current.initial_equity_usd != baseline.initial_equity_usd
     {
         bail!("Arcus runtime cumulative equity baseline changed across restart/rollback");
@@ -2657,7 +2894,7 @@ fn require_risk_state_continuity(
         }
         (Some((baseline_day, baseline_equity)), Some((current_day, current_equity))) => {
             if current_day == baseline_day {
-                if current_equity != baseline_equity {
+                if current_equity != baseline_equity && rebased_equity != Some(current_equity) {
                     bail!("Arcus runtime daily equity baseline changed without a UTC rollover");
                 }
             } else {
@@ -2730,7 +2967,16 @@ fn require_risk_state_continuity(
                 bail!("Arcus runtime engaged an unexpected risk halt across restart/rollback")
             }
             (Some(_), None) => {
-                bail!("Arcus runtime omitted a newly triggered loss halt across restart/rollback")
+                // The one phase in which the runtime is *supposed* to omit
+                // it. Scoped to that phase only: an unexpected halt is
+                // still rejected above, and once the resume commits the
+                // baskets are re-anchored and the ordinary expectation
+                // applies again (Codex P1, pairtrade#309).
+                if !corporate_action_units_are_stale(config, current) {
+                    bail!(
+                        "Arcus runtime omitted a newly triggered loss halt across restart/rollback"
+                    )
+                }
             }
             (Some((kind, loss, limit)), Some(halt)) => {
                 let current_day = current_daily
@@ -3332,6 +3578,7 @@ fn require_acceptance_ledger_and_position_continuity(
     runtime_sequence_advance: u64,
     acceptance_not_before: DateTime<Utc>,
     acceptance_not_after: DateTime<Utc>,
+    corporate_action: &ArcusSpotCorporateActionContinuity,
 ) -> Result<()> {
     let baseline_runtime = baseline.runtime.state();
     let current_runtime = current.runtime.state();
@@ -3392,8 +3639,31 @@ fn require_acceptance_ledger_and_position_continuity(
                     bail!("Arcus no-swap runtime state does not match its recorder evidence");
                 }
             }
-            if !position_state_matches(baseline_runtime, current_runtime) {
-                bail!("Arcus position state changed without a reconciled acceptance attempt");
+            // A corporate-action resume moves inventory with no swap and no
+            // ledger attempt -- that is the whole point of it -- so the one
+            // transition the approved config declares is compared against
+            // the reconciled holding instead of against the backup. The
+            // replay directly above has already reproduced this same state
+            // from the recorder evidence; this keeps the independent check
+            // meaningful rather than skipping it (bot-strategy#853).
+            match corporate_action.resumed_inventory {
+                Some(inventory) => {
+                    let mut expected = baseline_runtime.clone();
+                    expected.inventory = inventory;
+                    if !position_state_matches(&expected, current_runtime) {
+                        bail!(
+                            "Arcus position state changed beyond the declared corporate-action \
+                             resume"
+                        );
+                    }
+                }
+                None => {
+                    if !position_state_matches(baseline_runtime, current_runtime) {
+                        bail!(
+                            "Arcus position state changed without a reconciled acceptance attempt"
+                        );
+                    }
+                }
             }
         }
         1 => {
@@ -3524,7 +3794,7 @@ fn require_acceptance_ledger_and_position_continuity(
             let (actual_sell_quantity, actual_buy_quantity, filled_at) =
                 reconciled_fill_for_continuity(config, &plan, attempt, evidence.evaluation_time)?;
             replayed_runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, evidence.evaluation_time)
                 .map_err(anyhow::Error::msg)
                 .context("Arcus acceptance plan is inconsistent with the backup position")?;
             let applied = replayed_runtime
@@ -3547,11 +3817,387 @@ fn require_acceptance_ledger_and_position_continuity(
     Ok(())
 }
 
+/// A corporate-action transition (bot-strategy#853) that the approved config
+/// itself authorizes, for the continuity checks below.
+///
+/// A resume and the history discard that precedes it both change state with
+/// no ledger attempt and no swap: inventory, both risk baskets, the
+/// cumulative equity baseline and the whole signal window move on an
+/// ordinary observation tick. Every one of those is, correctly, a violation
+/// for any *other* reason, so rather than loosening the rules this derives
+/// the one transition the config declares and hands the checks its exact
+/// shape. Nothing here trusts the current checkpoint's say-so: the event has
+/// to be declared, with a reconciled holding, and every field the resume
+/// touches has to have landed on the value that holding implies.
+#[derive(Debug, Clone, Default)]
+struct ArcusSpotCorporateActionContinuity {
+    /// The pre-event signal window was discarded at a declared
+    /// `effective_at`, or by the resume that followed it.
+    history_discarded: bool,
+    /// The runtime resumed onto the operator's reconciled holding.
+    resumed_inventory: Option<ArcusSpotInventory>,
+}
+
+fn corporate_action_continuity(
+    config: &ArcusSpotRuntimeConfig,
+    baseline: &ArcusSpotRuntimeState,
+    current: &ArcusSpotRuntimeState,
+    sequence_advance: u64,
+    verified_at: DateTime<Utc>,
+) -> Result<ArcusSpotCorporateActionContinuity> {
+    let mut authorized = ArcusSpotCorporateActionContinuity::default();
+
+    // A legacy record is resolved once, at load, from the observation
+    // watermark. A backup taken before that resolution and the state after
+    // it therefore differ in slots neither side changed deliberately, so the
+    // append-only prefix -- and only that comparison -- is made on copies
+    // resolved with the *baseline's* watermark: the same information, one
+    // answer. Every other check below still reads what the runtime actually
+    // wrote (Codex P1, pairtrade#309).
+    let (resolved_baseline, resolved_current) = {
+        let mut resolved_baseline = baseline.clone();
+        let mut resolved_current = current.clone();
+        let watermark = baseline.last_observation_at;
+        resolve_handled_corporate_action_fingerprints(&mut resolved_baseline, config, watermark);
+        resolve_handled_corporate_action_fingerprints(&mut resolved_current, config, watermark);
+        (resolved_baseline, resolved_current)
+    };
+
+    if current.handled_corporate_action_ids.len() < baseline.handled_corporate_action_ids.len()
+        || current.handled_corporate_action_ids[..baseline.handled_corporate_action_ids.len()]
+            != baseline.handled_corporate_action_ids[..]
+    {
+        bail!(
+            "Arcus runtime lost or reordered its handled corporate actions across restart/rollback"
+        );
+    }
+    // The fingerprints are the identity half of the same record and are
+    // append-only in exactly the same way: dropping one would let a renamed
+    // entry be applied again after a restore (Codex P1, pairtrade#309).
+    let fingerprints_before = baseline.handled_corporate_action_fingerprints.len();
+    // Resolution is a first-load event. Once the backup says it happened,
+    // the raw slots are what must match: comparing resolved copies would
+    // otherwise let a candidate blank a slot, claim the marker, and look
+    // identical -- after which `from_state` skips the backfill and the
+    // declaration silently becomes a reused id (Codex P1, pairtrade#309).
+    let (compare_baseline, compare_current) = if baseline.handled_corporate_actions_resolved {
+        (baseline, current)
+    } else {
+        (&resolved_baseline, &resolved_current)
+    };
+    if compare_current.handled_corporate_action_fingerprints.len()
+        < compare_baseline.handled_corporate_action_fingerprints.len()
+        || compare_current.handled_corporate_action_fingerprints
+            [..compare_baseline.handled_corporate_action_fingerprints.len()]
+            != compare_baseline.handled_corporate_action_fingerprints[..]
+    {
+        bail!(
+            "Arcus runtime lost or reordered its handled corporate-action fingerprints across \
+             restart/rollback"
+        );
+    }
+    // Raw slicing below: a checkpoint whose fingerprint vector is shorter
+    // than its id vector is exactly the adversarially-shaped state this
+    // function exists to reject, so say so rather than panicking on the
+    // index (independent review, pairtrade#309).
+    if current.handled_corporate_action_fingerprints.len() < fingerprints_before
+        || current.handled_corporate_action_fingerprints.len()
+            != current.handled_corporate_action_ids.len()
+    {
+        bail!(
+            "Arcus runtime lost or reordered its handled corporate-action fingerprints across \
+             restart/rollback"
+        );
+    }
+    let resumed =
+        &current.handled_corporate_action_ids[baseline.handled_corporate_action_ids.len()..];
+    let resumed_fingerprints =
+        &current.handled_corporate_action_fingerprints[fingerprints_before..];
+    match resumed {
+        [] => {
+            if !resumed_fingerprints.is_empty() {
+                bail!("Arcus runtime recorded a corporate-action fingerprint without a resume");
+            }
+        }
+        [event_id] => {
+            if sequence_advance != 1 {
+                bail!("Arcus corporate action {event_id} resumed without a single new observation");
+            }
+            // By id, or by the fingerprint recorded beside it: a completed
+            // entry the operator renamed afterwards is the same event, which
+            // is the whole point of the fingerprint (Codex P2,
+            // pairtrade#309).
+            // The appended fingerprint is the *last* of the newly added
+            // entries: a legacy record (ids with no fingerprints) is padded
+            // with empty strings first, so `first()` would read padding
+            // (Codex P2, pairtrade#309).
+            let resumed_fingerprint = resumed_fingerprints.last().filter(|it| !it.is_empty());
+            let event = config
+                .corporate_actions
+                .iter()
+                .find(|event| {
+                    event.event_id.eq_ignore_ascii_case(event_id)
+                        || resumed_fingerprint
+                            .is_some_and(|recorded| *recorded == event.fingerprint())
+                })
+                .with_context(|| {
+                    format!("Arcus runtime resumed corporate action {event_id}, which the approved config does not declare")
+                })?;
+            let inventory = event.post_event_inventory.with_context(|| {
+                format!("Arcus corporate action {event_id} resumed without a reconciled post_event_inventory")
+            })?;
+            if current.inventory != inventory
+                || current.initial_baseline_inventory != Some(inventory)
+                || current.daily_baseline_inventory != Some(inventory)
+            {
+                bail!("Arcus corporate action {event_id} did not land on its reconciled holding");
+            }
+            if current.regime != ArcusSpotRegime::Neutral
+                || current.rotated_quantity.is_some()
+                || current.last_rotation_at.is_some()
+            {
+                bail!("Arcus corporate action {event_id} resumed with a rotation still open");
+            }
+            if current.corporate_action.is_some() {
+                bail!("Arcus corporate action {event_id} resumed without clearing its progress");
+            }
+            // The pair is appended in step. A legacy record (ids without
+            // fingerprints) is padded with empty entries first so the new
+            // fingerprint lands beside its own id, never beside an older one
+            // (Codex P1, pairtrade#309).
+            let ids = current.handled_corporate_action_ids.len();
+            let fingerprints = &current.handled_corporate_action_fingerprints;
+            let aligned = fingerprints.len() == ids
+                && fingerprints[fingerprints_before..ids - 1]
+                    .iter()
+                    .all(String::is_empty)
+                && fingerprints[ids - 1] == event.fingerprint();
+            if !aligned {
+                bail!(
+                    "Arcus corporate action {event_id} resumed without recording the fingerprint \
+                     of the declared event beside its id"
+                );
+            }
+            authorized.resumed_inventory = Some(inventory);
+            authorized.history_discarded = true;
+        }
+        _ => bail!("Arcus runtime resumed more than one corporate action in a single observation"),
+    }
+
+    // The progress record itself may only change the way an observation
+    // changes it. Anything else -- above all a pinned pre-event identity
+    // replaced with the post-event one, which makes the runtime's drift
+    // check compare the replacement contract to itself -- is an edit, not a
+    // transition (Codex P1, pairtrade#309).
+    require_corporate_action_progress_transition(
+        config,
+        baseline,
+        current,
+        sequence_advance,
+        !resumed.is_empty(),
+        verified_at,
+    )?;
+
+    // The discard is its own tick, at `effective_at`, and leaves the window
+    // empty with the progress record stamped. `resumed` above covers the
+    // degenerate case where one tick does both.
+    let baseline_invalidated = baseline
+        .corporate_action
+        .as_ref()
+        .and_then(|progress| progress.history_invalidated_at);
+    if let Some(progress) = &current.corporate_action {
+        if progress.history_invalidated_at.is_some() && baseline_invalidated.is_none() {
+            if sequence_advance != 1 {
+                bail!(
+                    "Arcus corporate action {} discarded its signal window without a new observation",
+                    progress.event_id
+                );
+            }
+            if !current.relative_log_price_history.is_empty() {
+                bail!(
+                    "Arcus corporate action {} stamped a discard it did not perform",
+                    progress.event_id
+                );
+            }
+            authorized.history_discarded = true;
+        }
+    }
+
+    Ok(authorized)
+}
+
+fn require_corporate_action_progress_transition(
+    config: &ArcusSpotRuntimeConfig,
+    baseline: &ArcusSpotRuntimeState,
+    current: &ArcusSpotRuntimeState,
+    sequence_advance: u64,
+    resumed: bool,
+    verified_at: DateTime<Utc>,
+) -> Result<()> {
+    if sequence_advance == 0 {
+        if current.corporate_action != baseline.corporate_action {
+            bail!("Arcus corporate-action progress changed without a new observation");
+        }
+        // The cached identities are what a window opening copies into its
+        // pre-event pins, so a forged cache would let a relisting compare
+        // the replacement contract against itself and resume. Nothing else
+        // compares them (Codex P1, pairtrade#309).
+        if current.last_token_a_identity != baseline.last_token_a_identity
+            || current.last_token_b_identity != baseline.last_token_b_identity
+            || current.last_token_identity_at != baseline.last_token_identity_at
+        {
+            bail!("Arcus cached token identities changed without a new observation");
+        }
+        // The price clock decides the stale-unit exemption, so it is
+        // forgeable evidence and gets the same treatment.
+        if current.last_reference_price_at != baseline.last_reference_price_at {
+            bail!("Arcus reference-price timestamp changed without a new observation");
+        }
+        // Resolution may run at load without advancing the sequence, so the
+        // marker is allowed to go false -> true; the reverse, and any change
+        // to an already-resolved record, is not.
+        if baseline.handled_corporate_actions_resolved
+            && (!current.handled_corporate_actions_resolved
+                || current.handled_corporate_action_fingerprints
+                    != baseline.handled_corporate_action_fingerprints)
+        {
+            bail!("Arcus handled corporate-action resolution changed without a new observation");
+        }
+        return Ok(());
+    }
+    // A discard stamp may only sit at or after the cutoff it claims to mark
+    // and no later than the observation that produced it. Applied wherever a
+    // stamp can appear -- a window opening already stamped counts (Codex P1,
+    // pairtrade#309).
+    let stamp_within_bounds = |progress: &ArcusSpotCorporateActionProgress,
+                               stamped_at: DateTime<Utc>| {
+        // Shared with the runtime's own stale-unit predicate: an amendment
+        // that moved the cutoff earlier is the one that counts, and the two
+        // must not disagree about a window that has been amended (Codex P1,
+        // pairtrade#309).
+        let cutoff = corporate_action_effective_cutoff(progress, config);
+        // Lower bound: the cutoff it claims to mark. Upper bound: the clock
+        // this verification runs at -- *not* `last_observation_at`. The
+        // runtime stamps with `evaluation_time`, which `live-tick` takes
+        // with `Utc::now()` after fetching the snapshot, so the stamp is
+        // normally later than the observation watermark and bounding it
+        // there rejected every genuine discard (Codex P1, pairtrade#309).
+        cutoff.is_some_and(|cutoff| stamped_at >= cutoff) && stamped_at <= verified_at
+    };
+    match (&baseline.corporate_action, &current.corporate_action) {
+        (None, None) => {}
+        (Some(_), None) => {
+            if !resumed {
+                bail!("Arcus corporate-action progress was cleared without a resume");
+            }
+        }
+        (None, Some(opened)) => {
+            // A window opened on this observation. Its declaration must be
+            // in the approved config, its cutoff copied from it, and its
+            // pins must be exactly what the runtime had observed *before*
+            // `entry_block_at` -- or absent when nothing had been.
+            let event = config
+                .corporate_actions
+                .iter()
+                .find(|event| {
+                    (!opened.fingerprint.is_empty() && opened.fingerprint == event.fingerprint())
+                        || event.event_id.eq_ignore_ascii_case(&opened.event_id)
+                })
+                .with_context(|| {
+                    format!(
+                        "Arcus corporate action {} opened a window the approved config does not declare",
+                        opened.event_id
+                    )
+                })?;
+            if opened.effective_at != Some(event.effective_at)
+                || opened.symbols != event.symbols
+                || opened.fingerprint != event.fingerprint()
+            {
+                bail!(
+                    "Arcus corporate action {} opened with a record that does not match its declaration",
+                    opened.event_id
+                );
+            }
+            let pre_event_observed = baseline
+                .last_token_identity_at
+                .is_some_and(|observed_at| observed_at < event.entry_block_at);
+            let (expected_a, expected_b) = if pre_event_observed {
+                (
+                    baseline.last_token_a_identity.clone(),
+                    baseline.last_token_b_identity.clone(),
+                )
+            } else {
+                (None, None)
+            };
+            if opened.pre_event_token_a != expected_a || opened.pre_event_token_b != expected_b {
+                bail!(
+                    "Arcus corporate action {} pinned a pre-event identity the backup never observed",
+                    opened.event_id
+                );
+            }
+            // The runtime only writes this record once the evaluation clock
+            // reaches `entry_block_at`, so a record opened earlier is not a
+            // transition -- and restoring one makes pre-window ticks treat
+            // it as unresolved progress, blocking entries and suppressing
+            // history before the window exists (Codex P2, pairtrade#309).
+            if opened.blocked_at < event.entry_block_at || opened.blocked_at > verified_at {
+                bail!(
+                    "Arcus corporate action {} opened at {}, outside its declared window",
+                    opened.event_id,
+                    opened.blocked_at
+                );
+            }
+            if let Some(stamped_at) = opened.history_invalidated_at {
+                if !stamp_within_bounds(opened, stamped_at) {
+                    bail!(
+                        "Arcus corporate action {} opened with a discard stamp no observation \
+                         produces",
+                        opened.event_id
+                    );
+                }
+            }
+        }
+        (Some(before), Some(after)) => {
+            let same_event = after.fingerprint == before.fingerprint
+                || (before.fingerprint.is_empty()
+                    && after.event_id.eq_ignore_ascii_case(&before.event_id));
+            // A stamp may appear, but only at or after the cutoff it claims
+            // to mark and no later than the observation that produced it.
+            // Otherwise a modified checkpoint could discard its window early
+            // and -- because the stamp is what makes the units read as stale
+            // -- suppress exits before the declared cutoff (Codex P1,
+            // pairtrade#309).
+            let stamp_ok = match (before.history_invalidated_at, after.history_invalidated_at) {
+                (Some(was), Some(now)) => was == now,
+                (None, None) => true,
+                (Some(_), None) => false,
+                (None, Some(stamped_at)) => stamp_within_bounds(after, stamped_at),
+            };
+            if !same_event
+                || !stamp_ok
+                || after.blocked_at != before.blocked_at
+                || after.pre_event_token_a != before.pre_event_token_a
+                || after.pre_event_token_b != before.pre_event_token_b
+                || after.effective_at != before.effective_at
+                || after.symbols != before.symbols
+                || (after.event_id != before.event_id && before.fingerprint.is_empty())
+            {
+                bail!(
+                    "Arcus corporate action {} progress changed in a way no observation produces",
+                    before.event_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn require_signal_history_continuity(
     baseline: &[f64],
     current: &[f64],
     sequence_advance: u64,
     signal_window_samples: usize,
+    corporate_action: &ArcusSpotCorporateActionContinuity,
 ) -> Result<()> {
     if baseline.len() > signal_window_samples || current.len() > signal_window_samples {
         bail!("Arcus runtime signal history exceeds the configured window");
@@ -3570,6 +4216,26 @@ fn require_signal_history_continuity(
             // exactly its oldest value.
             if current == baseline {
                 return Ok(());
+            }
+            // A declared `effective_at` discards the window outright and
+            // accumulates nothing until the resume, so an empty history is
+            // the expected shape on exactly that tick -- and only when
+            // `corporate_action_continuity` proved the config declares it
+            // (bot-strategy#853).
+            if corporate_action.history_discarded {
+                if current.is_empty() {
+                    return Ok(());
+                }
+                // The degenerate one-tick path: no tick ran between
+                // `effective_at` and `resume_not_before`, so the same
+                // observation discards the pre-event window *and* resumes.
+                // The resume clears the gate, so that tick's own post-event
+                // sample is appended to the emptied window and the shape is
+                // one fresh value -- unrelated to the discarded baseline,
+                // which is why the ordinary `starts_with` rule cannot see it.
+                if corporate_action.resumed_inventory.is_some() && current.len() == 1 {
+                    return Ok(());
+                }
             }
             let expected_len = baseline.len().saturating_add(1).min(signal_window_samples);
             let dropped = baseline
@@ -3601,11 +4267,23 @@ fn require_arcus_state_continuity(
         .sequence
         .checked_sub(baseline_runtime.sequence)
         .context("Arcus runtime sequence regressed across restart/rollback")?;
+    // Derived once, before anything relaxes: an unexplained move in any of
+    // these fields is still a violation, and this is what separates the
+    // transition the approved config declares from one that merely looks
+    // like it (bot-strategy#853).
+    let corporate_action = corporate_action_continuity(
+        &config.runtime,
+        baseline_runtime,
+        current_runtime,
+        sequence_advance,
+        acceptance_not_after,
+    )?;
     require_signal_history_continuity(
         &baseline_runtime.relative_log_price_history,
         &current_runtime.relative_log_price_history,
         sequence_advance,
         config.runtime.signal_window_samples,
+        &corporate_action,
     )?;
     require_risk_state_continuity(
         &config.runtime,
@@ -3614,6 +4292,7 @@ fn require_arcus_state_continuity(
         sequence_advance,
         acceptance_not_before,
         acceptance_not_after,
+        &corporate_action,
     )?;
     if sequence_advance == 1
         && current_runtime.last_observation_at != baseline_runtime.last_observation_at
@@ -3647,6 +4326,7 @@ fn require_arcus_state_continuity(
         sequence_advance,
         acceptance_not_before,
         acceptance_not_after,
+        &corporate_action,
     )
 }
 
@@ -4445,6 +5125,41 @@ async fn main() -> Result<()> {
                     .context("cost buffers exceed Decimal range")?
                     .normalize(),
             );
+            // The same reasoning for the corporate-action calendar
+            // (bot-strategy#853): a window that was meant to be declared and
+            // silently is not looks exactly like no window at all, and the
+            // one moment an operator can still catch that is while
+            // installing the config they just edited. `deny_unknown_fields`
+            // catches a mistyped key; this catches an event that landed
+            // somewhere other than where it was meant to.
+            if config.runtime.corporate_actions.is_empty() {
+                eprintln!("[arcus-config] corporate actions: none declared");
+            } else {
+                eprintln!(
+                    "[arcus-config] corporate actions: {} declared",
+                    config.runtime.corporate_actions.len()
+                );
+                for event in &config.runtime.corporate_actions {
+                    eprintln!(
+                        "[arcus-config]   {} ({}) block {} -> exit {} -> effective {} -> resume {}                          [{}] source: {}",
+                        event.event_id,
+                        event.symbols.join("+"),
+                        event.entry_block_at,
+                        event.reduce_exit_at,
+                        event.effective_at,
+                        event.resume_not_before,
+                        match event.post_event_inventory {
+                            Some(inventory) => format!(
+                                "reconciled token_a={} token_b={}",
+                                inventory.token_a.normalize(),
+                                inventory.token_b.normalize()
+                            ),
+                            None => "NOT RECONCILED -- the resume will hold".to_string(),
+                        },
+                        event.source,
+                    );
+                }
+            }
             println!("{}", auto_execute_config_digest(&config)?);
             Ok(())
         }
@@ -4617,11 +5332,13 @@ async fn main() -> Result<()> {
                 ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = executor
-                .execute_plan_once(&plan, &plan_config_digest)
+                .execute_plan_once(&plan, &plan_config_digest, &|at| {
+                    runtime.validate_plan_consistent_with_state(&plan, at)
+                })
                 .await?;
             let attempt = finalize_reconciled_attempt(
                 &config,
@@ -4664,11 +5381,13 @@ async fn main() -> Result<()> {
                 ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
             let runtime = runtime_store.load_or_create(&config.runtime)?;
             runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
             let attempt = executor
-                .execute_plan_once(&plan, &plan_config_digest)
+                .execute_plan_once(&plan, &plan_config_digest, &|at| {
+                    runtime.validate_plan_consistent_with_state(&plan, at)
+                })
                 .await?;
             let attempt = finalize_reconciled_attempt(
                 &config,
@@ -4937,10 +5656,21 @@ async fn main() -> Result<()> {
                 );
             }
             fresh_runtime
-                .validate_plan_consistent_with_state(&plan)
+                .validate_plan_consistent_with_state(&plan, Utc::now())
                 .map_err(anyhow::Error::msg)
                 .context("Arcus plan is inconsistent with the current runtime checkpoint")?;
-            let attempt = match executor.execute_plan_once(&plan, &plan_config_digest).await {
+            let attempt = match executor
+                .execute_plan_once(&plan, &plan_config_digest, &|at| {
+                    // The re-read instance, like the pre-dispatch check
+                    // above: the guard exists to judge the submission seam
+                    // against current state, and closing over the
+                    // pre-lock `runtime` silently defeats that for anything
+                    // added to the validator later (independent review,
+                    // pairtrade#309).
+                    fresh_runtime.validate_plan_consistent_with_state(&plan, at)
+                })
+                .await
+            {
                 Ok(attempt) => attempt,
                 // The venue could not quote and said so before this dispatch
                 // touched anything (bot-strategy#967). Like an unsupported
@@ -5599,6 +6329,27 @@ runtime:
         .unwrap();
     }
 
+    /// The token identities, and the observation they were read from, that
+    /// `step_at` now records on every structurally valid observation
+    /// (bot-strategy#853). A hand-written checkpoint has to carry them for
+    /// exactly the reason it already carries `last_token_*_reference_price_usd`:
+    /// the continuity replay reproduces them from the recorder evidence, and
+    /// a fixture without them is not a checkpoint the runtime would ever
+    /// have written.
+    fn set_observed_token_identities(state: &mut serde_json::Value, observed_at: &str) {
+        state["last_token_a_identity"] = json!({
+            "symbol": "NVDA",
+            "address": "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC",
+            "decimals": 18,
+        });
+        state["last_token_b_identity"] = json!({
+            "symbol": "AMD",
+            "address": "0x86923f96303D656E4aa86D9d42D1e57ad2023fdC",
+            "decimals": 18,
+        });
+        state["last_token_identity_at"] = json!(observed_at);
+    }
+
     fn rewrite_checkpoint_state(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -5830,7 +6581,9 @@ runtime:
             state["relative_log_price_history"] = json!([0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:00:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            set_observed_token_identities(state, "2026-08-16T12:00:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
             state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -5914,7 +6667,9 @@ runtime:
             state["relative_log_price_history"] = json!(shifted_history);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("57.300959372038022");
+            set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["initial_equity_usd"] = json!("79.16815349952608352");
             state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -5961,7 +6716,9 @@ runtime:
             state["relative_log_price_history"] = json!(unchanged_full_window);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["initial_equity_usd"] = json!("98.2399008827070608");
             state["initial_baseline_inventory"] = state["inventory"].clone();
             state["daily_baseline_day"] = json!("2026-08-16");
@@ -6269,7 +7026,9 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
+            set_observed_token_identities(state, "2026-08-16T00:00:01Z");
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
             state["daily_baseline_inventory"] = state["inventory"].clone();
@@ -6325,7 +7084,9 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T00:00:01Z");
             state["last_token_a_reference_price_usd"] = json!("600");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
+            set_observed_token_identities(state, "2026-08-16T00:00:01Z");
             // The day and its equity mark roll, as they always did...
             state["daily_baseline_day"] = json!("2026-08-16");
             state["daily_baseline_equity_usd"] = json!("294.7197026481211824");
@@ -6382,6 +7143,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             state["daily_baseline_day"] = json!("2026-08-17");
             state["daily_baseline_equity_usd"] = json!("98.2399008827070608");
@@ -6464,7 +7226,9 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("600");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("529.49814155075739");
+            set_observed_token_identities(state, "2026-08-16T12:01:00Z");
             state["last_equity_usd"] = json!("294.7197026481211824");
         });
         let observed_at = DateTime::parse_from_rfc3339("2026-08-16T12:01:00Z")
@@ -6527,6 +7291,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.0, 0.125]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("176.49938051691913");
             // Inflated rather than deflated (it was "95" before #813): the
             // basket is genuinely worth 98.2399… at these marks, so a mark
@@ -6570,6 +7335,7 @@ runtime:
             state["relative_log_price_history"] = json!([0.2]);
             state["last_observation_at"] = json!("2026-08-16T12:01:00Z");
             state["last_token_a_reference_price_usd"] = json!("200");
+            state["last_reference_price_at"] = state["last_observation_at"].clone();
             state["last_token_b_reference_price_usd"] = json!("163.7461506155964");
             state["initial_equity_usd"] = json!("96.199384098495424");
             state["initial_baseline_inventory"] = state["inventory"].clone();
@@ -9654,6 +10420,142 @@ runtime:
     }
 
     #[test]
+    fn reset_window_carries_the_handled_corporate_actions_forward() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        // The state being reset already resumed from a split.
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        state.handled_corporate_action_fingerprints = vec!["fp-split".to_string()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+        let next = reset_window_next_config(dir.path());
+
+        commit_runtime_window_reset(&next).unwrap();
+
+        let fresh = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone())
+            .load_existing(&next.runtime)
+            .unwrap();
+        assert!(fresh.state().relative_log_price_history.is_empty());
+        assert_eq!(
+            fresh.state().handled_corporate_action_ids,
+            vec!["NVDA-2026-08-SPLIT".to_string()],
+        );
+        assert_eq!(
+            fresh.state().handled_corporate_action_fingerprints,
+            vec!["fp-split".to_string()],
+        );
+    }
+
+    #[test]
+    fn reset_window_resolves_a_carried_legacy_handled_record() {
+        // A legacy checkpoint carries ids with no fingerprints. The fresh
+        // state a reset builds is already marked resolved, so without
+        // resolving them here the still-declared completed action would read
+        // as a reused label and block entries forever.
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        state.handled_corporate_action_fingerprints.clear();
+        state.handled_corporate_actions_resolved = false;
+        state.last_observation_at = Some("2026-08-17T00:00:00Z".parse().unwrap());
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+
+        let mut next = reset_window_next_config(dir.path());
+        next.runtime.corporate_actions = vec![ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec![next.runtime.pair.sell_symbol.clone()],
+            entry_block_at: "2026-08-16T00:00:00Z".parse().unwrap(),
+            reduce_exit_at: "2026-08-16T01:00:00Z".parse().unwrap(),
+            effective_at: "2026-08-16T02:00:00Z".parse().unwrap(),
+            resume_not_before: "2026-08-16T03:00:00Z".parse().unwrap(),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        }];
+        commit_runtime_window_reset(&next).unwrap();
+
+        let fresh = ArcusSpotRuntimeCheckpointStore::new(next.runtime_state_path.clone())
+            .load_existing(&next.runtime)
+            .unwrap();
+        assert_eq!(
+            fresh.state().handled_corporate_action_fingerprints,
+            vec![next.runtime.corporate_actions[0].fingerprint()],
+            "the carried legacy record is resolved, not left ambiguous",
+        );
+    }
+
+    #[test]
+    fn reset_window_refuses_to_drop_an_open_corporate_action_window() {
+        let dir = tempdir().unwrap();
+        let config = reset_window_config(dir.path());
+        seed_reset_window_host(&config, 2);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        let mut state = store
+            .load_existing(&config.runtime)
+            .unwrap()
+            .state()
+            .clone();
+        state.corporate_action = Some(stale_unit_progress());
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state).unwrap())
+            .unwrap();
+
+        // An unrelated state-invalidating change: refused.
+        let mut unrelated = reset_window_config(dir.path());
+        unrelated.runtime.signal_window_samples += 1;
+        let error = commit_runtime_window_reset(&unrelated)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inside corporate action NVDA-2026-08-SPLIT"),
+            "{error}"
+        );
+
+        // A `pair` edit that keeps the affected token -- swapped legs, or
+        // only the other leg changed -- is not a replacement.
+        let mut swapped = reset_window_config(dir.path());
+        let (a, b) = (
+            swapped.runtime.pair.sell_symbol.clone(),
+            swapped.runtime.pair.buy_symbol.clone(),
+        );
+        swapped.runtime.pair.sell_symbol = b;
+        swapped.runtime.pair.buy_symbol = a;
+        let error = commit_runtime_window_reset(&swapped)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("inside corporate action NVDA-2026-08-SPLIT"),
+            "{error}"
+        );
+
+        // Replacing the instrument is the documented recovery for a relisted
+        // ticker, and makes the old window moot.
+        let mut replaced = reset_window_config(dir.path());
+        replaced.runtime.pair.sell_symbol = "NVDB".to_string();
+        commit_runtime_window_reset(&replaced).unwrap();
+        let fresh = ArcusSpotRuntimeCheckpointStore::new(replaced.runtime_state_path.clone())
+            .load_existing(&replaced.runtime)
+            .unwrap();
+        assert_eq!(fresh.state().corporate_action, None);
+    }
+
+    #[test]
     fn reset_window_keeps_the_replaced_checkpoint_beside_the_new_one() {
         let dir = tempdir().unwrap();
         let config = reset_window_config(dir.path());
@@ -9899,5 +10801,1267 @@ runtime:
 
         assert!(error.contains("risk halt"), "{error}");
         assert!(error.contains("clear-risk-halt"), "{error}");
+    }
+
+    // ---- corporate-action continuity (bot-strategy#853, Codex P1) ----
+
+    fn continuity_state(sequence: u64, inventory: (&str, &str)) -> ArcusSpotRuntimeState {
+        serde_json::from_value(json!({
+            "sequence": sequence,
+            "inventory": {"token_a": inventory.0, "token_b": inventory.1},
+            "regime": "neutral",
+            "relative_log_price_history": [0.25],
+            "last_token_a_reference_price_usd": "200",
+            "last_token_b_reference_price_usd": "100",
+            "last_observation_at": "2026-08-16T12:00:00Z",
+            "last_rotation_at": null,
+            "rotated_quantity": null,
+            "initial_equity_usd": "300",
+            "initial_baseline_inventory": {"token_a": inventory.0, "token_b": inventory.1},
+            "daily_baseline_day": "2026-08-16",
+            "daily_baseline_equity_usd": "300",
+            "daily_baseline_inventory": {"token_a": inventory.0, "token_b": inventory.1},
+            "last_equity_usd": "300",
+            "risk_halt": null,
+        }))
+        .unwrap()
+    }
+
+    fn fixture_event() -> ArcusSpotCorporateActionEvent {
+        config_with_corporate_action(None).corporate_actions[0].clone()
+    }
+
+    fn config_with_corporate_action(
+        post_event_inventory: Option<(&str, &str)>,
+    ) -> ArcusSpotRuntimeConfig {
+        let dir = tempdir().unwrap();
+        let mut config = execute_once_config(
+            dir.path().join("l.json").to_str().unwrap(),
+            dir.path().join("r.json").to_str().unwrap(),
+            "100000000000000000",
+        )
+        .runtime;
+        config.corporate_actions = vec![ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec!["NVDA".to_string()],
+            entry_block_at: "2026-08-16T00:00:00Z".parse().unwrap(),
+            reduce_exit_at: "2026-08-16T01:00:00Z".parse().unwrap(),
+            effective_at: "2026-08-16T02:00:00Z".parse().unwrap(),
+            resume_not_before: "2026-08-16T03:00:00Z".parse().unwrap(),
+            source: "issuer notice".to_string(),
+            post_event_inventory: post_event_inventory.map(|(a, b)| ArcusSpotInventory {
+                token_a: a.parse().unwrap(),
+                token_b: b.parse().unwrap(),
+            }),
+        }];
+        config
+    }
+
+    /// baseline: mid-window, history already discarded. current: resumed onto
+    /// the reconciled holding, with all three equity marks re-derived from it.
+    fn resume_pair() -> (ArcusSpotRuntimeState, ArcusSpotRuntimeState) {
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.relative_log_price_history.clear();
+        baseline.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: String::new(),
+            effective_at: None,
+            symbols: vec!["NVDA".to_string()],
+        });
+
+        let mut current = continuity_state(8, ("4", "1"));
+        current.relative_log_price_history = vec![0.25];
+        current.corporate_action = None;
+        current.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        current.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
+        // 4 NVDA at 200 + 1 AMD at 100.
+        for mark in [
+            &mut current.initial_equity_usd,
+            &mut current.daily_baseline_equity_usd,
+            &mut current.last_equity_usd,
+        ] {
+            *mark = Some(Decimal::from(900));
+        }
+        (baseline, current)
+    }
+
+    #[test]
+    fn a_declared_corporate_action_resume_is_authorized() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, current) = resume_pair();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+        assert_eq!(
+            authorized.resumed_inventory,
+            Some(ArcusSpotInventory {
+                token_a: Decimal::from(4),
+                token_b: Decimal::ONE,
+            }),
+        );
+        assert!(authorized.history_discarded);
+    }
+
+    #[test]
+    fn a_resume_of_an_undeclared_event_is_rejected() {
+        let mut config = config_with_corporate_action(Some(("4", "1")));
+        config.corporate_actions.clear();
+        let (baseline, current) = resume_pair();
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not declare"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_without_a_reconciled_holding_is_rejected() {
+        let config = config_with_corporate_action(None);
+        let (baseline, current) = resume_pair();
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("post_event_inventory"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_onto_a_holding_the_config_did_not_declare_is_rejected() {
+        // The checkpoint claims the resume but landed somewhere else.
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, mut current) = resume_pair();
+        current.inventory.token_a = Decimal::from(5);
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("did not land on its reconciled holding"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_resume_that_left_a_rotation_open_is_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, mut current) = resume_pair();
+        current.regime = ArcusSpotRegime::RotatedAToB;
+        current.rotated_quantity = Some(Decimal::ONE);
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rotation still open"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_without_a_new_observation_is_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, current) = resume_pair();
+        let error = corporate_action_continuity(&config, &baseline, &current, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("single new observation"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_must_record_the_declared_events_fingerprint() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        // A fingerprint vector shorter than the id vector is a malformed
+        // record, caught by the length guard before anything slices it.
+        let (baseline, mut current) = resume_pair();
+        current.handled_corporate_action_fingerprints.clear();
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+
+        // And it must be *this* event's: a fingerprint of some other
+        // declaration does not make the rename guard's record.
+        let (baseline, mut current) = resume_pair();
+        current.handled_corporate_action_fingerprints = vec!["deadbeef".to_string()];
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("without recording the fingerprint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn progress_edits_that_no_observation_produces_are_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.corporate_action = Some(stale_unit_progress());
+        let pinned = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        baseline
+            .corporate_action
+            .as_mut()
+            .unwrap()
+            .pre_event_token_a = Some(pinned.clone());
+
+        // Same sequence, pin replaced with the post-event identity: the
+        // drift check would then compare the replacement to itself.
+        let mut edited = baseline.clone();
+        edited.corporate_action.as_mut().unwrap().pre_event_token_a =
+            Some(ArcusSpotTokenIdentity {
+                address: "0xdeadbeef00000000000000000000000000000000".to_string(),
+                ..pinned.clone()
+            });
+        let error = corporate_action_continuity(&config, &baseline, &edited, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("changed without a new observation"),
+            "{error}"
+        );
+
+        // One observation later, the same edit is still not a transition.
+        let mut edited = baseline.clone();
+        edited.sequence = 8;
+        edited.corporate_action.as_mut().unwrap().pre_event_token_a = None;
+        let error = corporate_action_continuity(&config, &baseline, &edited, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no observation produces"), "{error}");
+
+        // ...whereas the discard stamp appearing is exactly what one does.
+        let mut stamped = baseline.clone();
+        stamped.sequence = 8;
+        stamped.relative_log_price_history.clear();
+        stamped
+            .corporate_action
+            .as_mut()
+            .unwrap()
+            .history_invalidated_at = None;
+        let mut before = baseline.clone();
+        before
+            .corporate_action
+            .as_mut()
+            .unwrap()
+            .history_invalidated_at = None;
+        stamped
+            .corporate_action
+            .as_mut()
+            .unwrap()
+            .history_invalidated_at = Some("2026-08-16T02:00:01Z".parse().unwrap());
+        corporate_action_continuity(&config, &before, &stamped, 1, verified_now()).unwrap();
+
+        // Cleared without a resume: not a transition either.
+        let mut cleared = baseline.clone();
+        cleared.sequence = 8;
+        cleared.corporate_action = None;
+        let error = corporate_action_continuity(&config, &baseline, &cleared, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cleared without a resume"), "{error}");
+    }
+
+    #[test]
+    fn cached_token_identities_may_not_change_without_an_observation() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        corporate_action_continuity(&config, &baseline, &baseline.clone(), 0, verified_now())
+            .unwrap();
+
+        // The post-event contract, dropped into the cache at the same
+        // sequence: a later window would pin it as the *pre-event* identity.
+        let mut forged = baseline.clone();
+        forged.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            address: "0xdeadbeef00000000000000000000000000000000".to_string(),
+            ..observed
+        });
+        let error = corporate_action_continuity(&config, &baseline, &forged, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cached token identities"), "{error}");
+
+        let mut restamped = baseline.clone();
+        restamped.last_token_identity_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
+        let error = corporate_action_continuity(&config, &baseline, &restamped, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cached token identities"), "{error}");
+
+        // The price clock decides the stale-unit exemption, so it is
+        // forgeable evidence and gets the same treatment.
+        let mut repriced = baseline.clone();
+        repriced.last_reference_price_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
+        let error = corporate_action_continuity(&config, &baseline, &repriced, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reference-price timestamp"), "{error}");
+    }
+
+    #[test]
+    fn a_window_may_not_open_before_its_declared_entry_block() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let event = fixture_event();
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        let opened_at = |at: &str| {
+            let mut current = continuity_state(8, ("1", "1"));
+            current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+                event_id: event.event_id.clone(),
+                blocked_at: at.parse().unwrap(),
+                pre_event_token_a: Some(observed.clone()),
+                pre_event_token_b: None,
+                history_invalidated_at: None,
+                fingerprint: event.fingerprint(),
+                effective_at: Some(event.effective_at),
+                symbols: event.symbols.clone(),
+            });
+            current
+        };
+        // entry_block_at is 2026-08-16T00:00:00Z.
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened_at("2026-08-16T00:00:01Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap();
+
+        // Opened before the window exists: restoring this blocks entries and
+        // suppresses history early.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened_at("2026-08-15T20:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outside its declared window"), "{error}");
+
+        // Opened after the verification clock.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened_at("2026-08-18T00:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outside its declared window"), "{error}");
+    }
+
+    #[test]
+    fn an_opened_window_may_not_arrive_already_stamped_early() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let event = fixture_event();
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        let opened = |stamp: Option<&str>| {
+            let mut current = continuity_state(8, ("1", "1"));
+            current.relative_log_price_history.clear();
+            current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+                event_id: event.event_id.clone(),
+                blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+                pre_event_token_a: Some(observed.clone()),
+                pre_event_token_b: None,
+                history_invalidated_at: stamp.map(|at| at.parse().unwrap()),
+                fingerprint: event.fingerprint(),
+                effective_at: Some(event.effective_at),
+                symbols: event.symbols.clone(),
+            });
+            current
+        };
+        // Unstamped, and stamped at the cutoff: both are transitions.
+        corporate_action_continuity(&config, &baseline, &opened(None), 1, verified_now()).unwrap();
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened(Some("2026-08-16T02:00:01Z")),
+            1,
+            verified_now(),
+        )
+        .unwrap();
+
+        // Stamped before the cutoff: after a restore this would suppress
+        // halts and refuse exits before effective_at ever arrived.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &opened(Some("2026-08-16T00:30:00Z")),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("discard stamp no observation produces"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_discard_stamp_must_sit_at_or_after_its_cutoff() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut open = stale_unit_progress();
+        open.history_invalidated_at = None;
+        baseline.corporate_action = Some(open.clone());
+        let stamped = |at: &str| {
+            let mut current = continuity_state(8, ("1", "1"));
+            current.relative_log_price_history.clear();
+            let mut progress = open.clone();
+            progress.history_invalidated_at = Some(at.parse().unwrap());
+            current.corporate_action = Some(progress);
+            current
+        };
+
+        // The cutoff is 02:00Z and the observation 12:00Z.
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-16T02:00:01Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap();
+
+        // Stamped before the cutoff: a premature discard, which would also
+        // make dispatch treat the units as stale early.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-16T01:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no observation produces"), "{error}");
+
+        // The runtime stamps with `evaluation_time`, which live-tick takes
+        // after fetching the snapshot, so a stamp later than the observation
+        // watermark is normal and must verify.
+        corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-16T13:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap();
+
+        // Stamped after the verification clock: not a transition this backup
+        // can have produced.
+        let error = corporate_action_continuity(
+            &config,
+            &baseline,
+            &stamped("2026-08-18T00:00:00Z"),
+            1,
+            verified_now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no observation produces"), "{error}");
+    }
+
+    #[test]
+    fn an_opened_window_must_pin_what_the_backup_observed() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let event = fixture_event();
+        let observed = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.last_token_a_identity = Some(observed.clone());
+        baseline.last_token_identity_at = Some("2026-08-15T23:00:00Z".parse().unwrap());
+        let mut current = continuity_state(8, ("1", "1"));
+        let opened = ArcusSpotCorporateActionProgress {
+            event_id: event.event_id.clone(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: Some(observed.clone()),
+            pre_event_token_b: None,
+            history_invalidated_at: None,
+            fingerprint: event.fingerprint(),
+            effective_at: Some(event.effective_at),
+            symbols: event.symbols.clone(),
+        };
+        current.corporate_action = Some(opened.clone());
+        corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+
+        // A pin the backup never observed.
+        let mut forged = current.clone();
+        forged.corporate_action.as_mut().unwrap().pre_event_token_a =
+            Some(ArcusSpotTokenIdentity {
+                address: "0xdeadbeef00000000000000000000000000000000".to_string(),
+                ..observed.clone()
+            });
+        let error = corporate_action_continuity(&config, &baseline, &forged, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never observed"), "{error}");
+
+        // The backup's identity came from inside the window: nothing may be
+        // pinned.
+        let mut late = baseline.clone();
+        late.last_token_identity_at = Some("2026-08-16T00:00:00Z".parse().unwrap());
+        let error = corporate_action_continuity(&config, &late, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never observed"), "{error}");
+    }
+
+    #[test]
+    fn a_renamed_completed_event_is_matched_by_fingerprint() {
+        // The backup predates the resume; afterwards the operator renamed
+        // the completed entry. Same fingerprint, new id.
+        let mut config = config_with_corporate_action(Some(("4", "1")));
+        let (baseline, current) = resume_pair();
+        config.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+        assert!(authorized.resumed_inventory.is_some());
+
+        // ... including across legacy padding: the backup has an id with no
+        // fingerprint, so the resume pads before appending and the resumed
+        // event's fingerprint is the *last* new entry, not the first.
+        let (mut legacy_baseline, mut legacy_current) = resume_pair();
+        legacy_baseline.handled_corporate_action_ids = vec!["OLDER".to_string()];
+        legacy_baseline
+            .handled_corporate_action_fingerprints
+            .clear();
+        legacy_current.handled_corporate_action_ids =
+            vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
+        legacy_current.handled_corporate_action_fingerprints =
+            vec![String::new(), fixture_event().fingerprint()];
+        let authorized = corporate_action_continuity(
+            &config,
+            &legacy_baseline,
+            &legacy_current,
+            1,
+            verified_now(),
+        )
+        .unwrap();
+        assert!(authorized.resumed_inventory.is_some());
+
+        // A genuinely undeclared resume is still refused.
+        let mut gone = config.clone();
+        gone.corporate_actions.clear();
+        let error = corporate_action_continuity(&gone, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not declare"), "{error}");
+    }
+
+    #[test]
+    fn a_resume_after_a_legacy_record_pads_before_appending() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, mut current) = resume_pair();
+        baseline.handled_corporate_action_ids = vec!["OLDER".to_string()];
+        baseline.handled_corporate_action_fingerprints.clear();
+        current.handled_corporate_action_ids =
+            vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
+        current.handled_corporate_action_fingerprints =
+            vec![String::new(), fixture_event().fingerprint()];
+        corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+
+        // Appended without padding: the fingerprint sits beside OLDER, so
+        // the resolved prefix no longer matches the backup's.
+        let mut misaligned = current.clone();
+        misaligned.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
+        let error = corporate_action_continuity(&config, &baseline, &misaligned, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+
+        // Padded correctly but the appended fingerprint is not the declared
+        // event's: that is what the alignment check is for.
+        let mut wrong = current.clone();
+        wrong.handled_corporate_action_fingerprints =
+            vec![String::new(), "not-the-declared-event".to_string()];
+        let error = corporate_action_continuity(&config, &baseline, &wrong, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("beside its id"), "{error}");
+    }
+
+    #[test]
+    fn dropped_handled_fingerprints_are_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, mut current) = resume_pair();
+        baseline.handled_corporate_action_ids = vec!["OLDER".to_string()];
+        baseline.handled_corporate_action_fingerprints = vec!["older-fp".to_string()];
+        current.handled_corporate_action_ids =
+            vec!["OLDER".to_string(), "NVDA-2026-08-SPLIT".to_string()];
+        // The older fingerprint is gone.
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fingerprints"), "{error}");
+    }
+
+    #[test]
+    fn dropped_or_reordered_handled_events_are_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, current) = resume_pair();
+        baseline.handled_corporate_action_ids = vec!["SOMETHING-ELSE".to_string()];
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+    }
+
+    #[test]
+    fn a_stamped_discard_that_did_not_empty_the_window_is_rejected() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: fixture_event().fingerprint(),
+            effective_at: Some(fixture_event().effective_at),
+            symbols: vec!["NVDA".to_string()],
+        });
+        assert!(!current.relative_log_price_history.is_empty());
+        let error = corporate_action_continuity(&config, &baseline, &current, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("stamped a discard it did not perform"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_discard_authorizes_the_emptied_window() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.relative_log_price_history.clear();
+        current.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: fixture_event().fingerprint(),
+            effective_at: Some(fixture_event().effective_at),
+            symbols: vec!["NVDA".to_string()],
+        });
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+        assert!(authorized.history_discarded);
+        assert_eq!(authorized.resumed_inventory, None);
+        // And that is exactly what lets the history check accept it.
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &authorized,
+        )
+        .unwrap();
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err();
+    }
+
+    /// A verification clock comfortably after every fixture timestamp.
+    fn verified_now() -> DateTime<Utc> {
+        "2026-08-17T00:00:00Z".parse().unwrap()
+    }
+
+    fn stale_unit_progress() -> ArcusSpotCorporateActionProgress {
+        ArcusSpotCorporateActionProgress {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            blocked_at: "2026-08-16T00:00:01Z".parse().unwrap(),
+            // Pinned: an unpinned window is the "cannot verify" shape, which
+            // the runtime treats as suppressing halt engagement, and these
+            // fixtures are about the ordinary stale-unit phase.
+            pre_event_token_a: Some(ArcusSpotTokenIdentity {
+                symbol: "NVDA".to_string(),
+                address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+                decimals: 18,
+            }),
+            pre_event_token_b: None,
+            history_invalidated_at: Some("2026-08-16T02:00:01Z".parse().unwrap()),
+            fingerprint: fixture_event().fingerprint(),
+            effective_at: Some(fixture_event().effective_at),
+            symbols: vec!["NVDA".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_stale_unit_phase_does_not_demand_a_halt() {
+        // The runtime declines to engage a halt between `effective_at` and
+        // the resume, because the wallet-vs-basket gap is priced in units
+        // the venue no longer quotes. This verifier re-derives that same
+        // loss, so without the matching exception every valid backup
+        // spanning such a tick is rejected for "omitting" a halt the
+        // runtime was right not to engage.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        // A $10 daily loss against the $2 limit -- measured in pre-event
+        // units at post-event prices.
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = Some(stale_unit_progress());
+        // The transition rules are covered elsewhere; here the window is
+        // open on both sides so only the halt expectation is under test.
+        let mut baseline = baseline;
+        baseline.corporate_action = current.corporate_action.clone();
+        let none = ArcusSpotCorporateActionContinuity::default();
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+
+        // An ordinary tick with the same loss still has to have halted.
+        let mut ordinary = continuity_state(8, ("1", "1"));
+        ordinary.last_equity_usd = Some(Decimal::from(290));
+        let error = require_risk_state_continuity(
+            &config, &baseline, &ordinary, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // And the exemption is not something a checkpoint can mint for
+        // itself: the progress must name an event the approved config
+        // declares, and one the runtime has not already handled.
+        let mut undeclared = config.clone();
+        undeclared.corporate_actions.clear();
+        // (Without a recorded cutoff: an orphan *with* one is the shape the
+        // runtime writes itself and is exempt -- see below.)
+        let mut no_cutoff = current.clone();
+        no_cutoff.corporate_action.as_mut().unwrap().effective_at = None;
+        let mut no_cutoff_baseline = baseline.clone();
+        no_cutoff_baseline.corporate_action = no_cutoff.corporate_action.clone();
+        let error = require_risk_state_continuity(
+            &undeclared,
+            &no_cutoff_baseline,
+            &no_cutoff,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+        // ... unless the orphaned record carries its own cutoff and a stamp
+        // at or after it -- the one shape the runtime writes without a
+        // declaration -- and is not already handled.
+        let mut orphaned = current.clone();
+        orphaned.corporate_action.as_mut().unwrap().effective_at =
+            Some("2026-08-16T02:00:00Z".parse().unwrap());
+        require_risk_state_continuity(
+            &undeclared,
+            &baseline,
+            &orphaned,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap();
+        let mut inconsistent = orphaned.clone();
+        inconsistent.corporate_action.as_mut().unwrap().effective_at =
+            Some("2026-08-16T02:30:00Z".parse().unwrap());
+        require_risk_state_continuity(
+            &undeclared,
+            &baseline,
+            &inconsistent,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap_err();
+
+        // A genuinely handled record -- resolved, with the declared event's
+        // fingerprint beside its id -- gets no exemption. (An id with no
+        // fingerprint is an unresolved legacy record, which the runtime and
+        // this verifier both read as a reused label.)
+        let mut handled = current.clone();
+        handled.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        handled.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
+        let error = require_risk_state_continuity(
+            &config, &baseline, &handled, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_reused_ids_stale_phase_does_not_demand_a_halt_either() {
+        // A distinct later action under a handled id never gets a progress
+        // record, but the runtime treats its units as stale from its cutoff
+        // and declines to engage a halt. The verifier must agree, or every
+        // backup from that phase is rejected for "omitting" the halt.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = None;
+        // The id is handled, but under a different fingerprint: the config
+        // entry is a new action wearing the old label.
+        current.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        current.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        let mut baseline = baseline;
+        baseline.handled_corporate_action_ids = current.handled_corporate_action_ids.clone();
+        baseline.handled_corporate_action_fingerprints =
+            current.handled_corporate_action_fingerprints.clone();
+        // last_observation_at (12:00Z) is past the fixture's effective_at.
+        let none = ArcusSpotCorporateActionContinuity::default();
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+
+        // Before that cutoff the halt is still demanded.
+        let mut early = current.clone();
+        early.last_observation_at = Some("2026-08-16T01:00:00Z".parse().unwrap());
+        let error = require_risk_state_continuity(
+            &config, &baseline, &early, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_legacy_record_reads_as_reused_in_the_stale_check() {
+        // The runtime classifies a handled id with no aligned fingerprint as
+        // a reused label, records progress and suppresses the halt after the
+        // cutoff. This verifier has to read it the same way, or a valid
+        // checkpoint from that phase is rejected for omitting the halt.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = None;
+        for state in [&mut baseline, &mut current] {
+            state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+            state.handled_corporate_action_fingerprints.clear();
+        }
+        require_risk_state_continuity(
+            &config,
+            &baseline,
+            &current,
+            1,
+            not_before,
+            not_after,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_pre_cutoff_priced_mark_still_owes_its_halt() {
+        // The tick that first crosses the cutoff stamps with the evaluation
+        // clock, but the runtime judged the halt on the price clock. If the
+        // prices predate the cutoff a genuine halt may have engaged, so the
+        // exemption must not be granted on the stamp alone.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = Some(stale_unit_progress());
+        baseline.corporate_action = current.corporate_action.clone();
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Prices from before the cutoff (02:00Z): the halt is still owed.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T01:59:00Z".parse().unwrap());
+        }
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Prices from after it: the runtime suppressed, and so does this.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T02:01:00Z".parse().unwrap());
+        }
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_reused_ids_stale_phase_is_judged_on_the_price_clock() {
+        // Same rule as the progress-record path: on the tick that first
+        // crosses the cutoff a pre-cutoff mark may have engaged a genuine
+        // halt, so the exemption cannot come from the observation watermark.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        current.corporate_action = None;
+        for state in [&mut baseline, &mut current] {
+            state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+            state.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        }
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Prices from before the cutoff (02:00Z): the halt is still owed.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T01:59:00Z".parse().unwrap());
+        }
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Prices from after it: the runtime suppressed, and so does this.
+        for state in [&mut baseline, &mut current] {
+            state.last_reference_price_at = Some("2026-08-16T02:01:00Z".parse().unwrap());
+        }
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_drifted_identity_does_not_owe_a_halt() {
+        // The runtime declines to halt on a mark whose quantity and price
+        // belong to different contracts, so this must not demand one.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let pinned = ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 18,
+        };
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        let mut progress = stale_unit_progress();
+        progress.history_invalidated_at = None;
+        progress.pre_event_token_a = Some(pinned.clone());
+        current.corporate_action = Some(progress.clone());
+        baseline.corporate_action = Some(progress);
+        for state in [&mut baseline, &mut current] {
+            state.last_token_a_identity = Some(pinned.clone());
+        }
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Identity intact: the halt is owed.
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Repointed: the mark is mixed-unit and no halt is owed.
+        current.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            address: "0xdeadbeef00000000000000000000000000000000".to_string(),
+            ..pinned
+        });
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn identity_comparison_matches_the_runtimes_rule() {
+        // The runtime compares address case-insensitively and ignores the
+        // symbol; a derived `!=` disagreed on checksum casing, and on a
+        // missing pin the runtime suppresses while this used to demand a
+        // halt. Both let a rollback drop a genuine sticky halt.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.last_equity_usd = Some(Decimal::from(290));
+        let mut progress = stale_unit_progress();
+        progress.history_invalidated_at = None;
+        current.corporate_action = Some(progress.clone());
+        baseline.corporate_action = Some(progress);
+        let none = ArcusSpotCorporateActionContinuity::default();
+
+        // Same contract, lower-cased and with a different symbol string:
+        // the runtime sees no drift and halts, so this must demand one.
+        current.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "nvda.us".to_string(),
+            address: "0xd0601ce157db5bdc3162bbac2a2c8af5320d9eec".to_string(),
+            decimals: 18,
+        });
+        let error = require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("omitted a newly triggered loss halt"),
+            "{error}"
+        );
+
+        // Different decimals is a different instrument.
+        current.last_token_a_identity = Some(ArcusSpotTokenIdentity {
+            symbol: "NVDA".to_string(),
+            address: "0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC".to_string(),
+            decimals: 6,
+        });
+        require_risk_state_continuity(
+            &config, &baseline, &current, 1, not_before, not_after, &none,
+        )
+        .unwrap();
+
+        // No pin: the runtime cannot verify the mark and does not engage.
+        let mut unpinned = current.clone();
+        unpinned
+            .corporate_action
+            .as_mut()
+            .unwrap()
+            .pre_event_token_a = None;
+        let mut unpinned_baseline = baseline.clone();
+        unpinned_baseline.corporate_action = unpinned.corporate_action.clone();
+        require_risk_state_continuity(
+            &config,
+            &unpinned_baseline,
+            &unpinned,
+            1,
+            not_before,
+            not_after,
+            &none,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_resolved_record_may_not_be_blanked_at_the_same_sequence() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let mut baseline = continuity_state(7, ("1", "1"));
+        baseline.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        baseline.handled_corporate_action_fingerprints = vec![fixture_event().fingerprint()];
+        baseline.handled_corporate_actions_resolved = true;
+        corporate_action_continuity(&config, &baseline, &baseline.clone(), 0, verified_now())
+            .unwrap();
+
+        // Blank the slot but keep the marker: after a restore `from_state`
+        // skips the backfill and the declaration becomes a reused id. The
+        // raw prefix comparison catches it, because the backup says the
+        // record is already resolved.
+        let mut blanked = baseline.clone();
+        blanked.handled_corporate_action_fingerprints = vec![String::new()];
+        let error = corporate_action_continuity(&config, &baseline, &blanked, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+
+        // Un-resolving a resolved record is not a transition either.
+        let mut unresolved = baseline.clone();
+        unresolved.handled_corporate_actions_resolved = false;
+        let error = corporate_action_continuity(&config, &baseline, &unresolved, 0, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("resolution changed"), "{error}");
+
+        // The same blanking one observation later is caught by the
+        // append-only prefix, which now compares raw slots once the backup
+        // says the record is resolved.
+        let mut later = blanked.clone();
+        later.sequence = 8;
+        let error = corporate_action_continuity(&config, &baseline, &later, 1, verified_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("lost or reordered"), "{error}");
+    }
+
+    #[test]
+    fn the_stale_unit_phase_still_rejects_an_unexpected_halt() {
+        // Only the omission is excused. A halt that appeared without a
+        // derivable loss is still an unexplained change.
+        let not_before: DateTime<Utc> = "2026-08-16T11:00:00Z".parse().unwrap();
+        let not_after: DateTime<Utc> = "2026-08-16T13:00:00Z".parse().unwrap();
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let baseline = continuity_state(7, ("1", "1"));
+        let mut current = continuity_state(8, ("1", "1"));
+        current.corporate_action = Some(stale_unit_progress());
+        current.risk_halt = Some(ArcusSpotRiskHalt {
+            kind: ArcusSpotRiskHaltKind::DailyLoss,
+            engaged_at: "2026-08-16T12:00:00Z".parse().unwrap(),
+            equity_usd: Decimal::from(300),
+            loss_usd: Decimal::from(5),
+            limit_usd: Decimal::from(2),
+        });
+        let error = require_risk_state_continuity(
+            &config,
+            &baseline,
+            &current,
+            1,
+            not_before,
+            not_after,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unexpected risk halt"), "{error}");
+    }
+
+    #[test]
+    fn a_same_tick_discard_and_resume_authorizes_its_one_fresh_sample() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, current) = resume_pair();
+        // The backup was taken after the reconciled config landed but before
+        // any tick ran inside the window, so it still holds the pre-event
+        // history and carries no progress stamp. The resume tick then does
+        // both: it discards that window and appends its own post-event
+        // sample.
+        baseline.relative_log_price_history = vec![0.10, 0.11, 0.12];
+        baseline.corporate_action = None;
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+        assert!(authorized.history_discarded);
+        assert!(authorized.resumed_inventory.is_some());
+        assert_eq!(current.relative_log_price_history.len(), 1);
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &authorized,
+        )
+        .unwrap();
+        // Only the resume earns that sample: a discard-only tick that
+        // carries one is still the "stamped a discard it did not perform"
+        // shape, and an undeclared transition is rejected outright.
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &ArcusSpotCorporateActionContinuity {
+                history_discarded: true,
+                resumed_inventory: None,
+            },
+        )
+        .unwrap_err();
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &ArcusSpotCorporateActionContinuity::default(),
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn a_resume_may_not_carry_more_than_one_fresh_sample() {
+        let config = config_with_corporate_action(Some(("4", "1")));
+        let (mut baseline, mut current) = resume_pair();
+        baseline.relative_log_price_history = vec![0.10, 0.11, 0.12];
+        baseline.corporate_action = None;
+        current.relative_log_price_history = vec![0.25, 0.26];
+        let authorized =
+            corporate_action_continuity(&config, &baseline, &current, 1, verified_now()).unwrap();
+        require_signal_history_continuity(
+            &baseline.relative_log_price_history,
+            &current.relative_log_price_history,
+            1,
+            96,
+            &authorized,
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn rebase_marks_must_be_the_reconciled_holding_priced_at_this_tick() {
+        let (_, current) = resume_pair();
+        let inventory = ArcusSpotInventory {
+            token_a: Decimal::from(4),
+            token_b: Decimal::ONE,
+        };
+        assert_eq!(
+            require_corporate_action_rebase_marks(&current, inventory).unwrap(),
+            Decimal::from(900),
+        );
+
+        let mut drifted = current.clone();
+        drifted.daily_baseline_equity_usd = Some(Decimal::from(901));
+        let error = require_corporate_action_rebase_marks(&drifted, inventory)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must all be the reconciled holding"),
+            "{error}"
+        );
     }
 }

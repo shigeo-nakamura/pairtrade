@@ -8,10 +8,15 @@
 //! maintained copies of it.
 
 use super::{
-    ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    runtime::{
+        backfill_handled_corporate_action_fingerprints, handled_corporate_action_record,
+        HandledMatch,
+    },
+    ArcusSpotCorporateActionEvent, ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt,
+    ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Duration, Utc};
 use dex_connector::ArcusSpotPair;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -53,6 +58,24 @@ pub struct ArcusSpotCheckpointSummary {
     /// figure and would otherwise overwrite realized trading deltas
     /// (Codex P1 follow-up, bot-strategy#903).
     pub inventory: ArcusSpotInventory,
+    /// Corporate actions this state already resumed from. A fresh window
+    /// built by `reset-window` must carry these forward: the completed
+    /// declarations may still be in the config, and a fresh state that has
+    /// forgotten them treats each as unhandled, re-applies its obsolete
+    /// `post_event_inventory` over the newly declared holding and clears
+    /// the window again (Codex P1, pairtrade#309).
+    pub handled_corporate_action_ids: Vec<String>,
+    pub handled_corporate_action_fingerprints: Vec<String>,
+    /// The corporate-action window the state is currently inside, if any.
+    /// `reset-window` refuses to discard it (Codex P1, pairtrade#309).
+    pub corporate_action_event_id: Option<String>,
+    /// The symbols that window is about (empty when the record predates
+    /// the field).
+    pub corporate_action_symbols: Vec<String>,
+    /// The observation watermark the stored state reached. `reset-window`
+    /// carries the handled record forward and resolves any legacy entry
+    /// against it (Codex P2, pairtrade#309).
+    pub last_observation_at: Option<DateTime<Utc>>,
 }
 
 /// How a config change since the checkpoint was written relates to the state
@@ -119,6 +142,8 @@ fn classify_config_drift(
         max_inventory_imbalance_fraction: stored_max_inventory_imbalance_fraction,
         daily_loss_limit_usd: stored_daily_loss_limit_usd,
         cumulative_loss_limit_usd: stored_cumulative_loss_limit_usd,
+        corporate_actions: stored_corporate_actions,
+        corporate_action_settlement_margin_secs: stored_corporate_action_settlement_margin_secs,
     } = stored;
     let ArcusSpotRuntimeConfig {
         mode: current_mode,
@@ -140,6 +165,8 @@ fn classify_config_drift(
         max_inventory_imbalance_fraction: current_max_inventory_imbalance_fraction,
         daily_loss_limit_usd: current_daily_loss_limit_usd,
         cumulative_loss_limit_usd: current_cumulative_loss_limit_usd,
+        corporate_actions: current_corporate_actions,
+        corporate_action_settlement_margin_secs: current_corporate_action_settlement_margin_secs,
     } = current;
 
     let mut drift = ArcusSpotCheckpointConfigDrift::default();
@@ -242,6 +269,29 @@ fn classify_config_drift(
     if stored_cumulative_loss_limit_usd != current_cumulative_loss_limit_usd {
         drift.state_preserving.push("cumulative_loss_limit_usd");
     }
+    // Declaring, amending or reconciling a corporate-action window must not
+    // require a window reset: the whole point of the calendar is that an
+    // operator can add the event they just learned about while the runtime
+    // keeps marking, keeps risk-accounting, and keeps the ability to exit.
+    // The one state change a window does make -- discarding the pre-event
+    // signal history -- is performed by the guard itself, once, at the
+    // declared effective time, and recorded in the checkpoint; a blanket
+    // reset here would instead discard it at config-install time, which is
+    // the wrong moment and would also drop the regime and risk baselines
+    // that the forced exit still needs.
+    // How early exits stop before a declared cutoff. A pure forward-looking
+    // guard: it re-aims the next dispatch decision and reinterprets nothing
+    // that is stored.
+    if stored_corporate_action_settlement_margin_secs
+        != current_corporate_action_settlement_margin_secs
+    {
+        drift
+            .state_preserving
+            .push("corporate_action_settlement_margin_secs");
+    }
+    if stored_corporate_actions != current_corporate_actions {
+        drift.state_preserving.push("corporate_actions");
+    }
 
     drift
 }
@@ -270,6 +320,35 @@ fn read_private_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
 
 pub struct ArcusSpotRuntimeCheckpointStore {
     path: PathBuf,
+}
+
+/// Does `event` still promise everything the stored declaration promised?
+///
+/// Only asked of a window that is already live. The runtime's hold on an
+/// amended window is a *progress* record, and a window whose first tick has
+/// not run has none -- so between a stored cutoff and a later amended one
+/// there is nothing to refuse an entry, force an open rotation's unwind, or
+/// stop an ordinary exit sized on quantities the stored event already
+/// declared stale. An amendment is therefore a re-declaration of this window
+/// only while every cutoff moves in the direction that keeps the guard at
+/// least as wide -- block entries earlier, unwind earlier, halt earlier,
+/// resume later -- and keeps every symbol it covered. Narrowing one is
+/// removal by another name, and fails the load with the same recoverable
+/// message (Codex P1, pairtrade#309).
+fn amendment_still_covers(
+    event: &ArcusSpotCorporateActionEvent,
+    stored: &ArcusSpotCorporateActionEvent,
+) -> bool {
+    event.entry_block_at <= stored.entry_block_at
+        && event.reduce_exit_at <= stored.reduce_exit_at
+        && event.effective_at <= stored.effective_at
+        && event.resume_not_before >= stored.resume_not_before
+        && stored.symbols.iter().all(|stored_symbol| {
+            event
+                .symbols
+                .iter()
+                .any(|symbol| symbol.eq_ignore_ascii_case(stored_symbol))
+        })
 }
 
 impl ArcusSpotRuntimeCheckpointStore {
@@ -330,7 +409,24 @@ impl ArcusSpotRuntimeCheckpointStore {
             rotated_quantity: checkpoint.state.rotated_quantity,
             risk_halt: checkpoint.state.risk_halt,
             relative_log_price_samples: checkpoint.state.relative_log_price_history.len(),
+            handled_corporate_action_ids: checkpoint.state.handled_corporate_action_ids.clone(),
+            handled_corporate_action_fingerprints: checkpoint
+                .state
+                .handled_corporate_action_fingerprints
+                .clone(),
             inventory: checkpoint.state.inventory,
+            corporate_action_event_id: checkpoint
+                .state
+                .corporate_action
+                .as_ref()
+                .map(|progress| progress.event_id.clone()),
+            last_observation_at: checkpoint.state.last_observation_at,
+            corporate_action_symbols: checkpoint
+                .state
+                .corporate_action
+                .as_ref()
+                .map(|progress| progress.symbols.clone())
+                .unwrap_or_default(),
         }))
     }
 
@@ -371,6 +467,20 @@ impl ArcusSpotRuntimeCheckpointStore {
     /// turn a missing checkpoint into a successful first-run state: absence
     /// is precisely the reset condition those checks are meant to detect.
     pub fn load_existing(&self, config: &ArcusSpotRuntimeConfig) -> Result<ArcusSpotRuntime> {
+        self.load_existing_at(config, Utc::now())
+    }
+
+    /// `load_existing` with the clock supplied. Window liveness is judged
+    /// against *now*, not against the checkpoint's own watermark: the
+    /// watermark does not advance while the bot is down, so a process that
+    /// was stopped before `entry_block_at` and started after it would
+    /// otherwise accept a config that dropped an already-open window (Codex
+    /// P1, pairtrade#309).
+    pub fn load_existing_at(
+        &self,
+        config: &ArcusSpotRuntimeConfig,
+        now: DateTime<Utc>,
+    ) -> Result<ArcusSpotRuntime> {
         if !self.path.exists() {
             bail!(
                 "Arcus runtime checkpoint {} does not exist",
@@ -382,6 +492,100 @@ impl ArcusSpotRuntimeCheckpointStore {
             .with_context(|| format!("invalid runtime checkpoint {}", self.path.display()))?;
         if checkpoint.schema_version != RUNTIME_CHECKPOINT_SCHEMA_VERSION {
             bail!("unsupported Arcus runtime checkpoint schema");
+        }
+        // `corporate_actions` drift is state-preserving, but *removing* a
+        // window the stored config declared is not a tuning change: it drops
+        // a live guard. Before any tick has written progress there is
+        // nothing else for the runtime to fail closed on, so an older but
+        // still-validly-signed config could be loaded and dispatch an entry
+        // or a stale-unit exit straight through the cutoff. Retiring a
+        // declaration whose window had not opened by the last observation is
+        // still ordinary housekeeping (Codex P1, pairtrade#309).
+        // The handled record is resolved the same way `from_state` will
+        // resolve it, so "already handled" reads identically here and in the
+        // runtime this load is about to build.
+        let mut resolved = checkpoint.state.clone();
+        backfill_handled_corporate_action_fingerprints(&mut resolved, &checkpoint.config);
+        let live_by = checkpoint
+            .state
+            .last_observation_at
+            .map(|observed_at| observed_at.max(now))
+            .unwrap_or(now);
+        // The window need not have opened yet: this load builds the runtime
+        // that a submit guard closes over, and quote/preflight/signing can
+        // cross `entry_block_at` before the order goes out -- at which point
+        // the guard cannot see a declaration the stripped config never had.
+        // The margin that bounds how long a submission takes is the same one
+        // exits already stop for, so removal is only housekeeping for a
+        // window that cannot open within it (Codex P1, pairtrade#309).
+        let submit_margin = Duration::seconds(
+            checkpoint
+                .config
+                .corporate_action_settlement_margin_secs
+                .max(config.corporate_action_settlement_margin_secs),
+        );
+        let live_by = live_by + submit_margin;
+        // The margin is a cutoff too, and the only one the fingerprint does
+        // not carry: it is what keeps a submission from crossing
+        // `entry_block_at` mid-flight and an exit from settling after the
+        // unit change. This load decides a window is live using the *larger*
+        // of the two margins, but the runtime it returns will use the
+        // supplied one -- so an otherwise identical re-declaration with a
+        // smaller margin plans entries closer to the opening and exits
+        // closer to `effective_at` than the stored declaration allowed.
+        // That is a narrowing of every unhandled live window at once, so no
+        // re-declaration can stand against it (Codex P1, pairtrade#309).
+        let margin_narrowed = config.corporate_action_settlement_margin_secs
+            < checkpoint.config.corporate_action_settlement_margin_secs;
+        if let Some(dropped) = checkpoint.config.corporate_actions.iter().find(|stored| {
+            live_by >= stored.entry_block_at
+                // "Handled" by the same rule a tick applies: an id whose
+                // recorded fingerprint belongs to a *different* event is a
+                // reused label, not a completed window, and dropping it
+                // would remove a guard that was never resolved.
+                && !matches!(
+                    handled_corporate_action_record(&resolved, stored),
+                    Some(HandledMatch::Same)
+                )
+                // Still declared if *either* half of its identity is there:
+                // a rename keeps the fingerprint, an amendment keeps the id.
+                // Matching on the fingerprint alone made rescheduling an
+                // open window read as removal and hard-fail the load, which
+                // takes live-tick, state-backup, state-verify-continuity and
+                // reset-window down with it -- while the runtime's own gate
+                // already refuses an amended open window with a recoverable
+                // hold (independent review, pairtrade#309).
+                //
+                // That hold is a *progress* record, though, and a window
+                // whose first tick has not run yet has none: keeping the id
+                // while pushing `entry_block_at` past the stored one leaves
+                // the open window with nothing guarding it, because
+                // `active_corporate_action` does not see the rescheduled one
+                // either. An amendment therefore only counts as still
+                // declaring this window if it still covers where the stored
+                // one opened; moving the opening later is removal by another
+                // name (Codex P1, pairtrade#309).
+                && (margin_narrowed
+                    || !config.corporate_actions.iter().any(|event| {
+                        event.fingerprint() == stored.fingerprint()
+                            || (event.event_id.eq_ignore_ascii_case(&stored.event_id)
+                                && amendment_still_covers(event, stored))
+                    }))
+        }) {
+            bail!(
+                "Arcus runtime checkpoint {} was written under a config declaring corporate \
+                 action {} (window opening at {}, within the submission margin of now and not \
+                 yet handled), which the supplied config no longer declares from that instant \
+                 -- it is absent, or re-declared under the same id in a way that narrows the \
+                 guard (a later opening, a later forced unwind, a later effective instant, an \
+                 earlier resume, a dropped symbol, or a smaller \
+                 corporate_action_settlement_margin_secs). Removing a live window, or amending it \
+                 out from under itself, drops the guard it exists to be; restore the \
+                 declaration at its stored cutoffs, or resolve the window first",
+                self.path.display(),
+                dropped.event_id,
+                dropped.entry_block_at.to_rfc3339(),
+            );
         }
         let drift = classify_config_drift(&checkpoint.config, config);
         if !drift.state_invalidating.is_empty() {
@@ -417,7 +621,22 @@ impl ArcusSpotRuntimeCheckpointStore {
         // (the authenticated one), never from the checkpoint's stored copy.
         // That copy is only the witness `classify_config_drift` compares
         // against, and the next `persist` overwrites it with this one.
-        ArcusSpotRuntime::from_state(config.clone(), checkpoint.state)
+        //
+        // The *handled* records are the exception, and they travel in the
+        // state: `resolved` above already pinned each legacy id to the
+        // declaration that was in force when the checkpoint was written, and
+        // it is that resolution the runtime has to inherit. Handing
+        // `from_state` the raw state instead let it resolve the same ids
+        // against the supplied config, so a config replacing a completed
+        // declaration with a later, already-ended action reusing the id
+        // would have the later action read as already handled -- skipping
+        // its window, its history invalidation, and its inventory
+        // reconciliation. `backfill_handled_corporate_action_fingerprints`
+        // is a no-op on an already-resolved state, so this is also what
+        // makes the comment above the scan true: "already handled" now reads
+        // identically here and in the runtime this load builds (Codex P1,
+        // pairtrade#309).
+        ArcusSpotRuntime::from_state(config.clone(), resolved)
             .map_err(anyhow::Error::msg)
             .context("invalid Arcus runtime checkpoint state")
     }
@@ -517,6 +736,17 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::new(76, 2),
             daily_loss_limit_usd: Decimal::from(3),
             cumulative_loss_limit_usd: Decimal::from(11),
+            corporate_actions: vec![super::super::ArcusSpotCorporateActionEvent {
+                event_id: "SPY-2026-SPLIT".to_string(),
+                symbols: vec!["SPY".to_string()],
+                entry_block_at: "2026-10-01T00:00:00Z".parse().unwrap(),
+                reduce_exit_at: "2026-10-01T12:00:00Z".parse().unwrap(),
+                effective_at: "2026-10-02T00:00:00Z".parse().unwrap(),
+                resume_not_before: "2026-10-03T00:00:00Z".parse().unwrap(),
+                source: "issuer notice".to_string(),
+                post_event_inventory: None,
+            }],
+            corporate_action_settlement_margin_secs: 42,
         }
     }
 
@@ -550,6 +780,8 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::new(75, 2),
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
+            corporate_actions: Vec::new(),
+            corporate_action_settlement_margin_secs: 300,
         }
     }
 
@@ -652,7 +884,12 @@ mod tests {
         let stored = live_runtime_config();
         let current = maximally_different_config();
 
-        let field_count = serde_json::to_value(&stored)
+        // Counted from `current`, not `stored`: fields whose value is the
+        // default are skipped in the canonical serialization (so an
+        // unchanged YAML keeps its auto-execute digest across a binary
+        // upgrade), and `maximally_different_config` populates every one of
+        // them, so its object has a key per field.
+        let field_count = serde_json::to_value(&current)
             .unwrap()
             .as_object()
             .expect("runtime config serializes as an object")
@@ -679,6 +916,269 @@ mod tests {
                 "signal_window_samples",
             ],
         );
+        assert!(drift.state_preserving.contains(&"corporate_actions"));
+        assert!(drift
+            .state_preserving
+            .contains(&"corporate_action_settlement_margin_secs"));
+    }
+
+    #[test]
+    fn a_legacy_handled_id_resolves_against_the_config_that_recorded_it() {
+        use super::super::ArcusSpotCorporateActionEvent;
+        // A checkpoint written before fingerprints existed records handled
+        // *ids* only. Resolving one against the supplied config lets a
+        // config that replaced the completed declaration with a later
+        // action reusing the id inherit "already handled" -- skipping that
+        // action's window, its history invalidation, and its inventory
+        // reconciliation. The resolution has to be the one the stored
+        // config produces (Codex P1, pairtrade#309).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.json");
+        let store = ArcusSpotRuntimeCheckpointStore::new(path.clone());
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-08-16T00:00:00Z".parse().unwrap();
+        let event_at = |start: chrono::DateTime<chrono::Utc>| ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec!["NVDA".to_string()],
+            entry_block_at: start,
+            reduce_exit_at: start + chrono::Duration::hours(1),
+            effective_at: start + chrono::Duration::hours(2),
+            resume_not_before: start + chrono::Duration::hours(3),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        };
+        let completed = event_at(anchor);
+        let reused_id = event_at(anchor + chrono::Duration::hours(10));
+        assert_ne!(completed.fingerprint(), reused_id.fingerprint());
+
+        let mut stored_config = live_runtime_config();
+        stored_config.corporate_actions = vec![completed.clone()];
+        let mut state = ArcusSpotRuntime::new(stored_config.clone())
+            .unwrap()
+            .state()
+            .clone();
+        // Both declarations have ended by the watermark, so the only thing
+        // separating them is which config the id is resolved against.
+        state.last_observation_at = Some(anchor + chrono::Duration::hours(20));
+        state.handled_corporate_action_ids = vec![completed.event_id.clone()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(stored_config.clone(), state).unwrap())
+            .unwrap();
+        // `from_state` resolves on the way in, so strip the record back to
+        // its legacy shape in the file the loader will actually read.
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        raw["state"]["handled_corporate_action_fingerprints"] = serde_json::json!([]);
+        raw["state"]["handled_corporate_actions_resolved"] = serde_json::json!(false);
+        fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let mut supplied = live_runtime_config();
+        supplied.corporate_actions = vec![reused_id.clone()];
+        let runtime = store
+            .load_existing_at(&supplied, anchor + chrono::Duration::hours(20))
+            .expect("the load itself is ordinary: the completed window is handled");
+
+        assert_eq!(
+            runtime.state().handled_corporate_action_fingerprints,
+            vec![completed.fingerprint()],
+            "the legacy id belongs to the declaration that was in force when it was recorded",
+        );
+        assert!(
+            !matches!(
+                handled_corporate_action_record(runtime.state(), &reused_id),
+                Some(HandledMatch::Same)
+            ),
+            "a later action reusing the id has not been handled",
+        );
+    }
+
+    #[test]
+    fn load_refuses_a_config_that_dropped_a_live_window() {
+        use super::super::ArcusSpotCorporateActionEvent;
+        let dir = tempdir().unwrap();
+        let store = ArcusSpotRuntimeCheckpointStore::new(dir.path().join("runtime.json"));
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-08-16T00:00:00Z".parse().unwrap();
+        let mut declared = live_runtime_config();
+        declared.corporate_actions = vec![ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec![declared.pair.sell_symbol.clone()],
+            entry_block_at: anchor,
+            reduce_exit_at: anchor + chrono::Duration::hours(1),
+            effective_at: anchor + chrono::Duration::hours(2),
+            resume_not_before: anchor + chrono::Duration::hours(3),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        }];
+        // The window has opened as of the last observation, and no tick has
+        // written progress yet -- the exact gap this guard closes.
+        let mut state = ArcusSpotRuntime::new(declared.clone())
+            .unwrap()
+            .state()
+            .clone();
+        state.last_observation_at = Some(anchor + chrono::Duration::minutes(1));
+        assert!(state.corporate_action.is_none());
+        let runtime = ArcusSpotRuntime::from_state(declared.clone(), state.clone()).unwrap();
+        store.persist(&runtime).unwrap();
+
+        let mut dropped = declared.clone();
+        dropped.corporate_actions.clear();
+        let inside = anchor + chrono::Duration::minutes(2);
+        let error = match store.load_existing_at(&dropped, inside) {
+            Ok(_) => panic!("expected the dropped window to be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Renaming it is not removing it: same fingerprint, still declared.
+        let mut renamed = declared.clone();
+        renamed.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
+        assert!(store.load_existing_at(&renamed, inside).is_ok());
+
+        // Nor is amending it, while the amendment cannot narrow the guard:
+        // the id is still there, every cutoff moves in the direction that
+        // keeps the window at least as wide, and failing the load instead
+        // would take state-backup, state-verify-continuity and reset-window
+        // down with it.
+        let mut amended = declared.clone();
+        amended.corporate_actions[0].effective_at -= chrono::Duration::minutes(30);
+        amended.corporate_actions[0].resume_not_before += chrono::Duration::hours(1);
+        assert!(store.load_existing_at(&amended, inside).is_ok());
+
+        // ...but a cutoff moved *out* is the same hole as a later opening,
+        // and for the same reason: the hold on an amended window is a
+        // progress record, and this one has none. Between the stored cutoff
+        // and the amended one, an open rotation would miss its forced unwind
+        // or exit on quantities the stored event already declared stale
+        // (Codex P1, pairtrade#309).
+        for narrowing in [
+            "reduce_exit_at",
+            "effective_at",
+            "resume_not_before",
+            "symbols",
+        ] {
+            let mut narrowed = declared.clone();
+            match narrowing {
+                "reduce_exit_at" => {
+                    narrowed.corporate_actions[0].reduce_exit_at += chrono::Duration::hours(1)
+                }
+                "effective_at" => {
+                    narrowed.corporate_actions[0].effective_at += chrono::Duration::hours(1)
+                }
+                "resume_not_before" => {
+                    narrowed.corporate_actions[0].resume_not_before -= chrono::Duration::hours(1)
+                }
+                "symbols" => narrowed.corporate_actions[0].symbols = vec!["ZZZZ".to_string()],
+                other => unreachable!("{other}"),
+            }
+            let error = match store.load_existing_at(&narrowed, inside) {
+                Ok(_) => panic!("narrowing a live window's {narrowing} is removal"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("Removing a live window"),
+                "{narrowing}: {error}"
+            );
+        }
+
+        // The settlement margin is a cutoff the fingerprint does not carry:
+        // shrinking it lets the returned runtime plan entries closer to the
+        // opening and exits closer to `effective_at` than the stored
+        // declaration allowed, even though the declaration itself is
+        // byte-identical (Codex P1, pairtrade#309).
+        let mut tighter_margin = declared.clone();
+        tighter_margin.corporate_action_settlement_margin_secs -= 60;
+        let error = match store.load_existing_at(&tighter_margin, inside) {
+            Ok(_) => panic!("shrinking the settlement margin narrows every live window"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Widening it only ever holds the guard open for longer.
+        let mut wider_margin = declared.clone();
+        wider_margin.corporate_action_settlement_margin_secs += 60;
+        assert!(store.load_existing_at(&wider_margin, inside).is_ok());
+
+        // Case only: the symbol comparison follows the fingerprint's own
+        // lowercase normalisation, so re-spelling a symbol is not dropping it.
+        let mut recased = declared.clone();
+        recased.corporate_actions[0].symbols = recased.corporate_actions[0]
+            .symbols
+            .iter()
+            .map(|symbol| symbol.to_ascii_lowercase())
+            .collect();
+        recased.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v3".to_string();
+        assert!(store.load_existing_at(&recased, inside).is_ok());
+
+        // Rescheduling the *opening* later under the same label is removal
+        // by another name. The runtime's hold is a progress record, and a
+        // window whose first tick has not run has none; the rescheduled
+        // declaration is not active yet either, so nothing would refuse an
+        // entry inside the window that is open right now.
+        let mut rescheduled = declared.clone();
+        rescheduled.corporate_actions[0].entry_block_at += chrono::Duration::hours(1);
+        rescheduled.corporate_actions[0].reduce_exit_at += chrono::Duration::hours(1);
+        rescheduled.corporate_actions[0].effective_at += chrono::Duration::hours(1);
+        rescheduled.corporate_actions[0].resume_not_before += chrono::Duration::hours(1);
+        let error = match store.load_existing_at(&rescheduled, inside) {
+            Ok(_) => panic!("rescheduling a live window's opening later is removal"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Pulling the opening earlier only widens the guard, so it stays a
+        // declaration of the same window.
+        let mut earlier = declared.clone();
+        earlier.corporate_actions[0].entry_block_at -= chrono::Duration::hours(1);
+        assert!(store.load_existing_at(&earlier, inside).is_ok());
+
+        // Downtime does not make a window un-live: the watermark stays before
+        // `entry_block_at` while the clock moves past it.
+        let mut early_state = state.clone();
+        early_state.last_observation_at = Some(anchor - chrono::Duration::hours(1));
+        store
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), early_state.clone()).unwrap())
+            .unwrap();
+        let error = match store.load_existing_at(&dropped, inside) {
+            Ok(_) => panic!("a window open by the clock is live even after downtime"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Retiring one that cannot open within the submission margin is
+        // housekeeping. The default margin is 300s, so a minute before the
+        // window is still refused -- the runtime this load builds could
+        // submit after it opened.
+        let error = match store.load_existing_at(&dropped, anchor - chrono::Duration::minutes(1)) {
+            Ok(_) => panic!("a window that can open mid-submission is still live"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+        assert!(store
+            .load_existing_at(&dropped, anchor - chrono::Duration::hours(1))
+            .is_ok());
+
+        // A reused id is not "handled": the recorded fingerprint is another
+        // event's, so the declaration is still an unresolved window.
+        let mut reused_state = state.clone();
+        reused_state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        reused_state.handled_corporate_action_fingerprints = vec!["an-older-event".to_string()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), reused_state).unwrap())
+            .unwrap();
+        let error = match store.load_existing_at(&dropped, inside) {
+            Ok(_) => panic!("a reused id must not read as handled"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Genuinely handled (same fingerprint): removal is fine.
+        let mut handled_state = state.clone();
+        handled_state.handled_corporate_action_ids = vec!["NVDA-2026-08-SPLIT".to_string()];
+        handled_state.handled_corporate_action_fingerprints =
+            vec![declared.corporate_actions[0].fingerprint()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(declared.clone(), handled_state).unwrap())
+            .unwrap();
+        assert!(store.load_existing_at(&dropped, inside).is_ok());
     }
 
     #[test]
