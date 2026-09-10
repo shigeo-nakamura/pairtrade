@@ -156,6 +156,34 @@ pub struct ArcusSpotRuntimeConfig {
     pub max_all_in_round_trip_cost_bps: Decimal,
     pub gas_buffer_bps: Decimal,
     pub settlement_buffer_bps: Decimal,
+    /// How far above the router's own `referencePrice` (in bps) a venue
+    /// quote may sit and still be selected for a leg. The router's
+    /// `recommended` is just the largest buyAmount, and on 2026-09-10
+    /// rialto intermittently quoted +212 bps over the reference, so the
+    /// recommendation pointed at the least believable quote exactly when it
+    /// mattered and the tick was discarded with it (bot-strategy#1001).
+    /// Honest quotes measured 2-20 bps *below* the reference; 25 bps admits a
+    /// lagging reference and rejects the anomaly by an order of magnitude.
+    /// Omitted from serialization at its default so an unchanged YAML keeps
+    /// its policy digest (see `corporate_actions` above).
+    #[serde(
+        default = "default_max_favourable_quote_deviation_bps",
+        skip_serializing_if = "is_default_max_favourable_quote_deviation_bps"
+    )]
+    pub max_favourable_quote_deviation_bps: Decimal,
+    /// How old (seconds, at receipt) a route response's `referencePrice`
+    /// may be and still judge its venue quotes. A frozen or lagging
+    /// reference makes every honest quote look unfavourable and an
+    /// anomalous one look fair, so past this age the leg selects nothing
+    /// (Codex on dex-connector#95). The router's reference advanced every
+    /// 15 s in US hours on 2026-09-10; 120 s passes a slow tick and refuses
+    /// a weekend, holiday or outage freeze. Omitted from serialization at
+    /// its default, like the band above.
+    #[serde(
+        default = "default_max_reference_price_age_secs",
+        skip_serializing_if = "is_default_max_reference_price_age_secs"
+    )]
+    pub max_reference_price_age_secs: i64,
     pub max_inventory_imbalance_fraction: Decimal,
     pub daily_loss_limit_usd: Decimal,
     pub cumulative_loss_limit_usd: Decimal,
@@ -189,6 +217,22 @@ pub struct ArcusSpotRuntimeConfig {
 
 fn default_corporate_action_settlement_margin_secs() -> i64 {
     300
+}
+
+fn default_max_favourable_quote_deviation_bps() -> Decimal {
+    Decimal::from(dex_connector::DEFAULT_MAX_FAVOURABLE_QUOTE_DEVIATION_BPS)
+}
+
+fn is_default_max_favourable_quote_deviation_bps(value: &Decimal) -> bool {
+    *value == default_max_favourable_quote_deviation_bps()
+}
+
+fn default_max_reference_price_age_secs() -> i64 {
+    dex_connector::DEFAULT_MAX_REFERENCE_PRICE_AGE_SECS
+}
+
+fn is_default_max_reference_price_age_secs(value: &i64) -> bool {
+    *value == default_max_reference_price_age_secs()
 }
 
 fn is_default_corporate_action_settlement_margin_secs(value: &i64) -> bool {
@@ -297,6 +341,16 @@ impl ArcusSpotRuntimeConfig {
         }
         if self.max_all_in_round_trip_cost_bps <= Decimal::ZERO {
             return Err("max_all_in_round_trip_cost_bps must be positive".to_string());
+        }
+        if self.max_favourable_quote_deviation_bps < Decimal::ZERO
+            || self.max_favourable_quote_deviation_bps > Decimal::from(10_000)
+        {
+            return Err(
+                "max_favourable_quote_deviation_bps must be between 0 and 10000".to_string(),
+            );
+        }
+        if !(1..=86_400).contains(&self.max_reference_price_age_secs) {
+            return Err("max_reference_price_age_secs must be between 1 and 86400".to_string());
         }
         let fixed_buffers = self
             .gas_buffer_bps
@@ -499,6 +553,8 @@ mod tests {
             max_inventory_imbalance_fraction: Decimal::new(8, 1),
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
+            max_favourable_quote_deviation_bps: default_max_favourable_quote_deviation_bps(),
+            max_reference_price_age_secs: default_max_reference_price_age_secs(),
             corporate_actions: Vec::new(),
         }
     }
@@ -634,6 +690,77 @@ corporate_action:
         assert!(error.contains("corporate_action"), "{error}");
     }
 
+    // The deployed 2026-09-10 runtime YAML, field for field, except `mode`:
+    // `live` only exists under the `arcus-spot-live` feature and the
+    // `arcus-spot-sdk`-only CI job (`cargo test --lib --features
+    // arcus-spot-sdk arcus_spot`) compiles this module without it. The
+    // defaulting under test is per-field and mode-independent.
+    const LIVE_SHAPED_RUNTIME_YAML: &str = r#"mode: read_only
+chain_id: 4663
+pair:
+  sell_symbol: SPY
+  buy_symbol: QQQ
+notional_usd: "400.00"
+initial_inventory: {token_a: "1.937025506988038957", token_b: "2.087371762778876145"}
+inventory_floors: {token_a: "0.193702550698803895", token_b: "0.208737176277887614"}
+max_rotation_fraction: "0.35"
+signal_window_samples: 96
+min_signal_samples: 32
+entry_z_score: 1.0
+exit_z_score: 0.25
+max_quote_age_secs: 60
+max_hold_secs: 86400
+max_all_in_round_trip_cost_bps: "60"
+gas_buffer_bps: "10"
+settlement_buffer_bps: "10"
+max_inventory_imbalance_fraction: "0.75"
+daily_loss_limit_usd: "32"
+cumulative_loss_limit_usd: "160"
+"#;
+
+    #[test]
+    fn plausibility_band_is_bounded_and_defaults_when_the_yaml_omits_it() {
+        let mut config = valid_config();
+        config.max_favourable_quote_deviation_bps = Decimal::NEGATIVE_ONE;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("max_favourable_quote_deviation_bps"));
+        config.max_favourable_quote_deviation_bps = Decimal::from(10_001);
+        assert!(config.validate().is_err());
+        config.max_favourable_quote_deviation_bps = Decimal::ZERO;
+        config.validate().unwrap();
+        config.max_favourable_quote_deviation_bps = Decimal::from(10_000);
+        config.validate().unwrap();
+        config.max_reference_price_age_secs = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("max_reference_price_age_secs"));
+        config.max_reference_price_age_secs = 86_401;
+        assert!(config.validate().is_err());
+        config.max_reference_price_age_secs = 120;
+        config.validate().unwrap();
+        // The deployed 2026-09-10 YAML never mentions the field:
+        // deserialization supplies the default rather than rejecting the
+        // file (`deny_unknown_fields` only bites on *unknown* keys), and the
+        // resulting config serializes without it, so its policy digest is
+        // the one already installed.
+        let parsed: ArcusSpotRuntimeConfig =
+            serde_yaml::from_str(LIVE_SHAPED_RUNTIME_YAML).unwrap();
+        assert_eq!(parsed.max_favourable_quote_deviation_bps, Decimal::from(25));
+        assert_eq!(parsed.max_reference_price_age_secs, 120);
+        let object = serde_json::to_value(&parsed).unwrap();
+        let object = object.as_object().unwrap();
+        assert!(!object.contains_key("max_favourable_quote_deviation_bps"));
+        assert!(!object.contains_key("max_reference_price_age_secs"));
+        let parsed: ArcusSpotRuntimeConfig = serde_yaml::from_str(&format!(
+            "{LIVE_SHAPED_RUNTIME_YAML}max_favourable_quote_deviation_bps: \"40\"\n"
+        ))
+        .unwrap();
+        assert_eq!(parsed.max_favourable_quote_deviation_bps, Decimal::from(40));
+    }
+
     #[test]
     fn an_empty_calendar_is_valid_and_is_the_default() {
         let config = valid_config();
@@ -691,6 +818,7 @@ corporate_action:
         let config = valid_config();
         assert!(config.corporate_actions.is_empty());
         assert_eq!(config.corporate_action_settlement_margin_secs, 300);
+        assert_eq!(config.max_favourable_quote_deviation_bps, Decimal::from(25));
         let value = serde_json::to_value(&config).unwrap();
         let object = value.as_object().unwrap();
         assert!(!object.contains_key("corporate_actions"), "{object:?}");
@@ -698,6 +826,21 @@ corporate_action:
             !object.contains_key("corporate_action_settlement_margin_secs"),
             "{object:?}"
         );
+        assert!(
+            !object.contains_key("max_favourable_quote_deviation_bps"),
+            "{object:?}"
+        );
+        assert!(
+            !object.contains_key("max_reference_price_age_secs"),
+            "{object:?}"
+        );
+        let mut widened = valid_config();
+        widened.max_favourable_quote_deviation_bps = Decimal::from(40);
+        widened.max_reference_price_age_secs = 300;
+        let value = serde_json::to_value(&widened).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(object.contains_key("max_favourable_quote_deviation_bps"));
+        assert!(object.contains_key("max_reference_price_age_secs"));
 
         // A deployment that uses either one is a deliberate config change
         // and does move the digest.

@@ -882,6 +882,13 @@ fn require_fresh_quote_matches_approved_plan(
             "fresh Arcus buy amount {fresh_buy_amount} undercuts approved plan floor {approved_floor} (approved target {approved_buy}, slippage_bps={slippage_bps})"
         );
     }
+    // Deliberately no ceiling. A fresh quote paying more than the approved
+    // target is what a favourable move between plan and dispatch looks
+    // like, and refusing it would also refuse a max-hold or
+    // corporate-action exit that happens to land on one (Codex P2,
+    // pairtrade#323). Plausibility is judged where the plan is built, per
+    // venue against the router's reference; here the floor is the only
+    // thing that protects the approved economics.
     Ok(())
 }
 
@@ -1468,6 +1475,15 @@ mod tests {
         // 50 bps = 0.5% of 1000 = 5, so 995 is the exact floor.
         require_fresh_quote_matches_approved_plan(&plan, U256::from(995_u64), 50).unwrap();
         assert!(require_fresh_quote_matches_approved_plan(&plan, U256::from(994_u64), 50).is_err());
+    }
+
+    #[test]
+    fn fresh_quote_may_pay_more_than_the_approved_plan() {
+        // A favourable move between plan and dispatch is not a reason to
+        // refuse an approved trade -- least of all an exit.
+        let plan = plan_with_buy_amount("1000");
+        require_fresh_quote_matches_approved_plan(&plan, U256::from(1006_u64), 50).unwrap();
+        require_fresh_quote_matches_approved_plan(&plan, U256::from(1021_u64), 50).unwrap();
     }
 
     // bot-strategy#880: a fresh quote whose *target* buy amount exactly
