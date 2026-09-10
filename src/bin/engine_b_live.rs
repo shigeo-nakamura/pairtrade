@@ -2005,6 +2005,24 @@ struct EngineBLiveEngine {
     /// routinely seen on the very tick that observes the account flat
     /// (pairtrade#320 Codex review, P1).
     fill_ledger_entry_side: Option<OrderSide>,
+    /// The ledger is accumulating for a trade that has not been
+    /// summarised yet.
+    ///
+    /// The lifecycle this makes explicit: the ledger opens at the
+    /// **earliest moment a fill for the trade can exist** -- the entry
+    /// send, before any harvest can run -- and closes when the trade's
+    /// settled record is written. Opening it later loses fills to the
+    /// wrong trade: an entry fill arriving while the send is still
+    /// `PendingConfirm` would be counted against the previous trade's
+    /// still-active accumulators, marked seen process-wide, and then be
+    /// unavailable to the trade it actually belongs to, leaving every
+    /// second-and-later trade permanently unsettled (pairtrade#320
+    /// Codex review round 4).
+    ///
+    /// Between close and the next open the side is deliberately kept,
+    /// so a fill that straggles in after the close still lands in the
+    /// durable ledger with the right leg.
+    fill_ledger_trade_open: bool,
 }
 
 impl EngineBLiveEngine {
@@ -4286,11 +4304,14 @@ impl EngineBLiveEngine {
     /// Shared tail of a successful (or adopted) entry: record the
     /// position, mark the day as acted on, persist, log, notify.
     fn record_entry(&mut self, pos: OpenPosition, epsilon: f64, notional_usd: f64, note: &str) {
-        // A fresh settled account per position, so one day's fills can
-        // never be folded into the next day's VWAP (bot-strategy#919).
-        // The harvest on this same tick then picks up the fills that
-        // produced this entry.
-        self.begin_fill_ledger(pos.side);
+        // Normally already open, from the send. This covers the paths
+        // that reach a position without one -- DRY_RUN, where nothing is
+        // sent -- without discarding fills already accumulated for this
+        // very trade (bot-strategy#919, pairtrade#320 Codex review
+        // round 4).
+        if !self.fill_ledger_trade_open {
+            self.begin_fill_ledger(pos.side);
+        }
         let side = pos.side;
         let price = pos.entry_price;
         let size = pos.size;
@@ -4800,6 +4821,11 @@ impl EngineBLiveEngine {
         // `poll_pending_confirm` on the following ticks; `day.entered`
         // stays false until then so a restart in between re-checks the
         // exchange (pre-submit block above) rather than re-sending.
+        // Open the ledger before the first harvest can run: the fill
+        // for this send may already be in the connector's cache, and
+        // counting it against the previous trade would consume it for
+        // good (pairtrade#320 Codex review round 4).
+        self.begin_fill_ledger(side);
         self.pending = Some(PendingConfirm::Entry {
             side,
             requested,
@@ -5106,10 +5132,11 @@ impl EngineBLiveEngine {
                 "dry_run": self.cfg.dry_run,
             }),
         );
-        // The ledger is deliberately NOT cleared here. A fill that
-        // arrives after the close is booked still belongs in the durable
-        // record, and the next entry starts a fresh account anyway
-        // (`begin_fill_ledger`).
+        // The trade is summarised; the ledger closes. Its accumulators
+        // and side are deliberately kept, so a fill that straggles in
+        // after the close still reaches the durable record with the
+        // right leg. The next entry opens a fresh one.
+        self.fill_ledger_trade_open = false;
         send_notification(
             format!(
                 "Han Bridge EXIT {} pnl=${pnl:.2}",
@@ -5298,7 +5325,7 @@ impl EngineBLiveEngine {
         // process and are not recoverable, so its settlement stays
         // unknown -- which is correct. The exit fills still have to be
         // recorded.
-        if self.fill_ledger_entry_side.is_none() {
+        if !self.fill_ledger_trade_open {
             if let Some(side) = self.position.as_ref().map(|p| p.side) {
                 self.begin_fill_ledger(side);
             }
@@ -5440,6 +5467,7 @@ impl EngineBLiveEngine {
         self.entry_fills = LegFills::default();
         self.exit_fills = LegFills::default();
         self.fill_ledger_entry_side = Some(side);
+        self.fill_ledger_trade_open = true;
     }
 
     fn spawn_venue_equity_refresh(&mut self, now_us: i64) {
@@ -5970,6 +5998,7 @@ async fn main() -> Result<()> {
         exit_fills: LegFills::default(),
         seen_trade_ids: std::collections::HashSet::new(),
         fill_ledger_entry_side: None,
+        fill_ledger_trade_open: false,
     };
     if let Some(p) = engine.state.open_position.as_ref() {
         log::warn!(
@@ -7435,6 +7464,7 @@ mod tests {
             exit_fills: LegFills::default(),
             seen_trade_ids: std::collections::HashSet::new(),
             fill_ledger_entry_side: None,
+            fill_ledger_trade_open: false,
         };
         Harness {
             engine,
@@ -9557,6 +9587,105 @@ mod tests {
             .expect("the entry fill must not wait a tick to become durable");
         assert_eq!(raw.lines().count(), 1);
         assert_eq!(h.engine.entry_fills.fills, 1);
+    }
+
+    /// pairtrade#320 Codex review round 4, and the reason the ledger
+    /// now has an explicit lifecycle rather than an implicit one.
+    ///
+    /// After a completed trade the accumulators and side stay behind so
+    /// a straggling fill still lands somewhere sensible. The next
+    /// session's entry fill can reach the connector cache while the send
+    /// is still `PendingConfirm` -- and a harvest then counted it
+    /// against the *previous* trade and marked it seen process-wide, so
+    /// `record_entry`'s reset left the new trade with a fill it could
+    /// never obtain again. Every second-and-later trade in a process
+    /// would have been permanently unsettled.
+    ///
+    /// Driven through `maybe_enter`, because the fix is that the ledger
+    /// opens inside the send.
+    #[tokio::test]
+    async fn a_second_trade_settles_when_its_fill_arrives_before_confirmation() {
+        let mut h = harness();
+
+        // Trade 1, complete.
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T1_US).await;
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert!(!last_pnl_record(&h)["settled"].is_null(), "trade 1 settles");
+
+        // Trade 2's send. Its fill is already on the venue by the time
+        // the order returns -- the ordering that broke this.
+        h.engine.position = None;
+        h.engine.day.entered = false;
+        h.engine.day.exited = false;
+        h.engine.state.last_session_date = None;
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1, "trade 2 was sent");
+
+        // kr up, us flat -> epsilon positive -> this entry is a long,
+        // the opposite side from trade 1. That is the case that hurts:
+        // attributed against trade 1's still-open ledger it would land
+        // in its *exit* leg.
+        h.connector
+            .push_fill("t3", OrderSide::Long, "0.05", "1700.00", None);
+        h.harvest(T1_US + 2_000_000).await;
+        assert_eq!(
+            h.engine.entry_fills.fills, 1,
+            "the fill belongs to the trade being sent, not the one just closed"
+        );
+        assert!(
+            (h.engine.entry_fills.size - 0.05).abs() < 1e-9,
+            "and trade 1's quantity is not in it"
+        );
+        assert_eq!(h.engine.exit_fills.fills, 0);
+    }
+
+    /// The closing half of the lifecycle. Once a trade is summarised the
+    /// ledger is closed, so a position that turns up afterwards without
+    /// going through an entry -- adopted from the exchange -- starts its
+    /// own account instead of accumulating into the finished trade's.
+    #[tokio::test]
+    async fn a_position_adopted_after_a_close_starts_its_own_account() {
+        let mut h = harness();
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T1_US).await;
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert!(h.engine.entry_fills.fills > 0, "the closed trade's totals");
+
+        // An exposure appears that this process did not open: no entry,
+        // no send, just a position.
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: true,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T2_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        });
+        h.harvest(T2_US + 1_000_000).await;
+        assert_eq!(
+            h.engine.entry_fills.fills, 0,
+            "the finished trade's fills must not carry into this one"
+        );
+        assert_eq!(h.engine.exit_fills.fills, 0);
+        assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Long));
     }
 
     #[tokio::test]

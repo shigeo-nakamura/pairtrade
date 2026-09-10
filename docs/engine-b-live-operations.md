@@ -155,12 +155,21 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     of it) and would otherwise be summarised before it was ever seen.
     (The venue *equity* read does go to REST and is deliberately
     off-tick -- see below.)
-  - The ledger follows the position, not the entry. A position restored
-    after a restart or adopted from the exchange never goes through the
-    entry path, so the ledger adopts its side on the next harvest and
-    records everything from there. Its pre-restart entry fills are gone,
-    so that trade settles as unknown -- correct -- but its exit fills
-    are still recorded.
+  - **The ledger has an explicit lifetime, and it starts at the send.**
+    It opens the moment an entry order goes out -- before any harvest
+    can run, because the fill may already be in the connector's cache by
+    the time the send returns -- and closes when that trade's settled
+    record is written. Opening it later would count the new trade's
+    entry fill against the previous trade's still-open accumulators and
+    mark it seen process-wide, leaving every second-and-later trade in a
+    process permanently unsettled.
+  - Between close and the next open the side and totals are kept, so a
+    fill that straggles in after the close still reaches the durable
+    ledger with the right leg. A position that appears without an entry
+    -- restored after a restart, or adopted from the exchange -- opens
+    its own account on the next harvest. Its pre-restart entry fills are
+    unrecoverable, so that trade settles as unknown (correct), but its
+    exit fills are recorded.
   - A fill is counted only once its ledger row is on disk. If the append
     fails the fill is left unmarked and untotalled, and the connector's
     next re-serve retries it -- a transient filesystem error must not
