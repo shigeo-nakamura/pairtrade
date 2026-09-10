@@ -1789,18 +1789,35 @@ struct HanBridgeStatus {
     /// excluded: this engine has no cost basis for exposure it did not
     /// open.
     unrealized_pnl_usd_mid_estimate: Option<f64>,
-    /// When today's exit stops being retried and the day is abandoned
-    /// with the position still open (`t2 + exit_deadline_secs`), or
-    /// `None` when nothing is open.
+    /// The **emergency-close threshold** for the open position
+    /// (`t2 + exit_deadline_secs`), or `None` when nothing is open or
+    /// the position carries no scheduled boundary.
     ///
-    /// Published so a dashboard can say a scheduled exit is *late*.
-    /// bot-strategy#917 closes an unconfirmable exit by leaving the
-    /// position open on purpose -- a documented open position beats a
-    /// close nobody can verify -- and until now that outcome had no
-    /// signal anywhere but an e-mail and the journal. A card that knows
-    /// when the exit was due can show it as overdue instead of going on
-    /// reading "Entered, holding" indefinitely.
+    /// Explicitly *not* "when retrying stops". Past this point
+    /// `maybe_exit` stops waiting for the scheduled boundary and forces
+    /// a close, and `poll_pending_confirm` clears an expired attempt so
+    /// the next tick sends another -- the engine tries harder here, not
+    /// less (pairtrade#319 Codex review). A consumer that renders this
+    /// as "abandoned" would report an active close loop as a stopped
+    /// one.
+    ///
+    /// Published so a dashboard can say a scheduled exit is late, and
+    /// distinguish "still inside its window" from "past it and
+    /// force-closing". bot-strategy#917 leaves an unconfirmable close
+    /// open on purpose -- a documented open position beats a close
+    /// nobody can verify -- and that outcome had no signal anywhere but
+    /// an e-mail and the journal.
     exit_deadline_us: Option<i64>,
+    /// A position **this engine opened and manages** is open.
+    ///
+    /// Not the same question as the document's top-level
+    /// `has_position`, which counts `unmanaged_positions` too: an
+    /// exposure adopted from the exchange, or left behind by a former
+    /// `us_primary`, makes that flag true on a day Engine B opened
+    /// nothing. A consumer that read it as "Engine B is holding" would
+    /// announce an exit for a position Engine B never took
+    /// (debot-dashboard#47 Codex review).
+    managed_position_open: bool,
 }
 
 #[derive(Serialize)]
@@ -5339,6 +5356,7 @@ impl EngineBLiveEngine {
             venue_equity_stale,
             unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
             exit_deadline_us: self.position.as_ref().and_then(|p| p.exit_deadline_us),
+            managed_position_open: self.position.is_some(),
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -6213,6 +6231,7 @@ mod tests {
                 venue_equity_stale: false,
                 unrealized_pnl_usd_mid_estimate: None,
                 exit_deadline_us: None,
+                managed_position_open: false,
             },
         }
     }
@@ -8558,6 +8577,31 @@ mod tests {
     /// "the refresh is slow" but "a slow refresh stops the engine from
     /// closing a position", so the assertion is on the tick completing
     /// while the venue read is still outstanding.
+    /// `has_position` counts unmanaged exposures, so it cannot answer
+    /// "is Engine B holding" -- a consumer that read it that way would
+    /// announce an exit for a position Engine B never took
+    /// (debot-dashboard#47 Codex review).
+    #[tokio::test]
+    async fn managed_and_account_wide_position_flags_are_not_the_same_question() {
+        let mut h = harness();
+        h.engine
+            .state
+            .unmanaged_positions
+            .push(persisted_long(0.04, TODAY));
+        h.engine.write_status_if_due(T1_US);
+        let status = read_status(&h);
+        assert_eq!(
+            status["has_position"],
+            serde_json::json!(true),
+            "the account does hold something"
+        );
+        assert_eq!(
+            status["han_bridge"]["managed_position_open"],
+            serde_json::json!(false),
+            "but this engine opened nothing, so it has no exit to announce"
+        );
+    }
+
     /// The exit deadline is what lets a card say a scheduled exit is
     /// late rather than reading "Entered, holding" forever after an
     /// unconfirmable close (bot-strategy#917).
@@ -8584,9 +8628,14 @@ mod tests {
             exit_deadline_us: Some(T2_US + 900_000_000),
         });
         h.engine.write_status_if_due(T1_US + 60_000_000);
+        let status = read_status(&h);
         assert_eq!(
-            read_status(&h)["han_bridge"]["exit_deadline_us"],
+            status["han_bridge"]["exit_deadline_us"],
             serde_json::json!(T2_US + 900_000_000)
+        );
+        assert_eq!(
+            status["han_bridge"]["managed_position_open"],
+            serde_json::json!(true)
         );
     }
 
