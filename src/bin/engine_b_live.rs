@@ -7139,6 +7139,12 @@ mod tests {
                 filled_size: Some(size),
                 filled_value: Some(size * price),
                 filled_fee: fee.map(|f| Decimal::from_str(f).unwrap()),
+                // Engine B trades Lighter perps, where the fee is charged
+                // in the quote asset; the base-fee field exists for
+                // Hyperliquid spot (dex-connector v4.7.25,
+                // bot-strategy#998). `None` here says "not applicable",
+                // which is what this stub means.
+                filled_base_fee: None,
                 filled_ts_ms: None,
                 tx_hash: None,
             });
@@ -7154,6 +7160,19 @@ mod tests {
     impl DexConnector for StubConnector {
         async fn start(&self) -> Result<(), dex_connector::DexError> {
             Ok(())
+        }
+        /// Required since dex-connector v4.7.26 (bot-strategy#963). The
+        /// stub has no funding history to answer with, and an empty list
+        /// would be the wrong answer: the trait's contract is that a
+        /// connector which cannot report funding says so rather than
+        /// implying nothing was charged.
+        async fn get_funding_payments(
+            &self,
+            _since_secs: i64,
+        ) -> Result<Vec<dex_connector::FundingPayment>, dex_connector::DexError> {
+            Err(dex_connector::DexError::Permanent(
+                "StubConnector reports no funding history".to_string(),
+            ))
         }
         async fn stop(&self) -> Result<(), dex_connector::DexError> {
             Ok(())
