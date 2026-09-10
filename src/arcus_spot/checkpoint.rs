@@ -12,8 +12,8 @@ use super::{
         backfill_handled_corporate_action_fingerprints, handled_corporate_action_record,
         HandledMatch,
     },
-    ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt, ArcusSpotRuntime,
-    ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
+    ArcusSpotCorporateActionEvent, ArcusSpotInventory, ArcusSpotRegime, ArcusSpotRiskHalt,
+    ArcusSpotRuntime, ArcusSpotRuntimeConfig, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -322,6 +322,35 @@ pub struct ArcusSpotRuntimeCheckpointStore {
     path: PathBuf,
 }
 
+/// Does `event` still promise everything the stored declaration promised?
+///
+/// Only asked of a window that is already live. The runtime's hold on an
+/// amended window is a *progress* record, and a window whose first tick has
+/// not run has none -- so between a stored cutoff and a later amended one
+/// there is nothing to refuse an entry, force an open rotation's unwind, or
+/// stop an ordinary exit sized on quantities the stored event already
+/// declared stale. An amendment is therefore a re-declaration of this window
+/// only while every cutoff moves in the direction that keeps the guard at
+/// least as wide -- block entries earlier, unwind earlier, halt earlier,
+/// resume later -- and keeps every symbol it covered. Narrowing one is
+/// removal by another name, and fails the load with the same recoverable
+/// message (Codex P1, pairtrade#309).
+fn amendment_still_covers(
+    event: &ArcusSpotCorporateActionEvent,
+    stored: &ArcusSpotCorporateActionEvent,
+) -> bool {
+    event.entry_block_at <= stored.entry_block_at
+        && event.reduce_exit_at <= stored.reduce_exit_at
+        && event.effective_at <= stored.effective_at
+        && event.resume_not_before >= stored.resume_not_before
+        && stored.symbols.iter().all(|stored_symbol| {
+            event
+                .symbols
+                .iter()
+                .any(|symbol| symbol.eq_ignore_ascii_case(stored_symbol))
+        })
+}
+
 impl ArcusSpotRuntimeCheckpointStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -527,17 +556,18 @@ impl ArcusSpotRuntimeCheckpointStore {
                 && !config.corporate_actions.iter().any(|event| {
                     event.fingerprint() == stored.fingerprint()
                         || (event.event_id.eq_ignore_ascii_case(&stored.event_id)
-                            && event.entry_block_at <= stored.entry_block_at)
+                            && amendment_still_covers(event, stored))
                 })
         }) {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config declaring corporate \
                  action {} (window opening at {}, within the submission margin of now and not \
                  yet handled), which the supplied config no longer declares from that instant \
-                 -- it is absent, or re-declared under the same id but opening later. Removing \
-                 a live window, or rescheduling it out from under itself, drops the guard it \
-                 exists to be; restore the declaration at its stored opening, or resolve the \
-                 window first",
+                 -- it is absent, or re-declared under the same id in a way that narrows the \
+                 guard (a later opening, a later forced unwind, a later effective instant, an \
+                 earlier resume, or a dropped symbol). Removing a live window, or amending it \
+                 out from under itself, drops the guard it exists to be; restore the \
+                 declaration at its stored cutoffs, or resolve the window first",
                 self.path.display(),
                 dropped.event_id,
                 dropped.entry_block_at.to_rfc3339(),
@@ -905,14 +935,62 @@ mod tests {
         renamed.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v2".to_string();
         assert!(store.load_existing_at(&renamed, inside).is_ok());
 
-        // Nor is amending it: the id is still there. The runtime's own gate
-        // refuses an amended open window with a recoverable hold; failing
-        // the load instead would take state-backup, state-verify-continuity
-        // and reset-window down with it.
+        // Nor is amending it, while the amendment cannot narrow the guard:
+        // the id is still there, every cutoff moves in the direction that
+        // keeps the window at least as wide, and failing the load instead
+        // would take state-backup, state-verify-continuity and reset-window
+        // down with it.
         let mut amended = declared.clone();
-        amended.corporate_actions[0].effective_at += chrono::Duration::hours(1);
+        amended.corporate_actions[0].effective_at -= chrono::Duration::minutes(30);
         amended.corporate_actions[0].resume_not_before += chrono::Duration::hours(1);
         assert!(store.load_existing_at(&amended, inside).is_ok());
+
+        // ...but a cutoff moved *out* is the same hole as a later opening,
+        // and for the same reason: the hold on an amended window is a
+        // progress record, and this one has none. Between the stored cutoff
+        // and the amended one, an open rotation would miss its forced unwind
+        // or exit on quantities the stored event already declared stale
+        // (Codex P1, pairtrade#309).
+        for narrowing in [
+            "reduce_exit_at",
+            "effective_at",
+            "resume_not_before",
+            "symbols",
+        ] {
+            let mut narrowed = declared.clone();
+            match narrowing {
+                "reduce_exit_at" => {
+                    narrowed.corporate_actions[0].reduce_exit_at += chrono::Duration::hours(1)
+                }
+                "effective_at" => {
+                    narrowed.corporate_actions[0].effective_at += chrono::Duration::hours(1)
+                }
+                "resume_not_before" => {
+                    narrowed.corporate_actions[0].resume_not_before -= chrono::Duration::hours(1)
+                }
+                "symbols" => narrowed.corporate_actions[0].symbols = vec!["ZZZZ".to_string()],
+                other => unreachable!("{other}"),
+            }
+            let error = match store.load_existing_at(&narrowed, inside) {
+                Ok(_) => panic!("narrowing a live window's {narrowing} is removal"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("Removing a live window"),
+                "{narrowing}: {error}"
+            );
+        }
+
+        // Case only: the symbol comparison follows the fingerprint's own
+        // lowercase normalisation, so re-spelling a symbol is not dropping it.
+        let mut recased = declared.clone();
+        recased.corporate_actions[0].symbols = recased.corporate_actions[0]
+            .symbols
+            .iter()
+            .map(|symbol| symbol.to_ascii_lowercase())
+            .collect();
+        recased.corporate_actions[0].event_id = "NVDA-2026-08-SPLIT-v3".to_string();
+        assert!(store.load_existing_at(&recased, inside).is_ok());
 
         // Rescheduling the *opening* later under the same label is removal
         // by another name. The runtime's hold is a progress record, and a
