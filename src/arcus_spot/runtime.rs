@@ -3516,8 +3516,31 @@ impl ArcusSpotRuntime {
                 .iter()
                 .any(|event| Self::progress_matches(progress, event));
             if !declared {
-                return progress
-                    .effective_at
+                // "Orphaned" covers two shapes, and only one of them is a
+                // deletion. An amendment that moves `effective_at` *earlier*
+                // -- a widening the checkpoint's own removal scan accepts --
+                // no longer matches the stamped fingerprint either, but it is
+                // the same window, and the venue re-denominates the units
+                // when the calendar says so, not when the stamp does. Reading
+                // only the superseded cutoff leaves the span between the two
+                // instants looking like valid units, where `step_at` can
+                // engage a sticky loss halt off post-event prices -- and that
+                // halt then wedges recovery, because the unresolved window
+                // blocks trading while `reset-window` and post-cutoff halt
+                // clearance both refuse it. Take the earliest cutoff any
+                // surviving declaration of this window names (Codex P1,
+                // pairtrade#309).
+                let amended_cutoff = self
+                    .config
+                    .corporate_actions
+                    .iter()
+                    .filter(|event| progress.event_id.eq_ignore_ascii_case(&event.event_id))
+                    .map(|event| event.effective_at)
+                    .min();
+                return [progress.effective_at, amended_cutoff]
+                    .into_iter()
+                    .flatten()
+                    .min()
                     .is_none_or(|effective_at| evaluation_time >= effective_at);
             }
         }
@@ -9255,6 +9278,56 @@ mod tests {
         );
         assert_eq!(runtime.state.corporate_action, None, "window re-opened");
         assert_eq!(runtime.state.handled_corporate_action_ids.len(), 1);
+    }
+
+    #[test]
+    fn an_amendment_to_an_earlier_effective_at_makes_units_stale_at_the_new_instant() {
+        // The checkpoint's removal scan accepts a *widening* amendment, an
+        // earlier `effective_at` among them, so the window stays declared.
+        // The stamped progress still carries the superseded fingerprint and
+        // cutoff, and reading only those leaves the span between the amended
+        // and stored instants looking like valid units -- where `step_at`
+        // values the old quantities at post-event prices and can engage a
+        // sticky loss halt that then wedges recovery, since the unresolved
+        // window blocks trading while `reset-window` and post-cutoff halt
+        // clearance both refuse the halt (Codex P1, pairtrade#309).
+        let anchor = event_time();
+        let mut cfg = config();
+        cfg.corporate_actions = vec![corporate_action_event(anchor)];
+        let mut runtime = ArcusSpotRuntime::new(cfg).unwrap();
+        seed_entry_signal_history(&mut runtime);
+
+        // Open the window; the record copies the declaration's own cutoff.
+        let during = anchor + Duration::seconds(1);
+        runtime.step_at(&snapshot_with_valid_row(during), during);
+        let progress = runtime
+            .state
+            .corporate_action
+            .clone()
+            .expect("the window is open");
+        assert_eq!(progress.effective_at, Some(anchor + Duration::seconds(4)));
+        assert!(progress.history_invalidated_at.is_none());
+        assert!(!progress.fingerprint.is_empty());
+
+        // The operator amends it to take effect sooner: same id, and every
+        // cutoff moving the way that only widens the guard.
+        let amended = anchor + Duration::seconds(3);
+        runtime.config.corporate_actions[0].effective_at = amended;
+        assert!(
+            !runtime
+                .config
+                .corporate_actions
+                .iter()
+                .any(|event| ArcusSpotRuntime::progress_matches(&progress, event)),
+            "the amendment no longer matches the stamped fingerprint",
+        );
+
+        // Past the amended cutoff the venue quotes the new units, whatever
+        // the superseded stamp says.
+        assert!(runtime.corporate_action_units_are_stale(amended));
+        assert!(runtime.corporate_action_units_are_stale(anchor + Duration::seconds(4)));
+        // Before it, they are still the old ones.
+        assert!(!runtime.corporate_action_units_are_stale(anchor + Duration::seconds(2)));
     }
 
     #[test]

@@ -621,7 +621,22 @@ impl ArcusSpotRuntimeCheckpointStore {
         // (the authenticated one), never from the checkpoint's stored copy.
         // That copy is only the witness `classify_config_drift` compares
         // against, and the next `persist` overwrites it with this one.
-        ArcusSpotRuntime::from_state(config.clone(), checkpoint.state)
+        //
+        // The *handled* records are the exception, and they travel in the
+        // state: `resolved` above already pinned each legacy id to the
+        // declaration that was in force when the checkpoint was written, and
+        // it is that resolution the runtime has to inherit. Handing
+        // `from_state` the raw state instead let it resolve the same ids
+        // against the supplied config, so a config replacing a completed
+        // declaration with a later, already-ended action reusing the id
+        // would have the later action read as already handled -- skipping
+        // its window, its history invalidation, and its inventory
+        // reconciliation. `backfill_handled_corporate_action_fingerprints`
+        // is a no-op on an already-resolved state, so this is also what
+        // makes the comment above the scan true: "already handled" now reads
+        // identically here and in the runtime this load builds (Codex P1,
+        // pairtrade#309).
+        ArcusSpotRuntime::from_state(config.clone(), resolved)
             .map_err(anyhow::Error::msg)
             .context("invalid Arcus runtime checkpoint state")
     }
@@ -905,6 +920,75 @@ mod tests {
         assert!(drift
             .state_preserving
             .contains(&"corporate_action_settlement_margin_secs"));
+    }
+
+    #[test]
+    fn a_legacy_handled_id_resolves_against_the_config_that_recorded_it() {
+        use super::super::ArcusSpotCorporateActionEvent;
+        // A checkpoint written before fingerprints existed records handled
+        // *ids* only. Resolving one against the supplied config lets a
+        // config that replaced the completed declaration with a later
+        // action reusing the id inherit "already handled" -- skipping that
+        // action's window, its history invalidation, and its inventory
+        // reconciliation. The resolution has to be the one the stored
+        // config produces (Codex P1, pairtrade#309).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("runtime.json");
+        let store = ArcusSpotRuntimeCheckpointStore::new(path.clone());
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-08-16T00:00:00Z".parse().unwrap();
+        let event_at = |start: chrono::DateTime<chrono::Utc>| ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec!["NVDA".to_string()],
+            entry_block_at: start,
+            reduce_exit_at: start + chrono::Duration::hours(1),
+            effective_at: start + chrono::Duration::hours(2),
+            resume_not_before: start + chrono::Duration::hours(3),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        };
+        let completed = event_at(anchor);
+        let reused_id = event_at(anchor + chrono::Duration::hours(10));
+        assert_ne!(completed.fingerprint(), reused_id.fingerprint());
+
+        let mut stored_config = live_runtime_config();
+        stored_config.corporate_actions = vec![completed.clone()];
+        let mut state = ArcusSpotRuntime::new(stored_config.clone())
+            .unwrap()
+            .state()
+            .clone();
+        // Both declarations have ended by the watermark, so the only thing
+        // separating them is which config the id is resolved against.
+        state.last_observation_at = Some(anchor + chrono::Duration::hours(20));
+        state.handled_corporate_action_ids = vec![completed.event_id.clone()];
+        store
+            .persist(&ArcusSpotRuntime::from_state(stored_config.clone(), state).unwrap())
+            .unwrap();
+        // `from_state` resolves on the way in, so strip the record back to
+        // its legacy shape in the file the loader will actually read.
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        raw["state"]["handled_corporate_action_fingerprints"] = serde_json::json!([]);
+        raw["state"]["handled_corporate_actions_resolved"] = serde_json::json!(false);
+        fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let mut supplied = live_runtime_config();
+        supplied.corporate_actions = vec![reused_id.clone()];
+        let runtime = store
+            .load_existing_at(&supplied, anchor + chrono::Duration::hours(20))
+            .expect("the load itself is ordinary: the completed window is handled");
+
+        assert_eq!(
+            runtime.state().handled_corporate_action_fingerprints,
+            vec![completed.fingerprint()],
+            "the legacy id belongs to the declaration that was in force when it was recorded",
+        );
+        assert!(
+            !matches!(
+                handled_corporate_action_record(runtime.state(), &reused_id),
+                Some(HandledMatch::Same)
+            ),
+            "a later action reusing the id has not been handled",
+        );
     }
 
     #[test]
