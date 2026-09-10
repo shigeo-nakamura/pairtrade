@@ -114,6 +114,94 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     booked off the last raw mid, or as a last resort off the entry price
     with `source=entry_price_pnl_unknown` in the log -- reconcile that one
     from the exchange fill.
+- **Every fill is recorded, and the settled result is kept apart from
+  the mid-based one** (bot-strategy#919). `fills.jsonl`
+  (`ENGINE_B_LIVE_FILLS_LOG_PATH`) gets one line per exchange fill the
+  moment it is seen, deduped by the venue's own `trade_id`, and
+  `pnl.jsonl` gains a `settled` block beside the existing `pnl_usd`:
+  - `pnl_usd` means exactly what it always did -- the WS-mid figure the
+    engine books, sizes and halts on -- and now says so via
+    `pnl_source: "ws_mid_estimate"`. Nothing about the trading path
+    changed.
+  - `settled` carries `entry_vwap` / `exit_vwap` (quantity-weighted, so
+    partial fills at different prices are averaged correctly),
+    `gross_pnl_usd`, and `mid_estimate_error_usd` -- how far the booked
+    figure sits from what the account did. On the first live cycle
+    (2026-09-10) that error was **$0.07 on a $2.5 result, 2.8%**,
+    entirely because the close was booked at a mid of 1717.855 while the
+    fill was 1719.14.
+  - `settled` is **null**, not a partial number, whenever the venue's
+    fills do not cover both legs -- after a restart mid-position, for an
+    adopted position, or while the fill stream is still catching up. A
+    settled PnL computed from half an exit is a wrong number with an
+    authoritative name. `fills.jsonl` still holds the raw rows for
+    offline reconstruction.
+  - The figures are **gross**: `entry_fee_usd` / `exit_fee_usd` are
+    `null` rather than `0.0`, because Lighter surfaces no per-fill fee
+    through the connector (`FilledOrder::filled_fee` is hard-coded
+    `None` in both its WS and REST parsers). Getting the real number
+    needs Lighter's authenticated `/api/v1/trades`, which is
+    dex-connector work; so is settled funding. Until then a `null` fee
+    is the honest reading and reading it as zero would overstate every
+    result.
+  - A final harvest runs on **every** exit from the main loop --
+    SIGTERM/SIGINT and a closed price feed alike. A fill can reach the
+    connector's cache after the last tick, and nothing else would ever
+    write it: on restart the cache is gone and the row is
+    unrecoverable.
+  - Harvesting costs nothing on the wire -- the Lighter connector
+    serves `get_filled_orders` from its own WS-populated cache and
+    issues no request -- and happens **twice, both of which earn their
+    place**: once per tick before the decisions, so the durable ledger
+    stays current through the holding period and a crash mid-hold does
+    not lose the entry fill; and again immediately before a close is
+    summarised, because the exit fill is routinely visible on the very
+    tick that observes the account flat (the account is flat *because*
+    of it) and would otherwise be summarised before it was ever seen.
+    (The venue *equity* read does go to REST and is deliberately
+    off-tick -- see below.)
+  - **The ledger has an explicit lifetime, and it starts at the send.**
+    It opens the moment an entry order goes out -- before any harvest
+    can run, because the fill may already be in the connector's cache by
+    the time the send returns -- and closes when that trade's settled
+    record is written. Opening it later would count the new trade's
+    entry fill against the previous trade's still-open accumulators and
+    mark it seen process-wide, leaving every second-and-later trade in a
+    process permanently unsettled.
+  - The ledger's key is kept in step with the position **where fills
+    are classified**, not at each of the four sites that install one
+    (confirmed entry, unconfirmed-send adoption, exchange adoption,
+    restart restore). While a position exists its side is the entry
+    side, so the invariant is just that the two agree. If the exchange
+    holds the **opposite side** from the one submitted, its answer is
+    authoritative and the ledger is re-keyed to it, swapping the two
+    legs. Left alone it would file the entry fill
+    as the close and publish a gross PnL with the wrong sign. Rows
+    already in `fills.jsonl` keep the pre-swap `leg` label -- an
+    append-only log cannot be rewritten -- but their `side` field is the
+    venue's own and stays correct, so reconstruct from `side`, not
+    `leg`, if this warning (`[FILLS] confirmed side ... differs`) ever
+    appears.
+  - Between close and the next open the side and totals are kept, so a
+    fill that straggles in after the close still reaches the durable
+    ledger with the right leg. A position that appears without an entry
+    -- restored after a restart, or adopted from the exchange -- opens
+    its own account on the next harvest. Its pre-restart entry fills are
+    unrecoverable, so that trade settles as unknown (correct), but its
+    exit fills are recorded.
+  - A fill is counted only once its ledger row is on disk. If the append
+    fails the fill is left unmarked and untotalled, and the connector's
+    next re-serve retries it -- a transient filesystem error must not
+    turn into a permanently missing row while the totals move anyway.
+  - A leg whose fee is unknown **stays** unknown. One fee-less fill
+    makes the leg's total unknowable, and a later fill that does report
+    a fee must not resurrect a total missing the first one's cost.
+  - The set of already-counted `trade_id`s **outlives every trade in
+    the process**. Nothing prunes the connector's fill cache, so
+    forgetting them between trades would make yesterday's fills look new
+    at today's entry, pile their quantity into both of today's legs, and
+    leave coverage failing for the rest of the process. Only the two
+    per-leg accumulators are reset, at entry.
 - **Venue equity is published, never traded on** (bot-strategy#919).
   `status.json`'s `han_bridge` block carries `venue_equity_usd`
   (`total_asset_value`), `venue_available_usd` (`available_balance`),

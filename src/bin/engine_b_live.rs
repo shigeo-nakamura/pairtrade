@@ -373,6 +373,12 @@ struct EngineBLiveConfig {
     state_path: PathBuf,
     status_path: PathBuf,
     pnl_log_path: PathBuf,
+    /// Append-only record of every exchange fill this process observed
+    /// (bot-strategy#919). One JSON object per fill, deduped by the
+    /// venue's own `trade_id`, written the moment the fill is seen --
+    /// so the settled account of a trade survives a crash between the
+    /// fill and the close that would have summarised it.
+    fills_log_path: PathBuf,
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -488,6 +494,10 @@ impl EngineBLiveConfig {
             status_path: PathBuf::from(env_string(
                 "ENGINE_B_LIVE_STATUS_PATH",
                 &format!("{base_dir}/status.json"),
+            )),
+            fills_log_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_FILLS_LOG_PATH",
+                &format!("{base_dir}/fills.jsonl"),
             )),
             pnl_log_path: PathBuf::from(env_string(
                 "ENGINE_B_LIVE_PNL_LOG_PATH",
@@ -852,16 +862,27 @@ fn atomic_write_json_checked(path: &Path, value: &impl Serialize) -> std::io::Re
     atomic_write_bytes_checked(path, json.as_bytes())
 }
 
-fn append_pnl_log(path: &Path, record: &serde_json::Value) {
+/// Append one JSON line. Returns whether the whole line reached the
+/// file: a caller that treats a fill as counted only once it is durable
+/// needs to know, and a best-effort write that silently drops a row is
+/// how a "durable ledger" quietly stops being one (pairtrade#320 Codex
+/// review round 2).
+fn append_pnl_log(path: &Path, record: &serde_json::Value) -> bool {
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     else {
         log::warn!("[PNL_LOG] open failed: {}", path.display());
-        return;
+        return false;
     };
-    let _ = writeln!(f, "{record}");
+    match writeln!(f, "{record}") {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("[PNL_LOG] write failed for {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1675,6 +1696,72 @@ struct VenueEquity {
 /// "stale" rather than to "silently wedged".
 const VENUE_EQUITY_READ_TIMEOUT_SECS: u64 = 30;
 
+/// What the exchange says a leg actually traded, accumulated from its
+/// own fill events (bot-strategy#919).
+///
+/// This exists because the engine books PnL off the WS mid, and the mid
+/// is not the fill. On 2026-09-10's first live cycle the two differed by
+/// $0.07 on a $2.5 result -- 2.8% -- entirely because the exit was
+/// booked at a mid of 1717.855 while the fill was 1719.14. A mark is a
+/// fine thing to *watch*; it is not what the account did.
+///
+/// Deliberately separate from the mid-based figures rather than
+/// replacing them: until coverage is complete the settled numbers are
+/// not knowable, and the issue's own rule is that an incomplete
+/// settlement stays unknown rather than being topped up with a mid.
+#[derive(Debug, Clone, Default, Serialize)]
+struct LegFills {
+    /// Quantity the venue reported filled, summed across partial fills.
+    size: f64,
+    /// Notional the venue reported, summed. `size * price` per fill, so
+    /// `value / size` is the true quantity-weighted average price
+    /// rather than an average of prices.
+    value: f64,
+    /// Fees the venue reported, summed. Meaningful only while
+    /// `fee_unknown` is false.
+    fee_reported_usd: f64,
+    /// Some observed fill did not carry a fee, so this leg's total is
+    /// unknowable -- and stays that way. **Sticky on purpose**: a
+    /// fee-less fill followed by one that does report a fee must not
+    /// resurrect a total that is missing the first fill's cost
+    /// (pairtrade#320 Codex review round 2). Today it is set by every
+    /// Lighter fill, since `FilledOrder::filled_fee` is hard-coded
+    /// `None` in the connector's WS and REST parsers alike; it will
+    /// start mattering the moment that stops being true for only some
+    /// fills.
+    fee_unknown: bool,
+    fills: u32,
+}
+
+impl LegFills {
+    /// The leg's total fee, or `None` when any observed fill did not
+    /// report one. Never 0.0 for "unknown": reading a missing fee as
+    /// zero would quietly overstate every settled result.
+    fn fee_usd(&self) -> Option<f64> {
+        (!self.fee_unknown).then_some(self.fee_reported_usd)
+    }
+
+    /// Quantity-weighted average price, or `None` when nothing has been
+    /// observed yet.
+    fn vwap(&self) -> Option<f64> {
+        (self.size > 0.0).then(|| self.value / self.size)
+    }
+
+    /// Whether the venue's fills account for the whole quantity this
+    /// leg is believed to have traded. A fill stream that is still
+    /// catching up, or a leg whose events were missed entirely, must
+    /// not produce a settled figure for part of a position and let it
+    /// pass as the whole.
+    ///
+    /// The tolerance is one part in ten thousand of the expected size,
+    /// which absorbs decimal rounding without absorbing a missing fill:
+    /// the smallest tradable increment on these markets is orders of
+    /// magnitude larger.
+    fn covers(&self, expected_size: f64) -> bool {
+        expected_size > 0.0 && (self.size - expected_size).abs() <= expected_size * 1e-4
+    }
+}
+
 /// Shared cell the off-tick equity reader publishes into and the status
 /// writer samples (bot-strategy#919, pairtrade#316 Codex P1).
 #[derive(Default)]
@@ -1894,6 +1981,48 @@ struct EngineBLiveEngine {
     /// throttle must not sit on the next read for up to a full interval
     /// (pairtrade#316 Codex review round 2).
     last_position_fingerprint: Option<u64>,
+    /// Settled fills for the position currently open (or the one just
+    /// closed, until its close is booked), keyed by leg
+    /// (bot-strategy#919).
+    entry_fills: LegFills,
+    exit_fills: LegFills,
+    /// Venue trade ids already folded into the two accumulators above.
+    /// The connector re-serves its whole fill cache on every call, so
+    /// without this every harvest would count the same fills again.
+    ///
+    /// **Never cleared while the process lives.** Nothing prunes the
+    /// connector's cache -- no production path calls
+    /// `clear_filled_order` -- so clearing this between trades would
+    /// make every historical fill look new at the next entry, pile
+    /// yesterday's quantities into both of today's legs, and leave
+    /// `covers()` failing for every remaining trade in the process
+    /// (pairtrade#320 Codex review, P1). It grows by a handful of
+    /// entries per session day.
+    seen_trade_ids: std::collections::HashSet<String>,
+    /// The side the open (or just-closed) trade entered on. Held here
+    /// rather than read from `self.position` so a fill can still be
+    /// attributed after the close has removed it -- the exit fill is
+    /// routinely seen on the very tick that observes the account flat
+    /// (pairtrade#320 Codex review, P1).
+    fill_ledger_entry_side: Option<OrderSide>,
+    /// The ledger is accumulating for a trade that has not been
+    /// summarised yet.
+    ///
+    /// The lifecycle this makes explicit: the ledger opens at the
+    /// **earliest moment a fill for the trade can exist** -- the entry
+    /// send, before any harvest can run -- and closes when the trade's
+    /// settled record is written. Opening it later loses fills to the
+    /// wrong trade: an entry fill arriving while the send is still
+    /// `PendingConfirm` would be counted against the previous trade's
+    /// still-active accumulators, marked seen process-wide, and then be
+    /// unavailable to the trade it actually belongs to, leaving every
+    /// second-and-later trade permanently unsettled (pairtrade#320
+    /// Codex review round 4).
+    ///
+    /// Between close and the next open the side is deliberately kept,
+    /// so a fill that straggles in after the close still lands in the
+    /// durable ledger with the right leg.
+    fill_ledger_trade_open: bool,
 }
 
 impl EngineBLiveEngine {
@@ -3787,7 +3916,7 @@ impl EngineBLiveEngine {
                         match exchange_position_for(&positions, &self.cfg.us_primary_symbol) {
                             None => {
                                 self.pending = None;
-                                self.on_exit(exit_price, now_us);
+                                self.on_exit(exit_price, now_us).await;
                             }
                             Some(remaining) => {
                                 // A side flip while the exit is pending is
@@ -4179,6 +4308,9 @@ impl EngineBLiveEngine {
         let price = pos.entry_price;
         let size = pos.size;
         self.position = Some(pos);
+        // After the position is installed, so the ledger keys off the
+        // side the exchange confirmed rather than the one submitted.
+        self.align_fill_ledger_with_position();
         // Durable before anything else: from here on a restart resumes
         // this position for its scheduled exit (bot-strategy#917).
         self.persist_position();
@@ -4684,6 +4816,11 @@ impl EngineBLiveEngine {
         // `poll_pending_confirm` on the following ticks; `day.entered`
         // stays false until then so a restart in between re-checks the
         // exchange (pre-submit block above) rather than re-sending.
+        // Open the ledger before the first harvest can run: the fill
+        // for this send may already be in the connector's cache, and
+        // counting it against the previous trade would consume it for
+        // good (pairtrade#320 Codex review round 4).
+        self.begin_fill_ledger(side);
         self.pending = Some(PendingConfirm::Entry {
             side,
             requested,
@@ -4788,7 +4925,7 @@ impl EngineBLiveEngine {
         }
         if self.cfg.dry_run {
             match self.submit_order(opposite(pos.side), pos.size, true).await {
-                Ok(_) => self.on_exit(price, now_us),
+                Ok(_) => self.on_exit(price, now_us).await,
                 Err(e) => log::error!("[EXIT] order failed, position still open: {e:?}"),
             }
             return;
@@ -4854,7 +4991,7 @@ impl EngineBLiveEngine {
                          sending an order (closed externally, or the entry never filled)",
                         self.cfg.us_primary_symbol
                     );
-                    self.on_exit(price, now_us);
+                    self.on_exit(price, now_us).await;
                     return;
                 }
             },
@@ -4892,7 +5029,7 @@ impl EngineBLiveEngine {
         });
     }
 
-    fn on_exit(&mut self, exit_price: f64, now_us: i64) {
+    async fn on_exit(&mut self, exit_price: f64, now_us: i64) {
         let Some(pos) = self.position.take() else {
             return;
         };
@@ -4956,7 +5093,24 @@ impl EngineBLiveEngine {
         self.day.exited = true;
         self.mark_day_acted(self.day.skip_reason.clone());
 
-        append_pnl_log(
+        // One last harvest before the account is summarised. The exit
+        // fill is routinely visible in the connector's cache on the very
+        // tick that observes the account flat -- the account is flat
+        // *because* of it -- and the tick's own harvest runs after the
+        // decisions, so without this the closing fill would never be
+        // recorded and every trade would settle as unknown
+        // (pairtrade#320 Codex review, P1).
+        self.harvest_fills(now_us).await;
+        // The settled account of this trade, from the venue's own fills
+        // (bot-strategy#919). Published beside the mid-based figures,
+        // never in place of them: `pnl_usd` keeps meaning exactly what
+        // it meant before, and a reader that wants what the account did
+        // reads `settled`. When coverage is incomplete the whole block
+        // is null rather than a partial number wearing a settled label.
+        let settled = self.settled_trade_record(&pos, sign, pnl);
+        // Best-effort here: the close has already been booked into the
+        // durable state, and nothing re-derives it from this line.
+        let _ = append_pnl_log(
             &self.cfg.pnl_log_path,
             &serde_json::json!({
                 "ts_us": now_us,
@@ -4967,10 +5121,17 @@ impl EngineBLiveEngine {
                 "exit_price": exit_price,
                 "size": pos.size,
                 "pnl_usd": pnl,
+                "pnl_source": "ws_mid_estimate",
+                "settled": settled,
                 "held_secs": (now_us - pos.entered_at_us) / 1_000_000,
                 "dry_run": self.cfg.dry_run,
             }),
         );
+        // The trade is summarised; the ledger closes. Its accumulators
+        // and side are deliberately kept, so a fill that straggles in
+        // after the close still reaches the durable record with the
+        // right leg. The next entry opens a fresh one.
+        self.fill_ledger_trade_open = false;
         send_notification(
             format!(
                 "Han Bridge EXIT {} pnl=${pnl:.2}",
@@ -4996,6 +5157,17 @@ impl EngineBLiveEngine {
         if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
             self.try_adopt_unconfirmed(now).await;
         }
+        // Fold in whatever the venue has reported so far, *before* the
+        // decisions that may close the position (pairtrade#320 Codex
+        // review round 2). Two harvests, and both earn their place: this
+        // one keeps the durable ledger current through the holding
+        // period, so a crash mid-hold does not lose the entry fill; the
+        // one inside `on_exit` catches the closing fill, which lands on
+        // the very tick that observes the account flat and would
+        // otherwise be summarised before it was ever seen. Neither
+        // subsumes the other. Costs nothing on the wire -- the connector
+        // serves this from its WS-populated cache.
+        self.harvest_fills(now).await;
         self.poll_unresolved_claims(now).await;
         if self.pending.is_some() {
             // One exchange read per tick until the in-flight entry/exit is
@@ -5016,6 +5188,13 @@ impl EngineBLiveEngine {
         // persisting it itself (bot-strategy#917); a no-op when nothing
         // changed.
         self.persist_position();
+        // And once more, because an entry confirmed *during* this tick
+        // initialised the ledger only after the harvest above had
+        // already run and found no side. Its fill is sitting in the
+        // connector's cache right now; waiting 5 s for the next tick
+        // would lose it to a crash in between (pairtrade#320 Codex
+        // review round 3). A no-op when nothing new arrived.
+        self.harvest_fills(now).await;
         // Observational only (bot-strategy#919). Spawned, never
         // awaited: a hung venue read must not hold the tick that drives
         // confirmation, exit and shutdown (pairtrade#316 Codex P1).
@@ -5109,6 +5288,213 @@ impl EngineBLiveEngine {
         // 0 is the "never attempted" sentinel the throttle already
         // treats as due.
         self.last_venue_equity_attempt_us = 0;
+    }
+
+    /// Fold every fill the venue has reported and this process has not
+    /// seen into the leg it belongs to, and append it to the durable
+    /// ledger (bot-strategy#919).
+    ///
+    /// Cheap enough to run on every tick: the Lighter connector serves
+    /// `get_filled_orders` from its own WS-populated cache and issues no
+    /// request, so this adds nothing to the account's rate budget. It is
+    /// awaited on the tick for the same reason -- there is no network
+    /// call to hang on. (The venue *equity* read, which does go to REST,
+    /// is deliberately off-tick; see `spawn_venue_equity_refresh`.)
+    ///
+    /// Which leg a fill belongs to is decided by its own side, not by
+    /// timing: the entry and the exit are opposite sides, and only one
+    /// entry may be sent per session day, so within a session the side
+    /// is unambiguous. A fill whose side the venue did not report is
+    /// counted in neither leg -- it would otherwise land in whichever
+    /// leg happened to be open and silently corrupt a VWAP.
+    async fn harvest_fills(&mut self, now_us: i64) {
+        self.align_fill_ledger_with_position();
+        let Some(entry_side) = self.fill_ledger_entry_side else {
+            return;
+        };
+        let Ok(response) = self
+            .connector
+            .get_filled_orders(&self.cfg.us_primary_symbol)
+            .await
+        else {
+            // The cache read does not fail in practice; if it ever
+            // does, coverage simply stays incomplete and the settled
+            // figures stay unknown. Nothing to fail closed *on* -- this
+            // path books nothing and gates nothing.
+            return;
+        };
+        for fill in response.orders.iter() {
+            if fill.is_rejected || self.seen_trade_ids.contains(&fill.trade_id) {
+                continue;
+            }
+            let (Some(side), Some(size), Some(value)) =
+                (fill.filled_side, fill.filled_size, fill.filled_value)
+            else {
+                continue;
+            };
+            let (Some(size), Some(value)) = (size.to_f64(), value.to_f64()) else {
+                continue;
+            };
+            let leg_name = if side == entry_side { "entry" } else { "exit" };
+            let fee = fill.filled_fee.and_then(|f| f.to_f64());
+            // Durable first, counted second. The connector keeps
+            // re-serving this fill, so a row that failed to reach the
+            // ledger can still be retried on a later harvest -- but only
+            // if it was never marked seen, and only if it was not
+            // already folded into a total (pairtrade#320 Codex review
+            // round 2). Marking it seen before the write turned a
+            // transient filesystem error into a permanently missing row.
+            if !append_pnl_log(
+                &self.cfg.fills_log_path,
+                &serde_json::json!({
+                    "ts_us": now_us,
+                    "instance_id": self.cfg.instance_id,
+                    "symbol": self.cfg.us_primary_symbol,
+                    "leg": leg_name,
+                    "order_id": fill.order_id,
+                    "trade_id": fill.trade_id,
+                    "side": side.to_string(),
+                    "size": size,
+                    "value": value,
+                    "price": if size > 0.0 { Some(value / size) } else { None },
+                    "fee_usd": fee,
+                    "dry_run": self.cfg.dry_run,
+                }),
+            ) {
+                continue;
+            }
+            let leg = if side == entry_side {
+                &mut self.entry_fills
+            } else {
+                &mut self.exit_fills
+            };
+            leg.size += size;
+            leg.value += value;
+            leg.fills += 1;
+            match fee {
+                Some(fee) => leg.fee_reported_usd += fee,
+                // Sticky: once a fill arrives without a fee this leg's
+                // total is unknowable, and a later fill that does report
+                // one must not resurrect a total missing this cost.
+                None => leg.fee_unknown = true,
+            }
+            self.seen_trade_ids.insert(fill.trade_id.clone());
+        }
+    }
+
+    /// The settled account of a closed trade, or `None` when the
+    /// venue's fills do not cover both legs (bot-strategy#919).
+    ///
+    /// `None` rather than a partial figure, on purpose. A settled PnL
+    /// computed from half the exit fills is not a smaller truth, it is
+    /// a wrong number with an authoritative name, and this is the field
+    /// a reconciliation would trust over the mid.
+    ///
+    /// What it reports is *gross*: fees are not in it, because Lighter
+    /// does not surface a per-fill fee through the connector today
+    /// (`filled_fee` is hard-coded `None`), and `fee_usd` says so by
+    /// being null rather than zero. Gross-settled is still the number
+    /// that would have caught 2026-09-10's $0.07 mid-vs-fill gap; the
+    /// fee half needs Lighter's authenticated `/api/v1/trades`, which
+    /// is dex-connector work.
+    fn settled_trade_record(
+        &self,
+        pos: &OpenPosition,
+        sign: f64,
+        mid_pnl: f64,
+    ) -> Option<serde_json::Value> {
+        // `size` is the quantity confirmed at entry; the exit leg has to
+        // account for the same quantity for the pair to describe one
+        // round trip.
+        if !self.entry_fills.covers(pos.size) || !self.exit_fills.covers(pos.size) {
+            return None;
+        }
+        let entry_vwap = self.entry_fills.vwap()?;
+        let exit_vwap = self.exit_fills.vwap()?;
+        let gross = sign * (exit_vwap - entry_vwap) * pos.size;
+        Some(serde_json::json!({
+            "entry_vwap": entry_vwap,
+            "exit_vwap": exit_vwap,
+            "entry_size": self.entry_fills.size,
+            "exit_size": self.exit_fills.size,
+            "entry_fills": self.entry_fills.fills,
+            "exit_fills": self.exit_fills.fills,
+            "gross_pnl_usd": gross,
+            // Null, not zero: see the doc comment. A reader must be able
+            // to tell "no fees" from "fees unknown".
+            "entry_fee_usd": self.entry_fills.fee_usd(),
+            "exit_fee_usd": self.exit_fills.fee_usd(),
+            // The gap this record exists to make visible: how far the
+            // mid-based figure the engine actually booked sits from what
+            // the account did. Both describe the same round trip -- the
+            // exit leg aggregates every partial reduction, and `mid_pnl`
+            // already carries `realized_partial_pnl` -- so the
+            // difference is the mark-versus-fill error and nothing else.
+            "mid_estimate_error_usd": gross - mid_pnl,
+        }))
+    }
+
+    /// Keep the ledger's key in step with the position it is recording.
+    ///
+    /// Enforced here, at the single point every fill passes through,
+    /// rather than at each site that installs a position. There are
+    /// four of those -- the confirmed entry, the unconfirmed-send
+    /// adoption, the exchange adoption, and the restart restore -- and
+    /// patching them one at a time is how the same defect kept coming
+    /// back in review (pairtrade#320 rounds 3, 5 and 6). While a
+    /// position exists its side *is* the entry side, so the invariant
+    /// is simply that the two agree.
+    ///
+    /// Two ways they can disagree:
+    ///
+    /// - **No key at all.** A position restored after a restart or
+    ///   adopted from the exchange never went through an entry. Its
+    ///   pre-existing fills are not recoverable, so that trade settles
+    ///   as unknown -- correct -- but everything from here on is
+    ///   recorded.
+    /// - **The wrong key.** The exchange confirmed the opposite side
+    ///   from the one submitted, and its answer is authoritative.
+    ///   Everything harvested so far was sorted against the submitted
+    ///   side, so the two legs are inverted, not lost: swapping them is
+    ///   the whole correction. Left alone, `settled` would publish
+    ///   reversed VWAPs and a gross PnL with the wrong sign -- the one
+    ///   number here that is meant to be more trustworthy than the mid.
+    ///
+    /// Rows already written keep a `leg` derived from the mistaken
+    /// side; an append-only log cannot be rewritten. Their `side` field
+    /// is the venue's own and stays correct, so reconstruct from that.
+    fn align_fill_ledger_with_position(&mut self) {
+        let Some(pos_side) = self.position.as_ref().map(|p| p.side) else {
+            return;
+        };
+        if !self.fill_ledger_trade_open {
+            self.begin_fill_ledger(pos_side);
+        } else if self.fill_ledger_entry_side != Some(pos_side) {
+            log::warn!(
+                "[FILLS] the position's side {} differs from the ledger's {:?}; re-keying and \
+                 swapping its legs. Rows already written carry the pre-swap `leg` label -- \
+                 reconstruct from `side`.",
+                pos_side,
+                self.fill_ledger_entry_side
+            );
+            std::mem::swap(&mut self.entry_fills, &mut self.exit_fills);
+            self.fill_ledger_entry_side = Some(pos_side);
+        }
+    }
+
+    /// Start a fresh settled account for a trade entering on `side`.
+    ///
+    /// Clears the two accumulators so one day's fills cannot be folded
+    /// into the next day's VWAP -- but deliberately **not**
+    /// `seen_trade_ids`, which must outlive every trade in the process:
+    /// the connector never prunes its fill cache, so a forgotten trade
+    /// id is a fill counted a second time (pairtrade#320 Codex review,
+    /// P1).
+    fn begin_fill_ledger(&mut self, side: OrderSide) {
+        self.entry_fills = LegFills::default();
+        self.exit_fills = LegFills::default();
+        self.fill_ledger_entry_side = Some(side);
+        self.fill_ledger_trade_open = true;
     }
 
     fn spawn_venue_equity_refresh(&mut self, now_us: i64) {
@@ -5635,6 +6021,11 @@ async fn main() -> Result<()> {
         venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
         last_venue_equity_attempt_us: 0,
         last_position_fingerprint: None,
+        entry_fills: LegFills::default(),
+        exit_fills: LegFills::default(),
+        seen_trade_ids: std::collections::HashSet::new(),
+        fill_ledger_entry_side: None,
+        fill_ledger_trade_open: false,
     };
     if let Some(p) = engine.state.open_position.as_ref() {
         log::warn!(
@@ -5707,6 +6098,15 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // Every way out of the loop, not just the signal one: the
+    // feed-closed branch above breaks immediately too (pairtrade#320
+    // Codex review rounds 6 and 7). A fill can reach the connector's
+    // cache after the last tick, and nothing else will ever write it --
+    // on restart the cache is gone and the row is unrecoverable,
+    // leaving that trade permanently unsettled. One last read of an
+    // in-memory cache on the way out.
+    engine.harvest_fills(engine.now()).await;
 
     Ok(())
 }
@@ -5803,6 +6203,7 @@ mod tests {
             state_path: PathBuf::from("/nonexistent/state.json"),
             status_path: PathBuf::from("/nonexistent/status.json"),
             pnl_log_path: PathBuf::from("/nonexistent/pnl.jsonl"),
+            fills_log_path: PathBuf::from("/nonexistent/fills.jsonl"),
         }
     }
 
@@ -6674,6 +7075,10 @@ mod tests {
         /// outage where the REST read hangs. The tick must survive it
         /// (pairtrade#316 Codex P1).
         hang_balance: std::sync::atomic::AtomicBool,
+        /// Fills the venue reports. The real connector re-serves its
+        /// whole cache on every call, so this does too -- which is what
+        /// makes trade-id dedupe load-bearing (bot-strategy#919).
+        fills: std::sync::Mutex<Vec<dex_connector::FilledOrder>>,
     }
 
     impl StubConnector {
@@ -6713,6 +7118,32 @@ mod tests {
             *self.balance.lock().unwrap() = None;
         }
 
+        /// `fee` is `Option` because Lighter reports none today; the
+        /// tests cover both what the venue does now and what it would
+        /// look like once it reports one.
+        fn push_fill(
+            &self,
+            trade_id: &str,
+            side: OrderSide,
+            size: &str,
+            price: &str,
+            fee: Option<&str>,
+        ) {
+            let size = Decimal::from_str(size).unwrap();
+            let price = Decimal::from_str(price).unwrap();
+            self.fills.lock().unwrap().push(dex_connector::FilledOrder {
+                order_id: format!("o-{trade_id}"),
+                is_rejected: false,
+                trade_id: trade_id.to_string(),
+                filled_side: Some(side),
+                filled_size: Some(size),
+                filled_value: Some(size * price),
+                filled_fee: fee.map(|f| Decimal::from_str(f).unwrap()),
+                filled_ts_ms: None,
+                tx_hash: None,
+            });
+        }
+
         fn hang_balance(&self) {
             self.hang_balance
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -6748,7 +7179,9 @@ mod tests {
             &self,
             _symbol: &str,
         ) -> Result<dex_connector::FilledOrdersResponse, dex_connector::DexError> {
-            unimplemented!("engine_b_live does not call get_filled_orders")
+            Ok(dex_connector::FilledOrdersResponse {
+                orders: self.fills.lock().unwrap().clone(),
+            })
         }
         async fn get_canceled_orders(
             &self,
@@ -7014,6 +7447,7 @@ mod tests {
         cfg.state_path = dir.path().join("state.json");
         cfg.status_path = dir.path().join("status.json");
         cfg.pnl_log_path = dir.path().join("pnl.jsonl");
+        cfg.fills_log_path = dir.path().join("fills.jsonl");
         // Unroutable: any eligibility fetch fails fast and offline. Tests
         // that need the gate satisfied set `eligibility_confirmed`.
         cfg.lighter_rest_url = "http://127.0.0.1:1".to_string();
@@ -7062,6 +7496,11 @@ mod tests {
             venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
             last_venue_equity_attempt_us: 0,
             last_position_fingerprint: None,
+            entry_fills: LegFills::default(),
+            exit_fills: LegFills::default(),
+            seen_trade_ids: std::collections::HashSet::new(),
+            fill_ledger_entry_side: None,
+            fill_ledger_trade_open: false,
         };
         Harness {
             engine,
@@ -7099,6 +7538,11 @@ mod tests {
         /// the result has to wait here instead. Bounded: a refresh that
         /// never lands is a hang, and the test should fail rather than
         /// spin forever.
+        async fn harvest(&mut self, now_us: i64) {
+            self.set_now(now_us);
+            self.engine.harvest_fills(now_us).await;
+        }
+
         async fn refresh_equity(&mut self, now_us: i64) {
             // The reader stamps the clock when the answer lands, so the
             // harness clock has to be where the test says it is.
@@ -8446,7 +8890,7 @@ mod tests {
             load_state(&h.engine.cfg.state_path).open_position,
             Some(saved)
         );
-        h.engine.on_exit(1769.1, T2_US);
+        h.engine.on_exit(1769.1, T2_US).await;
         assert!(h.engine.state.open_position.is_none());
         assert!(load_state(&h.engine.cfg.state_path).open_position.is_none());
     }
@@ -8765,6 +9209,623 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------
+    // Settled fills (bot-strategy#919).
+    //
+    // The engine books PnL off the WS mid. These pin that the venue's
+    // own fills are recorded beside it, and that a settlement which
+    // cannot be completed says so instead of borrowing the mid.
+    // -------------------------------------------------------------
+
+    fn open_short(h: &mut Harness, size: f64, entry_price: f64) {
+        h.engine.begin_fill_ledger(OrderSide::Short);
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size,
+            open_size: size,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+    }
+
+    fn last_pnl_record(h: &Harness) -> serde_json::Value {
+        let raw = std::fs::read_to_string(&h.engine.cfg.pnl_log_path).unwrap();
+        serde_json::from_str(raw.lines().last().unwrap()).unwrap()
+    }
+
+    /// 2026-09-10's live cycle, to the tick: short 0.0566 filled at
+    /// 1763.60, closed at 1719.14, while the engine booked the close off
+    /// a mid of 1717.855. The settled record must show the fills, and
+    /// the error against the mid-based figure the engine actually used.
+    #[tokio::test]
+    async fn the_settled_record_reproduces_the_first_live_cycle() {
+        let mut h = harness();
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.harvest(T1_US).await;
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T2_US).await;
+
+        h.engine.on_exit(1717.855, T2_US).await;
+        let rec = last_pnl_record(&h);
+
+        // Unchanged meaning: still the mid-based figure, now labelled.
+        assert_eq!(rec["pnl_source"], serde_json::json!("ws_mid_estimate"));
+        let mid_pnl = rec["pnl_usd"].as_f64().unwrap();
+        assert!((mid_pnl - 2.589).abs() < 1e-3, "mid pnl: {mid_pnl}");
+
+        let settled = &rec["settled"];
+        assert!((settled["entry_vwap"].as_f64().unwrap() - 1763.60).abs() < 1e-9);
+        assert!((settled["exit_vwap"].as_f64().unwrap() - 1719.14).abs() < 1e-9);
+        let gross = settled["gross_pnl_usd"].as_f64().unwrap();
+        assert!((gross - 2.516).abs() < 1e-3, "settled gross: {gross}");
+        // The $0.07 that started this issue.
+        let err = settled["mid_estimate_error_usd"].as_f64().unwrap();
+        assert!(
+            (err + 0.0729).abs() < 1e-3,
+            "the mid overstated the result by ~$0.07; got {err}"
+        );
+        // Lighter reports no per-fill fee: null, never 0.0.
+        assert_eq!(settled["entry_fee_usd"], serde_json::json!(null));
+        assert_eq!(settled["exit_fee_usd"], serde_json::json!(null));
+    }
+
+    #[tokio::test]
+    async fn partial_fills_average_by_quantity_and_are_deduped_by_trade_id() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        // Two entry fills at different sizes: a mean of prices (101.0)
+        // would be wrong; the quantity-weighted price is 100.75.
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.25", "102.00", None);
+        h.connector
+            .push_fill("e2", OrderSide::Short, "0.75", "100.333333333", None);
+        h.harvest(T1_US).await;
+        // The connector re-serves its whole cache every call.
+        h.harvest(T1_US + 1_000_000).await;
+        h.harvest(T1_US + 2_000_000).await;
+
+        assert_eq!(h.engine.entry_fills.fills, 2, "counted once, not six times");
+        assert!((h.engine.entry_fills.size - 1.0).abs() < 1e-9);
+        let vwap = h.engine.entry_fills.vwap().unwrap();
+        assert!((vwap - 100.75).abs() < 1e-6, "vwap {vwap}");
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_settlement_is_null_rather_than_a_partial_number() {
+        let mut h = harness();
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        // Only half the exit came back before the close was booked.
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0283", "1719.14", None);
+        h.harvest(T2_US).await;
+
+        h.engine.on_exit(1717.855, T2_US).await;
+        let rec = last_pnl_record(&h);
+        assert_eq!(
+            rec["settled"],
+            serde_json::json!(null),
+            "half an exit is not a settled trade -- a wrong number with an authoritative name"
+        );
+        assert!(
+            rec["pnl_usd"].as_f64().unwrap() > 0.0,
+            "the mid-based figure is unaffected: it is what the engine books"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_unreported_fee_leaves_the_leg_fee_unknown() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.5", "100.0", Some("0.02"));
+        h.harvest(T1_US).await;
+        assert_eq!(h.engine.entry_fills.fee_usd(), Some(0.02));
+        // A second fill with no fee makes the leg total unknowable --
+        // it must not read as the 0.02 already seen.
+        h.connector
+            .push_fill("e2", OrderSide::Short, "0.5", "100.0", None);
+        h.harvest(T1_US + 1_000_000).await;
+        assert_eq!(h.engine.entry_fills.fee_usd(), None);
+    }
+
+    #[tokio::test]
+    async fn every_fill_reaches_the_durable_ledger_as_it_is_seen() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.4", "100.0", None);
+        h.connector
+            .push_fill("e2", OrderSide::Short, "0.6", "101.0", None);
+        h.harvest(T1_US).await;
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "one line per fill, written when seen");
+        assert_eq!(lines[0]["trade_id"], serde_json::json!("e1"));
+        assert_eq!(lines[0]["leg"], serde_json::json!("entry"));
+        assert!((lines[1]["price"].as_f64().unwrap() - 101.0).abs() < 1e-9);
+    }
+
+    /// pairtrade#320 Codex review, P1. The exit fill is routinely
+    /// visible on the very tick that observes the account flat -- the
+    /// account is flat *because* of it -- and the tick's own harvest
+    /// runs after the decisions. Booking the close without harvesting
+    /// first left every trade permanently unsettled and the closing
+    /// fill missing from the ledger entirely.
+    #[tokio::test]
+    async fn a_fill_seen_only_at_the_close_still_settles_the_trade() {
+        let mut h = harness();
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.harvest(T1_US).await;
+
+        // The exit fill appears with no harvest tick of its own before
+        // the close is booked.
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.set_now(T2_US);
+        h.engine.on_exit(1717.855, T2_US).await;
+
+        let rec = last_pnl_record(&h);
+        assert!(
+            !rec["settled"].is_null(),
+            "the closing fill must be harvested before the account is summarised"
+        );
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            2,
+            "and it must reach the durable ledger, not only the summary"
+        );
+    }
+
+    /// pairtrade#320 Codex review, P1. Nothing prunes the connector's
+    /// fill cache, so forgetting which trade ids were already counted
+    /// makes every historical fill look new at the next entry -- which
+    /// would pile the previous trade's quantity into both of this
+    /// trade's legs and leave `covers()` failing for the rest of the
+    /// process.
+    #[tokio::test]
+    async fn a_second_trade_settles_despite_the_first_trades_fills_still_being_cached() {
+        let mut h = harness();
+
+        // Trade 1, closed.
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T1_US).await;
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert!(!last_pnl_record(&h)["settled"].is_null());
+
+        // Trade 2. The connector still serves trade 1's fills, exactly
+        // as it does in production.
+        h.engine.begin_fill_ledger(OrderSide::Short);
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.connector
+            .push_fill("t3", OrderSide::Short, "0.05", "1700.00", None);
+        h.connector
+            .push_fill("t4", OrderSide::Long, "0.05", "1690.00", None);
+        h.harvest(T2_US + 60_000_000).await;
+
+        assert_eq!(
+            h.engine.entry_fills.size, 0.05,
+            "yesterday's 0.0566 must not be in this leg"
+        );
+        assert_eq!(h.engine.exit_fills.size, 0.05);
+        h.engine.on_exit(1690.0, T2_US + 120_000_000).await;
+        let rec = last_pnl_record(&h);
+        assert!(
+            !rec["settled"].is_null(),
+            "the second trade of a process must settle too"
+        );
+        let gross = rec["settled"]["gross_pnl_usd"].as_f64().unwrap();
+        assert!(
+            (gross - 0.5).abs() < 1e-9,
+            "short 1700 -> 1690 on 0.05: {gross}"
+        );
+    }
+
+    /// pairtrade#320 Codex review round 2. The pre-close harvest is not
+    /// a substitute for a periodic one: a ledger that only gets written
+    /// when a trade closes loses the entry fill to any crash during the
+    /// holding period, which is most of the day.
+    #[tokio::test]
+    async fn the_entry_fill_is_durable_before_the_close() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+
+        // A plain tick during the holding period -- no close, no
+        // confirmation pending.
+        h.set_now(T1_US + 60_000_000);
+        h.engine.tick().await;
+
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path)
+            .expect("the entry fill must be on disk long before the exit");
+        assert_eq!(raw.lines().count(), 1);
+        assert!(h.engine.position.is_some(), "still holding");
+    }
+
+    /// pairtrade#320 Codex review round 2: one missing fee makes the
+    /// leg unknown *for good*. A later fill that does report one must
+    /// not resurrect a total that is missing the first fill's cost.
+    #[tokio::test]
+    async fn an_unknown_fee_stays_unknown_when_a_later_fill_reports_one() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.5", "100.0", None);
+        h.harvest(T1_US).await;
+        assert_eq!(h.engine.entry_fills.fee_usd(), None);
+
+        h.connector
+            .push_fill("e2", OrderSide::Short, "0.5", "100.0", Some("0.02"));
+        h.harvest(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.engine.entry_fills.fee_usd(),
+            None,
+            "$0.02 is not this leg's fee total -- the first fill's is still unknown"
+        );
+    }
+
+    /// pairtrade#320 Codex review round 2: a fill counts only once it is
+    /// durable. Marking it seen before the write turned a transient
+    /// filesystem error into a permanently missing ledger row, while the
+    /// totals moved anyway.
+    #[tokio::test]
+    async fn a_fill_that_could_not_be_written_is_retried_not_lost() {
+        let mut h = harness();
+        open_short(&mut h, 1.0, 100.0);
+        // An unwritable path: the directory does not exist.
+        h.engine.cfg.fills_log_path = h
+            .engine
+            .cfg
+            .state_path
+            .parent()
+            .unwrap()
+            .join("no-such-dir")
+            .join("fills.jsonl");
+        h.connector
+            .push_fill("e1", OrderSide::Short, "1.0", "100.0", None);
+        h.harvest(T1_US).await;
+        assert_eq!(
+            h.engine.entry_fills.fills, 0,
+            "a fill that never reached the ledger must not be counted either"
+        );
+        assert!(!h.engine.seen_trade_ids.contains("e1"));
+
+        // The connector still serves it; once the path works the fill
+        // lands exactly once.
+        h.engine.cfg.fills_log_path = h
+            .engine
+            .cfg
+            .state_path
+            .parent()
+            .unwrap()
+            .join("fills.jsonl");
+        h.harvest(T1_US + 1_000_000).await;
+        h.harvest(T1_US + 2_000_000).await;
+        assert_eq!(h.engine.entry_fills.fills, 1);
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+    }
+
+    /// pairtrade#320 Codex review round 3. A position restored after a
+    /// restart never goes through `record_entry`, so the ledger had no
+    /// side and every harvest returned immediately -- for the whole
+    /// remaining life of that position, including its exit.
+    #[tokio::test]
+    async fn a_restored_position_still_records_its_exit_fill() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        // As a restart leaves it: a position, and a ledger that was
+        // never told about it.
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1763.60,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.0566,
+            open_size: 0.0566,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        assert!(h.engine.fill_ledger_entry_side.is_none());
+
+        h.connector
+            .push_fill("x1", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T2_US).await;
+
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path)
+            .expect("a restarted process must still record what it sees");
+        assert_eq!(raw.lines().count(), 1);
+        assert_eq!(h.engine.exit_fills.fills, 1);
+        // The entry fills predate this process, so the settlement is
+        // honestly unknown rather than wrong.
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert_eq!(
+            last_pnl_record(&h)["settled"],
+            serde_json::json!(null),
+            "an entry this process never saw cannot be settled"
+        );
+    }
+
+    /// pairtrade#320 Codex review round 3: an entry confirmed during a
+    /// tick initialises the ledger *after* that tick's pre-decision
+    /// harvest has already run and found no side. Its fill is in the
+    /// connector cache at that moment; waiting for the next 5 s tick
+    /// loses it to a crash in between.
+    ///
+    /// Driven through the real confirmation path -- a `PendingConfirm`
+    /// the tick resolves -- because that is the ordering under test.
+    /// Installing the position by hand before the tick would let the
+    /// pre-decision harvest catch it and the assertion would pass with
+    /// the post-decision harvest removed.
+    #[tokio::test]
+    async fn an_entry_confirmed_mid_tick_is_durable_on_that_tick() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.day.entered = false;
+        // The order is out and its fill is already on the venue.
+        h.engine.pending = Some(PendingConfirm::Entry {
+            side: OrderSide::Short,
+            requested: 0.05,
+            price: 1700.0,
+            epsilon: -0.01,
+            notional_usd: 100.0,
+            deadline_us: T1_US + 180_000_000,
+            after_send_error: None,
+            saw_reading: false,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.05", -1, Some("1700.00")));
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.05", "1700.00", None);
+
+        h.set_now(T1_US + 10_000_000);
+        h.engine.tick().await;
+
+        assert!(h.engine.position.is_some(), "the entry was confirmed");
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path)
+            .expect("the entry fill must not wait a tick to become durable");
+        assert_eq!(raw.lines().count(), 1);
+        assert_eq!(h.engine.entry_fills.fills, 1);
+    }
+
+    /// pairtrade#320 Codex review round 4, and the reason the ledger
+    /// now has an explicit lifecycle rather than an implicit one.
+    ///
+    /// After a completed trade the accumulators and side stay behind so
+    /// a straggling fill still lands somewhere sensible. The next
+    /// session's entry fill can reach the connector cache while the send
+    /// is still `PendingConfirm` -- and a harvest then counted it
+    /// against the *previous* trade and marked it seen process-wide, so
+    /// `record_entry`'s reset left the new trade with a fill it could
+    /// never obtain again. Every second-and-later trade in a process
+    /// would have been permanently unsettled.
+    ///
+    /// Driven through `maybe_enter`, because the fix is that the ledger
+    /// opens inside the send.
+    #[tokio::test]
+    async fn a_second_trade_settles_when_its_fill_arrives_before_confirmation() {
+        let mut h = harness();
+
+        // Trade 1, complete.
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T1_US).await;
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert!(!last_pnl_record(&h)["settled"].is_null(), "trade 1 settles");
+
+        // Trade 2's send. Its fill is already on the venue by the time
+        // the order returns -- the ordering that broke this.
+        h.engine.position = None;
+        h.engine.day.entered = false;
+        h.engine.day.exited = false;
+        h.engine.state.last_session_date = None;
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1, "trade 2 was sent");
+
+        // kr up, us flat -> epsilon positive -> this entry is a long,
+        // the opposite side from trade 1. That is the case that hurts:
+        // attributed against trade 1's still-open ledger it would land
+        // in its *exit* leg.
+        h.connector
+            .push_fill("t3", OrderSide::Long, "0.05", "1700.00", None);
+        h.harvest(T1_US + 2_000_000).await;
+        assert_eq!(
+            h.engine.entry_fills.fills, 1,
+            "the fill belongs to the trade being sent, not the one just closed"
+        );
+        assert!(
+            (h.engine.entry_fills.size - 0.05).abs() < 1e-9,
+            "and trade 1's quantity is not in it"
+        );
+        assert_eq!(h.engine.exit_fills.fills, 0);
+    }
+
+    /// The closing half of the lifecycle. Once a trade is summarised the
+    /// ledger is closed, so a position that turns up afterwards without
+    /// going through an entry -- adopted from the exchange -- starts its
+    /// own account instead of accumulating into the finished trade's.
+    #[tokio::test]
+    async fn a_position_adopted_after_a_close_starts_its_own_account() {
+        let mut h = harness();
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T1_US).await;
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert!(h.engine.entry_fills.fills > 0, "the closed trade's totals");
+
+        // An exposure appears that this process did not open: no entry,
+        // no send, just a position.
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 1700.0,
+            entry_price_estimated: true,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T2_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        });
+        h.harvest(T2_US + 1_000_000).await;
+        assert_eq!(
+            h.engine.entry_fills.fills, 0,
+            "the finished trade's fills must not carry into this one"
+        );
+        assert_eq!(h.engine.exit_fills.fills, 0);
+        assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Long));
+    }
+
+    /// pairtrade#320 Codex review round 5: when the exchange holds the
+    /// opposite side from the one submitted, its answer is
+    /// authoritative -- and a ledger still keyed to the submitted side
+    /// files the entry fill as the close and the close as the entry,
+    /// publishing reversed VWAPs and a gross PnL with the wrong sign.
+    #[tokio::test]
+    async fn a_confirmed_side_mismatch_re_keys_the_ledger() {
+        let mut h = harness();
+        // Submitted long; the fill that came back is a short.
+        h.engine.begin_fill_ledger(OrderSide::Long);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.05", "1700.00", None);
+        h.harvest(T1_US).await;
+        assert_eq!(
+            h.engine.exit_fills.fills, 1,
+            "sorted against the submitted side, it lands in the wrong leg"
+        );
+
+        // The exchange's side is what gets recorded.
+        h.engine.record_entry(
+            OpenPosition {
+                side: OrderSide::Short,
+                entry_price: 1700.0,
+                entry_price_estimated: false,
+                entry_price_unknown: false,
+                size: 0.05,
+                open_size: 0.05,
+                realized_partial_pnl: 0.0,
+                entered_at_us: T1_US,
+                flatten_asap: false,
+                exit_deadline_us: Some(T2_US + 900_000_000),
+            },
+            -0.01,
+            100.0,
+            "side_mismatch=true",
+        );
+        assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Short));
+        assert_eq!(
+            h.engine.entry_fills.fills, 1,
+            "the legs are swapped, not lost"
+        );
+        assert_eq!(h.engine.exit_fills.fills, 0);
+
+        // And the settled result now has the right sign: short
+        // 1700 -> 1690 on 0.05 is +$0.50, not -$0.50.
+        h.connector
+            .push_fill("x1", OrderSide::Long, "0.05", "1690.00", None);
+        h.harvest(T2_US).await;
+        h.engine.on_exit(1690.0, T2_US).await;
+        let gross = last_pnl_record(&h)["settled"]["gross_pnl_usd"]
+            .as_f64()
+            .unwrap();
+        assert!((gross - 0.5).abs() < 1e-9, "gross {gross}");
+    }
+
+    /// pairtrade#320 Codex review round 6: the same inversion as the
+    /// confirmed-entry case, reached through a path that never touches
+    /// `record_entry` -- an adoption after the confirmation window
+    /// expired. Pinned here because the invariant is now enforced where
+    /// fills are classified, not at each site that installs a position.
+    #[tokio::test]
+    async fn a_position_adopted_on_the_other_side_re_keys_the_ledger_too() {
+        let mut h = harness();
+        // Submitted long; the venue filled a short and the confirmation
+        // window expired, so the position is installed directly.
+        h.engine.begin_fill_ledger(OrderSide::Long);
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.05", "1700.00", None);
+        h.harvest(T1_US).await;
+        assert_eq!(
+            h.engine.exit_fills.fills, 1,
+            "sorted against the submitted side"
+        );
+
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            entry_price_estimated: true,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        h.connector
+            .push_fill("x1", OrderSide::Long, "0.05", "1690.00", None);
+        h.harvest(T2_US).await;
+        assert_eq!(h.engine.fill_ledger_entry_side, Some(OrderSide::Short));
+        assert_eq!(h.engine.entry_fills.fills, 1, "legs swapped, not lost");
+
+        h.engine.on_exit(1690.0, T2_US).await;
+        let gross = last_pnl_record(&h)["settled"]["gross_pnl_usd"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            (gross - 0.5).abs() < 1e-9,
+            "short 1700 -> 1690 on 0.05 is +$0.50, not -$0.50: {gross}"
+        );
+    }
+
     #[tokio::test]
     async fn a_hung_venue_read_does_not_hold_the_trading_tick() {
         let mut h = harness();
@@ -9052,7 +10113,7 @@ mod tests {
             exit_deadline_us: None,
         });
         h.engine.persist_position();
-        h.engine.on_exit(1769.1, T2_US);
+        h.engine.on_exit(1769.1, T2_US).await;
         // Whatever is on disk must never show "flat" without also showing
         // the trade that made it flat.
         let on_disk = load_state(&h.engine.cfg.state_path);
@@ -9881,7 +10942,7 @@ mod tests {
         );
         // And the final close books nothing either.
         let before = h.engine.state.realized_pnl_session;
-        h.engine.on_exit(1769.10, T2_US);
+        h.engine.on_exit(1769.10, T2_US).await;
         assert!((h.engine.state.realized_pnl_session - before).abs() < 1e-9);
     }
 
@@ -10001,7 +11062,7 @@ mod tests {
         // old code booked (quote - 0.0) * size -- the entire notional as
         // profit, straight into peak equity and the drawdown halt.
         let before = h.engine.state.realized_pnl_session;
-        h.engine.on_exit(1769.10, T2_US);
+        h.engine.on_exit(1769.10, T2_US).await;
         let booked = h.engine.state.realized_pnl_session - before;
         assert!(
             booked.abs() < 1e-9,
