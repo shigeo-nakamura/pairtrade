@@ -6183,9 +6183,11 @@ async fn main() -> Result<()> {
             // The runtime and the recorder must judge venue quotes with the
             // same band, or the runtime's linkage check would refuse the
             // recorder's own rows (bot-strategy#1001).
-            let recorder_config = recorder_config.with_max_favourable_quote_deviation_bps(
-                config.runtime.max_favourable_quote_deviation_bps,
-            );
+            let recorder_config = recorder_config
+                .with_max_favourable_quote_deviation_bps(
+                    config.runtime.max_favourable_quote_deviation_bps,
+                )
+                .with_max_reference_price_age_secs(config.runtime.max_reference_price_age_secs);
             let recorder = ArcusSpotRecorder::new(client, recorder_config)
                 .context("invalid Arcus recorder configuration")?;
             let snapshot: ArcusSpotRecorderSnapshot = recorder.collect_once().await;
@@ -6971,6 +6973,7 @@ runtime:
                         "payload": {
                             "recommended": "arcus",
                             "referencePrice": "1.000500250125062531",
+                            "referencePriceTimestamp": at.timestamp_millis(),
                             "all": [{"venue": "arcus", "buyAmount": "50000000000000000", "sellAmount": "50000000000000000", "fees": []}],
                             "errors": []
                         },
@@ -6990,7 +6993,8 @@ runtime:
                     "response": {
                         "payload": {
                             "recommended": "arcus",
-                            "referencePrice": "0.992846423211605803",
+                            "referencePrice": "0.9995",
+                            "referencePriceTimestamp": at.timestamp_millis(),
                             "all": [{"venue": "arcus", "buyAmount": "49617500000000000", "sellAmount": "50000000000000000", "fees": []}],
                             "errors": []
                         },

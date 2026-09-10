@@ -1799,6 +1799,7 @@ impl ArcusSpotRuntime {
                 evaluation_time,
                 self.config.max_quote_age_secs,
                 self.config.max_favourable_quote_deviation_bps,
+                self.config.max_reference_price_age_secs,
             )?;
             verify_reverse_notional_bound(
                 reverse_route,
@@ -1820,6 +1821,7 @@ impl ArcusSpotRuntime {
                 evaluation_time,
                 self.config.max_quote_age_secs,
                 self.config.max_favourable_quote_deviation_bps,
+                self.config.max_reference_price_age_secs,
             )?;
             validate_route_leg(
                 reverse_route,
@@ -1828,6 +1830,7 @@ impl ArcusSpotRuntime {
                 evaluation_time,
                 self.config.max_quote_age_secs,
                 self.config.max_favourable_quote_deviation_bps,
+                self.config.max_reference_price_age_secs,
             )?;
             verify_requested_notional_amount(
                 row,
@@ -1847,6 +1850,7 @@ impl ArcusSpotRuntime {
                 cycle_sell_token,
                 cycle_buy_token,
                 self.config.max_favourable_quote_deviation_bps,
+                self.config.max_reference_price_age_secs,
             )?
         };
 
@@ -1998,6 +2002,7 @@ impl ArcusSpotRuntime {
             evaluation_time,
             self.config.max_quote_age_secs,
             self.config.max_favourable_quote_deviation_bps,
+            self.config.max_reference_price_age_secs,
         )?;
         if row.requested_sell_amount.as_deref() != Some(open_raw.as_str())
             || forward_route.sell_amount != open_raw
@@ -2182,12 +2187,14 @@ impl ArcusSpotRuntime {
             evaluation_time,
             self.config.max_quote_age_secs,
             self.config.max_favourable_quote_deviation_bps,
+            self.config.max_reference_price_age_secs,
         )?;
         let quote = select_route_quote(
             route,
             sell_token,
             buy_token,
             self.config.max_favourable_quote_deviation_bps,
+            self.config.max_reference_price_age_secs,
         )?
         .quote;
 
@@ -2738,6 +2745,7 @@ fn select_route_quote<'a>(
     sell_token: &ArcusSpotToken,
     buy_token: &ArcusSpotToken,
     max_favourable_quote_deviation_bps: Decimal,
+    max_reference_price_age_secs: i64,
 ) -> Result<ArcusSpotSelectedQuote<'a>, ArcusSpotHold> {
     route
         .response
@@ -2746,6 +2754,8 @@ fn select_route_quote<'a>(
             sell_token.decimals,
             buy_token.decimals,
             max_favourable_quote_deviation_bps,
+            route.response.received_at,
+            max_reference_price_age_secs,
         )
         .map_err(|error| {
             ArcusSpotHold::new(
@@ -2789,6 +2799,7 @@ fn validate_route_leg(
     evaluation_time: DateTime<Utc>,
     max_quote_age_secs: i64,
     max_favourable_quote_deviation_bps: Decimal,
+    max_reference_price_age_secs: i64,
 ) -> Result<(), ArcusSpotHold> {
     validate_route(route, sell_token, buy_token)?;
     let selected = select_route_quote(
@@ -2796,6 +2807,7 @@ fn validate_route_leg(
         sell_token,
         buy_token,
         max_favourable_quote_deviation_bps,
+        max_reference_price_age_secs,
     )?;
     if selected.quote.sell_amount != route.sell_amount {
         return Err(ArcusSpotHold::new(
@@ -2983,6 +2995,7 @@ fn verify_round_trip_linkage_and_loss(
     sell_token: &ArcusSpotToken,
     buy_token: &ArcusSpotToken,
     max_favourable_quote_deviation_bps: Decimal,
+    max_reference_price_age_secs: i64,
 ) -> Result<Decimal, ArcusSpotHold> {
     let forward = row
         .forward
@@ -2997,12 +3010,14 @@ fn verify_round_trip_linkage_and_loss(
         sell_token,
         buy_token,
         max_favourable_quote_deviation_bps,
+        max_reference_price_age_secs,
     )?;
     let reverse_quote = select_route_quote(
         reverse,
         buy_token,
         sell_token,
         max_favourable_quote_deviation_bps,
+        max_reference_price_age_secs,
     )?;
     // The recorder chained the reverse leg off the venue *it* selected. If
     // this runtime's band selects a different venue for the same payload,
@@ -3074,6 +3089,36 @@ fn verify_round_trip_linkage_and_loss(
                 "round-trip loss exceeds Decimal range",
             )
         })?;
+    // Each leg was judged against its own referencePrice, and those are
+    // supplied independently by the router. They must be reciprocals (the
+    // same market seen from both sides; measured 0.0 bps apart live), or a
+    // pair that disagrees by more than the band could pass both leg checks
+    // while together implying an arbitrarily favourable -- and fictitious
+    // -- round trip (Codex P1, pairtrade#323).
+    let forward_reference = reference_price_of(forward, "forward")?;
+    let reverse_reference = reference_price_of(reverse, "reverse")?;
+    let reference_gap_bps = forward_reference
+        .checked_mul(reverse_reference)
+        .and_then(|product| product.checked_sub(Decimal::ONE))
+        .and_then(|gap| gap.checked_mul(Decimal::from(10_000)))
+        .map(|gap| gap.abs())
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "reference reciprocity exceeds Decimal range",
+            )
+        })?;
+    if reference_gap_bps > max_favourable_quote_deviation_bps {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!(
+                "forward and reverse referencePrices disagree by {} bps, more than the {} bps \
+                 band; they do not describe one market",
+                reference_gap_bps.round_dp(3).normalize(),
+                max_favourable_quote_deviation_bps.normalize()
+            ),
+        ));
+    }
     let recorded = parse_signed_round_trip_loss_bps(
         "optimistic_round_trip_loss_bps",
         row.optimistic_round_trip_loss_bps.as_deref(),
@@ -3087,9 +3132,53 @@ fn verify_round_trip_linkage_and_loss(
             ),
         ));
     }
+    // With each leg at most `band` above its reference and the two
+    // references within `band` of reciprocal, a genuine round trip returns
+    // at most (1 + band)^3 of what it started with. The three checks above
+    // already imply this, so the bound is unreachable while they hold; it
+    // is kept so that relaxing any one of them can never silently make a
+    // favourable round trip free at the cost gate.
+    let band_ratio = Decimal::ONE
+        + max_favourable_quote_deviation_bps
+            .checked_div(Decimal::from(10_000))
+            .unwrap_or(Decimal::ZERO);
+    let most_favourable_credible = band_ratio
+        .checked_mul(band_ratio)
+        .and_then(|square| square.checked_mul(band_ratio))
+        .and_then(|cube| cube.checked_sub(Decimal::ONE))
+        .and_then(|gain| gain.checked_mul(Decimal::from(10_000)))
+        .ok_or_else(|| {
+            ArcusSpotHold::new(
+                ArcusSpotHoldCode::InvalidSnapshot,
+                "round-trip bound exceeds Decimal range",
+            )
+        })?;
+    if recomputed < -most_favourable_credible {
+        return Err(ArcusSpotHold::new(
+            ArcusSpotHoldCode::InvalidSnapshot,
+            format!(
+                "round trip returns {} bps more than it started with, beyond the {} bps that \
+                 in-band quotes on both legs can explain",
+                (-recomputed).round_dp(3).normalize(),
+                most_favourable_credible.normalize()
+            ),
+        ));
+    }
     // Signed agreement is what proves the legs chain; the cost gate itself
     // never credits a favourable round trip (see parse_round_trip_loss_bps).
     Ok(recomputed.max(Decimal::ZERO))
+}
+
+fn reference_price_of(
+    route: &ArcusSpotRouteObservation,
+    leg: &str,
+) -> Result<Decimal, ArcusSpotHold> {
+    route.response.payload.reference_price().map_err(|error| {
+        ArcusSpotHold::new(
+            ArcusSpotHoldCode::RouteUnavailable,
+            format!("{leg} leg: {error}"),
+        )
+    })
 }
 
 /// Shared by `apply_confirmed_live_fill` (post-fill commit) and
@@ -4522,6 +4611,7 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
             max_favourable_quote_deviation_bps: Decimal::from(25),
+            max_reference_price_age_secs: 120,
             corporate_actions: Vec::new(),
             // The corporate-action fixtures use second-scale windows, so
             // the 300s production default would leave no dispatchable reduce
@@ -4575,6 +4665,7 @@ mod tests {
                     "payload": {
                         "recommended": "arcus",
                         "referencePrice": reference_price("49000000000000000", "25000000000000000"),
+                        "referencePriceTimestamp": received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "49000000000000000",
@@ -4599,7 +4690,8 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
-                        "referencePrice": reference_price("24800000000000000", "49000000000000000"),
+                        "referencePrice": reciprocal_reference("49000000000000000", "25000000000000000"),
+                        "referencePriceTimestamp": reverse_received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "24800000000000000",
@@ -4652,6 +4744,7 @@ mod tests {
                     "payload": {
                         "recommended": "arcus",
                         "referencePrice": reference_price("24500000000000000", "50000000000000000"),
+                        "referencePriceTimestamp": received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "24500000000000000",
@@ -4676,7 +4769,8 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
-                        "referencePrice": reference_price("49600000000000000", "24500000000000000"),
+                        "referencePrice": reciprocal_reference("24500000000000000", "50000000000000000"),
+                        "referencePriceTimestamp": reverse_received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "49600000000000000",
@@ -5257,6 +5351,15 @@ mod tests {
         (implied / Decimal::new(9995, 4)).normalize().to_string()
     }
 
+    /// The reverse leg's reference for the same market: the exact
+    /// reciprocal of the forward leg's (`reference_price(forward_buy,
+    /// forward_sell)`), so the two legs describe one price.
+    fn reciprocal_reference(forward_buy_amount: &str, forward_sell_amount: &str) -> String {
+        let forward =
+            Decimal::from_str(&reference_price(forward_buy_amount, forward_sell_amount)).unwrap();
+        (Decimal::ONE / forward).normalize().to_string()
+    }
+
     fn with_implausible_rialto_recommended(route: &mut ArcusSpotRouteObservation) {
         // The live 2026-09-10 shape: rialto's buyAmount is ~2.1% larger
         // than arcus's, the router recommends it on that alone, and it
@@ -5296,6 +5399,7 @@ mod tests {
                     "payload": {
                         "recommended": "arcus",
                         "referencePrice": reference_price(forward_buy_amount, "25000000000000000"),
+                        "referencePriceTimestamp": event_time().timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": forward_buy_amount,
@@ -5320,7 +5424,8 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
-                        "referencePrice": reference_price(reverse_buy_amount, reverse_sell_amount),
+                        "referencePrice": reciprocal_reference(reverse_sell_amount, "25000000000000000"),
+                        "referencePriceTimestamp": event_time().timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": reverse_buy_amount,
@@ -5356,7 +5461,8 @@ mod tests {
                 &row,
                 &nvda_token(),
                 &amd_token(),
-                Decimal::from(25)
+                Decimal::from(25),
+                120,
             )
             .unwrap(),
             Decimal::from(80)
@@ -5380,6 +5486,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(25),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
@@ -5400,6 +5507,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(25),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
@@ -5423,6 +5531,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(25),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
@@ -5449,7 +5558,8 @@ mod tests {
                 &row,
                 &nvda_token(),
                 &amd_token(),
-                Decimal::from(25)
+                Decimal::from(25),
+                120,
             )
             .unwrap(),
             Decimal::from(80)
@@ -5462,6 +5572,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(300),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
@@ -5486,6 +5597,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(25),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
@@ -5511,7 +5623,8 @@ mod tests {
                 &row,
                 &nvda_token(),
                 &amd_token(),
-                Decimal::from(25)
+                Decimal::from(25),
+                120,
             )
             .unwrap(),
             Decimal::ZERO
@@ -5525,6 +5638,142 @@ mod tests {
             Decimal::from(4)
         );
         assert!(parse_round_trip_loss_bps("x", None).is_err());
+    }
+
+    #[test]
+    fn round_trip_linkage_rejects_references_that_are_not_reciprocal() {
+        // Both legs sit 5 bps under their own reference, but the reverse
+        // reference has drifted 1% from the forward one's reciprocal: the
+        // two legs were not judged against one market.
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        let reverse = row.reverse.as_mut().unwrap();
+        let drifted = reverse.response.payload.reference_price().unwrap() * Decimal::new(101, 2);
+        // Keep the reverse quote in band against its drifted reference.
+        reverse.response.payload.quotes[0].buy_amount =
+            (Decimal::from_str("24800000000000000").unwrap() * Decimal::new(101, 2))
+                .round()
+                .to_string();
+        reverse.response.payload.extra.insert(
+            "referencePrice".to_string(),
+            json!(drifted.normalize().to_string()),
+        );
+        row.optimistic_return_amount = Some(reverse.response.payload.quotes[0].buy_amount.clone());
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+            120,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::InvalidSnapshot);
+        assert!(
+            error.detail.contains("referencePrices disagree"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_most_favourable_round_trip_in_band_quotes_can_explain_is_costed_at_zero() {
+        // Every check at its limit at once: forward quote exactly +band over
+        // its reference, reverse quote exactly +band over its reference, and
+        // the two references exactly +band apart from reciprocal. The chained
+        // amounts then return (1 + band)^3 of what they started with -- the
+        // most favourable round trip the per-leg and reciprocity checks
+        // admit -- and the cost gate sees zero, not a rejection. One more
+        // bps anywhere trips the check that owns it (the tests around this
+        // one), so nothing more favourable can reach the bound.
+        let band = Decimal::from(25);
+        let ratio = Decimal::ONE + band / Decimal::from(10_000);
+        let forward_sell = Decimal::from_str("25000000000000000").unwrap();
+        let forward_reference = Decimal::new(2, 0);
+        let forward_buy = (forward_sell * forward_reference * ratio).round();
+        let reverse_reference = ratio / forward_reference;
+        let reverse_buy = (forward_buy * reverse_reference * ratio).round();
+        let loss = ((forward_sell - reverse_buy) / forward_sell * Decimal::from(10_000))
+            .normalize()
+            .to_string();
+        let mut row = round_trip_row(
+            &forward_buy.to_string(),
+            &forward_buy.to_string(),
+            &reverse_buy.to_string(),
+            &reverse_buy.to_string(),
+            &loss,
+        );
+        row.forward.as_mut().unwrap().response.payload.extra.insert(
+            "referencePrice".to_string(),
+            json!(forward_reference.normalize().to_string()),
+        );
+        row.reverse.as_mut().unwrap().response.payload.extra.insert(
+            "referencePrice".to_string(),
+            json!(reverse_reference.normalize().to_string()),
+        );
+        assert!(Decimal::from_str(&loss).unwrap() < -Decimal::from(75));
+        assert_eq!(
+            verify_round_trip_linkage_and_loss(&row, &nvda_token(), &amd_token(), band, 120)
+                .unwrap(),
+            Decimal::ZERO
+        );
+        // Push the reverse quote one bps past its band and the leg check,
+        // not the bound, refuses it.
+        let over = (reverse_buy * (Decimal::ONE + Decimal::new(1, 4))).round();
+        let mut row = round_trip_row(
+            &forward_buy.to_string(),
+            &forward_buy.to_string(),
+            &over.to_string(),
+            &over.to_string(),
+            &((forward_sell - over) / forward_sell * Decimal::from(10_000))
+                .normalize()
+                .to_string(),
+        );
+        row.forward.as_mut().unwrap().response.payload.extra.insert(
+            "referencePrice".to_string(),
+            json!(forward_reference.normalize().to_string()),
+        );
+        row.reverse.as_mut().unwrap().response.payload.extra.insert(
+            "referencePrice".to_string(),
+            json!(reverse_reference.normalize().to_string()),
+        );
+        let error =
+            verify_round_trip_linkage_and_loss(&row, &nvda_token(), &amd_token(), band, 120)
+                .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+        assert!(
+            error.detail.contains("no plausible venue quote"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_leg_with_a_stale_reference_holds_as_route_unavailable() {
+        let mut row = round_trip_row(
+            "49000000000000000",
+            "49000000000000000",
+            "24800000000000000",
+            "24800000000000000",
+            "80",
+        );
+        let received_at = row.forward.as_ref().unwrap().response.received_at;
+        row.forward.as_mut().unwrap().response.payload.extra.insert(
+            "referencePriceTimestamp".to_string(),
+            json!((received_at - Duration::seconds(121)).timestamp_millis()),
+        );
+        let error = verify_round_trip_linkage_and_loss(
+            &row,
+            &nvda_token(),
+            &amd_token(),
+            Decimal::from(25),
+            120,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
+        assert!(error.detail.contains("121s old"), "{error:?}");
     }
 
     #[test]
@@ -5549,6 +5798,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(25),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
@@ -5571,6 +5821,7 @@ mod tests {
             &nvda_token(),
             &amd_token(),
             Decimal::from(25),
+            120,
         )
         .unwrap_err();
         assert_eq!(error.code, ArcusSpotHoldCode::RouteUnavailable);
@@ -6609,6 +6860,7 @@ mod tests {
                     "payload": {
                         "recommended": "arcus",
                         "referencePrice": reference_price("49000000000000000", "25000000000000000"),
+                        "referencePriceTimestamp": stale_forward_received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "49000000000000000",
@@ -6633,7 +6885,8 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
-                        "referencePrice": reference_price("24800000000000000", "49000000000000000"),
+                        "referencePrice": reciprocal_reference("49000000000000000", "25000000000000000"),
+                        "referencePriceTimestamp": event_time().timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": "24800000000000000",
@@ -6778,6 +7031,7 @@ mod tests {
                     "payload": {
                         "recommended": "arcus",
                         "referencePrice": reference_price(forward_buy_amount, sell_amount),
+                        "referencePriceTimestamp": received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": forward_buy_amount,
@@ -6802,7 +7056,8 @@ mod tests {
                 "response": {
                     "payload": {
                         "recommended": "arcus",
-                        "referencePrice": reference_price(reverse_buy_amount, forward_buy_amount),
+                        "referencePrice": reciprocal_reference(forward_buy_amount, sell_amount),
+                        "referencePriceTimestamp": received_at.timestamp_millis(),
                         "all": [{
                             "venue": "arcus",
                             "buyAmount": reverse_buy_amount,

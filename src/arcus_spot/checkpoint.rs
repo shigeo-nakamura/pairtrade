@@ -140,6 +140,7 @@ fn classify_config_drift(
         gas_buffer_bps: stored_gas_buffer_bps,
         settlement_buffer_bps: stored_settlement_buffer_bps,
         max_favourable_quote_deviation_bps: stored_max_favourable_quote_deviation_bps,
+        max_reference_price_age_secs: stored_max_reference_price_age_secs,
         max_inventory_imbalance_fraction: stored_max_inventory_imbalance_fraction,
         daily_loss_limit_usd: stored_daily_loss_limit_usd,
         cumulative_loss_limit_usd: stored_cumulative_loss_limit_usd,
@@ -164,6 +165,7 @@ fn classify_config_drift(
         gas_buffer_bps: current_gas_buffer_bps,
         settlement_buffer_bps: current_settlement_buffer_bps,
         max_favourable_quote_deviation_bps: current_max_favourable_quote_deviation_bps,
+        max_reference_price_age_secs: current_max_reference_price_age_secs,
         max_inventory_imbalance_fraction: current_max_inventory_imbalance_fraction,
         daily_loss_limit_usd: current_daily_loss_limit_usd,
         cumulative_loss_limit_usd: current_cumulative_loss_limit_usd,
@@ -263,6 +265,9 @@ fn classify_config_drift(
         drift
             .state_preserving
             .push("max_favourable_quote_deviation_bps");
+    }
+    if stored_max_reference_price_age_secs != current_max_reference_price_age_secs {
+        drift.state_preserving.push("max_reference_price_age_secs");
     }
     if stored_max_inventory_imbalance_fraction != current_max_inventory_imbalance_fraction {
         drift
@@ -746,6 +751,7 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(3),
             cumulative_loss_limit_usd: Decimal::from(11),
             max_favourable_quote_deviation_bps: Decimal::from(25),
+            max_reference_price_age_secs: 120,
             corporate_actions: vec![super::super::ArcusSpotCorporateActionEvent {
                 event_id: "SPY-2026-SPLIT".to_string(),
                 symbols: vec!["SPY".to_string()],
@@ -791,6 +797,7 @@ mod tests {
             daily_loss_limit_usd: Decimal::from(2),
             cumulative_loss_limit_usd: Decimal::from(10),
             max_favourable_quote_deviation_bps: Decimal::from(25),
+            max_reference_price_age_secs: 120,
             corporate_actions: Vec::new(),
             corporate_action_settlement_margin_secs: 300,
         }
@@ -862,6 +869,7 @@ mod tests {
         let mut retuned = live_runtime_config();
         retuned.max_rotation_fraction = Decimal::new(30, 2);
         retuned.max_favourable_quote_deviation_bps = Decimal::from(40);
+        retuned.max_reference_price_age_secs = 300;
         let restored = store.load_or_create(&retuned).unwrap();
 
         assert_eq!(
@@ -876,6 +884,7 @@ mod tests {
             restored.config().max_favourable_quote_deviation_bps,
             Decimal::from(40)
         );
+        assert_eq!(restored.config().max_reference_price_age_secs, 300);
 
         // And the next persist writes the new config through, so the drift is
         // reported once rather than on every subsequent load.
