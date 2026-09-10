@@ -5326,6 +5326,22 @@ impl EngineBLiveEngine {
             calendar_version: self.calendar.calendar_version.clone(),
         };
         let stale_or_missing_symbols = self.stale_or_missing_symbols(now_us);
+        // Mirrors the `positions` fallback above, and for the same
+        // reason: a saved claim this process has not yet reconciled --
+        // `get_positions()` failed at startup, say -- is not evidence of
+        // a flat account. Reporting `managed_position_open=false` and no
+        // deadline through a venue outage would hide the hold exactly
+        // when it matters most, while the same document is still listing
+        // that exposure in `positions` (pairtrade#319 Codex review
+        // round 2). `positions_ready` stays false throughout, which is
+        // where the uncertainty belongs.
+        let (managed_claim_open, managed_claim_exit_deadline_us) = match self.position.as_ref() {
+            Some(p) => (true, p.exit_deadline_us),
+            None => match self.state.open_position.as_ref() {
+                Some(p) => (true, p.exit_deadline_us),
+                None => (false, None),
+            },
+        };
         // One lock for both fields so a refresh landing between two
         // reads cannot publish a reading against the wrong staleness
         // verdict.
@@ -5355,8 +5371,8 @@ impl EngineBLiveEngine {
                 .map(|v| ((now_us - v.fetched_at_us) / 1_000_000).max(0)),
             venue_equity_stale,
             unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
-            exit_deadline_us: self.position.as_ref().and_then(|p| p.exit_deadline_us),
-            managed_position_open: self.position.is_some(),
+            exit_deadline_us: managed_claim_exit_deadline_us,
+            managed_position_open: managed_claim_open,
         };
         let status = FullStatus {
             dashboard: DashboardStatus {
@@ -8599,6 +8615,43 @@ mod tests {
             status["han_bridge"]["managed_position_open"],
             serde_json::json!(false),
             "but this engine opened nothing, so it has no exit to announce"
+        );
+    }
+
+    /// pairtrade#319 Codex review round 2: a venue outage at startup is
+    /// exactly when the persisted claim must not read as flat. The
+    /// `positions` list already falls back to it; these fields have to
+    /// agree with the document they sit in.
+    #[tokio::test]
+    async fn an_unreconciled_claim_still_reports_a_managed_hold_and_its_deadline() {
+        let mut h = harness();
+        h.engine.reconciled = false;
+        h.engine.position = None;
+        h.engine.state.open_position = Some(PersistedPosition {
+            exit_deadline_us: Some(T2_US + 900_000_000),
+            ..persisted_long(0.05, TODAY)
+        });
+        h.engine.write_status_if_due(T1_US);
+        let status = read_status(&h);
+        assert_eq!(
+            status["han_bridge"]["managed_position_open"],
+            serde_json::json!(true),
+            "the account could not be read; that is not evidence of flat"
+        );
+        assert_eq!(
+            status["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(T2_US + 900_000_000),
+            "and the saved exit must not vanish for the outage"
+        );
+        assert_eq!(
+            status["positions_ready"],
+            serde_json::json!(false),
+            "the uncertainty belongs here, not in a claim of flatness"
+        );
+        assert_eq!(
+            status["positions"].as_array().map(|a| a.len()),
+            Some(1),
+            "consistent with the list the same document publishes"
         );
     }
 

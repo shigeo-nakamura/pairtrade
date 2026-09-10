@@ -146,7 +146,12 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     makes it true on a day Engine B opened nothing. Anything asking "is
     Engine B holding" (an exit countdown, the unrealized mark) must read
     the `han_bridge` flag; the top-level one answers a different
-    question.
+    question. Both it and `exit_deadline_us` fall back to the persisted
+    claim while reconciliation has not completed -- a `get_positions()`
+    failure at startup is not evidence of a flat account, and the same
+    document already lists that exposure in `positions`. The uncertainty
+    is carried by `positions_ready=false`, not by pretending to be
+    flat.
   - **`venue_solvency_reported` is how a consumer knows the field exists
     at all.** It is always true from this build. A consumer cannot use
     JSON key presence for that -- debot-dashboard decodes and re-encodes
