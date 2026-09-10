@@ -1966,7 +1966,22 @@ struct EngineBLiveEngine {
     /// Venue trade ids already folded into the two accumulators above.
     /// The connector re-serves its whole fill cache on every call, so
     /// without this every harvest would count the same fills again.
+    ///
+    /// **Never cleared while the process lives.** Nothing prunes the
+    /// connector's cache -- no production path calls
+    /// `clear_filled_order` -- so clearing this between trades would
+    /// make every historical fill look new at the next entry, pile
+    /// yesterday's quantities into both of today's legs, and leave
+    /// `covers()` failing for every remaining trade in the process
+    /// (pairtrade#320 Codex review, P1). It grows by a handful of
+    /// entries per session day.
     seen_trade_ids: std::collections::HashSet<String>,
+    /// The side the open (or just-closed) trade entered on. Held here
+    /// rather than read from `self.position` so a fill can still be
+    /// attributed after the close has removed it -- the exit fill is
+    /// routinely seen on the very tick that observes the account flat
+    /// (pairtrade#320 Codex review, P1).
+    fill_ledger_entry_side: Option<OrderSide>,
 }
 
 impl EngineBLiveEngine {
@@ -3860,7 +3875,7 @@ impl EngineBLiveEngine {
                         match exchange_position_for(&positions, &self.cfg.us_primary_symbol) {
                             None => {
                                 self.pending = None;
-                                self.on_exit(exit_price, now_us);
+                                self.on_exit(exit_price, now_us).await;
                             }
                             Some(remaining) => {
                                 // A side flip while the exit is pending is
@@ -4252,7 +4267,7 @@ impl EngineBLiveEngine {
         // never be folded into the next day's VWAP (bot-strategy#919).
         // The harvest on this same tick then picks up the fills that
         // produced this entry.
-        self.reset_fill_ledger();
+        self.begin_fill_ledger(pos.side);
         let side = pos.side;
         let price = pos.entry_price;
         let size = pos.size;
@@ -4866,7 +4881,7 @@ impl EngineBLiveEngine {
         }
         if self.cfg.dry_run {
             match self.submit_order(opposite(pos.side), pos.size, true).await {
-                Ok(_) => self.on_exit(price, now_us),
+                Ok(_) => self.on_exit(price, now_us).await,
                 Err(e) => log::error!("[EXIT] order failed, position still open: {e:?}"),
             }
             return;
@@ -4932,7 +4947,7 @@ impl EngineBLiveEngine {
                          sending an order (closed externally, or the entry never filled)",
                         self.cfg.us_primary_symbol
                     );
-                    self.on_exit(price, now_us);
+                    self.on_exit(price, now_us).await;
                     return;
                 }
             },
@@ -4970,7 +4985,7 @@ impl EngineBLiveEngine {
         });
     }
 
-    fn on_exit(&mut self, exit_price: f64, now_us: i64) {
+    async fn on_exit(&mut self, exit_price: f64, now_us: i64) {
         let Some(pos) = self.position.take() else {
             return;
         };
@@ -5034,6 +5049,14 @@ impl EngineBLiveEngine {
         self.day.exited = true;
         self.mark_day_acted(self.day.skip_reason.clone());
 
+        // One last harvest before the account is summarised. The exit
+        // fill is routinely visible in the connector's cache on the very
+        // tick that observes the account flat -- the account is flat
+        // *because* of it -- and the tick's own harvest runs after the
+        // decisions, so without this the closing fill would never be
+        // recorded and every trade would settle as unknown
+        // (pairtrade#320 Codex review, P1).
+        self.harvest_fills(now_us).await;
         // The settled account of this trade, from the venue's own fills
         // (bot-strategy#919). Published beside the mid-based figures,
         // never in place of them: `pnl_usd` keeps meaning exactly what
@@ -5058,7 +5081,10 @@ impl EngineBLiveEngine {
                 "dry_run": self.cfg.dry_run,
             }),
         );
-        self.reset_fill_ledger();
+        // The ledger is deliberately NOT cleared here. A fill that
+        // arrives after the close is booked still belongs in the durable
+        // record, and the next entry starts a fresh account anyway
+        // (`begin_fill_ledger`).
         send_notification(
             format!(
                 "Han Bridge EXIT {} pnl=${pnl:.2}",
@@ -5107,9 +5133,6 @@ impl EngineBLiveEngine {
         // Observational only (bot-strategy#919). Spawned, never
         // awaited: a hung venue read must not hold the tick that drives
         // confirmation, exit and shutdown (pairtrade#316 Codex P1).
-        // Reads the connector's fill cache only -- no request, so this
-        // is safe to await on the tick (bot-strategy#919).
-        self.harvest_fills(now).await;
         self.force_venue_equity_refresh_after_a_fill();
         self.spawn_venue_equity_refresh(now);
         self.write_status_if_due(now);
@@ -5220,7 +5243,7 @@ impl EngineBLiveEngine {
     /// counted in neither leg -- it would otherwise land in whichever
     /// leg happened to be open and silently corrupt a VWAP.
     async fn harvest_fills(&mut self, now_us: i64) {
-        let Some(entry_side) = self.position.as_ref().map(|p| p.side) else {
+        let Some(entry_side) = self.fill_ledger_entry_side else {
             return;
         };
         let Ok(response) = self
@@ -5335,12 +5358,18 @@ impl EngineBLiveEngine {
         }))
     }
 
-    /// Start a fresh settled account. Called when a position is opened,
-    /// so one day's fills can never be folded into the next day's VWAP.
-    fn reset_fill_ledger(&mut self) {
+    /// Start a fresh settled account for a trade entering on `side`.
+    ///
+    /// Clears the two accumulators so one day's fills cannot be folded
+    /// into the next day's VWAP -- but deliberately **not**
+    /// `seen_trade_ids`, which must outlive every trade in the process:
+    /// the connector never prunes its fill cache, so a forgotten trade
+    /// id is a fill counted a second time (pairtrade#320 Codex review,
+    /// P1).
+    fn begin_fill_ledger(&mut self, side: OrderSide) {
         self.entry_fills = LegFills::default();
         self.exit_fills = LegFills::default();
-        self.seen_trade_ids.clear();
+        self.fill_ledger_entry_side = Some(side);
     }
 
     fn spawn_venue_equity_refresh(&mut self, now_us: i64) {
@@ -5870,6 +5899,7 @@ async fn main() -> Result<()> {
         entry_fills: LegFills::default(),
         exit_fills: LegFills::default(),
         seen_trade_ids: std::collections::HashSet::new(),
+        fill_ledger_entry_side: None,
     };
     if let Some(p) = engine.state.open_position.as_ref() {
         log::warn!(
@@ -7334,6 +7364,7 @@ mod tests {
             entry_fills: LegFills::default(),
             exit_fills: LegFills::default(),
             seen_trade_ids: std::collections::HashSet::new(),
+            fill_ledger_entry_side: None,
         };
         Harness {
             engine,
@@ -8723,7 +8754,7 @@ mod tests {
             load_state(&h.engine.cfg.state_path).open_position,
             Some(saved)
         );
-        h.engine.on_exit(1769.1, T2_US);
+        h.engine.on_exit(1769.1, T2_US).await;
         assert!(h.engine.state.open_position.is_none());
         assert!(load_state(&h.engine.cfg.state_path).open_position.is_none());
     }
@@ -9051,7 +9082,7 @@ mod tests {
     // -------------------------------------------------------------
 
     fn open_short(h: &mut Harness, size: f64, entry_price: f64) {
-        h.engine.reset_fill_ledger();
+        h.engine.begin_fill_ledger(OrderSide::Short);
         h.engine.position = Some(OpenPosition {
             side: OrderSide::Short,
             entry_price,
@@ -9086,7 +9117,7 @@ mod tests {
             .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
         h.harvest(T2_US).await;
 
-        h.engine.on_exit(1717.855, T2_US);
+        h.engine.on_exit(1717.855, T2_US).await;
         let rec = last_pnl_record(&h);
 
         // Unchanged meaning: still the mid-based figure, now labelled.
@@ -9142,7 +9173,7 @@ mod tests {
             .push_fill("t2", OrderSide::Long, "0.0283", "1719.14", None);
         h.harvest(T2_US).await;
 
-        h.engine.on_exit(1717.855, T2_US);
+        h.engine.on_exit(1717.855, T2_US).await;
         let rec = last_pnl_record(&h);
         assert_eq!(
             rec["settled"],
@@ -9189,6 +9220,99 @@ mod tests {
         assert_eq!(lines[0]["trade_id"], serde_json::json!("e1"));
         assert_eq!(lines[0]["leg"], serde_json::json!("entry"));
         assert!((lines[1]["price"].as_f64().unwrap() - 101.0).abs() < 1e-9);
+    }
+
+    /// pairtrade#320 Codex review, P1. The exit fill is routinely
+    /// visible on the very tick that observes the account flat -- the
+    /// account is flat *because* of it -- and the tick's own harvest
+    /// runs after the decisions. Booking the close without harvesting
+    /// first left every trade permanently unsettled and the closing
+    /// fill missing from the ledger entirely.
+    #[tokio::test]
+    async fn a_fill_seen_only_at_the_close_still_settles_the_trade() {
+        let mut h = harness();
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.harvest(T1_US).await;
+
+        // The exit fill appears with no harvest tick of its own before
+        // the close is booked.
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.set_now(T2_US);
+        h.engine.on_exit(1717.855, T2_US).await;
+
+        let rec = last_pnl_record(&h);
+        assert!(
+            !rec["settled"].is_null(),
+            "the closing fill must be harvested before the account is summarised"
+        );
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path).unwrap();
+        assert_eq!(
+            raw.lines().count(),
+            2,
+            "and it must reach the durable ledger, not only the summary"
+        );
+    }
+
+    /// pairtrade#320 Codex review, P1. Nothing prunes the connector's
+    /// fill cache, so forgetting which trade ids were already counted
+    /// makes every historical fill look new at the next entry -- which
+    /// would pile the previous trade's quantity into both of this
+    /// trade's legs and leave `covers()` failing for the rest of the
+    /// process.
+    #[tokio::test]
+    async fn a_second_trade_settles_despite_the_first_trades_fills_still_being_cached() {
+        let mut h = harness();
+
+        // Trade 1, closed.
+        open_short(&mut h, 0.0566, 1763.60);
+        h.connector
+            .push_fill("t1", OrderSide::Short, "0.0566", "1763.60", None);
+        h.connector
+            .push_fill("t2", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T1_US).await;
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert!(!last_pnl_record(&h)["settled"].is_null());
+
+        // Trade 2. The connector still serves trade 1's fills, exactly
+        // as it does in production.
+        h.engine.begin_fill_ledger(OrderSide::Short);
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1700.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.05,
+            open_size: 0.05,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: None,
+        });
+        h.connector
+            .push_fill("t3", OrderSide::Short, "0.05", "1700.00", None);
+        h.connector
+            .push_fill("t4", OrderSide::Long, "0.05", "1690.00", None);
+        h.harvest(T2_US + 60_000_000).await;
+
+        assert_eq!(
+            h.engine.entry_fills.size, 0.05,
+            "yesterday's 0.0566 must not be in this leg"
+        );
+        assert_eq!(h.engine.exit_fills.size, 0.05);
+        h.engine.on_exit(1690.0, T2_US + 120_000_000).await;
+        let rec = last_pnl_record(&h);
+        assert!(
+            !rec["settled"].is_null(),
+            "the second trade of a process must settle too"
+        );
+        let gross = rec["settled"]["gross_pnl_usd"].as_f64().unwrap();
+        assert!(
+            (gross - 0.5).abs() < 1e-9,
+            "short 1700 -> 1690 on 0.05: {gross}"
+        );
     }
 
     #[tokio::test]
@@ -9478,7 +9602,7 @@ mod tests {
             exit_deadline_us: None,
         });
         h.engine.persist_position();
-        h.engine.on_exit(1769.1, T2_US);
+        h.engine.on_exit(1769.1, T2_US).await;
         // Whatever is on disk must never show "flat" without also showing
         // the trade that made it flat.
         let on_disk = load_state(&h.engine.cfg.state_path);
@@ -10307,7 +10431,7 @@ mod tests {
         );
         // And the final close books nothing either.
         let before = h.engine.state.realized_pnl_session;
-        h.engine.on_exit(1769.10, T2_US);
+        h.engine.on_exit(1769.10, T2_US).await;
         assert!((h.engine.state.realized_pnl_session - before).abs() < 1e-9);
     }
 
@@ -10427,7 +10551,7 @@ mod tests {
         // old code booked (quote - 0.0) * size -- the entire notional as
         // profit, straight into peak equity and the drawdown halt.
         let before = h.engine.state.realized_pnl_session;
-        h.engine.on_exit(1769.10, T2_US);
+        h.engine.on_exit(1769.10, T2_US).await;
         let booked = h.engine.state.realized_pnl_session - before;
         assert!(
             booked.abs() < 1e-9,

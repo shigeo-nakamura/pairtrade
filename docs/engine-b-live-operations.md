@@ -144,10 +144,21 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     dex-connector work; so is settled funding. Until then a `null` fee
     is the honest reading and reading it as zero would overstate every
     result.
-  - Harvesting runs on the tick and costs nothing on the wire: the
-    Lighter connector serves `get_filled_orders` from its own
-    WS-populated cache and issues no request. (The venue *equity* read
-    does go to REST and is deliberately off-tick -- see below.)
+  - Harvesting costs nothing on the wire -- the Lighter connector
+    serves `get_filled_orders` from its own WS-populated cache and
+    issues no request -- and runs **immediately before a close is
+    summarised**, not merely once per tick. The exit fill is routinely
+    visible on the very tick that observes the account flat (the account
+    is flat *because* of it), so a harvest that ran after the decisions
+    would miss the closing fill entirely and leave every trade
+    unsettled. (The venue *equity* read does go to REST and is
+    deliberately off-tick -- see below.)
+  - The set of already-counted `trade_id`s **outlives every trade in
+    the process**. Nothing prunes the connector's fill cache, so
+    forgetting them between trades would make yesterday's fills look new
+    at today's entry, pile their quantity into both of today's legs, and
+    leave coverage failing for the rest of the process. Only the two
+    per-leg accumulators are reset, at entry.
 - **Venue equity is published, never traded on** (bot-strategy#919).
   `status.json`'s `han_bridge` block carries `venue_equity_usd`
   (`total_asset_value`), `venue_available_usd` (`available_balance`),
