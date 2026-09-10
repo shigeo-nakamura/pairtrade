@@ -4,6 +4,7 @@ use dex_connector::ArcusSpotSwapStatus;
 use ethers::types::{Address, H256, U256};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -26,11 +27,22 @@ pub enum ArcusSpotExecutionPhase {
     Unknown,
     OperatorHold,
     Reconciled,
+    /// An operator closed the position outside the bot and told it so
+    /// (`reconcile-position`, bot-strategy#977).
+    ///
+    /// Deliberately its own phase rather than a flag on `Reconciled`: a
+    /// reconciled attempt is one this executor dispatched and then verified
+    /// against the chain, and every check that consumes one -- continuity
+    /// verification above all -- is entitled to assume the recorder
+    /// evidence can reproduce it. A manual close has no such evidence by
+    /// construction, so it must not be able to reach those paths by
+    /// wearing the same label.
+    ManuallyClosed,
 }
 
 impl ArcusSpotExecutionPhase {
     pub fn blocks_new_execution(self) -> bool {
-        !matches!(self, Self::Reconciled)
+        !matches!(self, Self::Reconciled | Self::ManuallyClosed)
     }
 }
 
@@ -77,6 +89,17 @@ impl ArcusSpotExecutionIntent {
     fn validate(&self) -> Result<(Address, Address, U256, U256)> {
         if !self.venue.eq_ignore_ascii_case("arcus") && !self.venue.eq_ignore_ascii_case("rialto") {
             bail!("live execution requires venue=arcus or venue=rialto");
+        }
+        self.validate_without_venue()
+    }
+
+    /// Everything `validate` checks except which venue it is: a manual
+    /// close (bot-strategy#977) was performed by a person, wherever they
+    /// could actually close it, so "a venue this executor may dispatch to"
+    /// is not a property of it. Every other invariant still holds.
+    fn validate_without_venue(&self) -> Result<(Address, Address, U256, U256)> {
+        if self.venue.trim().is_empty() {
+            bail!("an execution intent must record its venue");
         }
         if self.sell_symbol.trim().is_empty()
             || self.buy_symbol.trim().is_empty()
@@ -230,7 +253,16 @@ impl ArcusSpotExecutionLedger {
                 bail!("Arcus execution attempt sequence is not strictly increasing");
             }
             previous = attempt.sequence;
-            attempt.intent.validate()?;
+            // A manual close is exempt from the dispatchable-venue rule
+            // only (bot-strategy#977); every other invariant is the same.
+            let validate_intent = || {
+                if attempt.phase == ArcusSpotExecutionPhase::ManuallyClosed {
+                    attempt.intent.validate_without_venue()
+                } else {
+                    attempt.intent.validate()
+                }
+            };
+            validate_intent()?;
             if attempt.chain_id == 0 {
                 bail!("Arcus execution attempt chain_id must be non-zero");
             }
@@ -239,7 +271,7 @@ impl ArcusSpotExecutionLedger {
             if taker == Address::zero() {
                 bail!("Arcus execution attempt taker must not be zero");
             }
-            let (sell_token, buy_token, _, _) = attempt.intent.validate()?;
+            let (sell_token, buy_token, _, _) = validate_intent()?;
             attempt.pre_balances.validate_for(sell_token, buy_token)?;
             if let Some(post) = &attempt.post_balances {
                 post.validate_for(sell_token, buy_token)?;
@@ -331,6 +363,116 @@ impl ArcusSpotExecutionLedger {
             rejection_origin: None,
         });
         Ok(self.active.as_ref().expect("active set above"))
+    }
+
+    /// Record a close the operator performed outside the bot
+    /// (bot-strategy#977).
+    ///
+    /// The runtime's position and the ledger are meant to move together --
+    /// `require_acceptance_ledger_and_position_continuity` refuses a
+    /// position change with no attempt to point at -- so returning to flat
+    /// after a manual close needs an attempt, and there is none: the swap
+    /// happened at the venue, not through this executor. This writes that
+    /// attempt.
+    ///
+    /// It is deliberately *not* a swap record. `phase` is `ManuallyClosed`,
+    /// never `Reconciled`, so no path that verifies a dispatched swap
+    /// against recorder evidence can consume it; `pre_balances` is the
+    /// wallet as the operator read it, and the settled amounts are what
+    /// they observed on the venue. Nothing here is derived by this process,
+    /// which is exactly why it may only be written under the administrator
+    /// policy digest.
+    ///
+    /// Refuses while an attempt is active: the manual close is a statement
+    /// about a position this executor believes it holds, and an in-flight
+    /// attempt means that belief is still moving.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_manual_close(
+        &mut self,
+        now: DateTime<Utc>,
+        chain_id: u64,
+        taker: impl Into<String>,
+        intent: ArcusSpotExecutionIntent,
+        observed_balances: ArcusSpotBalanceSnapshot,
+        tx_hash: Option<String>,
+        settled_sell_amount_raw: String,
+        settled_buy_amount_raw: String,
+        detail: String,
+    ) -> Result<&ArcusSpotExecutionAttempt> {
+        if let Some(active) = &self.active {
+            bail!(
+                "Arcus execution attempt {} is still active in phase {:?}; resolve it before                  recording a manual close",
+                active.sequence,
+                active.phase,
+            );
+        }
+        let taker = taker.into();
+        let parsed_taker = Address::from_str(&taker).context("invalid execution taker")?;
+        if parsed_taker == Address::zero() {
+            bail!("Arcus execution taker must not be zero");
+        }
+        // Not `intent.validate()`: that one requires a venue this executor
+        // may dispatch to, which a manual close is not. Everything else it
+        // checks still applies.
+        let (sell_token, buy_token, _, _) = intent.validate_without_venue()?;
+        observed_balances.validate_for(sell_token, buy_token)?;
+        U256::from_dec_str(&settled_sell_amount_raw)
+            .context("invalid manual-close settled sell amount")?;
+        U256::from_dec_str(&settled_buy_amount_raw)
+            .context("invalid manual-close settled buy amount")?;
+        if detail.trim().is_empty() {
+            bail!("a manual close must record why it was performed");
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .context("Arcus execution sequence overflow")?;
+        // The payload hash names what this attempt *is* -- there is no
+        // signed payload to hash, and reusing a swap's shape would let a
+        // manual close be mistaken for one.
+        let payload_hash = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                format!(
+                    "arcus-spot-manual-close|v1|{sequence}|{chain_id}|{taker}|{}|{}|{}|{}",
+                    intent.sell_symbol,
+                    intent.buy_symbol,
+                    settled_sell_amount_raw,
+                    settled_buy_amount_raw,
+                )
+                .as_bytes()
+            )
+        );
+        let hash_suffix = payload_hash
+            .strip_prefix("sha256:")
+            .unwrap_or_default()
+            .chars()
+            .take(16)
+            .collect::<String>();
+        self.history.push(ArcusSpotExecutionAttempt {
+            sequence,
+            idempotency_key: format!("arcus-spot-{sequence:020}-{hash_suffix}"),
+            payload_hash,
+            chain_id,
+            taker,
+            prepared_at: now,
+            // Never dispatched by this executor: that is the whole point.
+            dispatched_at: None,
+            updated_at: now,
+            phase: ArcusSpotExecutionPhase::ManuallyClosed,
+            intent,
+            pre_balances: observed_balances,
+            post_balances: None,
+            tx_hash,
+            router_status: None,
+            detail: Some(detail),
+            settled_buy_amount_raw: Some(settled_buy_amount_raw),
+            settled_sell_amount_raw: Some(settled_sell_amount_raw),
+            // Nobody refused this: the operator closed it at the venue.
+            rejection_origin: None,
+        });
+        Ok(self.history.last().expect("pushed above"))
     }
 
     /// Must be persisted before calling POST /v1/submit.

@@ -403,20 +403,80 @@ At `resume_not_before` the runtime resumes only when all three hold:
    `post_event_inventory` describes a wallet, and adopting it over an open
    position would overwrite the holding `rotated_quantity` refers to.
 
-   **Reconciling an open rotation -- read this before declaring a window.**
-   There is currently **no supported way to return the tracked state to
-   flat** once a rotation is caught by `effective_at`. Editing
-   `regime`/`rotated_quantity` at the same sequence is rejected by
-   continuity verification (a position change with no ledger attempt), and
-   restoring a pre-rotation checkpoint leaves its sequence behind the
-   event-stream tail, which the next append -- and `reset-window` -- refuse.
-   The runtime stays on `corporate_action_unresolved`, trading nothing,
-   until bot-strategy#977 lands: an atomic `reconcile-position` command that
-   records the operator's manual close in the ledger, appends the stream
-   event, moves the runtime to flat in post-event units and lets the
-   ordinary resume run. Until then the hold is a wedge that needs that
-   command, and it is still the correct outcome -- the alternative is an
-   exit sized in the wrong units. The mitigation is upstream of it: set
+   **Reconciling an open rotation.** Close it at the venue yourself, then
+   tell the bot with `reconcile-position` (bot-strategy#977):
+
+       arcus-spot-execute-once reconcile-position CONFIG_YAML \
+           SETTLED_SELL_AMOUNT_RAW SETTLED_BUY_AMOUNT_RAW \
+           OBSERVED_SELL_BALANCE_RAW OBSERVED_BUY_BALANCE_RAW \
+           OBSERVED_GAS_BALANCE_WEI TX_HASH_OR_none DETAIL
+
+   One transition, under the same administrator policy digest and exclusive
+   lock as `clear-risk-halt`/`reset-window`: it writes an execution-ledger
+   entry for the close (phase `ManuallyClosed`, never `Reconciled` --
+   nothing about a manual close can be reproduced from recorder evidence,
+   and every check that consumes a reconciled attempt is entitled to assume
+   it can), and a checkpoint that is flat with the wallet's post-close
+   holdings. The balances you pass are read the same way the resume's are
+   (`eth_call balanceOf` against `chain.rpc_urls[0]`), **after** the close,
+   in whatever units the venue quotes now -- nothing recomputes them from
+   the pre-event quantities, which is the whole reason the rotation could
+   not be exited normally.
+
+   The corporate-action progress is left in place: the window is not over,
+   and the ordinary resume (flat, identity intact, `post_event_inventory`
+   declared) is what ends it on a later tick. So this is step 1 of
+   "Completing the resume", not a replacement for it.
+
+   Because that resume adopts `post_event_inventory` **unconditionally**,
+   the command refuses when the declaration already carries one that
+   disagrees with the balances you pass: leaving the window pending with
+   the two out of step would hand the runtime holdings the wallet does not
+   have. Either declare the observed holdings first, or leave
+   `post_event_inventory` unset and fill it in afterwards.
+
+   It refuses unless a corporate-action window is open -- it is not a
+   general position editor -- and, like `reset-window`, unless the bot is
+   idle: no pending durable event, no active ledger attempt, no on-disk
+   pending plan, and a checkpoint in step with the event-stream tail. It is
+   also refused when the checkpoint is already flat.
+
+   The amounts you pass are in the units the venue quotes **now**, which
+   for a split is not what the runtime tracked: across a 4-for-1, a tracked
+   `rotated_quantity` of 2 is 8 units sold. The report says both, labelled
+   -- `settled_sell_quantity`/`settled_buy_quantity` for what actually
+   changed hands, `tracked_pre_event_quantity` for the stale figure the
+   runtime was carrying. A leg that ends at exactly zero is accepted
+   (subject to its inventory floor).
+
+   **Re-running it is safe, and nothing trades in the meantime.** The
+   ledger commits before the checkpoint, so an interruption in between
+   leaves the close recorded against a checkpoint that still shows the
+   rotation. Two things follow:
+
+   - **Nothing quotes or dispatches** while the ledger's tail is a
+     `ManuallyClosed` entry and the checkpoint is not flat. The check runs
+     wherever an executor is built -- `live-tick`, `execute`,
+     `auto-execute`, the resumes -- and again under the checkpoint lock
+     after live-tick's snapshot fetch, since the gap in between is exactly
+     when this command can commit its ledger half. Without it the stale
+     checkpoint would still show the rotation, and the window's forced exit
+     could be dispatched for inventory that is already sold. It exits
+     non-zero naming the ledger sequence to finish.
+   - **Running the command again finishes the transition.** It recognises
+     its own half-committed close -- every persisted input must match, down
+     to the DETAIL text -- and writes only the checkpoint, rather than
+     appending a second close and advancing the sequence again. The report
+     says `resumed_a_recorded_close: true` when that happened. If any input
+     differs it refuses and names the field, rather than finishing someone
+     else's declaration under new numbers.
+
+   **Take a fresh `state-backup` afterwards.** Like `reset-window`, this
+   writes over the record that earlier backups verify against, so those no
+   longer verify. Continuity verification compares a neutral, no-active
+   baseline against one later tick; the new backup is that baseline.
+
+   The mitigation is still upstream of all this: set
    `reduce_exit_at` with **real margin** before `effective_at` for the venue
    not quoting (the forced exit retries every tick through that phase, and
    stops `corporate_action_settlement_margin_secs` -- 300s by default --
@@ -424,7 +484,8 @@ At `resume_not_before` the runtime resumes only when all three hold:
    and
    do not open a window with a rotation you cannot afford to have stuck. If
    it happens anyway, close the position on the venue by hand, in post-event
-   units, keep the evidence, and wait for #977 rather than editing state.
+   units, keep the evidence -- and run `reconcile-position` with it, as
+   described above. Never edit the state files directly.
 2. **Unchanged token identity.** Each affected symbol's contract address and
    decimals are compared against what they were on the last observation
    *before* the window opened. A mismatch holds on

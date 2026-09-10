@@ -3726,6 +3726,17 @@ impl ArcusSpotRuntime {
 
     /// Whether `progress` was written for `event`: by fingerprint when the
     /// record carries one, by id for records that predate it.
+    /// Public form of `progress_matches` for the admin commands: does this
+    /// declaration describe the window this progress record belongs to?
+    /// (bot-strategy#977's `reconcile-position` has to read the pending
+    /// resume's declared holdings.)
+    pub fn progress_names_event(
+        progress: &ArcusSpotCorporateActionProgress,
+        event: &ArcusSpotCorporateActionEvent,
+    ) -> bool {
+        Self::progress_matches(progress, event)
+    }
+
     fn progress_matches(
         progress: &ArcusSpotCorporateActionProgress,
         event: &ArcusSpotCorporateActionEvent,
@@ -4214,7 +4225,7 @@ fn parse_positive_or_zero(field: &str, value: Option<&str>) -> Result<Decimal, A
     Ok(parsed)
 }
 
-pub(crate) fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
+pub fn raw_amount_to_quantity(raw: &str, decimals: u32) -> Result<Decimal, String> {
     let raw = raw.trim();
     if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(format!(

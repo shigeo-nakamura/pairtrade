@@ -14,6 +14,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use debot::arcus_spot::corporate_action_effective_cutoff;
 #[cfg(test)]
 use debot::arcus_spot::event_record;
+use debot::arcus_spot::raw_amount_to_quantity;
 use debot::arcus_spot::resolve_handled_corporate_action_fingerprints;
 use debot::arcus_spot::{
     build_arcus_spot_kms_signer, is_supported_live_route,
@@ -28,12 +29,14 @@ use debot::arcus_spot::{
     ArcusSpotRotationTrigger, ArcusSpotRuntime, ArcusSpotRuntimeCheckpointStore,
     ArcusSpotRuntimeConfig, ArcusSpotRuntimeEvent, ArcusSpotRuntimeMode, ArcusSpotRuntimeState,
 };
+// `reconcile-position` (bot-strategy#977) builds both of these at runtime.
+use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent};
 // Test-only since bot-strategy#853's cutoff rule moved to a shared helper:
 // nothing outside the tests names these types here any more.
 #[cfg(test)]
 use debot::arcus_spot::{
-    ArcusSpotBalanceSnapshot, ArcusSpotCorporateActionEvent, ArcusSpotExecutionIntent,
-    ArcusSpotHold, ArcusSpotHoldCode, ArcusSpotRiskHalt, ArcusSpotTokenIdentity,
+    ArcusSpotCorporateActionEvent, ArcusSpotHold, ArcusSpotHoldCode, ArcusSpotRiskHalt,
+    ArcusSpotTokenIdentity,
 };
 use dex_connector::{
     ArcusSpotClient, ArcusSpotConfig, ArcusSpotPair, ArcusSpotRecorder, ArcusSpotRecorderConfig,
@@ -415,6 +418,50 @@ async fn resume_live_tick_attempt(
     finalize_reconciled_attempt(config, &mut executor, &plan, &plan_config_digest, attempt)
 }
 
+/// Refuse to evaluate anything while a manual close is recorded in the
+/// ledger but not yet in the checkpoint (bot-strategy#977/#318).
+///
+/// `reconcile-position` writes the ledger first and the checkpoint second,
+/// so a crash between them leaves no active attempt and a checkpoint that
+/// still shows the rotation. Nothing else notices: the tick would load that
+/// stale checkpoint, and inside a corporate-action window it can produce
+/// the forced exit -- selling inventory the operator has already sold at
+/// the venue, or stranding a failed attempt trying to. Ticking is the wrong
+/// move until the operator re-runs the command and the two halves agree.
+///
+/// A completed close is invisible here: the checkpoint is flat, so the tail
+/// entry stays until the next rotation replaces it without ever blocking.
+fn require_no_half_committed_manual_close(
+    config: &ArcusSpotExecuteOnceConfig,
+    ledger: &ArcusSpotExecutionLedger,
+) -> Result<()> {
+    let Some(tail) = ledger.history.last() else {
+        return Ok(());
+    };
+    if tail.phase != ArcusSpotExecutionPhase::ManuallyClosed {
+        return Ok(());
+    }
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let Some((regime, rotated_quantity)) = store.peek_regime_and_rotated_quantity()? else {
+        return Ok(());
+    };
+    if regime == ArcusSpotRegime::Neutral && rotated_quantity.is_none() {
+        return Ok(());
+    }
+    bail!(
+        "Arcus ledger sequence {} records a manual close, but the runtime checkpoint still holds \
+         the rotation it closed (regime {:?}, rotated quantity {}). A `reconcile-position` run \
+         committed the ledger and did not reach the checkpoint; evaluating from that checkpoint \
+         could dispatch an exit for inventory that is already sold. Re-run `reconcile-position` \
+         with exactly the values that entry records to finish it",
+        tail.sequence,
+        regime,
+        rotated_quantity
+            .map(|quantity| quantity.normalize().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    )
+}
+
 /// How many router rejections in a row `live-tick` will clear on its own
 /// before it stops and waits for an operator.
 ///
@@ -560,6 +607,7 @@ async fn resume_active_live_tick_attempt(
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let lock = ledger_store.acquire_exclusive_lock(&config.runtime_state_path)?;
     let mut ledger = ledger_store.load_or_create(Utc::now())?;
+    require_no_half_committed_manual_close(config, &ledger)?;
     if clear_router_rejection_under_lock(&ledger_store, &mut ledger)? {
         drop(lock);
         // Nothing to resume: the tick continues into an ordinary evaluation.
@@ -1342,6 +1390,40 @@ fn trusted_token_decimals_for_symbol(
         .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
         .map(|(_, decimals)| *decimals)
         .with_context(|| format!("Arcus {caller} has no decimals pin for {symbol}"))
+}
+
+/// The administrator-pinned address for `symbol`, from
+/// `CONFIG_YAML.router.trusted_token_addresses`.
+fn trusted_token_address_for(config: &ArcusSpotExecuteOnceConfig, symbol: &str) -> Result<String> {
+    config
+        .router
+        .trusted_token_addresses
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(symbol))
+        .map(|(_, address)| address.clone())
+        .with_context(|| format!("Arcus config has no trusted address pin for {symbol}"))
+}
+
+/// `raw` scaled by the token's pinned decimals, refusing anything the
+/// runtime's own conversion refuses.
+fn raw_amount_to_quantity_checked(raw: &str, decimals: u32) -> Result<Decimal> {
+    raw_amount_to_quantity(raw.trim(), decimals)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("invalid raw token amount {raw:?} at {decimals} decimals"))
+}
+
+/// The same conversion for a *balance*, where zero is a real reading.
+///
+/// `raw_amount_to_quantity` refuses `"0"` because a swap of nothing is not
+/// a swap. A wallet that fully emptied one leg is an ordinary outcome of a
+/// manual close, though, and refusing it would make the recovery command
+/// unusable in exactly the case it exists for (Codex, pairtrade#318).
+fn raw_balance_to_quantity(raw: &str, decimals: u32) -> Result<Decimal> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte == b'0') {
+        return Ok(Decimal::ZERO);
+    }
+    raw_amount_to_quantity_checked(trimmed, decimals)
 }
 
 fn trusted_token_decimals_for_address(
@@ -2157,6 +2239,448 @@ fn reset_runtime_window(config_path: &Path) -> Result<serde_json::Value> {
     // config_path -- so the committing half cannot re-read CONFIG_YAML from
     // disk a second time (same TOCTOU reasoning as archive-rejected-apply).
     commit_runtime_window_reset(&config)
+}
+
+/// Return the runtime to flat after an operator closed the position at the
+/// venue (bot-strategy#977).
+///
+/// The gap this fills: bot-strategy#853 makes the runtime fail closed from
+/// a corporate action's `effective_at`, because the tracked inventory and
+/// `rotated_quantity` are denominated in units the venue no longer quotes.
+/// That is right -- sizing an exit it knows is wrong is worse -- but a
+/// rotation still open at that instant then stays open with no way back:
+/// editing the checkpoint to flat is a position change with no ledger
+/// attempt to point at, and restoring a pre-rotation checkpoint leaves its
+/// sequence behind the append-only stream's tail.
+///
+/// So the operator closes it at the venue and tells the bot, here, in one
+/// transition: an execution-ledger entry recording the close (phase
+/// `ManuallyClosed`, never `Reconciled` -- nothing about it can be
+/// reproduced from recorder evidence), and a checkpoint that is flat with
+/// the wallet's post-close holdings.
+///
+/// The corporate-action progress is deliberately left in place: the window
+/// is not over, and the ordinary resume -- flat, identity intact,
+/// `post_event_inventory` declared -- is what ends it on a later tick.
+///
+/// This is not a general position editor. It refuses unless a
+/// corporate-action window is open, which is the only situation that can
+/// produce the wedge.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_position(
+    config_path: &Path,
+    settled_sell_amount_raw: &str,
+    settled_buy_amount_raw: &str,
+    observed_sell_balance_raw: &str,
+    observed_buy_balance_raw: &str,
+    observed_gas_balance_wei: &str,
+    tx_hash: &str,
+    detail: &str,
+) -> Result<serde_json::Value> {
+    let config_bytes = read_private_regular_file(config_path, "config")?;
+    let config = parse_config(&config_bytes, config_path)?;
+    // Same administrator approval as clear-risk-halt/reset-window: this
+    // writes both the ledger and the checkpoint of a live, KMS-signing bot
+    // from numbers no part of this process derived.
+    let policy = auto_execute_policy_from_admin_file()?;
+    require_config_within_auto_execute_policy(&config, &policy)?;
+    commit_reconcile_position(
+        &config,
+        settled_sell_amount_raw,
+        settled_buy_amount_raw,
+        observed_sell_balance_raw,
+        observed_buy_balance_raw,
+        observed_gas_balance_wei,
+        tx_hash,
+        detail,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_reconcile_position(
+    config: &ArcusSpotExecuteOnceConfig,
+    settled_sell_amount_raw: &str,
+    settled_buy_amount_raw: &str,
+    observed_sell_balance_raw: &str,
+    observed_buy_balance_raw: &str,
+    observed_gas_balance_wei: &str,
+    tx_hash: &str,
+    detail: &str,
+) -> Result<serde_json::Value> {
+    let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+    let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+    // Same exclusive lock a dispatching tick takes.
+    let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
+
+    let publisher = live_tick_event_publisher(config)?;
+    match fs::symlink_metadata(publisher.pending_path()) {
+        Ok(_) => bail!(
+            "Arcus pending durable event {} must be recovered by a live-tick run first --              reconciling around it would strand an event the stream still expects",
+            publisher.pending_path().display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect Arcus pending durable event"),
+    }
+    let mut ledger = ledger_store.load_existing()?;
+    if let Some(active) = &ledger.active {
+        bail!(
+            "Arcus execution attempt {} is still active in phase {:?}; resolve it (auto-resume,              archive-rejected-apply, or manual-reconcile-apply) before recording a manual close",
+            active.sequence,
+            active.phase,
+        );
+    }
+    let pending_plan_path = live_tick_pending_plan_path(config)?;
+    match fs::symlink_metadata(&pending_plan_path) {
+        Ok(_) => bail!(
+            "Arcus live-tick pending plan {} still exists; it is the evidence of a dispatch this              would orphan",
+            pending_plan_path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("failed to inspect Arcus live-tick pending plan"),
+    }
+
+    let runtime = store.load_existing_at(&config.runtime, Utc::now())?;
+    let state = runtime.state().clone();
+    let Some(progress) = state.corporate_action.clone() else {
+        bail!(
+            "Arcus runtime checkpoint is not inside a corporate-action window. This command              exists for the one position a declared window can strand -- a rotation still open              at `effective_at`, whose units the venue no longer quotes -- and is not a general              way to edit the tracked position. Exit the rotation through the ordinary path"
+        );
+    };
+    let Some(rotated_quantity) = state.rotated_quantity else {
+        bail!(
+            "Arcus runtime checkpoint is already flat (regime {:?}); there is no open rotation              to reconcile",
+            state.regime,
+        );
+    };
+    if state.regime == ArcusSpotRegime::Neutral {
+        bail!(
+            "Arcus runtime checkpoint is already neutral; there is no open rotation to reconcile"
+        );
+    }
+
+    // The checkpoint and the stream must be exactly in step, for the same
+    // reason reset-window requires it: a checkpoint that has not seen every
+    // committed event cannot show whether the bot is idle, and this writes
+    // over that record rather than continuing it.
+    let tail_sequence = publisher
+        .stream()
+        .latest_committed()?
+        .map(|(sequence, _)| sequence)
+        .unwrap_or(0);
+    if state.sequence != tail_sequence {
+        bail!(
+            "Arcus runtime checkpoint is at sequence {} but the event stream tail is {}; the two              must be in step. Reconcile them with repair-report first",
+            state.sequence,
+            tail_sequence,
+        );
+    }
+
+    let (sell_symbol, buy_symbol) = match state.regime {
+        ArcusSpotRegime::RotatedAToB => (
+            config.runtime.pair.buy_symbol.clone(),
+            config.runtime.pair.sell_symbol.clone(),
+        ),
+        ArcusSpotRegime::RotatedBToA => (
+            config.runtime.pair.sell_symbol.clone(),
+            config.runtime.pair.buy_symbol.clone(),
+        ),
+        ArcusSpotRegime::Neutral => unreachable!("checked above"),
+    };
+    let sell_token = trusted_token_address_for(config, &sell_symbol)?;
+    let buy_token = trusted_token_address_for(config, &buy_symbol)?;
+    let sell_decimals = trusted_token_decimals_for_address(config, &sell_symbol, &sell_token)?;
+    let buy_decimals = trusted_token_decimals_for_address(config, &buy_symbol, &buy_token)?;
+
+    let observed_at = Utc::now();
+    let observed_balances = ArcusSpotBalanceSnapshot {
+        observed_at,
+        sell_token: sell_token.clone(),
+        buy_token: buy_token.clone(),
+        sell_balance_raw: observed_sell_balance_raw.trim().to_string(),
+        buy_balance_raw: observed_buy_balance_raw.trim().to_string(),
+        gas_balance_wei: observed_gas_balance_wei.trim().to_string(),
+    };
+    let intent = ArcusSpotExecutionIntent {
+        venue: "manual".to_string(),
+        sell_symbol: sell_symbol.clone(),
+        buy_symbol: buy_symbol.clone(),
+        sell_token: sell_token.clone(),
+        buy_token: buy_token.clone(),
+        sell_amount_raw: settled_sell_amount_raw.trim().to_string(),
+        minimum_buy_amount_raw: settled_buy_amount_raw.trim().to_string(),
+        plan_config_digest: format!("sha256:{}", "0".repeat(64)),
+    };
+    let tx_hash = match tx_hash.trim() {
+        "" | "none" | "None" => None,
+        value => Some(value.to_string()),
+    };
+    // The rotation is still open (checked above), so a `ManuallyClosed` at
+    // the tail can only be this command's own half-committed transition:
+    // nothing else writes one, and a completed close leaves the runtime
+    // flat. Finish it -- but only if this invocation describes the same
+    // close. Matching on the trade amounts alone would let a re-run with
+    // corrected balances or a corrected tx_hash keep the old ledger entry
+    // while persisting the new balances and reporting the new hash, leaving
+    // the ledger, the checkpoint and the report describing three different
+    // declarations (Codex P1, pairtrade#318). Every persisted input has to
+    // agree; a disagreement is an operator question, not something to guess
+    // at.
+    let already_recorded = match ledger
+        .history
+        .last()
+        .filter(|attempt| attempt.phase == ArcusSpotExecutionPhase::ManuallyClosed)
+    {
+        None => None,
+        Some(attempt) => {
+            let mismatches: Vec<&str> = [
+                (attempt.intent.sell_symbol != sell_symbol, "sell symbol"),
+                (attempt.intent.buy_symbol != buy_symbol, "buy symbol"),
+                (
+                    attempt.settled_sell_amount_raw.as_deref()
+                        != Some(settled_sell_amount_raw.trim()),
+                    "settled sell amount",
+                ),
+                (
+                    attempt.settled_buy_amount_raw.as_deref()
+                        != Some(settled_buy_amount_raw.trim()),
+                    "settled buy amount",
+                ),
+                (
+                    attempt.pre_balances.sell_balance_raw != observed_sell_balance_raw.trim(),
+                    "observed sell balance",
+                ),
+                (
+                    attempt.pre_balances.buy_balance_raw != observed_buy_balance_raw.trim(),
+                    "observed buy balance",
+                ),
+                (
+                    attempt.pre_balances.gas_balance_wei != observed_gas_balance_wei.trim(),
+                    "observed gas balance",
+                ),
+                (attempt.tx_hash != tx_hash, "tx hash"),
+                // `record_manual_close` persists this too, so a re-run that
+                // "corrects" it would commit the checkpoint while the ledger
+                // silently kept the earlier explanation -- and nothing would
+                // tell the operator their correction was dropped (Codex,
+                // pairtrade#318). It is the operator's account of why the
+                // close happened; the ledger is where it has to be right.
+                (attempt.detail.as_deref() != Some(detail.trim()), "detail"),
+                // Identities, not just amounts: a deployment between the
+                // two runs may have moved `executor.taker` or a trusted
+                // token address, and reusing a close recorded against the
+                // old wallet or contracts while building the checkpoint
+                // under the new ones would tie the two together wrongly
+                // (Codex P1, pairtrade#318).
+                (
+                    !attempt.taker.eq_ignore_ascii_case(&config.executor.taker),
+                    "taker",
+                ),
+                (attempt.chain_id != config.runtime.chain_id, "chain id"),
+                (
+                    !attempt.intent.sell_token.eq_ignore_ascii_case(&sell_token),
+                    "sell token address",
+                ),
+                (
+                    !attempt.intent.buy_token.eq_ignore_ascii_case(&buy_token),
+                    "buy token address",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(differs, label)| differs.then_some(label))
+            .collect();
+            if !mismatches.is_empty() {
+                bail!(
+                    "Arcus ledger sequence {} already records a manual close for this open \
+                     rotation, but this invocation declares a different {}. A previous run \
+                     committed that entry and did not reach the checkpoint; re-run with exactly \
+                     the values it recorded to finish it, or resolve the discrepancy first -- \
+                     recording a second close would advance the sequence again and leave two \
+                     accounts of one close",
+                    attempt.sequence,
+                    mismatches.join(", "),
+                );
+            }
+            eprintln!(
+                "[arcus-reconcile-position] ledger sequence={} already records this close; a \
+                 previous run committed it and did not reach the checkpoint. Finishing that \
+                 transition rather than recording a second one",
+                attempt.sequence,
+            );
+            Some(attempt.clone())
+        }
+    };
+    let resumed_a_recorded_close = already_recorded.is_some();
+    let attempt = match already_recorded {
+        Some(attempt) => attempt,
+        None => ledger
+            .record_manual_close(
+                observed_at,
+                config.runtime.chain_id,
+                config.executor.taker.clone(),
+                intent,
+                observed_balances.clone(),
+                tx_hash.clone(),
+                settled_sell_amount_raw.trim().to_string(),
+                settled_buy_amount_raw.trim().to_string(),
+                detail.trim().to_string(),
+            )?
+            .clone(),
+    };
+
+    // The wallet as the operator read it *after* the close is what the
+    // runtime holds now -- in post-event units if the event has passed.
+    // Nothing here recomputes it from the pre-event quantities, which is
+    // the whole reason the rotation could not be exited normally.
+    let token_a_symbol = config.runtime.pair.sell_symbol.clone();
+    let (token_a_raw, token_a_decimals, token_b_raw, token_b_decimals) =
+        if sell_symbol == token_a_symbol {
+            (
+                observed_balances.sell_balance_raw.as_str(),
+                sell_decimals,
+                observed_balances.buy_balance_raw.as_str(),
+                buy_decimals,
+            )
+        } else {
+            (
+                observed_balances.buy_balance_raw.as_str(),
+                buy_decimals,
+                observed_balances.sell_balance_raw.as_str(),
+                sell_decimals,
+            )
+        };
+    let observed_inventory = ArcusSpotInventory {
+        token_a: raw_balance_to_quantity(token_a_raw, token_a_decimals)?,
+        token_b: raw_balance_to_quantity(token_b_raw, token_b_decimals)?,
+    };
+
+    // The settled amount is in the venue's *current* units; the tracked
+    // `rotated_quantity` is in the pre-event ones this whole command exists
+    // because the runtime can no longer use. Reporting the tracked figure
+    // as "what was closed" would misstate the trade by the split ratio --
+    // 2 where 8 changed hands across a 4-for-1 (Codex, pairtrade#318). Both
+    // are useful, so both are reported, each labelled for what it is.
+    //
+    // Converted here, before either file is written: a settled amount that
+    // is a valid U256 but beyond `rust_decimal`'s range would otherwise
+    // fail *after* the close was committed, reporting failure on a
+    // transition that had already happened -- and the retry would then
+    // refuse, because the checkpoint is flat (Codex, pairtrade#318).
+    let settled_sell_quantity = raw_balance_to_quantity(settled_sell_amount_raw, sell_decimals)?;
+    let settled_buy_quantity = raw_balance_to_quantity(settled_buy_amount_raw, buy_decimals)?;
+
+    // `from_state` deliberately allows an inventory below the floors while
+    // corporate-action progress is pending, so that a resume whose declared
+    // `post_event_inventory` does satisfy them can run at all
+    // (bot-strategy#309). That exemption is about the *stale* pre-event
+    // quantity, not about what an operator declares here -- without this
+    // check the command would persist a below-floor holding while the
+    // runbook says it is "subject to its inventory floor" (Codex,
+    // pairtrade#318).
+    if observed_inventory.token_a < config.runtime.inventory_floors.token_a
+        || observed_inventory.token_b < config.runtime.inventory_floors.token_b
+    {
+        bail!(
+            "the observed post-close holdings (token_a={}, token_b={}) are below the configured \
+             inventory floors (token_a={}, token_b={}). Either the close left less than this \
+             config allows the bot to hold -- in which case lower the floors deliberately -- or \
+             the balances were read wrong",
+            observed_inventory.token_a.normalize(),
+            observed_inventory.token_b.normalize(),
+            config.runtime.inventory_floors.token_a.normalize(),
+            config.runtime.inventory_floors.token_b.normalize(),
+        );
+    }
+
+    // The window stays open, so the ordinary resume will run -- and it
+    // adopts the declaration's `post_event_inventory` *unconditionally*
+    // when it does. If that figure disagrees with what the operator just
+    // read off the wallet, leaving the window pending would hand the
+    // runtime holdings the wallet does not have, and every later size and
+    // floor check would reason about them (Codex P1, pairtrade#318). The
+    // floors above are only a lower bound; this is the equality that
+    // matters. A declaration with no `post_event_inventory` yet is fine:
+    // the operator supplies it later, and the resume holds until they do.
+    if let Some(declared) = config
+        .runtime
+        .corporate_actions
+        .iter()
+        .find(|event| ArcusSpotRuntime::progress_names_event(&progress, event))
+        .and_then(|event| event.post_event_inventory)
+    {
+        if declared != observed_inventory {
+            bail!(
+                "corporate action {}'s declared post_event_inventory (token_a={}, token_b={}) \
+                 does not match the holdings observed after this close (token_a={}, token_b={}). \
+                 The window stays open, and the resume adopts the declared figure as-is, so \
+                 leaving them different would size later swaps against holdings the wallet does \
+                 not have. Update the declaration to the observed holdings and re-run",
+                progress.event_id,
+                declared.token_a.normalize(),
+                declared.token_b.normalize(),
+                observed_inventory.token_a.normalize(),
+                observed_inventory.token_b.normalize(),
+            );
+        }
+    }
+
+    let mut updated_state = state.clone();
+    updated_state.regime = ArcusSpotRegime::Neutral;
+    updated_state.rotated_quantity = None;
+    updated_state.last_rotation_at = None;
+    updated_state.inventory = observed_inventory;
+    // Left exactly as it was: the window has not ended, and the ordinary
+    // resume is what ends it.
+    debug_assert!(updated_state.corporate_action.is_some());
+    let updated = ArcusSpotRuntime::from_state(config.runtime.clone(), updated_state)
+        .map_err(anyhow::Error::msg)
+        .context("the reconciled Arcus runtime state is itself invalid")?;
+
+    // Ledger first, and only when it changed: an attempt with no matching
+    // checkpoint reads as an unfinished manual close -- which the block
+    // above then finishes -- while a flat checkpoint with no attempt is the
+    // position change with nothing to point at that this command exists to
+    // avoid. Ordered this way, an interruption at any point leaves a state
+    // a re-run completes, and never one it duplicates.
+    if resumed_a_recorded_close {
+        eprintln!("[arcus-reconcile-position] ledger already committed; writing the checkpoint");
+    } else {
+        ledger_store.persist(&ledger)?;
+    }
+    store.persist(&updated)?;
+
+    eprintln!(
+        "[arcus-reconcile-position] sequence={} recorded a manual close: sold {} {} for {} {} \
+         (the runtime tracked {} {} in pre-event units) and returned to flat; corporate action \
+         {} stays open, so the ordinary resume still needs `post_event_inventory`. Take a fresh \
+         state-backup: backups from before this no longer verify",
+        attempt.sequence,
+        settled_sell_quantity.normalize(),
+        sell_symbol,
+        settled_buy_quantity.normalize(),
+        buy_symbol,
+        rotated_quantity.normalize(),
+        sell_symbol,
+        progress.event_id,
+    );
+    Ok(serde_json::json!({
+        "reconciled_position": {
+            "ledger_sequence": attempt.sequence,
+            "idempotency_key": attempt.idempotency_key,
+            "tx_hash": tx_hash,
+            "settled_sell_quantity": settled_sell_quantity.normalize().to_string(),
+            "settled_buy_quantity": settled_buy_quantity.normalize().to_string(),
+            "tracked_pre_event_quantity": rotated_quantity.normalize().to_string(),
+            "resumed_a_recorded_close": resumed_a_recorded_close,
+            "sell_symbol": sell_symbol,
+            "buy_symbol": buy_symbol,
+            "corporate_action_event_id": progress.event_id,
+            "checkpoint_sequence": updated.state().sequence,
+            "inventory": {
+                "token_a": updated.state().inventory.token_a.normalize().to_string(),
+                "token_b": updated.state().inventory.token_b.normalize().to_string(),
+            },
+        }
+    }))
 }
 
 /// Everything `reset-window` does once its administrator gate has passed.
@@ -4574,6 +5098,10 @@ fn usage() -> &'static str {
   arcus-spot-execute-once live-tick CONFIG_YAML
   arcus-spot-execute-once clear-risk-halt CONFIG_YAML
   arcus-spot-execute-once reset-window CONFIG_YAML
+  arcus-spot-execute-once reconcile-position CONFIG_YAML \\
+      SETTLED_SELL_AMOUNT_RAW SETTLED_BUY_AMOUNT_RAW \\
+      OBSERVED_SELL_BALANCE_RAW OBSERVED_BUY_BALANCE_RAW OBSERVED_GAS_BALANCE_WEI \\
+      TX_HASH_OR_none DETAIL
   arcus-spot-execute-once repair-report CONFIG_YAML EVENTS_JSONL
   arcus-spot-execute-once manual-reconcile-report CONFIG_YAML EVENTS_JSONL \
       EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW
@@ -4925,7 +5453,7 @@ async fn executor_from_config(
     // otherwise both dispatch against, while ledger_path is only where this
     // particular invocation happens to persist its own attempt history
     // (Codex P1 follow-up, pairtrade#181).
-    ArcusSpotLiveExecutor::new(
+    let executor = ArcusSpotLiveExecutor::new(
         config.executor.clone(),
         config.runtime.pair.clone(),
         client,
@@ -4933,7 +5461,16 @@ async fn executor_from_config(
         signer,
         store,
         &config.runtime_state_path,
-    )
+    )?;
+    // Every path that can quote or dispatch comes through here, and by this
+    // point the executor holds the lock -- so this is the one place the
+    // guard covers `execute`, `auto-execute`, the resumes and live-tick
+    // alike. A manual close committed to the ledger but not yet to the
+    // checkpoint leaves `active` empty, so `prepare` would accept a fresh
+    // attempt planned from the stale rotated checkpoint and sell the
+    // already-closed leg again (Codex P1, pairtrade#318).
+    require_no_half_committed_manual_close(config, executor.ledger())?;
+    Ok(executor)
 }
 
 fn finalize_reconciled_attempt(
@@ -5382,6 +5919,28 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        [command, config_path, settled_sell_amount_raw, settled_buy_amount_raw, observed_sell_balance_raw, observed_buy_balance_raw, observed_gas_balance_wei, tx_hash, detail]
+            if command == "reconcile-position" =>
+        {
+            // The recovery for a rotation a corporate action stranded
+            // (bot-strategy#977): the operator closed it at the venue, and
+            // this is how they tell the bot, in one transition, with the
+            // record of what they declared landing in the journal.
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&reconcile_position(
+                    Path::new(config_path),
+                    settled_sell_amount_raw,
+                    settled_buy_amount_raw,
+                    observed_sell_balance_raw,
+                    observed_buy_balance_raw,
+                    observed_gas_balance_wei,
+                    tx_hash,
+                    detail,
+                )?)?
+            );
+            Ok(())
+        }
         [command, config_path, backup_dir] if command == "state-backup" => {
             let config_bytes = read_private_regular_file(Path::new(config_path), "config")?;
             let config = parse_config(&config_bytes, Path::new(config_path))?;
@@ -5647,13 +6206,19 @@ async fn main() -> Result<()> {
 
             // The optimistic check before the public snapshot fetch is not
             // sufficient by itself: another live-tick can dispatch while
-            // this invocation is collecting that snapshot. Re-read the
-            // ledger under the same lock that guards the checkpoint before
-            // advancing the runtime or replacing pending-plan evidence.
-            // A rejection can appear between the optimistic check above and
-            // this one, so the same cleanup runs here rather than deferring
-            // it to the next scheduled tick (Codex, pairtrade#317).
+            // this invocation is collecting that snapshot -- and
+            // `reconcile-position` can take the lock in that same gap,
+            // commit its ledger half, and crash before the checkpoint,
+            // leaving no active attempt and a still-rotated checkpoint for
+            // this tick to evaluate from (Codex P1, pairtrade#318). Re-read
+            // the ledger under the same lock that guards the checkpoint and
+            // re-apply *every* check before advancing the runtime or
+            // replacing pending-plan evidence: a router rejection can
+            // appear in that window too, and deferring its cleanup to the
+            // next scheduled tick is the wait this all exists to remove
+            // (Codex, pairtrade#317).
             let mut rechecked_ledger = ledger_store_for_checkpoint.load_or_create(Utc::now())?;
+            require_no_half_committed_manual_close(&config, &rechecked_ledger)?;
             clear_router_rejection_under_lock(&ledger_store_for_checkpoint, &mut rechecked_ledger)?;
             if let Some((plan, plan_config_digest)) =
                 live_tick_active_recovery_plan(&config, &rechecked_ledger)?
@@ -8974,6 +9539,602 @@ runtime:
         ledger.next_sequence = 2;
         ledger.active = Some(reconciled_entry_attempt(config, plan, 1));
         ledger
+    }
+
+    /// bot-strategy#977: the recovery for a rotation a corporate action
+    /// stranded. Exercises `commit_reconcile_position` directly -- the
+    /// administrator policy gate above it is the same one
+    /// `reset-window`/`clear-risk-halt` already have tests for.
+    fn rotated_state_inside_a_window(
+        config: &ArcusSpotExecuteOnceConfig,
+    ) -> (ArcusSpotRuntimeState, ArcusSpotCorporateActionEvent) {
+        let anchor: DateTime<Utc> = "2026-08-16T00:00:00Z".parse().unwrap();
+        let event = ArcusSpotCorporateActionEvent {
+            event_id: "NVDA-2026-08-SPLIT".to_string(),
+            symbols: vec![config.runtime.pair.sell_symbol.clone()],
+            entry_block_at: anchor,
+            reduce_exit_at: anchor + chrono::Duration::hours(1),
+            effective_at: anchor + chrono::Duration::hours(2),
+            resume_not_before: anchor + chrono::Duration::hours(3),
+            source: "issuer notice".to_string(),
+            post_event_inventory: None,
+        };
+        let mut runtime_config = config.runtime.clone();
+        runtime_config.corporate_actions = vec![event.clone()];
+        let mut state = ArcusSpotRuntime::new(runtime_config)
+            .unwrap()
+            .state()
+            .clone();
+        state.last_observation_at = Some(anchor + chrono::Duration::minutes(1));
+        state.regime = ArcusSpotRegime::RotatedAToB;
+        state.rotated_quantity = Some(Decimal::from(2));
+        state.last_rotation_at = Some(anchor + chrono::Duration::minutes(1));
+        state.corporate_action = Some(ArcusSpotCorporateActionProgress {
+            event_id: event.event_id.clone(),
+            blocked_at: anchor + chrono::Duration::minutes(1),
+            pre_event_token_a: None,
+            pre_event_token_b: None,
+            history_invalidated_at: None,
+            fingerprint: event.fingerprint(),
+            effective_at: Some(event.effective_at),
+            symbols: event.symbols.clone(),
+        });
+        (state, event)
+    }
+
+    fn config_inside_a_window(
+        dir: &std::path::Path,
+    ) -> (ArcusSpotExecuteOnceConfig, ArcusSpotRuntimeState) {
+        let mut config = execute_once_config(
+            dir.join("ledger.json").to_str().unwrap(),
+            dir.join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let (state, event) = rotated_state_inside_a_window(&config);
+        config.runtime.corporate_actions = vec![event];
+        (config, state)
+    }
+
+    fn seed_reconcile_position_state(
+        config: &ArcusSpotExecuteOnceConfig,
+        state: &ArcusSpotRuntimeState,
+    ) {
+        // Creates the ledger, the lock the command takes, and a checkpoint.
+        persist_initial_operator_state(config);
+        let store = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone());
+        store
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn reconcile_position_records_a_manual_close_and_returns_to_flat() {
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+
+        // A 4-for-1 split: the runtime tracks 2 in pre-event units, and the
+        // operator actually sold 8 of the units the venue quotes now. The
+        // two must not be confused for each other (Codex, pairtrade#318).
+        let report = commit_reconcile_position(
+            &config,
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        )
+        .unwrap();
+
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert!(ledger.active.is_none());
+        let attempt = ledger.history.last().expect("the manual close is recorded");
+        assert_eq!(attempt.phase, ArcusSpotExecutionPhase::ManuallyClosed);
+        assert_eq!(attempt.tx_hash.as_deref(), Some("0xabc"));
+        assert_eq!(
+            attempt.dispatched_at, None,
+            "this executor dispatched nothing"
+        );
+        assert_eq!(
+            attempt.settled_sell_amount_raw.as_deref(),
+            Some("8000000000000000000")
+        );
+
+        let runtime = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .load_existing_at(&config.runtime, fixture_now())
+            .unwrap();
+        let after = runtime.state();
+        assert_eq!(after.regime, ArcusSpotRegime::Neutral);
+        assert_eq!(after.rotated_quantity, None);
+        assert_eq!(after.last_rotation_at, None);
+        // The wallet as the operator read it, in whatever units it is in
+        // now -- not recomputed from the pre-event quantities. RotatedAToB
+        // holds token_b, so the close sold token_b (AMD) back into token_a
+        // (NVDA): the observed *sell* balance is token_b's and the observed
+        // *buy* balance is token_a's.
+        assert_eq!(
+            after.inventory.token_a,
+            Decimal::from_str_exact("3.5").unwrap()
+        );
+        assert_eq!(
+            after.inventory.token_b,
+            Decimal::from_str_exact("0.5").unwrap()
+        );
+        // The window is not over: the ordinary resume still has to run.
+        assert!(after.corporate_action.is_some(), "progress is kept");
+        assert_eq!(report["reconciled_position"]["ledger_sequence"], 1);
+        // The settled amounts are in the venue's current units; the tracked
+        // quantity is in the pre-event ones. Both reported, each labelled.
+        assert_eq!(report["reconciled_position"]["settled_sell_quantity"], "8");
+        assert_eq!(report["reconciled_position"]["settled_buy_quantity"], "1.5");
+        assert_eq!(
+            report["reconciled_position"]["tracked_pre_event_quantity"], "2",
+            "the stale tracked figure is reported as such, never as what was sold"
+        );
+        assert_eq!(
+            report["reconciled_position"]["resumed_a_recorded_close"],
+            false
+        );
+    }
+
+    #[test]
+    fn reconcile_position_finishes_a_half_committed_transition_without_duplicating_it() {
+        // The ledger commits before the checkpoint, so a crash in between
+        // leaves the close recorded against a checkpoint that still shows
+        // the rotation. A re-run must finish that, not append a second
+        // close and advance the sequence again.
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let args = (
+            "2000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        );
+        commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+        // Put the checkpoint back to the pre-command state, leaving the
+        // ledger as the successful first half.
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+
+        let report = commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report["reconciled_position"]["resumed_a_recorded_close"],
+            true
+        );
+        assert_eq!(report["reconciled_position"]["ledger_sequence"], 1);
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert_eq!(ledger.history.len(), 1, "exactly one close is recorded");
+        assert_eq!(
+            ledger.next_sequence, 2,
+            "the sequence did not advance twice"
+        );
+        let runtime = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .load_existing_at(&config.runtime, fixture_now())
+            .unwrap();
+        assert_eq!(runtime.state().regime, ArcusSpotRegime::Neutral);
+    }
+
+    #[test]
+    fn a_resumed_close_must_declare_the_same_inputs() {
+        // A re-run that "corrects" a balance or a tx hash would otherwise
+        // keep the old ledger entry while persisting the new numbers, so
+        // the ledger, the checkpoint and the report would describe three
+        // different closes (Codex P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let args = (
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        );
+        commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+
+        for (label, changed) in [
+            (
+                "observed sell balance",
+                (args.0, args.1, "600000000000000000", args.3, args.4, args.5),
+            ),
+            (
+                "observed buy balance",
+                (
+                    args.0,
+                    args.1,
+                    args.2,
+                    "3600000000000000000",
+                    args.4,
+                    args.5,
+                ),
+            ),
+            (
+                "observed gas balance",
+                (args.0, args.1, args.2, args.3, "900000000000000000", args.5),
+            ),
+            ("tx hash", (args.0, args.1, args.2, args.3, args.4, "0xdef")),
+        ] {
+            let error = commit_reconcile_position(
+                &config, changed.0, changed.1, changed.2, changed.3, changed.4, changed.5, args.6,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(label),
+                "expected {label} to be named: {error}"
+            );
+            let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+                .load_existing()
+                .unwrap();
+            assert_eq!(ledger.history.len(), 1, "{label}: no second close appended");
+            assert_eq!(ledger.next_sequence, 2, "{label}: sequence did not advance");
+        }
+
+        // The operator's own account of the close is persisted too, so a
+        // "corrected" one is a different declaration, not a free-text note
+        // the ledger may quietly disagree with.
+        let error = commit_reconcile_position(
+            &config,
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            "actually closed it the following morning",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("detail"), "{error}");
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert_eq!(ledger.history.len(), 1, "detail: no second close appended");
+    }
+
+    #[test]
+    fn reconcile_position_refuses_a_declaration_that_disagrees_with_the_close() {
+        // The resume adopts `post_event_inventory` unconditionally, so
+        // leaving the window pending with a figure that disagrees with the
+        // wallet would hand the runtime holdings it does not have (Codex
+        // P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (mut config, state) = config_inside_a_window(dir.path());
+        config.runtime.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(9),
+            token_b: Decimal::from(9),
+        });
+        seed_reconcile_position_state(&config, &state);
+
+        let error = commit_reconcile_position(
+            &config,
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "closed at the venue",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("does not match the holdings observed"),
+            "{error}"
+        );
+
+        // Agreeing is accepted: token_a is the observed *buy* balance here
+        // (RotatedAToB holds token_b), token_b the observed sell balance.
+        config.runtime.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from_str_exact("3.5").unwrap(),
+            token_b: Decimal::from_str_exact("0.5").unwrap(),
+        });
+        commit_reconcile_position(
+            &config,
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "closed at the venue",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_half_committed_manual_close_stops_the_next_tick() {
+        // The dangerous half of the ledger-first order: no active attempt,
+        // a checkpoint that still shows the rotation, and inside a window
+        // the tick can dispatch the forced exit for inventory the operator
+        // has already sold (Codex P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let args = (
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        );
+        commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        // Completed: the checkpoint is flat, so nothing blocks.
+        require_no_half_committed_manual_close(&config, &ledger).unwrap();
+
+        // Now roll the checkpoint back to the pre-command state, which is
+        // exactly what a crash between the two persists leaves behind.
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+        let error = require_no_half_committed_manual_close(&config, &ledger)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("still holds the rotation it closed"),
+            "{error}"
+        );
+        assert!(error.contains("already sold"), "{error}");
+
+        // And an empty ledger, or one whose tail is an ordinary attempt,
+        // never blocks.
+        require_no_half_committed_manual_close(&config, &ArcusSpotExecutionLedger::default())
+            .unwrap();
+
+        // The guard is not live-tick's alone: `executor_from_config` runs it
+        // under the executor's own lock, so `execute`/`auto-execute` cannot
+        // plan an exit from the stale checkpoint either (Codex P1,
+        // pairtrade#318). Asserting the wiring rather than the network path:
+        // building a real executor needs KMS.
+        let source = std::fs::read_to_string(file!()).unwrap();
+        let wiring = source
+            .split("async fn executor_from_config(")
+            .nth(1)
+            .expect("executor_from_config is defined here");
+        let body = &wiring[..wiring.find("\nfn ").unwrap_or(wiring.len())];
+        assert!(
+            body.contains("require_no_half_committed_manual_close(config, executor.ledger())"),
+            "every quoting/dispatching path must run the guard under the executor's lock",
+        );
+    }
+
+    #[test]
+    fn a_resumed_close_must_match_the_recorded_account_identities() {
+        // A deployment between the two runs may have moved the taker or a
+        // trusted token address; a close recorded against the old ones is
+        // not this close (Codex P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let args = (
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        );
+        commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+
+        // The config is not Clone; rebuild it the way the fixture does and
+        // move the taker.
+        let (mut moved_taker, _) = config_inside_a_window(dir.path());
+        moved_taker.executor.taker = "0x0000000000000000000000000000000000000042".to_string();
+        let error = commit_reconcile_position(
+            &moved_taker,
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("taker"), "{error}");
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert_eq!(ledger.history.len(), 1, "no second close appended");
+    }
+
+    #[test]
+    fn reconcile_position_refuses_holdings_below_the_inventory_floors() {
+        // `from_state` allows a below-floor inventory while a window is
+        // pending, so this command has to check the floors itself or the
+        // runbook's "subject to its inventory floor" would be untrue.
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        assert!(config.runtime.inventory_floors.token_b > Decimal::ZERO);
+        seed_reconcile_position_state(&config, &state);
+
+        let error = commit_reconcile_position(
+            &config,
+            "8000000000000000000",
+            "1500000000000000000",
+            "0",
+            "4000000000000000000",
+            "1000000000000000000",
+            "none",
+            "closed the whole leg",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("below the configured"), "{error}");
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert!(ledger.history.is_empty(), "nothing was recorded");
+    }
+
+    #[test]
+    fn reconcile_position_accepts_a_fully_emptied_leg() {
+        // A close that leaves one token at exactly zero is an ordinary
+        // outcome, and raw_amount_to_quantity refuses "0" by design.
+        let dir = tempdir().unwrap();
+        let (mut config, state) = config_inside_a_window(dir.path());
+        // The case Codex named: the emptied leg's floor is zero too, so
+        // nothing but the conversion stands in the way.
+        config.runtime.inventory_floors.token_b = Decimal::ZERO;
+        seed_reconcile_position_state(&config, &state);
+
+        commit_reconcile_position(
+            &config,
+            "2000000000000000000",
+            "1500000000000000000",
+            "0",
+            "4000000000000000000",
+            "1000000000000000000",
+            "none",
+            "closed the whole leg",
+        )
+        .unwrap();
+
+        let runtime = ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .load_existing_at(&config.runtime, fixture_now())
+            .unwrap();
+        assert_eq!(runtime.state().inventory.token_b, Decimal::ZERO);
+        assert_eq!(runtime.state().inventory.token_a, Decimal::from(4));
+    }
+
+    #[test]
+    fn reconcile_position_refuses_outside_a_corporate_action_window() {
+        // Not a general position editor: without an open window the
+        // ordinary exit path is the answer.
+        let dir = tempdir().unwrap();
+        let (config, mut state) = config_inside_a_window(dir.path());
+        state.corporate_action = None;
+        seed_reconcile_position_state(&config, &state);
+
+        let error = commit_reconcile_position(
+            &config,
+            "2000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "manual close",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("not inside a corporate-action window"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reconcile_position_refuses_a_flat_checkpoint() {
+        let dir = tempdir().unwrap();
+        let (config, mut state) = config_inside_a_window(dir.path());
+        state.regime = ArcusSpotRegime::Neutral;
+        state.rotated_quantity = None;
+        seed_reconcile_position_state(&config, &state);
+
+        let error = commit_reconcile_position(
+            &config,
+            "2000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "manual close",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("already flat"), "{error}");
+    }
+
+    /// Refused twice over: this command checks it before touching
+    /// anything, and `record_manual_close` refuses independently -- a
+    /// manual close is a statement about a position this executor believes
+    /// it holds, and an in-flight attempt means that belief is still
+    /// moving. Removing either one alone still fails closed, which is why
+    /// this test passes with either in place.
+    #[test]
+    fn reconcile_position_refuses_while_an_attempt_is_active() {
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let plan = rotation_plan("entry_signal");
+        let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger.next_sequence = 2;
+        let mut active = reconciled_entry_attempt(&config, &plan, 1);
+        active.phase = ArcusSpotExecutionPhase::Submitted;
+        ledger.active = Some(active);
+        ledger_store.persist(&ledger).unwrap();
+
+        let error = commit_reconcile_position(
+            &config,
+            "2000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "manual close",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("is still active in phase"), "{error}");
+    }
+
+    #[test]
+    fn a_manual_close_never_reads_as_a_reconciled_swap() {
+        // The phase is the whole safety property: every check that consumes
+        // a Reconciled attempt is entitled to assume recorder evidence can
+        // reproduce it, and a manual close has none by construction.
+        assert!(!ArcusSpotExecutionPhase::ManuallyClosed.blocks_new_execution());
+        assert_ne!(
+            ArcusSpotExecutionPhase::ManuallyClosed,
+            ArcusSpotExecutionPhase::Reconciled
+        );
     }
 
     #[test]
