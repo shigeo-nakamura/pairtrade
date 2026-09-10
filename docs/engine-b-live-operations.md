@@ -151,8 +151,11 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     asks; with the engine throttle at the connector's own TTL, an entry
     landing just after a refresh would otherwise keep publishing
     pre-fill equity for up to a full interval. A change in the account's
-    shape (side, open size, or the number of unmanaged exposures) clears
-    the throttle so the next tick re-reads.
+    shape clears the throttle so the next tick re-reads. "Shape" is the
+    managed position's side and open size plus every unmanaged record's
+    symbol, side and open size -- counting the unmanaged records instead
+    of describing them missed a partial flatten or a side flip, which
+    `reconcile_unmanaged` performs by rewriting a record in place.
   - **`venue_equity_stale` is the failure signal, not the age.** It is
     true whenever the most recent attempt failed. A failed refresh keeps
     the last value and lets its age grow rather than blanking it or

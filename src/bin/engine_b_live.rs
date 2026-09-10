@@ -1858,13 +1858,13 @@ struct EngineBLiveEngine {
     /// failing venue cannot turn into a retry-every-tick REST loop
     /// against a 60 req/min account.
     last_venue_equity_attempt_us: i64,
-    /// What the account looked like at the last equity refresh
-    /// decision. A change means a fill landed, which is exactly when
-    /// the published balance is most wrong and when dex-connector's own
-    /// cache has just been invalidated -- so the engine-level throttle
-    /// must not sit on the next read for up to a full interval
+    /// A hash of what the account looked like at the last equity
+    /// refresh decision. A change means a fill landed, which is exactly
+    /// when the published balance is most wrong and when dex-connector's
+    /// own cache has just been invalidated -- so the engine-level
+    /// throttle must not sit on the next read for up to a full interval
     /// (pairtrade#316 Codex review round 2).
-    last_position_fingerprint: Option<(bool, f64, usize)>,
+    last_position_fingerprint: Option<u64>,
 }
 
 impl EngineBLiveEngine {
@@ -5028,16 +5028,39 @@ impl EngineBLiveEngine {
     ///
     /// At most one read is in flight at a time: a venue that hangs must
     /// not accumulate a task per interval behind it.
-    /// One `(side, open size, unmanaged count)` triple describing what
-    /// this process believes the account holds. Compared, never
+    /// A hash of every exposure this process believes the account
+    /// holds -- the managed position's side and open size, and each
+    /// unmanaged record's symbol, side and open size. Compared, never
     /// published: only its *changing* matters.
-    fn position_fingerprint(&self) -> Option<(bool, f64, usize)> {
-        let unmanaged = self.state.unmanaged_positions.len();
-        match self.position.as_ref() {
-            Some(p) => Some((matches!(p.side, OrderSide::Short), p.open_size, unmanaged)),
-            None if unmanaged > 0 => Some((false, 0.0, unmanaged)),
-            None => None,
+    ///
+    /// Every field earns its place. Counting the unmanaged records
+    /// instead of describing them missed a partial flatten or a side
+    /// flip, where `reconcile_unmanaged` rewrites a record in place and
+    /// the count stays put -- a fill that dropped the connector's cache
+    /// while this fingerprint compared equal, leaving the pre-fill
+    /// balance on the dashboard for a full interval (pairtrade#316
+    /// Codex review round 3). Sizes are hashed by their bit pattern
+    /// because that is what "the same number as last time" means here;
+    /// this is a change detector, not an arithmetic comparison.
+    fn position_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        if self.position.is_none() && self.state.unmanaged_positions.is_empty() {
+            return None;
         }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        match self.position.as_ref() {
+            Some(p) => {
+                matches!(p.side, OrderSide::Short).hash(&mut hasher);
+                p.open_size.to_bits().hash(&mut hasher);
+            }
+            None => "flat".hash(&mut hasher),
+        }
+        for u in self.state.unmanaged_positions.iter() {
+            u.symbol.hash(&mut hasher);
+            u.side.hash(&mut hasher);
+            u.open_size.to_bits().hash(&mut hasher);
+        }
+        Some(hasher.finish())
     }
 
     /// Clear the refresh throttle when the account has changed shape.
@@ -8666,6 +8689,35 @@ mod tests {
             3,
             "an unchanged account is not a reason to re-read"
         );
+
+        // An exposure this engine cannot trade is still an exposure
+        // whose fills move the balance. Adding one is a change...
+        h.engine
+            .state
+            .unmanaged_positions
+            .push(persisted_long(0.04, TODAY));
+        h.engine.force_venue_equity_refresh_after_a_fill();
+        h.refresh_equity(T1_US + 50_000_000).await;
+        assert_eq!(h.connector.balance_call_count(), 4);
+
+        // ...and so is partially flattening it, which `reconcile_unmanaged`
+        // does by rewriting the record in place. Counting the records
+        // instead of describing them missed exactly this (pairtrade#316
+        // Codex review round 3).
+        h.engine.state.unmanaged_positions[0].open_size = 0.01;
+        h.engine.force_venue_equity_refresh_after_a_fill();
+        h.refresh_equity(T1_US + 60_000_000).await;
+        assert_eq!(
+            h.connector.balance_call_count(),
+            5,
+            "a partial flatten of an unmanaged exposure is a fill too"
+        );
+
+        // Same for a side flip, which also leaves the count alone.
+        h.engine.state.unmanaged_positions[0].side = "short".to_string();
+        h.engine.force_venue_equity_refresh_after_a_fill();
+        h.refresh_equity(T1_US + 70_000_000).await;
+        assert_eq!(h.connector.balance_call_count(), 6);
     }
 
     #[tokio::test]
