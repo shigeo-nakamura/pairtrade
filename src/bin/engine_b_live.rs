@@ -5166,6 +5166,13 @@ impl EngineBLiveEngine {
         // persisting it itself (bot-strategy#917); a no-op when nothing
         // changed.
         self.persist_position();
+        // And once more, because an entry confirmed *during* this tick
+        // initialised the ledger only after the harvest above had
+        // already run and found no side. Its fill is sitting in the
+        // connector's cache right now; waiting 5 s for the next tick
+        // would lose it to a crash in between (pairtrade#320 Codex
+        // review round 3). A no-op when nothing new arrived.
+        self.harvest_fills(now).await;
         // Observational only (bot-strategy#919). Spawned, never
         // awaited: a hung venue read must not hold the tick that drives
         // confirmation, exit and shutdown (pairtrade#316 Codex P1).
@@ -5279,6 +5286,23 @@ impl EngineBLiveEngine {
     /// counted in neither leg -- it would otherwise land in whichever
     /// leg happened to be open and silently corrupt a VWAP.
     async fn harvest_fills(&mut self, now_us: i64) {
+        // A position this process did not open -- restored after a
+        // restart, or adopted from the exchange -- installs
+        // `self.position` without ever going through `record_entry`, so
+        // the ledger has no side and would sit idle for the rest of the
+        // position's life, recording nothing at all (pairtrade#320 Codex
+        // review round 3). Adopt it here, at the one place that would
+        // otherwise give up.
+        //
+        // The entry fills for such a position are from before this
+        // process and are not recoverable, so its settlement stays
+        // unknown -- which is correct. The exit fills still have to be
+        // recorded.
+        if self.fill_ledger_entry_side.is_none() {
+            if let Some(side) = self.position.as_ref().map(|p| p.side) {
+                self.begin_fill_ledger(side);
+            }
+        }
         let Some(entry_side) = self.fill_ledger_entry_side else {
             return;
         };
@@ -9446,6 +9470,93 @@ mod tests {
         assert_eq!(h.engine.entry_fills.fills, 1);
         let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path).unwrap();
         assert_eq!(raw.lines().count(), 1);
+    }
+
+    /// pairtrade#320 Codex review round 3. A position restored after a
+    /// restart never goes through `record_entry`, so the ledger had no
+    /// side and every harvest returned immediately -- for the whole
+    /// remaining life of that position, including its exit.
+    #[tokio::test]
+    async fn a_restored_position_still_records_its_exit_fill() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        // As a restart leaves it: a position, and a ledger that was
+        // never told about it.
+        h.engine.position = Some(OpenPosition {
+            side: OrderSide::Short,
+            entry_price: 1763.60,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 0.0566,
+            open_size: 0.0566,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        assert!(h.engine.fill_ledger_entry_side.is_none());
+
+        h.connector
+            .push_fill("x1", OrderSide::Long, "0.0566", "1719.14", None);
+        h.harvest(T2_US).await;
+
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path)
+            .expect("a restarted process must still record what it sees");
+        assert_eq!(raw.lines().count(), 1);
+        assert_eq!(h.engine.exit_fills.fills, 1);
+        // The entry fills predate this process, so the settlement is
+        // honestly unknown rather than wrong.
+        h.engine.on_exit(1717.855, T2_US).await;
+        assert_eq!(
+            last_pnl_record(&h)["settled"],
+            serde_json::json!(null),
+            "an entry this process never saw cannot be settled"
+        );
+    }
+
+    /// pairtrade#320 Codex review round 3: an entry confirmed during a
+    /// tick initialises the ledger *after* that tick's pre-decision
+    /// harvest has already run and found no side. Its fill is in the
+    /// connector cache at that moment; waiting for the next 5 s tick
+    /// loses it to a crash in between.
+    ///
+    /// Driven through the real confirmation path -- a `PendingConfirm`
+    /// the tick resolves -- because that is the ordering under test.
+    /// Installing the position by hand before the tick would let the
+    /// pre-decision harvest catch it and the assertion would pass with
+    /// the post-decision harvest removed.
+    #[tokio::test]
+    async fn an_entry_confirmed_mid_tick_is_durable_on_that_tick() {
+        let mut h = harness();
+        h.engine.reconciled = true;
+        h.engine.day.entered = false;
+        // The order is out and its fill is already on the venue.
+        h.engine.pending = Some(PendingConfirm::Entry {
+            side: OrderSide::Short,
+            requested: 0.05,
+            price: 1700.0,
+            epsilon: -0.01,
+            notional_usd: 100.0,
+            deadline_us: T1_US + 180_000_000,
+            after_send_error: None,
+            saw_reading: false,
+        });
+        h.connector
+            .positions
+            .lock()
+            .unwrap()
+            .push(snap("SNDK", "0.05", -1, Some("1700.00")));
+        h.connector
+            .push_fill("e1", OrderSide::Short, "0.05", "1700.00", None);
+
+        h.set_now(T1_US + 10_000_000);
+        h.engine.tick().await;
+
+        assert!(h.engine.position.is_some(), "the entry was confirmed");
+        let raw = std::fs::read_to_string(&h.engine.cfg.fills_log_path)
+            .expect("the entry fill must not wait a tick to become durable");
+        assert_eq!(raw.lines().count(), 1);
+        assert_eq!(h.engine.entry_fills.fills, 1);
     }
 
     #[tokio::test]

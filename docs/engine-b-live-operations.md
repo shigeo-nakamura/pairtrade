@@ -155,6 +155,12 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     of it) and would otherwise be summarised before it was ever seen.
     (The venue *equity* read does go to REST and is deliberately
     off-tick -- see below.)
+  - The ledger follows the position, not the entry. A position restored
+    after a restart or adopted from the exchange never goes through the
+    entry path, so the ledger adopts its side on the next harvest and
+    records everything from there. Its pre-restart entry fills are gone,
+    so that trade settles as unknown -- correct -- but its exit fills
+    are still recorded.
   - A fill is counted only once its ledger row is on disk. If the append
     fails the fill is left unmarked and untotalled, and the connector's
     next re-serve retries it -- a transient filesystem error must not
