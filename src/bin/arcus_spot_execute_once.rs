@@ -460,7 +460,9 @@ fn consecutive_tail_rejections(history: &[ArcusSpotExecutionAttempt]) -> usize {
 /// else (a `tx_hash` that may have reached the chain, `Unknown`,
 /// `OperatorHold`, `Failed`) still stops and waits, as does a run of
 /// rejections that reaches `MAX_CONSECUTIVE_AUTO_ARCHIVED_REJECTIONS`.
-fn auto_archive_router_rejection(ledger: &mut ArcusSpotExecutionLedger) -> Result<Option<u64>> {
+fn auto_archive_router_rejection(
+    ledger: &mut ArcusSpotExecutionLedger,
+) -> Result<Option<ArchivedRejection>> {
     let Some(active) = ledger.active.as_ref() else {
         return Ok(None);
     };
@@ -492,13 +494,59 @@ fn auto_archive_router_rejection(ledger: &mut ArcusSpotExecutionLedger) -> Resul
     // Delegates the phase/tx_hash invariants rather than restating them, so
     // this path can never be looser than the manual command's.
     ledger.archive_rejected()?;
+    // Deliberately no log here: the ledger is still only changed in memory,
+    // and a persist that then fails would leave the journal claiming a
+    // clearance the on-disk ledger does not have (Codex, pairtrade#317).
+    // `announce_archived_router_rejection` says so once it is durable.
+    Ok(Some(ArchivedRejection {
+        sequence,
+        run,
+        detail,
+    }))
+}
+
+/// What `auto_archive_router_rejection` cleared, reported to the journal
+/// only once the ledger holding that clearance has been persisted.
+struct ArchivedRejection {
+    sequence: u64,
+    run: usize,
+    detail: String,
+}
+
+fn announce_archived_router_rejection(archived: &ArchivedRejection) {
+    let ArchivedRejection {
+        sequence,
+        run,
+        detail,
+    } = archived;
     eprintln!(
         "[arcus-rejected] sequence={sequence} run={run} cleared automatically: the router \
          refused the submission and no transaction was sent, so there is nothing to reconcile; \
          this tick evaluates a fresh observation and never re-sends the refused plan. \
          detail: {detail}"
     );
-    Ok(Some(sequence))
+}
+
+/// Clear a router rejection under a lock the caller already holds, and
+/// persist the ledger that no longer carries it.
+///
+/// Both of `live-tick`'s active-attempt checks go through here: the
+/// optimistic one before the snapshot fetch, and the re-read under the
+/// checkpoint lock afterwards. A rejection can appear between them -- an
+/// overlapping tick dispatching while this one collects its snapshot -- and
+/// without this the later check would hand it to
+/// `resume_status_and_reconcile`, exit non-zero, and leave the cleanup to
+/// whichever invocation ran next (Codex, pairtrade#317).
+fn clear_router_rejection_under_lock(
+    ledger_store: &ArcusSpotExecutionLedgerStore,
+    ledger: &mut ArcusSpotExecutionLedger,
+) -> Result<bool> {
+    let Some(archived) = auto_archive_router_rejection(ledger)? else {
+        return Ok(false);
+    };
+    ledger_store.persist(ledger)?;
+    announce_archived_router_rejection(&archived);
+    Ok(true)
 }
 
 async fn resume_active_live_tick_attempt(
@@ -507,8 +555,7 @@ async fn resume_active_live_tick_attempt(
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let lock = ledger_store.acquire_exclusive_lock(&config.runtime_state_path)?;
     let mut ledger = ledger_store.load_or_create(Utc::now())?;
-    if auto_archive_router_rejection(&mut ledger)?.is_some() {
-        ledger_store.persist(&ledger)?;
+    if clear_router_rejection_under_lock(&ledger_store, &mut ledger)? {
         drop(lock);
         // Nothing to resume: the tick continues into an ordinary evaluation.
         return Ok(None);
@@ -5598,8 +5645,13 @@ async fn main() -> Result<()> {
             // this invocation is collecting that snapshot. Re-read the
             // ledger under the same lock that guards the checkpoint before
             // advancing the runtime or replacing pending-plan evidence.
+            // A rejection can appear between the optimistic check above and
+            // this one, so the same cleanup runs here rather than deferring
+            // it to the next scheduled tick (Codex, pairtrade#317).
+            let mut rechecked_ledger = ledger_store_for_checkpoint.load_or_create(Utc::now())?;
+            clear_router_rejection_under_lock(&ledger_store_for_checkpoint, &mut rechecked_ledger)?;
             if let Some((plan, plan_config_digest)) =
-                load_live_tick_active_recovery_plan(&config, &ledger_store_for_checkpoint)?
+                live_tick_active_recovery_plan(&config, &rechecked_ledger)?
             {
                 drop(checkpoint_lock);
                 let attempt = resume_live_tick_attempt(&config, plan, plan_config_digest).await?;
@@ -9018,7 +9070,12 @@ runtime:
         let plan = rotation_plan("entry_signal");
         let mut ledger = ledger_with(Some(rejected_attempt(&config, &plan, 1)), vec![]);
 
-        assert_eq!(auto_archive_router_rejection(&mut ledger).unwrap(), Some(1));
+        assert_eq!(
+            auto_archive_router_rejection(&mut ledger)
+                .unwrap()
+                .map(|archived| archived.sequence),
+            Some(1)
+        );
         assert!(ledger.active.is_none(), "the active slot is free again");
         assert_eq!(ledger.history.len(), 1, "the rejection is kept in history");
         assert_eq!(ledger.history[0].phase, ArcusSpotExecutionPhase::Rejected);
@@ -9040,7 +9097,9 @@ runtime:
         attempt.tx_hash = Some(format!("0x{}", "1".repeat(64)));
         let mut ledger = ledger_with(Some(attempt), vec![]);
 
-        assert_eq!(auto_archive_router_rejection(&mut ledger).unwrap(), None);
+        assert!(auto_archive_router_rejection(&mut ledger)
+            .unwrap()
+            .is_none());
         assert!(ledger.active.is_some(), "still held for an operator");
     }
 
@@ -9061,13 +9120,82 @@ runtime:
             let mut attempt = rejected_attempt(&config, &plan, 1);
             attempt.phase = phase;
             let mut ledger = ledger_with(Some(attempt), vec![]);
-            assert_eq!(
-                auto_archive_router_rejection(&mut ledger).unwrap(),
-                None,
+            assert!(
+                auto_archive_router_rejection(&mut ledger)
+                    .unwrap()
+                    .is_none(),
                 "{phase:?} is not a router rejection"
             );
             assert!(ledger.active.is_some(), "{phase:?} stays active");
         }
+    }
+
+    #[test]
+    fn clearing_a_rejection_persists_before_it_is_announced() {
+        // The message says the ledger no longer carries the rejection, so
+        // it must not be printed until that is true on disk (Codex).
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let plan = rotation_plan("entry_signal");
+        let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        let mut ledger = ledger_with(Some(rejected_attempt(&config, &plan, 1)), vec![]);
+        store.persist(&ledger).unwrap();
+
+        assert!(clear_router_rejection_under_lock(&store, &mut ledger).unwrap());
+
+        // The durable ledger, not just the in-memory one.
+        let reloaded = store.load_existing().unwrap();
+        assert!(reloaded.active.is_none());
+        assert_eq!(reloaded.history.len(), 1);
+        assert_eq!(reloaded.history[0].phase, ArcusSpotExecutionPhase::Rejected);
+
+        // And nothing to clear the second time round.
+        assert!(!clear_router_rejection_under_lock(&store, &mut ledger).unwrap());
+    }
+
+    #[test]
+    fn a_failed_persist_leaves_the_rejection_and_reports_the_failure() {
+        // The other half of "announce only what is durable": if the ledger
+        // cannot be written, the caller gets an error and the on-disk
+        // ledger still carries the rejection. The `?` on persist is what
+        // keeps the success message from being printed in that case.
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("state");
+        std::fs::create_dir(&nested).unwrap();
+        let config = execute_once_config(
+            nested.join("ledger.json").to_str().unwrap(),
+            nested.join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        persist_initial_operator_state(&config);
+        let plan = rotation_plan("entry_signal");
+        let store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
+        let mut ledger = ledger_with(Some(rejected_attempt(&config, &plan, 1)), vec![]);
+        store.persist(&ledger).unwrap();
+
+        // Make the directory unwritable so the atomic rename cannot land.
+        let mut permissions = std::fs::metadata(&nested).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o500);
+        std::fs::set_permissions(&nested, permissions).unwrap();
+        let result = clear_router_rejection_under_lock(&store, &mut ledger);
+        let mut permissions = std::fs::metadata(&nested).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&nested, permissions).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a failed persist is reported, not swallowed"
+        );
+        let reloaded = store.load_existing().unwrap();
+        assert!(
+            reloaded.active.is_some(),
+            "the durable ledger still carries the rejection"
+        );
     }
 
     #[test]
@@ -9087,7 +9215,9 @@ runtime:
         cancelled.detail = Some("submit guard refused the plan".to_string());
         let mut ledger = ledger_with(Some(cancelled.clone()), vec![]);
 
-        assert_eq!(auto_archive_router_rejection(&mut ledger).unwrap(), None);
+        assert!(auto_archive_router_rejection(&mut ledger)
+            .unwrap()
+            .is_none());
         assert!(ledger.active.is_some(), "left for an operator to look at");
 
         // Nor does it count toward the cap, or break the run it sits in.
@@ -9125,7 +9255,9 @@ runtime:
             history.clone(),
         );
 
-        assert_eq!(auto_archive_router_rejection(&mut ledger).unwrap(), None);
+        assert!(auto_archive_router_rejection(&mut ledger)
+            .unwrap()
+            .is_none());
         assert!(ledger.active.is_some(), "the cap hands it to an operator");
 
         // A success in between resets the run: this is about a venue
@@ -9138,7 +9270,9 @@ runtime:
             interrupted,
         );
         assert_eq!(
-            auto_archive_router_rejection(&mut ledger).unwrap(),
+            auto_archive_router_rejection(&mut ledger)
+                .unwrap()
+                .map(|archived| archived.sequence),
             Some(sequence + 1),
         );
     }
