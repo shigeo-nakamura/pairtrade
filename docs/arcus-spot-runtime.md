@@ -463,7 +463,8 @@ At `resume_not_before` the runtime resumes only when all three hold:
    and
    do not open a window with a rotation you cannot afford to have stuck. If
    it happens anyway, close the position on the venue by hand, in post-event
-   units, keep the evidence, and wait for #977 rather than editing state.
+   units, keep the evidence -- and run `reconcile-position` with it, as
+   described above. Never edit the state files directly.
 2. **Unchanged token identity.** Each affected symbol's contract address and
    decimals are compared against what they were on the last observation
    *before* the window opened. A mismatch holds on
