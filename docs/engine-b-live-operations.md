@@ -147,11 +147,16 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     Engine B holding" (an exit countdown, the unrealized mark) must read
     the `han_bridge` flag; the top-level one answers a different
     question. Both it and `exit_deadline_us` fall back to the persisted
-    claim while reconciliation has not completed -- a `get_positions()`
-    failure at startup is not evidence of a flat account, and the same
-    document already lists that exposure in `positions`. The uncertainty
-    is carried by `positions_ready=false`, not by pretending to be
-    flat.
+    claim while reconciliation has not completed **and** that claim is
+    for the symbol this instance trades -- a `get_positions()` failure
+    at startup is not evidence of a flat account, and the same document
+    already lists that exposure in `positions`. The uncertainty is
+    carried by `positions_ready=false`, not by pretending to be flat.
+    Both conditions matter: reconciliation having run and still left the
+    slot empty is a decision rather than an outage, and a record kept on
+    the *previous* `us_primary` is retained on purpose while explicitly
+    not being managed -- publishing either as a managed hold would put
+    the old symbol's deadline beside the new primary.
   - **`venue_solvency_reported` is how a consumer knows the field exists
     at all.** It is always true from this build. A consumer cannot use
     JSON key presence for that -- debot-dashboard decodes and re-encodes

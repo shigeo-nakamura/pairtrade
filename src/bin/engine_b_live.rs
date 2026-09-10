@@ -5337,9 +5337,22 @@ impl EngineBLiveEngine {
         // where the uncertainty belongs.
         let (managed_claim_open, managed_claim_exit_deadline_us) = match self.position.as_ref() {
             Some(p) => (true, p.exit_deadline_us),
+            // Both conditions earn their place. `!reconciled` keeps
+            // this to the window where the account genuinely could not
+            // be read: once reconciliation has run and still left the
+            // slot empty, that is a decision, not an outage. And the
+            // symbol must be the one this instance trades -- when
+            // `us_primary` changes with a saved position on the old
+            // symbol, DRY_RUN deliberately retains the record while
+            // refusing to manage it, and publishing it here would
+            // present an intentionally unmanaged exposure as a current
+            // hold, complete with the old symbol's deadline
+            // (pairtrade#319 Codex review round 3).
             None => match self.state.open_position.as_ref() {
-                Some(p) => (true, p.exit_deadline_us),
-                None => (false, None),
+                Some(p) if !self.reconciled && p.symbol == self.cfg.us_primary_symbol => {
+                    (true, p.exit_deadline_us)
+                }
+                _ => (false, None),
             },
         };
         // One lock for both fields so a refresh landing between two
@@ -8652,6 +8665,66 @@ mod tests {
             status["positions"].as_array().map(|a| a.len()),
             Some(1),
             "consistent with the list the same document publishes"
+        );
+    }
+
+    /// pairtrade#319 Codex review round 3: the fallback is for an
+    /// outage, not for every empty slot. A record kept on purpose while
+    /// refusing to manage it is not a managed hold.
+    #[tokio::test]
+    async fn a_retained_foreign_symbol_record_is_not_a_managed_hold() {
+        let mut h = harness();
+        h.engine.position = None;
+        h.engine.state.open_position = Some(PersistedPosition {
+            symbol: "MU".to_string(),
+            exit_deadline_us: Some(T2_US + 900_000_000),
+            ..persisted_long(0.05, TODAY)
+        });
+
+        // Reconciliation ran and left the slot empty on purpose.
+        h.engine.reconciled = true;
+        h.engine.write_status_if_due(T1_US);
+        let settled = read_status(&h);
+        assert_eq!(
+            settled["han_bridge"]["managed_position_open"],
+            serde_json::json!(false),
+            "a decision to not manage it is not an outage"
+        );
+        assert_eq!(
+            settled["han_bridge"]["exit_deadline_us"],
+            serde_json::json!(null),
+            "and the old symbol's deadline must not surface beside the new primary"
+        );
+
+        // Even mid-outage, a record for a symbol this instance does not
+        // trade is not this instance's hold.
+        h.engine.reconciled = false;
+        h.engine.write_status_if_due(T1_US + 60_000_000);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["managed_position_open"],
+            serde_json::json!(false)
+        );
+
+        // The two conditions are independent, so the matching-symbol
+        // half is pinned too: reconciliation having *run* and still
+        // left the slot empty is a decision about this exposure, and
+        // the fallback exists for the case where the account could not
+        // be read at all.
+        h.engine.reconciled = true;
+        h.engine.state.open_position = Some(PersistedPosition {
+            exit_deadline_us: Some(T2_US + 900_000_000),
+            ..persisted_long(0.05, TODAY)
+        });
+        assert_eq!(
+            h.engine.state.open_position.as_ref().unwrap().symbol,
+            h.engine.cfg.us_primary_symbol,
+            "this case is only meaningful with the symbol matching"
+        );
+        h.engine.write_status_if_due(T1_US + 120_000_000);
+        assert_eq!(
+            read_status(&h)["han_bridge"]["managed_position_open"],
+            serde_json::json!(false),
+            "reconciled and still empty is not an outage"
         );
     }
 
