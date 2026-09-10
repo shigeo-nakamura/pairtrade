@@ -144,10 +144,11 @@ documented in `docs/engine-b-order-spec.md` (bot-strategy#875, A-3 / A-8
     dex-connector work; so is settled funding. Until then a `null` fee
     is the honest reading and reading it as zero would overstate every
     result.
-  - A final harvest runs on SIGTERM/SIGINT. A fill can reach the
-    connector's cache after the last tick and before the signal, and
-    nothing else would ever write it -- on restart the cache is gone and
-    the row is unrecoverable.
+  - A final harvest runs on **every** exit from the main loop --
+    SIGTERM/SIGINT and a closed price feed alike. A fill can reach the
+    connector's cache after the last tick, and nothing else would ever
+    write it: on restart the cache is gone and the row is
+    unrecoverable.
   - Harvesting costs nothing on the wire -- the Lighter connector
     serves `get_filled_orders` from its own WS-populated cache and
     issues no request -- and happens **twice, both of which earn their

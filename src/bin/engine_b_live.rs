@@ -6093,19 +6093,20 @@ async fn main() -> Result<()> {
                 engine.tick().await;
             }
             Wake::Signal(signal) => {
-                // A fill can reach the connector's cache after the last
-                // tick and before the signal wins this select. Nothing
-                // else will ever write it: on restart the cache is gone
-                // and the row is unrecoverable, leaving that trade
-                // permanently unsettled (pairtrade#320 Codex review
-                // round 6). One last read of an in-memory cache, on a
-                // path that is already doing durable work.
-                engine.harvest_fills(engine.now()).await;
                 let _ = engine.note_shutdown_signal(signal);
                 break;
             }
         }
     }
+
+    // Every way out of the loop, not just the signal one: the
+    // feed-closed branch above breaks immediately too (pairtrade#320
+    // Codex review rounds 6 and 7). A fill can reach the connector's
+    // cache after the last tick, and nothing else will ever write it --
+    // on restart the cache is gone and the row is unrecoverable,
+    // leaving that trade permanently unsettled. One last read of an
+    // in-memory cache on the way out.
+    engine.harvest_fills(engine.now()).await;
 
     Ok(())
 }
