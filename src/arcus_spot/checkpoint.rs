@@ -525,6 +525,18 @@ impl ArcusSpotRuntimeCheckpointStore {
                 .max(config.corporate_action_settlement_margin_secs),
         );
         let live_by = live_by + submit_margin;
+        // The margin is a cutoff too, and the only one the fingerprint does
+        // not carry: it is what keeps a submission from crossing
+        // `entry_block_at` mid-flight and an exit from settling after the
+        // unit change. This load decides a window is live using the *larger*
+        // of the two margins, but the runtime it returns will use the
+        // supplied one -- so an otherwise identical re-declaration with a
+        // smaller margin plans entries closer to the opening and exits
+        // closer to `effective_at` than the stored declaration allowed.
+        // That is a narrowing of every unhandled live window at once, so no
+        // re-declaration can stand against it (Codex P1, pairtrade#309).
+        let margin_narrowed = config.corporate_action_settlement_margin_secs
+            < checkpoint.config.corporate_action_settlement_margin_secs;
         if let Some(dropped) = checkpoint.config.corporate_actions.iter().find(|stored| {
             live_by >= stored.entry_block_at
                 // "Handled" by the same rule a tick applies: an id whose
@@ -553,11 +565,12 @@ impl ArcusSpotRuntimeCheckpointStore {
                 // declaring this window if it still covers where the stored
                 // one opened; moving the opening later is removal by another
                 // name (Codex P1, pairtrade#309).
-                && !config.corporate_actions.iter().any(|event| {
-                    event.fingerprint() == stored.fingerprint()
-                        || (event.event_id.eq_ignore_ascii_case(&stored.event_id)
-                            && amendment_still_covers(event, stored))
-                })
+                && (margin_narrowed
+                    || !config.corporate_actions.iter().any(|event| {
+                        event.fingerprint() == stored.fingerprint()
+                            || (event.event_id.eq_ignore_ascii_case(&stored.event_id)
+                                && amendment_still_covers(event, stored))
+                    }))
         }) {
             bail!(
                 "Arcus runtime checkpoint {} was written under a config declaring corporate \
@@ -565,7 +578,8 @@ impl ArcusSpotRuntimeCheckpointStore {
                  yet handled), which the supplied config no longer declares from that instant \
                  -- it is absent, or re-declared under the same id in a way that narrows the \
                  guard (a later opening, a later forced unwind, a later effective instant, an \
-                 earlier resume, or a dropped symbol). Removing a live window, or amending it \
+                 earlier resume, a dropped symbol, or a smaller \
+                 corporate_action_settlement_margin_secs). Removing a live window, or amending it \
                  out from under itself, drops the guard it exists to be; restore the \
                  declaration at its stored cutoffs, or resolve the window first",
                 self.path.display(),
@@ -980,6 +994,24 @@ mod tests {
                 "{narrowing}: {error}"
             );
         }
+
+        // The settlement margin is a cutoff the fingerprint does not carry:
+        // shrinking it lets the returned runtime plan entries closer to the
+        // opening and exits closer to `effective_at` than the stored
+        // declaration allowed, even though the declaration itself is
+        // byte-identical (Codex P1, pairtrade#309).
+        let mut tighter_margin = declared.clone();
+        tighter_margin.corporate_action_settlement_margin_secs -= 60;
+        let error = match store.load_existing_at(&tighter_margin, inside) {
+            Ok(_) => panic!("shrinking the settlement margin narrows every live window"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Removing a live window"), "{error}");
+
+        // Widening it only ever holds the guard open for longer.
+        let mut wider_margin = declared.clone();
+        wider_margin.corporate_action_settlement_margin_secs += 60;
+        assert!(store.load_existing_at(&wider_margin, inside).is_ok());
 
         // Case only: the symbol comparison follows the fingerprint's own
         // lowercase normalisation, so re-spelling a symbol is not dropping it.
