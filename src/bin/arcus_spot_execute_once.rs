@@ -2263,6 +2263,25 @@ fn commit_reconcile_position(
                     "observed gas balance",
                 ),
                 (attempt.tx_hash != tx_hash, "tx hash"),
+                // Identities, not just amounts: a deployment between the
+                // two runs may have moved `executor.taker` or a trusted
+                // token address, and reusing a close recorded against the
+                // old wallet or contracts while building the checkpoint
+                // under the new ones would tie the two together wrongly
+                // (Codex P1, pairtrade#318).
+                (
+                    !attempt.taker.eq_ignore_ascii_case(&config.executor.taker),
+                    "taker",
+                ),
+                (attempt.chain_id != config.runtime.chain_id, "chain id"),
+                (
+                    !attempt.intent.sell_token.eq_ignore_ascii_case(&sell_token),
+                    "sell token address",
+                ),
+                (
+                    !attempt.intent.buy_token.eq_ignore_ascii_case(&buy_token),
+                    "buy token address",
+                ),
             ]
             .into_iter()
             .filter_map(|(differs, label)| differs.then_some(label))
@@ -2332,6 +2351,21 @@ fn commit_reconcile_position(
         token_b: raw_balance_to_quantity(token_b_raw, token_b_decimals)?,
     };
 
+    // The settled amount is in the venue's *current* units; the tracked
+    // `rotated_quantity` is in the pre-event ones this whole command exists
+    // because the runtime can no longer use. Reporting the tracked figure
+    // as "what was closed" would misstate the trade by the split ratio --
+    // 2 where 8 changed hands across a 4-for-1 (Codex, pairtrade#318). Both
+    // are useful, so both are reported, each labelled for what it is.
+    //
+    // Converted here, before either file is written: a settled amount that
+    // is a valid U256 but beyond `rust_decimal`'s range would otherwise
+    // fail *after* the close was committed, reporting failure on a
+    // transition that had already happened -- and the retry would then
+    // refuse, because the checkpoint is flat (Codex, pairtrade#318).
+    let settled_sell_quantity = raw_balance_to_quantity(settled_sell_amount_raw, sell_decimals)?;
+    let settled_buy_quantity = raw_balance_to_quantity(settled_buy_amount_raw, buy_decimals)?;
+
     // `from_state` deliberately allows an inventory below the floors while
     // corporate-action progress is pending, so that a resume whose declared
     // `post_event_inventory` does satisfy them can run at all
@@ -2353,6 +2387,38 @@ fn commit_reconcile_position(
             config.runtime.inventory_floors.token_a.normalize(),
             config.runtime.inventory_floors.token_b.normalize(),
         );
+    }
+
+    // The window stays open, so the ordinary resume will run -- and it
+    // adopts the declaration's `post_event_inventory` *unconditionally*
+    // when it does. If that figure disagrees with what the operator just
+    // read off the wallet, leaving the window pending would hand the
+    // runtime holdings the wallet does not have, and every later size and
+    // floor check would reason about them (Codex P1, pairtrade#318). The
+    // floors above are only a lower bound; this is the equality that
+    // matters. A declaration with no `post_event_inventory` yet is fine:
+    // the operator supplies it later, and the resume holds until they do.
+    if let Some(declared) = config
+        .runtime
+        .corporate_actions
+        .iter()
+        .find(|event| ArcusSpotRuntime::progress_names_event(&progress, event))
+        .and_then(|event| event.post_event_inventory)
+    {
+        if declared != observed_inventory {
+            bail!(
+                "corporate action {}'s declared post_event_inventory (token_a={}, token_b={}) \
+                 does not match the holdings observed after this close (token_a={}, token_b={}). \
+                 The window stays open, and the resume adopts the declared figure as-is, so \
+                 leaving them different would size later swaps against holdings the wallet does \
+                 not have. Update the declaration to the observed holdings and re-run",
+                progress.event_id,
+                declared.token_a.normalize(),
+                declared.token_b.normalize(),
+                observed_inventory.token_a.normalize(),
+                observed_inventory.token_b.normalize(),
+            );
+        }
     }
 
     let mut updated_state = state.clone();
@@ -2380,14 +2446,6 @@ fn commit_reconcile_position(
     }
     store.persist(&updated)?;
 
-    // The settled amount is in the venue's *current* units; the tracked
-    // `rotated_quantity` is in the pre-event ones this whole command exists
-    // because the runtime can no longer use. Reporting the tracked figure
-    // as "what was closed" would misstate the trade by the split ratio --
-    // 2 where 8 changed hands across a 4-for-1 (Codex, pairtrade#318). Both
-    // are useful, so both are reported, each labelled for what it is.
-    let settled_sell_quantity = raw_balance_to_quantity(settled_sell_amount_raw, sell_decimals)?;
-    let settled_buy_quantity = raw_balance_to_quantity(settled_buy_amount_raw, buy_decimals)?;
     eprintln!(
         "[arcus-reconcile-position] sequence={} recorded a manual close: sold {} {} for {} {} \
          (the runtime tracked {} {} in pre-event units) and returned to flat; corporate action \
@@ -9514,6 +9572,104 @@ runtime:
             assert_eq!(ledger.history.len(), 1, "{label}: no second close appended");
             assert_eq!(ledger.next_sequence, 2, "{label}: sequence did not advance");
         }
+    }
+
+    #[test]
+    fn reconcile_position_refuses_a_declaration_that_disagrees_with_the_close() {
+        // The resume adopts `post_event_inventory` unconditionally, so
+        // leaving the window pending with a figure that disagrees with the
+        // wallet would hand the runtime holdings it does not have (Codex
+        // P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (mut config, state) = config_inside_a_window(dir.path());
+        config.runtime.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from(9),
+            token_b: Decimal::from(9),
+        });
+        seed_reconcile_position_state(&config, &state);
+
+        let error = commit_reconcile_position(
+            &config,
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "closed at the venue",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("does not match the holdings observed"),
+            "{error}"
+        );
+
+        // Agreeing is accepted: token_a is the observed *buy* balance here
+        // (RotatedAToB holds token_b), token_b the observed sell balance.
+        config.runtime.corporate_actions[0].post_event_inventory = Some(ArcusSpotInventory {
+            token_a: Decimal::from_str_exact("3.5").unwrap(),
+            token_b: Decimal::from_str_exact("0.5").unwrap(),
+        });
+        commit_reconcile_position(
+            &config,
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "none",
+            "closed at the venue",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_resumed_close_must_match_the_recorded_account_identities() {
+        // A deployment between the two runs may have moved the taker or a
+        // trusted token address; a close recorded against the old ones is
+        // not this close (Codex P1, pairtrade#318).
+        let dir = tempdir().unwrap();
+        let (config, state) = config_inside_a_window(dir.path());
+        seed_reconcile_position_state(&config, &state);
+        let args = (
+            "8000000000000000000",
+            "1500000000000000000",
+            "500000000000000000",
+            "3500000000000000000",
+            "1000000000000000000",
+            "0xabc",
+            "closed at the venue during the split window",
+        );
+        commit_reconcile_position(
+            &config, args.0, args.1, args.2, args.3, args.4, args.5, args.6,
+        )
+        .unwrap();
+        ArcusSpotRuntimeCheckpointStore::new(config.runtime_state_path.clone())
+            .persist(&ArcusSpotRuntime::from_state(config.runtime.clone(), state.clone()).unwrap())
+            .unwrap();
+
+        // The config is not Clone; rebuild it the way the fixture does and
+        // move the taker.
+        let (mut moved_taker, _) = config_inside_a_window(dir.path());
+        moved_taker.executor.taker = "0x0000000000000000000000000000000000000042".to_string();
+        let error = commit_reconcile_position(
+            &moved_taker,
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            args.6,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("taker"), "{error}");
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert_eq!(ledger.history.len(), 1, "no second close appended");
     }
 
     #[test]

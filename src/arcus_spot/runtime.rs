@@ -3726,6 +3726,17 @@ impl ArcusSpotRuntime {
 
     /// Whether `progress` was written for `event`: by fingerprint when the
     /// record carries one, by id for records that predate it.
+    /// Public form of `progress_matches` for the admin commands: does this
+    /// declaration describe the window this progress record belongs to?
+    /// (bot-strategy#977's `reconcile-position` has to read the pending
+    /// resume's declared holdings.)
+    pub fn progress_names_event(
+        progress: &ArcusSpotCorporateActionProgress,
+        event: &ArcusSpotCorporateActionEvent,
+    ) -> bool {
+        Self::progress_matches(progress, event)
+    }
+
     fn progress_matches(
         progress: &ArcusSpotCorporateActionProgress,
         event: &ArcusSpotCorporateActionEvent,

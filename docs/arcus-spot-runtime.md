@@ -428,6 +428,13 @@ At `resume_not_before` the runtime resumes only when all three hold:
    declared) is what ends it on a later tick. So this is step 1 of
    "Completing the resume", not a replacement for it.
 
+   Because that resume adopts `post_event_inventory` **unconditionally**,
+   the command refuses when the declaration already carries one that
+   disagrees with the balances you pass: leaving the window pending with
+   the two out of step would hand the runtime holdings the wallet does not
+   have. Either declare the observed holdings first, or leave
+   `post_event_inventory` unset and fill it in afterwards.
+
    It refuses unless a corporate-action window is open -- it is not a
    general position editor -- and, like `reset-window`, unless the bot is
    idle: no pending durable event, no active ledger attempt, no on-disk
