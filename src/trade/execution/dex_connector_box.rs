@@ -677,6 +677,30 @@ impl DexConnector for DexConnectorBox {
         self.inner.get_positions().await
     }
 
+    /// Forwarded like every other method: a wrapper that answers for the
+    /// inner connector must answer with the inner connector's answer.
+    /// `get_funding_payments` is a required trait method (dex-connector
+    /// v4.7.26, bot-strategy#963), so forgetting this override is now a
+    /// compile error rather than the silent downgrade CLAUDE.md warns
+    /// about -- but the override still has to exist for the box to build.
+    async fn get_funding_payments(
+        &self,
+        since_secs: i64,
+    ) -> Result<Vec<dex_connector::FundingPayment>, DexError> {
+        // Same shape as the other fallible REST forwards above: a 429 /
+        // `RateLimited` on this read must feed the shared cooldown
+        // notification, not just surface to the caller.
+        let result = self.inner.get_funding_payments(since_secs).await;
+        if let Err(ref err) = result {
+            self.report_rate_limit(
+                "get_funding_payments",
+                &format!("since_secs={since_secs}"),
+                err,
+            );
+        }
+        result
+    }
+
     fn subscribe_price_updates(
         &self,
     ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
