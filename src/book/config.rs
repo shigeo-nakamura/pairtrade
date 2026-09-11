@@ -705,6 +705,7 @@ mod tests {
     /// (2026-09-11, ARB/OP; bot-strategy#941). `scripts/xsmom_universe_pool.py
     /// --check` refreshes the list against the live venues; this only pins
     /// the two names that were missed and the shape the fetcher relies on.
+    #[cfg(feature = "lighter-sdk")] // venue: lighter fails validate() in a build without it
     #[test]
     fn committed_xsmom_config_loads_and_covers_the_missed_names() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
