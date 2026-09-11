@@ -9,7 +9,7 @@
     "for": "5m",
     "condition": "C",
     "annotations": {
-      "summary": "Engine B archive monitor on {{ $labels.instance }} is down or its probe failed",
+      "summary": "Engine B archive monitor on debot-robinhood-lighter (Tokyo) is down or its probe failed",
       "description": "up{job=\"engine-b-phase0-archive\"} is 0, the series is absent, or engine_b_phase0_archive_probe_success is 0 for 5 minutes. HTTP 200 with probe_success=0 means the collector could not read storage or systemd; check engine-b-phase0-monitor.service and its journal."
     },
     "labels": {
@@ -128,7 +128,7 @@
     "for": "5m",
     "condition": "C",
     "annotations": {
-      "summary": "Engine B archive filesystem on {{ $labels.instance }} is low on space",
+      "summary": "Engine B archive filesystem on debot-robinhood-lighter (Tokyo) is low on space",
       "description": "engine_b_phase0_archive_disk_available_bytes is below 5 GiB or below 15 percent of the filesystem for 5 minutes. The hourly archiver's preflight refuses to run when free space is below 4x the partition size + 512 MiB, so a low disk stops the drain and the observer's own writes then fill the host. Initial operational thresholds, not a measured capacity guarantee."
     },
     "labels": {
@@ -247,7 +247,7 @@
     "for": "5m",
     "condition": "C",
     "annotations": {
-      "summary": "Engine B archive service failed or timer inactive on {{ $labels.instance }}",
+      "summary": "Engine B archive service failed or timer inactive on debot-robinhood-lighter (Tokyo)",
       "description": "engine_b_phase0_archive_service_failed is 1 (last systemd Result was not success, or the unit is in failed state) or engine_b_phase0_archive_timer_active is 0 for 5 minutes. Read journalctl -u engine-b-phase0-archive; a fail-closed preflight abort is expected to clear on the next hourly run once space or backlog conditions change."
     },
     "labels": {
@@ -366,7 +366,7 @@
     "for": "15m",
     "condition": "C",
     "annotations": {
-      "summary": "Engine B archive drain stalled on {{ $labels.instance }}",
+      "summary": "Engine B archive drain stalled on debot-robinhood-lighter (Tokyo)",
       "description": "engine_b_phase0_archive_eligible_partition_count is above 0 while the newest local seal whose source DB is gone is older than 10800 seconds, for 15 minutes. Successful no-op systemd runs do not count; only the verified-deletion path produces a qualifying seal. Assumes DELETE_VERIFIED_LOCAL=true and 24 h retention."
     },
     "labels": {

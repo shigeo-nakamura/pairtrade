@@ -9,7 +9,7 @@
     "for": "10m",
     "condition": "B",
     "annotations": {
-      "summary": "Engine B observer feed for venue {{ $labels.venue }} is stale on {{ $labels.instance }}",
+      "summary": "Engine B observer feed is stale on debot-robinhood-lighter (Tokyo)",
       "description": "engine_b_phase0_last_message_age_seconds stayed above 600 for 10 minutes, or the observer's /metrics endpoint stopped answering (no data alerts). This is the 2026-09-05 failure mode: mainnet silent for ~14.5 h while the process stayed active. Check engine-b-phase0.service, then the venue's WebSocket status."
     },
     "labels": {
@@ -90,7 +90,7 @@
     "for": "30m",
     "condition": "B",
     "annotations": {
-      "summary": "Engine B observer has unsynced order books on {{ $labels.instance }}",
+      "summary": "Engine B observer has unsynced order books on debot-robinhood-lighter (Tokyo)",
       "description": "count(engine_b_phase0_book_synced == 0) stayed above 0 for 30 minutes. A reconnect burst leaving most markets without a fresh snapshot (bot-strategy#908 item 2) looks exactly like this; a venue-side halt of one market does too, so identify which market_id before restarting anything. Active/connected alone is not healthy."
     },
     "labels": {

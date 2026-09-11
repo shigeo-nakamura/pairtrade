@@ -716,7 +716,17 @@ into the `bot-alerts` folder on every master push and prunes when a UID leaves
 the repo. They are Grafana-managed rules, not Prometheus ruler rules: there is
 no ruler to import into on this Grafana Cloud stack, so `absent(up{...})` is
 expressed as `noDataState: Alerting` on the rules that must fire when their
-series disappear. Notification routing is the folder's existing policy.
+series disappear. Classic conditions collapse every series into one unlabelled
+alert instance, so the annotations name the host in fixed text rather than via
+`{{ $labels.* }}`. Routing is by label matcher, not by folder: the rules carry
+`source=grafana` / `severity=warning` like the earlier pairtrade rules but
+`service=engine-b-phase0`, so confirm the existing notification policy matches
+them (or falls through to the default contact point) as part of acceptance.
+
+Deploy order matters for the two `noDataState: Alerting` rules
+(monitor-unavailable, feed-stale): merging this file provisions them
+immediately, so add the Alloy scrapes on the host first and let one scrape
+land, otherwise both fire after their `for` window until the series exist.
 
 The archive rules cover missing scrape/probe failure, less than 5 GiB or 15%
 available disk, archive failure/inactive timer, and eligible backlog without a
