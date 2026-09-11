@@ -1,0 +1,478 @@
+[
+  {
+    "uid": "engine-b-archive-monitor-unavailable",
+    "title": "Engine B archive monitoring unavailable or incomplete",
+    "ruleGroup": "engine-b-phase0",
+    "folderUID": "bot-alerts",
+    "noDataState": "Alerting",
+    "execErrState": "Error",
+    "for": "5m",
+    "condition": "C",
+    "annotations": {
+      "summary": "Engine B archive monitor on {{ $labels.instance }} is down or its probe failed",
+      "description": "up{job=\"engine-b-phase0-archive\"} is 0, the series is absent, or engine_b_phase0_archive_probe_success is 0 for 5 minutes. HTTP 200 with probe_success=0 means the collector could not read storage or systemd; check engine-b-phase0-monitor.service and its journal."
+    },
+    "labels": {
+      "service": "engine-b-phase0",
+      "severity": "warning",
+      "source": "grafana"
+    },
+    "data": [
+      {
+        "refId": "A",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "up{job=\"engine-b-phase0-archive\"}",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "A"
+        }
+      },
+      {
+        "refId": "B",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "engine_b_phase0_archive_probe_success",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "B"
+        }
+      },
+      {
+        "refId": "C",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 0,
+          "to": 0
+        },
+        "datasourceUid": "-100",
+        "model": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [
+                  1
+                ],
+                "type": "lt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": [
+                  "A"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            },
+            {
+              "evaluator": {
+                "params": [
+                  1
+                ],
+                "type": "lt"
+              },
+              "operator": {
+                "type": "or"
+              },
+              "query": {
+                "params": [
+                  "B"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            }
+          ],
+          "datasource": {
+            "type": "__expr__",
+            "uid": "-100"
+          },
+          "hide": false,
+          "intervalMs": 1000,
+          "maxDataPoints": 43200,
+          "refId": "C",
+          "type": "classic_conditions"
+        }
+      }
+    ]
+  },
+  {
+    "uid": "engine-b-archive-disk-low",
+    "title": "Engine B archive filesystem below 5 GiB or 15 percent free",
+    "ruleGroup": "engine-b-phase0",
+    "folderUID": "bot-alerts",
+    "noDataState": "OK",
+    "execErrState": "Error",
+    "for": "5m",
+    "condition": "C",
+    "annotations": {
+      "summary": "Engine B archive filesystem on {{ $labels.instance }} is low on space",
+      "description": "engine_b_phase0_archive_disk_available_bytes is below 5 GiB or below 15 percent of the filesystem for 5 minutes. The hourly archiver's preflight refuses to run when free space is below 4x the partition size + 512 MiB, so a low disk stops the drain and the observer's own writes then fill the host. Initial operational thresholds, not a measured capacity guarantee."
+    },
+    "labels": {
+      "service": "engine-b-phase0",
+      "severity": "warning",
+      "source": "grafana"
+    },
+    "data": [
+      {
+        "refId": "A",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "engine_b_phase0_archive_disk_available_bytes",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "A"
+        }
+      },
+      {
+        "refId": "B",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "engine_b_phase0_archive_disk_available_bytes / engine_b_phase0_archive_disk_size_bytes",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "B"
+        }
+      },
+      {
+        "refId": "C",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 0,
+          "to": 0
+        },
+        "datasourceUid": "-100",
+        "model": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [
+                  5368709120
+                ],
+                "type": "lt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": [
+                  "A"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            },
+            {
+              "evaluator": {
+                "params": [
+                  0.15
+                ],
+                "type": "lt"
+              },
+              "operator": {
+                "type": "or"
+              },
+              "query": {
+                "params": [
+                  "B"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            }
+          ],
+          "datasource": {
+            "type": "__expr__",
+            "uid": "-100"
+          },
+          "hide": false,
+          "intervalMs": 1000,
+          "maxDataPoints": 43200,
+          "refId": "C",
+          "type": "classic_conditions"
+        }
+      }
+    ]
+  },
+  {
+    "uid": "engine-b-archive-failed",
+    "title": "Engine B archive failed or its hourly timer is inactive",
+    "ruleGroup": "engine-b-phase0",
+    "folderUID": "bot-alerts",
+    "noDataState": "OK",
+    "execErrState": "Error",
+    "for": "5m",
+    "condition": "C",
+    "annotations": {
+      "summary": "Engine B archive service failed or timer inactive on {{ $labels.instance }}",
+      "description": "engine_b_phase0_archive_service_failed is 1 (last systemd Result was not success, or the unit is in failed state) or engine_b_phase0_archive_timer_active is 0 for 5 minutes. Read journalctl -u engine-b-phase0-archive; a fail-closed preflight abort is expected to clear on the next hourly run once space or backlog conditions change."
+    },
+    "labels": {
+      "service": "engine-b-phase0",
+      "severity": "warning",
+      "source": "grafana"
+    },
+    "data": [
+      {
+        "refId": "A",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "engine_b_phase0_archive_service_failed",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "A"
+        }
+      },
+      {
+        "refId": "B",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "engine_b_phase0_archive_timer_active",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "B"
+        }
+      },
+      {
+        "refId": "C",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 0,
+          "to": 0
+        },
+        "datasourceUid": "-100",
+        "model": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [
+                  0
+                ],
+                "type": "gt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": [
+                  "A"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            },
+            {
+              "evaluator": {
+                "params": [
+                  1
+                ],
+                "type": "lt"
+              },
+              "operator": {
+                "type": "or"
+              },
+              "query": {
+                "params": [
+                  "B"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            }
+          ],
+          "datasource": {
+            "type": "__expr__",
+            "uid": "-100"
+          },
+          "hide": false,
+          "intervalMs": 1000,
+          "maxDataPoints": 43200,
+          "refId": "C",
+          "type": "classic_conditions"
+        }
+      }
+    ]
+  },
+  {
+    "uid": "engine-b-archive-stalled",
+    "title": "Engine B has eligible partitions but no verified removal in three hours",
+    "ruleGroup": "engine-b-phase0",
+    "folderUID": "bot-alerts",
+    "noDataState": "OK",
+    "execErrState": "Error",
+    "for": "15m",
+    "condition": "C",
+    "annotations": {
+      "summary": "Engine B archive drain stalled on {{ $labels.instance }}",
+      "description": "engine_b_phase0_archive_eligible_partition_count is above 0 while the newest local seal whose source DB is gone is older than 10800 seconds, for 15 minutes. Successful no-op systemd runs do not count; only the verified-deletion path produces a qualifying seal. Assumes DELETE_VERIFIED_LOCAL=true and 24 h retention."
+    },
+    "labels": {
+      "service": "engine-b-phase0",
+      "severity": "warning",
+      "source": "grafana"
+    },
+    "data": [
+      {
+        "refId": "A",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "engine_b_phase0_archive_eligible_partition_count",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "A"
+        }
+      },
+      {
+        "refId": "B",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 600,
+          "to": 0
+        },
+        "datasourceUid": "__PROMETHEUS_UID__",
+        "model": {
+          "expr": "time() - engine_b_phase0_archive_last_verified_removal_timestamp_seconds",
+          "hide": false,
+          "instant": true,
+          "intervalMs": 60000,
+          "maxDataPoints": 43200,
+          "refId": "B"
+        }
+      },
+      {
+        "refId": "C",
+        "queryType": "",
+        "relativeTimeRange": {
+          "from": 0,
+          "to": 0
+        },
+        "datasourceUid": "-100",
+        "model": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [
+                  0
+                ],
+                "type": "gt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": [
+                  "A"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            },
+            {
+              "evaluator": {
+                "params": [
+                  10800
+                ],
+                "type": "gt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": [
+                  "B"
+                ]
+              },
+              "reducer": {
+                "params": [],
+                "type": "last"
+              },
+              "type": "query"
+            }
+          ],
+          "datasource": {
+            "type": "__expr__",
+            "uid": "-100"
+          },
+          "hide": false,
+          "intervalMs": 1000,
+          "maxDataPoints": 43200,
+          "refId": "C",
+          "type": "classic_conditions"
+        }
+      }
+    ]
+  }
+]

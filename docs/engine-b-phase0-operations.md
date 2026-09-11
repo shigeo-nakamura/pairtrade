@@ -682,26 +682,51 @@ assumes the approved 24-hour retention). These metrics and the stalled alert
 assume `DELETE_VERIFIED_LOCAL=true`; archive-only operation needs a separate
 completion marker and must not use the verified-removal metric as success.
 
-Add an Alloy scrape using the deployment's existing remote-write receiver:
+Add Alloy scrapes on the Tokyo host (`/etc/alloy/config.alloy`, hand-managed;
+the remote-write component there is `prometheus.remote_write "grafana_cloud"`).
+The observer's own `/metrics` (`127.0.0.1:9472`) is scraped alongside the
+monitor so the feed-health rules below have data:
 
 ```alloy
-prometheus.scrape "engine_b_phase0_archive" {
-  targets = [{ "__address__" = "127.0.0.1:9473" }]
-  job_name = "engine-b-phase0-archive"
+prometheus.scrape "engine_b_phase0" {
+  targets = [
+    {__address__ = "127.0.0.1:9472", instance = "debot-robinhood-lighter", host = "robinhood-lighter"},
+  ]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
   scrape_interval = "60s"
-  scrape_timeout = "30s"
-  forward_to = [prometheus.remote_write.EXISTING.receiver]
+  scrape_timeout  = "30s"
+  job_name        = "engine-b-phase0"
+}
+
+prometheus.scrape "engine_b_phase0_archive" {
+  targets = [
+    {__address__ = "127.0.0.1:9473", instance = "debot-robinhood-lighter", host = "robinhood-lighter"},
+  ]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "60s"
+  scrape_timeout  = "30s"
+  job_name        = "engine-b-phase0-archive"
 }
 ```
 
-Replace `EXISTING` with the actual configured component name. Import
-`grafana/alerts/engine-b-archive.rules.yml` into the connected Prometheus ruler
-and route warning alerts to the operator's existing contact point. The rules
-cover missing scrape/probe failure, less than 5 GiB or 15% available disk,
-archive failure/inactive timer, and eligible backlog without a verified removal
-for three hours. Warning thresholds are initial operational defaults, not a
-measured capacity guarantee. Confirm the job label in remote storage before
-loading the rules; the absent-series alert assumes this job should exist.
+Alert rules live in `grafana/alerts/engine-b-archive-rules.json` (the archive
+monitor) and `grafana/alerts/engine-b-observer-rules.json` (observer feed
+health), in the Grafana provisioning format that `deploy-grafana.yml` upserts
+into the `bot-alerts` folder on every master push and prunes when a UID leaves
+the repo. They are Grafana-managed rules, not Prometheus ruler rules: there is
+no ruler to import into on this Grafana Cloud stack, so `absent(up{...})` is
+expressed as `noDataState: Alerting` on the rules that must fire when their
+series disappear. Notification routing is the folder's existing policy.
+
+The archive rules cover missing scrape/probe failure, less than 5 GiB or 15%
+available disk, archive failure/inactive timer, and eligible backlog without a
+verified removal for three hours. The observer rules cover a venue silent for
+10 minutes (`last_message_age_seconds > 600`, the 2026-09-05 failure mode) and
+any order book unsynced for 30 minutes. Warning thresholds are initial
+operational defaults, not a measured capacity guarantee. Comparison filters
+are written as separate queries joined by classic conditions rather than as
+one `a == 0 or b == 0` expression: a PromQL comparison keeps the sample value,
+so `up == 0` would evaluate to 0 and never trip a `> 0` threshold.
 
 `last_verified_removal_timestamp_seconds` is the latest local seal timestamp
 whose source DB no longer exists. The archiver writes a seal before it verifies
@@ -721,11 +746,19 @@ canonical archived DB lengths, grouped by partition hour, and retained complete
 hours; deduplicate by partition and report coverage before extrapolating.
 
 Deployment acceptance remains operational work: confirm a normal hourly cycle,
-exercise each rule using a test series/ruler test without stopping collection or
-filling the disk, verify delivery to the contact point, and record the result in
-#915. Do not mark persistent monitoring complete merely because this endpoint
-or the rule file exists. Weekday recovered-feed write-rate measurement is also
-still required before closing #915.
+exercise each rule without stopping collection or filling the disk (Grafana's
+rule "Preview" against the live series, or a temporary threshold), verify
+delivery to the contact point, and record the result in #915. Do not mark
+persistent monitoring complete merely because this endpoint or the rule file
+exists.
+
+Weekday write rate (measured 2026-09-11 from the 24 complete retained
+partitions `20260910_07`..`20260911_06`, single venue, 14 markets, KRX and US
+sessions both open): **4.92 GB/day**, mean 205 MB/h, peak 352 MB/h in the US
+cash-open hour (13:00 UTC), trough 109 MB/h at 21:00 UTC. With 24 h retention
+the hot window itself is ~5 GB against a 21.4 GB filesystem, and the largest
+partition needs ~1.9 GB free for the archiver's preflight.
+
 ## Reproducible boundary preflight (#872)
 
 `scripts/engine_b_boundary_quality.py` audits **closed offline SQLite copies**
