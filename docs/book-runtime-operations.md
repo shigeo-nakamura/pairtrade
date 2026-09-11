@@ -216,8 +216,9 @@ persisted and the next start resumes from it.
   shadow watcher's `cron.log` mark line — differences come from the paper
   fill model (`paper_slippage_bps: 5` vs the shadow's opposite-touch fill)
   and the funding *estimate* vs the shadow's realized `/fundings`.
-- Metrics: `book_decision_total{outcome}`, `book_order_total{result}`,
-  `book_signal_age_seconds`, `book_session_halted`, `book_config_info{fp}`.
+- Counts: `ledger.jsonl` `decision` rows (`outcome`) and `order` rows
+  (`result`); `status.json` `book.signal_status` / `book.session_halted` /
+  `book.config_fp` for the live view.
 
 ## Risk rails
 
@@ -254,7 +255,7 @@ Not a checklist to execute now; recorded so the path is explicit:
    does not carry over: delete `state.json` positions or let the venue
    reconcile adopt whatever is there — it starts flat on a new account).
 5. First live decision: watch `[FILL]` lines for `venue_fills` fill-price
-   source and `book_order_total{result="filled"}`; residuals show as
-   `partial` with `residual_qty` in the ledger.
+   source and the `order` rows with `result: "filled"` in `ledger.jsonl`;
+   residuals show as `partial` with `residual_qty` in the ledger.
 6. Live is Lighter-only until dex-connector has a perp IOC path for
    Hyperliquid (`docs/book-runtime.md` §10).
