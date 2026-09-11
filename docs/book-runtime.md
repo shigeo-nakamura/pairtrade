@@ -397,7 +397,7 @@ reduce_only }`.
 - `status.json`: the flat `debot-dashboard` schema (`id`, `dry_run`,
   `has_position`, `positions`, `pnl_total`, `pnl_today`,
   `kill_switch_active`, `trade_stats`) plus a nested `book` block
-  (`next_decision_at`, `last_decision`, `signal_status`, `gross_usd`,
+  (`next_decision_at`, `last_decision`, `signal_status`, `signal_age_secs`, `gross_usd`,
   `net_usd`, `session_halted`, `pending_residual`). `pnl_total` is
   measured against `equity_reference_usd` in DRY_RUN and against the
   session's own start equity live, since the paper base says nothing

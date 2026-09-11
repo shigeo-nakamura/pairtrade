@@ -69,6 +69,10 @@ pub struct BookBlock {
     pub next_decision_at: Option<String>,
     pub last_decision: Option<super::state::DecisionRecord>,
     pub signal_status: String,
+    /// Seconds since the last *accepted* signal was generated (restored from
+    /// `state.json` across restarts, untouched by later rejects/skips).
+    /// `None` until a signal has been accepted.
+    pub signal_age_secs: Option<i64>,
     pub pending_residual: bool,
     pub positions_source: &'static str,
     pub equity_ready: bool,

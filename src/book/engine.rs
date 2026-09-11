@@ -2166,11 +2166,11 @@ impl BookEngine {
     }
 
     fn write_status(&mut self, now: i64, prices: &HashMap<String, f64>, equity: f64) {
-        let next = self.scheduler.next_after(now);
         if now - self.last_status_write < self.status_interval_secs {
             return;
         }
         self.last_status_write = now;
+        let next = self.scheduler.next_after(now);
         let today_start = self.state.daily.start_equity;
         let trades = self.state.trades_closed;
         let doc = StatusDoc {
@@ -2242,6 +2242,7 @@ impl BookEngine {
                 next_decision_at: next.as_ref().map(|d| status::rfc3339(d.decision_at)),
                 last_decision: self.state.last_decision.clone(),
                 signal_status: self.signal_status.clone(),
+                signal_age_secs: self.last_signal_generated_at.map(|g| now - g),
                 pending_residual: matches!(
                     self.state.last_decision.as_ref().map(|r| r.outcome),
                     Some(DecisionOutcome::Partial)
@@ -2396,6 +2397,11 @@ mod tests {
         assert_eq!(rec.outcome, DecisionOutcome::Applied);
         assert!(engine.signal_status.starts_with("applied:"));
         assert!(engine.last_signal_generated_at.is_some());
+        // The age is what the dashboard sees: the signal was generated 600s
+        // before this tick (write_signal's convention).
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg.paths.status).unwrap()).unwrap();
+        assert_eq!(status["book"]["signal_age_secs"], 600);
         drop(engine);
 
         // "Restart": a brand new engine over the same persisted state,
