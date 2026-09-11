@@ -33,7 +33,7 @@ Use UTC in every check and preserve venue exports under `~/bot/logs/`.
    endpoint, and flat account state are independently verified. Keep the kill
    switch engaged through startup checks.
 7. Verify `[CONFIG]` fingerprints for every arm, `dry_run`, equity reference,
-   leverage, WebSocket subscriptions, status S3, Prometheus, risk gates, and
+   leverage, WebSocket subscriptions, status S3, risk gates, and
    `No open positions detected`. Release the kill switch only by explicit
    operator decision.
 

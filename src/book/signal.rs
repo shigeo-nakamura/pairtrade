@@ -61,7 +61,7 @@ pub struct ValidSignal {
 }
 
 /// Why a signal file was rejected. Serialized (snake_case) into the
-/// `decision` ledger row and the `book_decision_total{outcome}` label.
+/// `decision` ledger row.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "reason", content = "detail")]
 pub enum SignalReject {

@@ -21,7 +21,7 @@
 //! - [`executor`]: `Executor` trait with a paper implementation and a
 //!   `DexConnector`-backed live implementation.
 //! - [`state`], [`ledger`], [`status`]: `state.json`, `ledger.jsonl` /
-//!   `pnl.jsonl`, `status.json` (+ S3 mirror) and Prometheus gauges.
+//!   `pnl.jsonl`, `status.json` (+ S3 mirror).
 //! - [`engine`]: the tick orchestration used by `src/bin/book_runtime.rs`
 //!   and by [`replay`].
 //!

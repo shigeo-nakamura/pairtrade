@@ -197,8 +197,7 @@ sudo journalctl -u book-runtime-xsmom-695 -n 50 --no-pager
 
 Expected startup lines: `[CONFIG] instance=xsmom-695 … fp=<12hex>` (must
 match `book_runtime --validate` on the deployed YAML), `[STARTUP]
-instance=xsmom-695 mode=DRY_RUN positions=… last_decision=…`, `[PROM]
-exporter listening on http://127.0.0.1:9474/metrics`.
+instance=xsmom-695 mode=DRY_RUN positions=… last_decision=…`.
 
 Stopping does not close the paper book (or a live one); the state is
 persisted and the next start resumes from it.
@@ -217,8 +216,10 @@ persisted and the next start resumes from it.
   shadow watcher's `cron.log` mark line — differences come from the paper
   fill model (`paper_slippage_bps: 5` vs the shadow's opposite-touch fill)
   and the funding *estimate* vs the shadow's realized `/fundings`.
-- Metrics: `book_decision_total{outcome}`, `book_order_total{result}`,
-  `book_signal_age_seconds`, `book_session_halted`, `book_config_info{fp}`.
+- Counts: `ledger.jsonl` `decision` rows (`outcome`), `fill` rows
+  (`result`) and `order_blocked` / `order_error` rows; `status.json`
+  `book.signal_status` / `book.session_halted` / `book.config_fp` for the
+  live view.
 
 ## Risk rails
 
@@ -255,7 +256,7 @@ Not a checklist to execute now; recorded so the path is explicit:
    does not carry over: delete `state.json` positions or let the venue
    reconcile adopt whatever is there — it starts flat on a new account).
 5. First live decision: watch `[FILL]` lines for `venue_fills` fill-price
-   source and `book_order_total{result="filled"}`; residuals show as
-   `partial` with `residual_qty` in the ledger.
+   source and the `fill` rows with `result: "filled"` in `ledger.jsonl`;
+   residuals show as `partial` with `residual_qty` in the ledger.
 6. Live is Lighter-only until dex-connector has a perp IOC path for
    Hyperliquid (`docs/book-runtime.md` §10).

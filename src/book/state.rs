@@ -57,7 +57,7 @@ pub struct DecisionRecord {
     /// this decision actually accepted a signal (Applied/Partial). `at`
     /// above is when this record was last written -- the apply time, a
     /// retry, or a halt -- and can be much later than the signal's true
-    /// generation time, so `book_signal_age_seconds` must restore from
+    /// generation time, so the restored signal age must come from
     /// this field rather than from `at`.
     #[serde(default)]
     pub signal_generated_at: Option<i64>,
@@ -133,7 +133,7 @@ pub struct BookState {
     /// `generated_at`, independent of `last_decision`: a later decision
     /// key that is Rejected or Skipped overwrites `last_decision` entirely
     /// (with no accepted signal of its own), but the book is still running
-    /// on the last one it did accept, so `book_signal_age_seconds` must
+    /// on the last one it did accept, so the tracked signal age must
     /// keep tracking that signal's age -- not reset to unknown -- across
     /// both a live reject/skip and a restart afterward.
     #[serde(default)]

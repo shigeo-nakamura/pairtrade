@@ -69,7 +69,6 @@
 //! KNOWN GAPS before any live use (bot-strategy#895 rollout gates):
 //! - `BULL_HOLDER_DRY_RUN=false` is refused at startup (code change to lift).
 //! - Lighter trigger orders have not been exercised live by pairtrade.
-//! - Prometheus export is not wired (status JSON only); follow-up.
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{FixedOffset, TimeZone, Timelike, Utc};

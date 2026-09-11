@@ -208,10 +208,10 @@ states plainly which parts are **not** done online.
    attempts creates no `ws_connection` row and, because of the
    one-open-gap-per-(venue, market, channel) partial unique index, only
    one coalesced `connection` gap -- the attempt count survives solely in
-   the in-memory `engine_b_phase0_reconnect_total` gauge (scraped by
-   Alloy), not in SQLite; `engine_b_phase0_sequence_gap_total` and
-   `engine_b_phase0_reconnect_total` give the live counts in Prometheus
-   meanwhile.
+   the in-memory `engine_b_phase0_reconnect_total` gauge on the local
+   `127.0.0.1:9472/metrics` endpoint, not in SQLite;
+   `engine_b_phase0_sequence_gap_total` and `engine_b_phase0_reconnect_total`
+   give the live counts there meanwhile.
 3. **Clock offset is not measured by the collector.** `max_clock_offset_us`
    is never populated and there is no NTP check in the process; §7's
    "offset > 250 ms → warning, > 1 s → halt" rule is a host-level
@@ -654,78 +654,6 @@ Before restart, inspect the last journal error, disk usage, the active SQLite
 WAL, and S3 archive continuity. A DB write failure or disk-full condition must
 remain fail-closed; do not bypass the archive verification to reclaim space.
 
-## Archive capacity monitoring (#915)
-
-`scripts/engine_b_archive_monitor.py` provides independent, read-only metrics on
-`127.0.0.1:9473/metrics`. It reads filesystem capacity, retained partition sizes,
-local seals, and the archive service/timer's systemd properties. It does not open
-SQLite databases, call an exchange, archive files, or change service state.
-`--once` prints the same observations plus errors as JSON and exits nonzero when
-any probe fails. Collection errors also emit `probe_success=0` over HTTP 200 so
-Prometheus can record partial observations; HTTP success alone is not health.
-
-The supplied unit uses the existing `engine-b-phase0` account. Install from a
-reviewed checkout (this monitor is separate from the observer runtime installer):
-
-```bash
-sudo install -o root -g engine-b-phase0 -m 0550 scripts/engine_b_archive_monitor.py /opt/engine-b-phase0/engine_b_archive_monitor.py
-sudo install -o root -g root -m 0644 deploy/engine-b-phase0-monitor.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now engine-b-phase0-monitor.service
-sudo -u engine-b-phase0 /usr/bin/python3 /opt/engine-b-phase0/engine_b_archive_monitor.py --once
-curl -fsS http://127.0.0.1:9473/metrics
-```
-
-Only the new monitoring service is started. Match its `--retention-hours` to the
-archive service's effective `ENGINE_B_PHASE0_RETENTION_HOURS` (the supplied unit
-assumes the approved 24-hour retention). These metrics and the stalled alert
-assume `DELETE_VERIFIED_LOCAL=true`; archive-only operation needs a separate
-completion marker and must not use the verified-removal metric as success.
-
-Add an Alloy scrape using the deployment's existing remote-write receiver:
-
-```alloy
-prometheus.scrape "engine_b_phase0_archive" {
-  targets = [{ "__address__" = "127.0.0.1:9473" }]
-  job_name = "engine-b-phase0-archive"
-  scrape_interval = "60s"
-  scrape_timeout = "30s"
-  forward_to = [prometheus.remote_write.EXISTING.receiver]
-}
-```
-
-Replace `EXISTING` with the actual configured component name. Import
-`grafana/alerts/engine-b-archive.rules.yml` into the connected Prometheus ruler
-and route warning alerts to the operator's existing contact point. The rules
-cover missing scrape/probe failure, less than 5 GiB or 15% available disk,
-archive failure/inactive timer, and eligible backlog without a verified removal
-for three hours. Warning thresholds are initial operational defaults, not a
-measured capacity guarantee. Confirm the job label in remote storage before
-loading the rules; the absent-series alert assumes this job should exist.
-
-`last_verified_removal_timestamp_seconds` is the latest local seal timestamp
-whose source DB no longer exists. The archiver writes a seal before it verifies
-remote sidecars, so a seal **with a retained source DB never counts as success**.
-No qualifying seal yields zero, even if systemd reports a successful no-op run.
-This is evidence of the normal verified-deletion path, not a fresh independent
-S3 integrity check, and assumes operators do not remove source DBs manually.
-The seal timestamp precedes completion by the sidecar-upload duration. Use the
-independent S3 restore procedure above for archive integrity verification.
-
-`retained_partition_bytes` and `eligible_partition_bytes` count DB file sizes,
-excluding WAL/SHM, seal indexes, and scratch files. Available disk includes all
-filesystem usage. Eligibility uses the partition **end** plus retention, never
-mtime. A retained-byte delta is not a write-rate estimate because archival
-removes files concurrently. Measure full weekday production separately from
-canonical archived DB lengths, grouped by partition hour, and retained complete
-hours; deduplicate by partition and report coverage before extrapolating.
-
-Deployment acceptance remains operational work: confirm a normal hourly cycle,
-exercise each rule using a test series/ruler test without stopping collection or
-filling the disk, verify delivery to the contact point, and record the result in
-#915. Do not mark persistent monitoring complete merely because this endpoint
-or the rule file exists. Weekday recovered-feed write-rate measurement is also
-still required before closing #915.
 ## Reproducible boundary preflight (#872)
 
 `scripts/engine_b_boundary_quality.py` audits **closed offline SQLite copies**

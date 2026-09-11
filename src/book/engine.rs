@@ -199,9 +199,6 @@ impl BookEngine {
         let pnl = Ledger::new(cfg.paths.pnl.clone(), &cfg.instance_id);
         let risk = RiskRails::new(cfg.risk.clone());
         let config_fp = cfg.fingerprint();
-        status::CONFIG_INFO
-            .with_label_values(&[&cfg.instance_id, &config_fp])
-            .set(1);
         // Reconstruct the process-local telemetry mirror from the
         // persisted decision record so a restart doesn't report
         // `signal_status: "none"` (and a bogus signal age) for up to a
@@ -408,9 +405,6 @@ impl BookEngine {
                     log::error!("[RISK] SESSION HALT {ev:?}; flattening");
                     self.ledger
                         .write(now, "halt", None, json!({ "risk": ev, "equity": equity }));
-                    status::DECISION_TOTAL
-                        .with_label_values(&[&self.cfg.instance_id, "halted"])
-                        .inc();
                     if let Some(r) = self.state.last_decision.as_mut() {
                         r.outcome = DecisionOutcome::Halted;
                         r.at = now;
@@ -974,9 +968,6 @@ impl BookEngine {
                     "reason": "residual_already_satisfied",
                 }),
             );
-            status::DECISION_TOTAL
-                .with_label_values(&[&self.cfg.instance_id, "applied"])
-                .inc();
             return;
         }
         let attempts = rec.attempts + 1;
@@ -1041,9 +1032,6 @@ impl BookEngine {
                 "residual_qty": summary.residual,
             }),
         );
-        status::DECISION_TOTAL
-            .with_label_values(&[&self.cfg.instance_id, label])
-            .inc();
     }
 
     fn finish_skipped(&mut self, now: i64, d: &Decision, reason: &str) {
@@ -1072,9 +1060,6 @@ impl BookEngine {
             Some(&d.key),
             json!({ "outcome": "skipped", "reason": reason, "decision_at": d.decision_at }),
         );
-        status::DECISION_TOTAL
-            .with_label_values(&[&self.cfg.instance_id, "skipped"])
-            .inc();
     }
 
     fn record_reject(
@@ -1117,9 +1102,6 @@ impl BookEngine {
                 Some(&d.key),
                 json!({ "outcome": "rejected", "reason": label, "detail": detail }),
             );
-            status::DECISION_TOTAL
-                .with_label_values(&[&self.cfg.instance_id, "rejected"])
-                .inc();
         }
     }
 
@@ -1315,15 +1297,6 @@ impl BookEngine {
                 "skipped": plan.skipped,
             }),
         );
-        status::DECISION_TOTAL
-            .with_label_values(&[
-                &self.cfg.instance_id,
-                match outcome {
-                    DecisionOutcome::Applied => "applied",
-                    _ => "partial",
-                },
-            ])
-            .inc();
         if outcome == DecisionOutcome::Partial {
             log::warn!(
                 "[REBALANCE] key={} residual after attempt {}: {:?}",
@@ -1476,9 +1449,6 @@ impl BookEngine {
                     Some(key),
                     json!({ "intent": intent, "reason": reason }),
                 );
-                status::ORDER_TOTAL
-                    .with_label_values(&[&self.cfg.instance_id, "blocked"])
-                    .inc();
                 s.blocked += 1;
                 continue;
             }
@@ -1505,9 +1475,6 @@ impl BookEngine {
                     Some(key),
                     json!({ "intent": intent, "reason": "ledger_append_failed" }),
                 );
-                status::ORDER_TOTAL
-                    .with_label_values(&[&self.cfg.instance_id, "blocked"])
-                    .inc();
                 s.blocked += 1;
                 continue;
             }
@@ -1576,9 +1543,6 @@ impl BookEngine {
                         Some(key),
                         json!({ "intent": intent, "error": e.to_string(), "pre_send": pre_send }),
                     );
-                    status::ORDER_TOTAL
-                        .with_label_values(&[&self.cfg.instance_id, "error"])
-                        .inc();
                     s.errors += 1;
                 }
             }
@@ -1815,9 +1779,6 @@ impl BookEngine {
                 }),
             );
         }
-        status::ORDER_TOTAL
-            .with_label_values(&[&self.cfg.instance_id, result])
-            .inc();
         result
     }
 
@@ -1869,9 +1830,6 @@ impl BookEngine {
                 "flat": self.state.is_flat(),
             }),
         );
-        status::DECISION_TOTAL
-            .with_label_values(&[&self.cfg.instance_id, "flatten"])
-            .inc();
     }
 
     async fn process_flatten(&mut self, now: i64, prices: &HashMap<String, f64>) {
@@ -1984,9 +1942,6 @@ impl BookEngine {
                             None,
                             json!({ "risk": ev, "equity": equity }),
                         );
-                        status::DECISION_TOTAL
-                            .with_label_values(&[&self.cfg.instance_id, "halted"])
-                            .inc();
                         if let Some(r) = self.state.last_decision.as_mut() {
                             r.outcome = DecisionOutcome::Halted;
                             r.at = now;
@@ -2211,21 +2166,11 @@ impl BookEngine {
     }
 
     fn write_status(&mut self, now: i64, prices: &HashMap<String, f64>, equity: f64) {
-        let next = self.scheduler.next_after(now);
-        let signal_age = self.last_signal_generated_at.map(|g| now - g);
-        status::record_gauges(
-            &self.cfg.instance_id,
-            &self.state,
-            prices,
-            equity,
-            self.risk.kill_switch_engaged(),
-            signal_age,
-            next.as_ref().map(|d| d.decision_at),
-        );
         if now - self.last_status_write < self.status_interval_secs {
             return;
         }
         self.last_status_write = now;
+        let next = self.scheduler.next_after(now);
         let today_start = self.state.daily.start_equity;
         let trades = self.state.trades_closed;
         let doc = StatusDoc {
@@ -2297,6 +2242,7 @@ impl BookEngine {
                 next_decision_at: next.as_ref().map(|d| status::rfc3339(d.decision_at)),
                 last_decision: self.state.last_decision.clone(),
                 signal_status: self.signal_status.clone(),
+                signal_age_secs: self.last_signal_generated_at.map(|g| now - g),
                 pending_residual: matches!(
                     self.state.last_decision.as_ref().map(|r| r.outcome),
                     Some(DecisionOutcome::Partial)
@@ -2451,6 +2397,11 @@ mod tests {
         assert_eq!(rec.outcome, DecisionOutcome::Applied);
         assert!(engine.signal_status.starts_with("applied:"));
         assert!(engine.last_signal_generated_at.is_some());
+        // The age is what the dashboard sees: the signal was generated 600s
+        // before this tick (write_signal's convention).
+        let status: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg.paths.status).unwrap()).unwrap();
+        assert_eq!(status["book"]["signal_age_secs"], 600);
         drop(engine);
 
         // "Restart": a brand new engine over the same persisted state,

@@ -7,8 +7,6 @@
 //!
 //! - [`logger`]: the `TIMEZONE_OFFSET` / `RUST_LOG` aware `env_logger`
 //!   setup wrapped in the [`crate::error_counter`] counting layer.
-//! - [`prom`]: process-wide Prometheus registry, the opt-in `PROM_LISTEN`
-//!   `/metrics` exporter, and the process-start / version gauges.
 //! - [`s3_mirror`]: fire-and-forget S3 mirror for `status.json`-style
 //!   files consumed by `debot-dashboard`.
 //!
@@ -18,7 +16,6 @@
 //! here as [`fs`] so new code has one obvious import path.
 
 pub mod logger;
-pub mod prom;
 pub mod s3_mirror;
 
 pub use crate::directional as fs;
