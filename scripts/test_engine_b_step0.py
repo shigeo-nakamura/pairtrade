@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -420,6 +422,107 @@ class ExtractTest(unittest.TestCase):
         self.assertIsNone(extract.session_points(calendar, datetime.date(2026, 9, 5)))
         # A date the calendar does not mention at all.
         self.assertIsNone(extract.session_points(calendar, datetime.date(2026, 9, 6)))
+
+    def test_previous_us_close_walks_back_over_weekend_and_holiday(self):
+        import datetime
+
+        calendar = {
+            "sessions": {
+                "2026-09-04": {"us_is_open": True, "us_close_utc_us": 400},
+                "2026-09-05": {"us_is_open": False, "us_close_utc_us": None},
+                "2026-09-06": {"us_is_open": False, "us_close_utc_us": None},
+                # Labor Day. The close timestamp is deliberately non-null: the
+                # is_open flag must decide, not the presence of a field.
+                "2026-09-07": {"us_is_open": False, "us_close_utc_us": 700},
+                "2026-09-08": {
+                    "krx_is_open": True,
+                    "us_is_open": True,
+                    "krx_open_utc_us": 1,
+                    "krx_close_utc_us": 2,
+                    "us_open_utc_us": 3,
+                    "us_close_utc_us": 800,
+                },
+                "2026-09-09": {
+                    "krx_is_open": True,
+                    "us_is_open": True,
+                    "krx_open_utc_us": 11,
+                    "krx_close_utc_us": 12,
+                    "us_open_utc_us": 13,
+                    "us_close_utc_us": 900,
+                },
+            }
+        }
+        # Tuesday after a US holiday Monday: the control is Friday's close.
+        self.assertEqual(extract.previous_us_close(calendar, datetime.date(2026, 9, 8)), 400)
+        self.assertEqual(extract.previous_us_close(calendar, datetime.date(2026, 9, 9)), 800)
+        # Off the calendar's front edge: unresolvable, never a guess.
+        self.assertIsNone(extract.previous_us_close(calendar, datetime.date(2026, 9, 4)))
+        # Only the requested instants come back, pc included on request.
+        self.assertEqual(
+            extract.session_points(calendar, datetime.date(2026, 9, 9)),
+            {"t0": 11, "t1": 12, "t2": 13},
+        )
+        self.assertEqual(
+            extract.session_points(calendar, datetime.date(2026, 9, 9), ["t1", "t2", "pc"]),
+            {"t1": 12, "t2": 13, "pc": 800},
+        )
+        # A session whose previous close cannot be resolved is not a session
+        # once pc is requested -- the same fail-closed rule as t0/t1/t2.
+        self.assertIsNone(
+            extract.session_points(calendar, datetime.date(2026, 9, 4), ["t1", "pc"])
+        )
+
+    def test_points_option_dedups_repeated_instants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calendar = os.path.join(tmp, "cal.json")
+            with open(calendar, "w") as handle:
+                json.dump(
+                    {
+                        "sessions": {
+                            "2026-09-08": {
+                                "krx_is_open": True,
+                                "us_is_open": True,
+                                "krx_open_utc_us": 1788825600 * US,
+                                "krx_close_utc_us": 1788849000 * US,
+                                "us_open_utc_us": 1788874200 * US,
+                            }
+                        }
+                    },
+                    handle,
+                )
+            out = os.path.join(tmp, "o.jsonl")
+            argv = [
+                "--calendar", calendar, "--data-dir", tmp, "--start", "2026-09-08",
+                "--end", "2026-09-08", "--out", out, "--workdir", tmp,
+                "--tolerance-secs", "1", "--points", "t1,t1",
+            ]
+            # no local partition and no archive: every partition is MISSING,
+            # and its record carries the number of targets it was asked for
+            original = extract.fetch_partition
+            extract.fetch_partition = lambda name, prefix, workdir: None
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(extract.main(argv), 0)
+            finally:
+                extract.fetch_partition = original
+            with open(out) as handle:
+                records = [json.loads(line) for line in handle]
+            self.assertEqual([r["status"] for r in records], ["missing"])
+            self.assertEqual(records[0]["targets"], 1)
+
+    def test_points_option_rejects_unknown_instants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calendar = os.path.join(tmp, "cal.json")
+            with open(calendar, "w") as handle:
+                json.dump({"sessions": {}}, handle)
+            argv = [
+                "--calendar", calendar, "--data-dir", tmp, "--start", "2026-09-08",
+                "--end", "2026-09-08", "--out", os.path.join(tmp, "o.jsonl"),
+                "--workdir", tmp, "--points", "t1,t3",
+            ]
+            with self.assertRaises(SystemExit) as raised:
+                extract.main(argv)
+            self.assertNotEqual(raised.exception.code, 0)
 
     def test_query_takes_the_nearest_row_and_filters_venue_and_symbol(self):
         with tempfile.TemporaryDirectory() as tmp:
