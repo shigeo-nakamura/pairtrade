@@ -31,7 +31,6 @@ use debot::book::replay;
 use debot::book::schedule::Scheduler;
 use debot::book::status::StatusWriter;
 use debot::infra::logger::init_logger;
-use debot::infra::prom;
 use debot::infra::s3_mirror::S3Mirror;
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{DexConnector, PriceUpdate};
@@ -328,10 +327,6 @@ async fn main() -> Result<()> {
     // Held for the rest of `main`: refuses a second process against the
     // same state before it can ever load it or reach the venue.
     let _instance_lock = acquire_instance_lock(&cfg.instance_lock_path())?;
-
-    prom::maybe_start_exporter();
-    let process_started_at = now_secs();
-    prom::record_process_info(&cfg.instance_id, process_started_at);
 
     // Subscribe the universe plus every symbol the persisted book still
     // holds (a leg removed from the universe must stay priceable so it can

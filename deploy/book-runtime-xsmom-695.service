@@ -13,7 +13,6 @@ WorkingDirectory=/opt/book-runtime
 EnvironmentFile=/etc/book-runtime/xsmom-695-secrets.env
 Environment=RUST_LOG=info
 Environment=BOOK_CONFIG=/opt/book-runtime/xsmom-695.yaml
-Environment=PROM_LISTEN=127.0.0.1:9474
 Environment=STATUS_S3_BUCKET=debot-dashboard
 Environment=STATUS_S3_KEY_PREFIX=debot/status/book-xsmom-695
 Environment=LD_LIBRARY_PATH=/opt/book-runtime/lib

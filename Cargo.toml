@@ -30,14 +30,9 @@ fs2 = "0.4"
 aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-s3 = "1"
 
-# In-process Prometheus exporter (bot-strategy#314 / #409). Always
-# initialised; the HTTP server is bound only when `PROM_LISTEN` is set in
-# the env, otherwise the gauges are updated as dead code.
-prometheus = { version = "0.13", default-features = false }
-
 # Effective-config fingerprinting (bot-strategy#580): short sha256 over the
 # resolved per-variant trading params + the on-disk config file, surfaced in
-# the [CONFIG] startup line and Prometheus so a config deployed-but-not-loaded
+# the [CONFIG] startup line so a config deployed-but-not-loaded
 # (deploy ≠ restart) is detectable within minutes. Already in the tree
 # transitively; this only promotes it to a direct dep.
 sha2 = "0.10"

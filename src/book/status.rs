@@ -1,105 +1,17 @@
-//! `status.json` (debot-dashboard schema + `book` block), S3 mirror, and
-//! Prometheus gauges. See `docs/book-runtime.md` §8.
+//! `status.json` (debot-dashboard schema + `book` block) and its S3 mirror.
+//! See `docs/book-runtime.md` §8.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use once_cell::sync::Lazy;
-use prometheus::{GaugeVec, IntCounterVec, IntGaugeVec};
 use serde::Serialize;
 
 use crate::directional::atomic_write;
-use crate::infra::prom::{register_gauge, register_int_counter, register_int_gauge};
 use crate::infra::s3_mirror::S3Mirror;
 
 use super::state::BookState;
-
-pub static GROSS_USD: Lazy<GaugeVec> = Lazy::new(|| {
-    register_gauge(
-        "book_gross_usd",
-        "Sum of |leg notional| at the last mark.",
-        &["instance"],
-    )
-});
-pub static NET_USD: Lazy<GaugeVec> = Lazy::new(|| {
-    register_gauge(
-        "book_net_usd",
-        "Signed sum of leg notional at the last mark.",
-        &["instance"],
-    )
-});
-pub static POSITION_COUNT: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge(
-        "book_position_count",
-        "Number of non-zero legs.",
-        &["instance"],
-    )
-});
-pub static EQUITY_USD: Lazy<GaugeVec> = Lazy::new(|| {
-    register_gauge(
-        "book_equity_usd",
-        "Equity used by the risk rails (venue or paper).",
-        &["instance"],
-    )
-});
-pub static SESSION_HALTED: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge(
-        "book_session_halted",
-        "1 while the sticky session halt is engaged.",
-        &["instance"],
-    )
-});
-pub static DAILY_HALTED: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge(
-        "book_daily_halted",
-        "1 while the daily loss halt blocks opens.",
-        &["instance"],
-    )
-});
-pub static KILL_SWITCH: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge(
-        "book_kill_switch_active",
-        "1 while the KILL_SWITCH file exists.",
-        &["instance"],
-    )
-});
-pub static SIGNAL_AGE_SECONDS: Lazy<GaugeVec> = Lazy::new(|| {
-    register_gauge(
-        "book_signal_age_seconds",
-        "now - generated_at of the last accepted signal (-1 = none yet).",
-        &["instance"],
-    )
-});
-pub static NEXT_DECISION_TS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge(
-        "book_next_decision_timestamp_seconds",
-        "Unix time of the next decision.",
-        &["instance"],
-    )
-});
-pub static DECISION_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter(
-        "book_decision_total",
-        "Decisions by outcome (applied|partial|rejected|skipped|halted|flatten).",
-        &["instance", "outcome"],
-    )
-});
-pub static ORDER_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter(
-        "book_order_total",
-        "Order attempts by result (filled|partial|unfilled|error|blocked).",
-        &["instance", "result"],
-    )
-});
-pub static CONFIG_INFO: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge(
-        "book_config_info",
-        "Effective config fingerprint of the running process (value 1).",
-        &["instance", "fp"],
-    )
-});
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardPosition {
@@ -225,40 +137,4 @@ pub fn dashboard_positions(
             ),
         })
         .collect()
-}
-
-pub fn record_gauges(
-    instance: &str,
-    state: &BookState,
-    prices: &HashMap<String, f64>,
-    equity: f64,
-    kill_switch: bool,
-    signal_age_secs: Option<i64>,
-    next_decision_ts: Option<i64>,
-) {
-    GROSS_USD
-        .with_label_values(&[instance])
-        .set(state.gross_usd(prices));
-    NET_USD
-        .with_label_values(&[instance])
-        .set(state.net_usd(prices));
-    POSITION_COUNT
-        .with_label_values(&[instance])
-        .set(state.positions.values().filter(|p| p.qty != 0.0).count() as i64);
-    EQUITY_USD.with_label_values(&[instance]).set(equity);
-    SESSION_HALTED
-        .with_label_values(&[instance])
-        .set(state.session.halted as i64);
-    DAILY_HALTED
-        .with_label_values(&[instance])
-        .set(state.daily.halted as i64);
-    KILL_SWITCH
-        .with_label_values(&[instance])
-        .set(kill_switch as i64);
-    SIGNAL_AGE_SECONDS
-        .with_label_values(&[instance])
-        .set(signal_age_secs.map(|s| s as f64).unwrap_or(-1.0));
-    NEXT_DECISION_TS
-        .with_label_values(&[instance])
-        .set(next_decision_ts.unwrap_or(0));
 }

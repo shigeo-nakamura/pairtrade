@@ -197,8 +197,7 @@ sudo journalctl -u book-runtime-xsmom-695 -n 50 --no-pager
 
 Expected startup lines: `[CONFIG] instance=xsmom-695 … fp=<12hex>` (must
 match `book_runtime --validate` on the deployed YAML), `[STARTUP]
-instance=xsmom-695 mode=DRY_RUN positions=… last_decision=…`, `[PROM]
-exporter listening on http://127.0.0.1:9474/metrics`.
+instance=xsmom-695 mode=DRY_RUN positions=… last_decision=…`.
 
 Stopping does not close the paper book (or a live one); the state is
 persisted and the next start resumes from it.

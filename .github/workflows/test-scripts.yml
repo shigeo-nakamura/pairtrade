@@ -32,8 +32,6 @@ jobs:
         run: python3 scripts/test_engine_b_phase0.py
       - name: Run Engine B Phase 0 archive test
         run: bash scripts/test_engine_b_phase0_archive.sh
-      - name: Run Engine B archive monitor tests
-        run: python3 scripts/test_engine_b_archive_monitor.py
       - name: Run Engine B boundary quality tests
         run: python3 scripts/test_engine_b_boundary_quality.py
       - name: Run Engine B Step 0 absorption tests

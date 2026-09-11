@@ -98,9 +98,9 @@ run as well as after it, and a relative path is anchored to the working
 directory before that comparison.
 
 The effective config is fingerprinted (`[CONFIG] instance=… fp=<sha256-12>`)
-at startup and exported as `book_config_info{instance,fp}` so a
-deployed-but-not-loaded config is visible on `/metrics` (same discipline as
-bot-strategy#580).
+at startup and carried in `status.json` (`book.config_fp`) so a
+deployed-but-not-loaded config is visible from the dashboard (same discipline
+as bot-strategy#580).
 
 ## 3. Signal file contract (schema v1)
 
@@ -403,11 +403,6 @@ reduce_only }`.
   session's own start equity live, since the paper base says nothing
   about the size of a real account. Mirrored to S3 when
   `STATUS_S3_BUCKET` / `STATUS_S3_KEY_PREFIX` are set.
-- Prometheus (`PROM_LISTEN`): `book_gross_usd`, `book_net_usd`,
-  `book_position_count`, `book_equity_usd`, `book_session_halted`,
-  `book_signal_age_seconds`, `book_decision_total{outcome}`,
-  `book_order_total{result}`, `book_config_info{fp}`, plus the shared
-  `debot_process_start_timestamp_seconds` / `debot_version_info`.
 
 ## 9. Replay
 
