@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import book_signal_file as bsf  # noqa: E402
 import xsmom_signal_producer as xp  # noqa: E402
+import xsmom_universe_pool as xu  # noqa: E402
 
 ROW = {
     "type": "rebalance", "date": "2026-09-06", "ts": 1788654050, "n_eligible": 56, "k": 11,
@@ -141,6 +142,78 @@ class ProducerTests(unittest.TestCase):
             for g in ["-1000", "0", "nan"]:
                 r = subprocess.run(cmd + ["--date", "2026-09-06", "--gross", g], capture_output=True, text=True)
                 self.assertEqual(r.returncode, 2, g)
+
+
+class PoolTest(unittest.TestCase):
+    """The pool predicate must match the watcher's screen exactly: every
+    exclusion the watcher applies before its liquidity filters, and no
+    other, or the config either misses a name (runtime skips the key) or
+    carries one the screen can never emit."""
+
+    OBD = [
+        {"symbol": "BTC", "status": "active", "market_config": {}},
+        {"symbol": "ARB", "status": "active", "market_config": {"hidden": False}},
+        {"symbol": "HID", "status": "active", "market_config": {"hidden": True}},
+        {"symbol": "RED", "status": "active", "market_config": {"force_reduce_only": True}},
+        {"symbol": "TSLA", "status": "active", "market_config": {"trading_hours": {"open": "13:30"}}},
+        {"symbol": "OLD", "status": "inactive", "market_config": {}},
+        {"symbol": "NOCFG", "status": "active"},
+        {"symbol": "LONLY", "status": "active", "market_config": {}},
+    ]
+    INFO = {"symbols": [
+        {"baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "ARB", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "HID", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "RED", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "TSLA", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "OLD", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "NOCFG", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        # Binance-side exclusions: wrong quote, halted, dated, index underlying
+        {"baseAsset": "BTC", "quoteAsset": "USDC", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "ARB", "quoteAsset": "USDT", "status": "SETTLING",
+         "contractType": "PERPETUAL", "underlyingType": "COIN"},
+        {"baseAsset": "LONLY", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "CURRENT_QUARTER", "underlyingType": "COIN"},
+        {"baseAsset": "DEFI", "quoteAsset": "USDT", "status": "TRADING",
+         "contractType": "PERPETUAL", "underlyingType": "INDEX"},
+    ]}
+
+    def test_pool_is_the_watchers_screen_before_liquidity(self):
+        self.assertEqual(xu.lighter_tradable(self.OBD), {"BTC", "ARB", "NOCFG", "LONLY"})
+        self.assertEqual(xu.binance_coin_bases(self.INFO),
+                         {"BTC", "ARB", "HID", "RED", "TSLA", "OLD", "NOCFG"})
+        self.assertEqual(xu.pool(self.OBD, self.INFO), ["ARB", "BTC", "NOCFG"])
+
+    def test_check_names_pool_symbols_the_config_lacks(self):
+        cfg_text = "schema_version: 1\nuniverse:\n  symbols:\n    - BTC\n    - ZZZ\nschedule:\n  kind: daily\n"
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, "x.yaml")
+            with open(cfg, "w") as f:
+                f.write(cfg_text)
+            real = xu.fetch_pool
+            xu.fetch_pool = lambda: ["ARB", "BTC", "OP"]
+            try:
+                import io
+                import contextlib
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = xu.main(["--check", cfg])
+                self.assertEqual(rc, 1)
+                self.assertIn("2 pool symbol(s) not in universe.symbols: ARB, OP", err.getvalue())
+                self.assertIn("outside the current pool: ZZZ", err.getvalue())
+                xu.fetch_pool = lambda: ["BTC"]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(xu.main(["--check", cfg]), 0)
+            finally:
+                xu.fetch_pool = real
 
 
 if __name__ == "__main__":

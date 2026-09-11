@@ -52,31 +52,57 @@ profile already on this machine.
 pairtrade#285/#286 are merged. The local `aws` CLI uses the admin profile
 that already exists on this machine.)
 
-## Universe drift (expect this, roughly every few rebalances)
+## Universe drift (a Lighter listing, not every rebalance)
 
 The shadow watcher re-screens its universe point-in-time at every
 rebalance, on purpose: pinning it would put survivorship back into the
-track (bot-strategy#695). So the book's membership genuinely moves. Over
-2026-07-03 .. 2026-09-06 it introduced **2 to 6 new symbols per
-rebalance**, and 21 of the 55 symbols it has held were never in the frozen
-L38 snapshot.
+track (bot-strategy#695). So the book's membership genuinely moves — over
+2026-07-03 .. 2026-09-06 it introduced 2 to 6 new symbols per rebalance.
 
-`configs/book/xsmom-695.yaml` therefore lists the **union** of that
-snapshot and everything the shadow book has actually held (59 symbols as
-of 2026-09-06), not L38.
+That screen has two layers, and only one of them moves on its own:
 
-A symbol outside that list makes the runtime reject the whole signal
-(`rejected:unknown_symbol` in `status.json`, previous book held). The
-producer's `--config` check turns that into a producer-side refusal
-naming the missing symbols:
+- the **pool**: Lighter markets that are `active`, not `hidden`, not
+  `force_reduce_only`, without `trading_hours`, intersected with the
+  Binance USDT perpetuals whose `underlyingType` is `COIN`. This changes
+  only when a venue lists or delists a market.
+- the **liquidity filters** on the rebalance morning (24h quote volume
+  ≥ $100k, spread ≤ 10 bps, top-5 depth ≥ $2k). These move daily and are
+  what admits a "new" name.
+
+`configs/book/xsmom-695.yaml` lists the **whole pool** (109 symbols on
+2026-09-11), so a name crossing the volume bar cannot surprise the
+runtime. It did once: the list used to be the union of the frozen L38
+snapshot and past books (59 symbols), ARB and OP crossed the bar on the
+2026-09-11 rebalance morning, the producer refused at 00:25 UTC, and
+nobody was awake to add them before the window closed at 02:00 UTC — the
+first real decision was `skipped:window_missed` and the paper book stayed
+empty for that hold. The window (00:30 + 90 min UTC) is not a slot a
+human can reliably act in, so the list must be right in advance.
+
+Check it before every decision day, and after any Lighter listing:
+
+```bash
+python3 scripts/xsmom_universe_pool.py --check configs/book/xsmom-695.yaml
+# exit 1 names the pool symbols the config lacks; paste the script's
+# plain output (no --check) over the symbols: block to refresh
+```
+
+`cargo test --lib book::config` loads the committed file under the
+runtime's own rules and pins the two names that were missed, so a
+regression cannot merge silently.
+
+A symbol outside the list still makes the runtime reject the whole
+signal (`rejected:unknown_symbol` in `status.json`, previous book held),
+and the producer's `--config` check still turns that into a producer-side
+refusal naming the missing symbols:
 
 ```
-refusing: 2026-09-11 book has 3 symbol(s) outside the deployed universe
-(...xsmom-695.yaml): FOO, BAR, BAZ. Add them to universe.symbols and
+refusing: 2026-09-11 book has 2 symbol(s) outside the deployed universe
+(...xsmom-695.yaml): ARB, OP. Add them to universe.symbols and
 redeploy the config, then re-run.
 ```
 
-When that fires:
+When that fires (it should now mean a listing the check above missed):
 
 1. Add the symbols to `universe.symbols`, open a PR, merge it, and let
    `Deploy Configs` install the new config.
@@ -94,13 +120,23 @@ When that fires:
    for a live book, restart outside a decision window.
 3. Re-run the producer.
 
-The window stays open for 90 minutes after 00:30 UTC, so a same-morning
-fix still lands, but only if the restart happens too.
+A delisted or reduce-only market may stay in the list: the runtime uses
+`universe.symbols` as its WS subscription seed, so a leg the book still
+holds keeps its price feed while it is closed out. The `--check` run
+reports such names as a note, not an error.
+
+Cost of the wider list: the runtime subscribes `order_book` +
+`market_stats` for every symbol on one Lighter WS connection (218
+channels at 109 symbols; ~7 % of one t4g.small core at 59), and the
+concurrent startup lot fetch hits Lighter's REST rate limit on a few
+more names (`[LOT] no lot metadata yet … will retry`; the 10-minute
+retry loop clears it, so restart well before a decision).
 
 Making the bound dynamic (accept any symbol the venue lists, keeping the
-per-symbol and gross/net caps as the real guard) is the proper fix,
-tracked as bot-strategy#941. Until that lands this is a recurring,
-expected maintenance step.
+per-symbol and gross/net caps as the real guard) remains the structural
+fix, tracked as bot-strategy#941: it needs a post-connect subscribe in
+dex-connector before the whitelist can go. With the pool listed in full,
+the manual step should only recur on a new listing.
 
 ## Host install (CI, no start)
 
@@ -209,6 +245,10 @@ persisted and the next start resumes from it.
   `partial:<sha>` / `rejected:<reason>` / `skipped:<reason>`),
   `book.next_decision_at`, `book.session_halted`, `position_count`,
   `book.gross_usd` ≈ shadow book gross.
+- The day before a decision (`book.next_decision_at` minus one day, so
+  the restart a wider list needs can happen outside the window):
+  `python3 scripts/xsmom_universe_pool.py --check configs/book/xsmom-695.yaml`
+  exits 0 — see "Universe drift".
 - On a rebalance day, `ledger.jsonl` must have one `decision` row for the
   key with `outcome=applied` and `signal_sha256` equal to the producer's
   `payload_sha256` (printed by the producer and in the S3 file).

@@ -14,67 +14,119 @@ universe:
   # The runtime rejects any signal naming a symbol outside this list, so it
   # must cover everything the producer's point-in-time screen can admit.
   # That screen is deliberately dynamic (it re-screens every rebalance to
-  # keep survivorship out of the shadow track, bot-strategy#695), so this
-  # is NOT the frozen 2026-07-03 L38 snapshot: it is the union of that
-  # snapshot and every symbol the shadow book has actually held through
-  # 2026-09-06.
+  # keep survivorship out of the shadow track, bot-strategy#695): the
+  # liquidity filters (24h volume, spread, depth) move daily, but the pool
+  # they select from -- Lighter markets that are active, not hidden, not
+  # reduce-only, not session-gated, intersected with Binance USDT
+  # perpetuals on a COIN underlying -- only moves on a listing or a
+  # delisting. This list is that whole pool (109 symbols on 2026-09-11),
+  # not the frozen L38 snapshot and not the union of past books: covering
+  # past books alone missed the 2026-09-11 decision when ARB and OP
+  # crossed the volume bar that morning (bot-strategy#941).
   #
-  # New names still appear at a rate of roughly 2-6 per rebalance, and one
-  # outside this list makes the runtime reject the whole signal
-  # (`rejected:unknown_symbol` in status.json) and hold the previous book.
-  # `xsmom_signal_producer.py --config` cross-checks against this file and
-  # refuses to publish such a signal, so the failure surfaces at the
-  # producer with the missing symbols named. Add them here and redeploy.
+  # Refresh with `scripts/xsmom_universe_pool.py --check` (exit 1 names
+  # the missing symbols) after a Lighter listing; a delisted market can
+  # stay listed here so a leg the book still holds keeps its price feed.
+  # `xsmom_signal_producer.py --config` still cross-checks against this
+  # file and refuses to publish a signal the runtime would reject.
   symbols:
+    - 0G
     - 1000BONK
+    - 1000FLOKI
     - 1000PEPE
     - 1000SHIB
+    - 2Z
     - AAVE
     - ADA
+    - AERO
     - APT
+    - ARB
+    - ARC
     - ASTER
     - AVAX
+    - AVNT
     - AXS
+    - AZTEC
     - BB
     - BCH
+    - BERA
+    - BIO
     - BNB
     - BTC
+    - CAP
     - CC
+    - CHIP
     - CRV
+    - CTR
     - DASH
     - DOGE
+    - DOLO
     - DOT
+    - DYDX
+    - EDEN
+    - EDGE
+    - EIGEN
     - ENA
     - ETH
+    - ETHFI
     - FARTCOIN
+    - FF
     - FIL
+    - FOGO
+    - FOLKS
+    - GMX
     - GRAM
     - GRASS
+    - HBAR
     - HYPE
     - ICP
     - JTO
     - JUP
     - KAITO
     - LDO
+    - LINEA
     - LINK
     - LIT
     - LTC
+    - MEGA
+    - MET
+    - MON
+    - MORPHO
+    - MYX
     - NEAR
+    - NMR
     - ONDO
+    - OP
     - PAXG
     - PENDLE
+    - PENGU
+    - POL
+    - PONS
+    - POPCAT
+    - PROVE
     - PUMP
+    - PYTH
+    - RESOLV
+    - RIVER
     - ROBO
+    - S
     - SEI
     - SKR
+    - SKY
     - SOL
     - SPX
+    - STABLE
+    - STBL
+    - STRK
     - SUI
+    - SYRUP
     - TAO
     - TIA
     - TRUMP
     - TRX
     - UNI
+    - USELESS
+    - VIRTUAL
     - VVV
     - WIF
     - WLD
@@ -84,8 +136,9 @@ universe:
     - XPL
     - XRP
     - ZEC
+    - ZK
+    - ZORA
     - ZRO
-
 schedule:
   kind: interval_days
   anchor_date: 2026-07-03          # first shadow book (#695)
