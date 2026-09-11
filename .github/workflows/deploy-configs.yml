@@ -42,7 +42,7 @@ jobs:
           bash -n debot/scripts/book_signal_fetch.sh
           bash -n debot/scripts/s3_object_present.sh
           bash -n debot/scripts/fetch_book_bundle.sh
-          python3 -m py_compile debot/scripts/xsmom_signal_producer.py debot/scripts/test_xsmom_signal_producer.py
+          python3 -m py_compile debot/scripts/xsmom_signal_producer.py debot/scripts/xsmom_universe_pool.py debot/scripts/test_xsmom_signal_producer.py
           python3 -m py_compile debot/scripts/engine_b_phase0.py debot/scripts/test_engine_b_phase0.py
           python3 -m py_compile debot/scripts/engine_b_trading_calendar_freeze.py debot/scripts/test_engine_b_trading_calendar_freeze.py
           python3 -m py_compile debot/scripts/engine_b_step0_extract.py debot/scripts/engine_b_step0_absorption.py debot/scripts/test_engine_b_step0.py
