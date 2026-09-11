@@ -21,6 +21,13 @@ every requested symbol and price type. Output is JSONL, one row per
 
 The script is append-only and idempotent per partition: rerunning it with the
 same `--out` file skips partitions already present unless `--force` is given.
+The completion record does not remember which series or instants were asked
+for, so a run with different `--points` / `--symbols` / `--price-types` must
+use a fresh `--out` file (or `--force`).
+
+`--points t0,t1,t2,pc` adds `pc`, the previous US cash session's close
+(20:00 or 21:00 UTC depending on DST, taken from the frozen calendar), which
+the Step 2 capture-rate estimate (bot-strategy#990) needs.
 
 Example (as root on the observer host):
 
@@ -55,6 +62,13 @@ DEFAULT_S3_PREFIX = (
     "s3://debot-dashboard/debot/engine-b/phase0/raw/debot-robinhood-lighter"
 )
 POINTS = ("t0", "t1", "t2")
+# Optional extra instant for the Step 2 capture-rate estimate
+# (bot-strategy#990): the close of the previous US cash session, so the
+# tradable 06:30->13:30 UTC leg can be measured against the whole
+# close-to-open gap.
+PREV_CLOSE_POINT = "pc"
+ALL_POINTS = POINTS + (PREV_CLOSE_POINT,)
+PREV_CLOSE_LOOKBACK_DAYS = 10
 US_PER_SEC = 1_000_000
 HOUR_US = 3600 * US_PER_SEC
 
@@ -103,12 +117,31 @@ def partitions_for_window(ts_us: int, tolerance_us: int) -> list:
     return names
 
 
-def session_points(calendar: dict, day: dt.date) -> Optional[dict]:
-    """t0/t1/t2 for a day, or None when the day is not a full session.
+def previous_us_close(calendar: dict, day: dt.date) -> Optional[int]:
+    """Close of the last US cash session strictly before `day`.
+
+    Walks back day by day (a long weekend plus a holiday is four days; the
+    lookback is generous beyond that) and returns None when the calendar runs
+    out or never marks a US session open in the lookback.
+    """
+    sessions = calendar.get("sessions", {})
+    for back in range(1, PREV_CLOSE_LOOKBACK_DAYS + 1):
+        entry = sessions.get((day - dt.timedelta(days=back)).isoformat())
+        if entry is None:
+            return None
+        if entry.get("us_is_open"):
+            close = entry.get("us_close_utc_us")
+            return None if close is None else int(close)
+    return None
+
+
+def session_points(calendar: dict, day: dt.date, points: Iterable[str] = POINTS) -> Optional[dict]:
+    """Requested instants for a day, or None when the day is not a full session.
 
     A day only qualifies when KRX *and* US cash are both open: t2 is the US
     cash open, so a US holiday (e.g. 2026-09-07 Labor Day) has no exit instant
-    even though KRX traded.
+    even though KRX traded. With `pc` requested, the day additionally needs a
+    resolvable previous US close.
     """
     entry = calendar.get("sessions", {}).get(day.isoformat())
     if entry is None:
@@ -120,7 +153,13 @@ def session_points(calendar: dict, day: dt.date) -> Optional[dict]:
     t2 = entry.get("us_open_utc_us")
     if t0 is None or t1 is None or t2 is None:
         return None
-    return {"t0": int(t0), "t1": int(t1), "t2": int(t2)}
+    resolved = {"t0": int(t0), "t1": int(t1), "t2": int(t2)}
+    if PREV_CLOSE_POINT in points:
+        pc = previous_us_close(calendar, day)
+        if pc is None:
+            return None
+        resolved[PREV_CLOSE_POINT] = pc
+    return {point: resolved[point] for point in points}
 
 
 def local_partition_path(data_dir: str, name: str) -> str:
@@ -299,6 +338,12 @@ def main(argv: Optional[list] = None) -> int:
         help="re-query every partition, including ones already completed in --out",
     )
     parser.add_argument("--workdir", default="/var/tmp/engine-b-step0/work")
+    parser.add_argument(
+        "--points",
+        default=",".join(POINTS),
+        help="instants to extract, from %s (pc = previous US cash close, "
+        "bot-strategy#990)" % ",".join(ALL_POINTS),
+    )
     args = parser.parse_args(argv)
 
     with open(args.calendar) as handle:
@@ -308,6 +353,10 @@ def main(argv: Optional[list] = None) -> int:
     price_types = [p for p in args.price_types.split(",") if p]
     venues = [v for v in args.venues.split(",") if v]
     tolerance_us = int(args.tolerance_secs * US_PER_SEC)
+    points = [p for p in args.points.split(",") if p]
+    unknown = [p for p in points if p not in ALL_POINTS]
+    if unknown or not points:
+        parser.error("--points must be a non-empty subset of %s" % ",".join(ALL_POINTS))
 
     # Group every needed instant by the hourly partitions its tolerance window
     # touches, so a partition is fetched and decompressed at most once and no
@@ -317,12 +366,12 @@ def main(argv: Optional[list] = None) -> int:
     by_partition = {}
     skipped_days = []
     for day in daterange(args.start, args.end):
-        points = session_points(calendar, day)
-        if points is None:
+        instants = session_points(calendar, day, points)
+        if instants is None:
             skipped_days.append(day.isoformat())
             continue
-        for point in POINTS:
-            ts_us = points[point]
+        for point in points:
+            ts_us = instants[point]
             for name in partitions_for_window(ts_us, tolerance_us):
                 by_partition.setdefault(name, []).append(
                     (day.isoformat(), point, ts_us)

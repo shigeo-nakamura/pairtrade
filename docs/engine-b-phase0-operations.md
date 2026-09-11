@@ -838,6 +838,26 @@ Each statistic uses every day that can support it: `fwd` needs only the US
 symbol at t1 and t2, the regression needs both symbols at t0 and t1, so a day
 with one hole still contributes where it can.
 
+### Step 2 capture rate (#990) — the extra `pc` instant
+
+Step 2 asks what fraction of the whole US close-to-open gap happens inside the
+06:30→13:30 UTC leg that Engine B actually holds. The extractor grows one
+optional instant for it, `pc` = the previous US cash session's close (from the
+frozen calendar's `us_close_utc_us`, so DST and holidays are handled: the
+Tuesday after Labor Day uses Friday's close). Ask for it explicitly and write
+to a fresh file — the completion record does not remember which instants a
+partition was queried for, so an old `prices.jsonl` would skip them:
+
+```bash
+python3 engine_b_step0_extract.py \
+  --start 2026-09-01 --end 2026-09-10 --points t0,t1,t2,pc \
+  --symbols SNDK,MU,SKHYNIXUSD --out /var/tmp/engine-b-step0/prices_990.jsonl
+```
+
+The statistics for Step 2 live in bot-strategy
+(`scripts/strategy_probes/leadlag_990/`); the absorption script here ignores
+`pc` rows.
+
 An instant's tolerance window can reach into the neighbouring hour — t0 is
 00:00:00 UTC exactly, so its window also covers the previous day's last
 partition — and every partition the window touches is queried. Each emits its
