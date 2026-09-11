@@ -844,9 +844,11 @@ Step 2 asks what fraction of the whole US close-to-open gap happens inside the
 06:30→13:30 UTC leg that Engine B actually holds. The extractor grows one
 optional instant for it, `pc` = the previous US cash session's close (from the
 frozen calendar's `us_close_utc_us`, so DST and holidays are handled: the
-Tuesday after Labor Day uses Friday's close). Ask for it explicitly and write
-to a fresh file — the completion record does not remember which instants a
-partition was queried for, so an old `prices.jsonl` would skip them:
+Tuesday after Labor Day uses Friday's close). Ask for it explicitly. Its
+partitions (19-21 UTC) are new to a Step 0 file, so appending to an old
+`prices.jsonl` does query them; a fresh file just keeps the two runs apart.
+(A changed `--symbols` / `--price-types` is the case that really needs a fresh
+file or `--force`: the completion record does not remember the series.)
 
 ```bash
 python3 engine_b_step0_extract.py \

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -469,6 +471,44 @@ class ExtractTest(unittest.TestCase):
         self.assertIsNone(
             extract.session_points(calendar, datetime.date(2026, 9, 4), ["t1", "pc"])
         )
+
+    def test_points_option_dedups_repeated_instants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            calendar = os.path.join(tmp, "cal.json")
+            with open(calendar, "w") as handle:
+                json.dump(
+                    {
+                        "sessions": {
+                            "2026-09-08": {
+                                "krx_is_open": True,
+                                "us_is_open": True,
+                                "krx_open_utc_us": 1788825600 * US,
+                                "krx_close_utc_us": 1788849000 * US,
+                                "us_open_utc_us": 1788874200 * US,
+                            }
+                        }
+                    },
+                    handle,
+                )
+            out = os.path.join(tmp, "o.jsonl")
+            argv = [
+                "--calendar", calendar, "--data-dir", tmp, "--start", "2026-09-08",
+                "--end", "2026-09-08", "--out", out, "--workdir", tmp,
+                "--tolerance-secs", "1", "--points", "t1,t1",
+            ]
+            # no local partition and no archive: every partition is MISSING,
+            # and its record carries the number of targets it was asked for
+            original = extract.fetch_partition
+            extract.fetch_partition = lambda name, prefix, workdir: None
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(extract.main(argv), 0)
+            finally:
+                extract.fetch_partition = original
+            with open(out) as handle:
+                records = [json.loads(line) for line in handle]
+            self.assertEqual([r["status"] for r in records], ["missing"])
+            self.assertEqual(records[0]["targets"], 1)
 
     def test_points_option_rejects_unknown_instants(self):
         with tempfile.TemporaryDirectory() as tmp:

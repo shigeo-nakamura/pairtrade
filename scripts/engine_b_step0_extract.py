@@ -21,9 +21,10 @@ every requested symbol and price type. Output is JSONL, one row per
 
 The script is append-only and idempotent per partition: rerunning it with the
 same `--out` file skips partitions already present unless `--force` is given.
-The completion record does not remember which series or instants were asked
-for, so a run with different `--points` / `--symbols` / `--price-types` must
-use a fresh `--out` file (or `--force`).
+The completion record does not remember which series were asked for, so a
+run with different `--symbols` / `--price-types` must use a fresh `--out` file
+(or `--force`). Adding `pc` to an existing file works as such -- its 19-21 UTC
+partitions are new to a t0/t1/t2 file -- but a fresh file keeps the runs apart.
 
 `--points t0,t1,t2,pc` adds `pc`, the previous US cash session's close
 (20:00 or 21:00 UTC depending on DST, taken from the frozen calendar), which
@@ -353,7 +354,7 @@ def main(argv: Optional[list] = None) -> int:
     price_types = [p for p in args.price_types.split(",") if p]
     venues = [v for v in args.venues.split(",") if v]
     tolerance_us = int(args.tolerance_secs * US_PER_SEC)
-    points = [p for p in args.points.split(",") if p]
+    points = list(dict.fromkeys(p for p in args.points.split(",") if p))  # dedup, order kept
     unknown = [p for p in points if p not in ALL_POINTS]
     if unknown or not points:
         parser.error("--points must be a non-empty subset of %s" % ",".join(ALL_POINTS))
