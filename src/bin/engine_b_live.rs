@@ -36,23 +36,51 @@
 //! JSON directly rather than recomputing calendar logic in Rust).
 //!
 //! Each day: capture the KR/US primary mid price at/after `t0` and again
-//! at/after `t1`; compute `epsilon = ln(kr_t1/kr_t0) - ln(us_t1/us_t0)`
-//! (`signal_model = "diff"`, the only model implemented in this prototype
-//! -- see KNOWN GAPS). If `|epsilon| >= epsilon_threshold`, enter within
-//! `t1 .. t1 + entry_deadline_secs` in the direction `sign(epsilon) *
+//! at/after `t1`; compute `epsilon` under the configured `signal_model`:
+//!
+//! - `"proxy_frozen"` (bot-strategy#1016, the live model since the
+//!   2026-09-13 swap): `epsilon = ln(kr_t1/kr_t0) - (alpha + beta *
+//!   ln(us_prev_close/us_prev_open))`, where `us_prev_*` are the US
+//!   primary's prices at the *previous US cash session's* open and
+//!   close (captured live by `maybe_capture_us_marks`, persisted in
+//!   `RiskState.us_session_marks`), and `alpha`/`beta`/`threshold` come
+//!   from `proxy_frozen.json` -- constants fitted once by bot-strategy
+//!   `leadlag_990/oos_signrule.py` on 2026-06-02..09-10 and never refit
+//!   here. This is the rule the registry record
+//!   `leadlag-kr-us-memory-990-oos` scores out of sample from Hyperliquid
+//!   bars; running it live adds the realized-fill sample beside the paper
+//!   one. The US primary's own move over the KRX session is deliberately
+//!   NOT an input.
+//! - `"diff"` (the 2026-09-03..09-13 placeholder): `epsilon =
+//!   ln(kr_t1/kr_t0) - ln(us_t1/us_t0)`. Kept selectable; Step 2 showed
+//!   it is `eps + 0.48*r_us`, i.e. mostly US-perp continuation, not a
+//!   Korea -> US residual.
+//!
+//! If `|epsilon| >= epsilon_threshold`, enter within `t1 .. t1 +
+//! entry_deadline_secs` in the direction `sign(epsilon) *
 //! direction_multiplier`. Exit (reduce-only) within `t2 .. t2 +
-//! exit_deadline_secs`.
+//! exit_deadline_secs`. `t1`/`t2` are calendar-driven: the US open is
+//! 14:30 UTC once US daylight time ends (2026-11-02), and the KRX close
+//! is 07:30 on the CSAT day (2026-11-19).
 //!
 //! ## KNOWN GAPS before any live use (see bot-strategy#866, #872-879)
 //!
-//! - `signal_model = "diff"` is a two-term placeholder for the
-//!   requirements doc's 5-coefficient regression (`R_kr = a + b1*R_us +
-//!   b2*R_soxl + b3*R_nvda + b4*R_ewy + b5*R_fx + e`, §4.5.3). SOXL/NVDA/
-//!   EWY/USDKRW are subscribed and their prices tracked (for a future
-//!   `signal_model = "regression"` implementation) but not used by "diff".
-//! - `epsilon_threshold` and `direction_multiplier` are operator-supplied
-//!   guesses, not fit/frozen from Phase 0A data (that data does not exist
-//!   yet at any meaningful sample size) -- see bot-strategy#872.
+//! - Neither model is the requirements doc's 5-coefficient regression
+//!   (`R_kr = a + b1*R_us + b2*R_soxl + b3*R_nvda + b4*R_ewy + b5*R_fx +
+//!   e`, §4.5.3), and Step 2 (bot-strategy#990) found that regression's
+//!   concurrent-control residual has no predictive power on the held
+//!   leg. SOXL/NVDA/EWY/USDKRW are subscribed and their prices tracked
+//!   but not used by either model.
+//! - Under `"diff"`, `epsilon_threshold` and `direction_multiplier` are
+//!   operator-supplied guesses. Under `"proxy_frozen"` the threshold is
+//!   the spec file's (the env must agree) and `direction_multiplier`
+//!   must stay `1.0` for the live rule to be the registered one.
+//! - `"proxy_frozen"` needs the previous US session's open AND close
+//!   marks on file: the first session day after a deploy/restart that
+//!   missed one of those instants skips with `no_prev_us_marks`
+//!   (fail-closed, never backfilled). `status.json`'s
+//!   `han_bridge.prev_us_marks_ready` says hours ahead whether today can
+//!   form a signal.
 //! - Entry/exit price is the WS mid at/after the boundary, not a full
 //!   top-5-depth VWAP walk (requirements doc §4.5.2's `P_exec_entry`/
 //!   `P_exec_exit`), but the *send* is now bounded: both legs go out as
@@ -212,6 +240,13 @@ struct SessionEntry {
     krx_close_utc_us: Option<i64>,
     us_is_open: bool,
     us_open_utc_us: Option<i64>,
+    /// The US cash close (20:00/21:00 UTC, 17:00/18:00 on half days) --
+    /// the end of the previous US session the `proxy_frozen` control is
+    /// measured over (bot-strategy#1016). Optional in the type because
+    /// the freeze script writes it only for `us_is_open` days; `load`
+    /// insists on it for those.
+    #[serde(default)]
+    us_close_utc_us: Option<i64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -240,6 +275,14 @@ impl TradingCalendar {
             if entry.us_is_open && entry.us_open_utc_us.is_none() {
                 anyhow::bail!("calendar entry {date} has us_is_open=true but missing us_open");
             }
+            if entry.us_is_open && entry.us_close_utc_us.is_none() {
+                anyhow::bail!("calendar entry {date} has us_is_open=true but missing us_close");
+            }
+            if let (Some(open), Some(close)) = (entry.us_open_utc_us, entry.us_close_utc_us) {
+                if close <= open {
+                    anyhow::bail!("calendar entry {date} has us_close <= us_open");
+                }
+            }
         }
         Ok(TradingCalendar {
             calendar_version: doc.calendar_version,
@@ -265,6 +308,202 @@ fn resolve_session_window(calendar: &TradingCalendar, date: NaiveDate) -> Option
     ))
 }
 
+/// The most recent US cash session strictly before `date`: its calendar
+/// key, open and close instants. Walks back day by day (a weekend, a US
+/// holiday, or both -- the Tuesday after Labor Day uses Friday's close),
+/// bounded so a calendar that simply ends returns `None` instead of
+/// looping. The same rule `session_days()` in bot-strategy
+/// `leadlag_990/capture_probe.py` applies (`last_close`/`last_open`), so
+/// the live control is measured over exactly the session the frozen
+/// out-of-sample record measures it over.
+fn prev_us_session(calendar: &TradingCalendar, date: NaiveDate) -> Option<(String, i64, i64)> {
+    let mut cursor = date;
+    for _ in 0..PREV_US_SESSION_MAX_LOOKBACK_DAYS {
+        cursor = cursor.pred_opt()?;
+        let entry = calendar.resolve(cursor)?;
+        if entry.us_is_open {
+            return Some((
+                cursor.format("%Y-%m-%d").to_string(),
+                entry.us_open_utc_us?,
+                entry.us_close_utc_us?,
+            ));
+        }
+    }
+    None
+}
+
+/// How many calendar days back `prev_us_session` will look for a US
+/// session. The longest gap in the frozen calendar is a long weekend
+/// plus a holiday (4 days); 10 leaves room without ever scanning a year.
+const PREV_US_SESSION_MAX_LOOKBACK_DAYS: usize = 10;
+
+// ---------------------------------------------------------------------
+// Frozen proxy spec (bot-strategy#1016)
+// ---------------------------------------------------------------------
+
+/// `signal_model = "proxy_frozen"`: the rule bot-strategy
+/// `scripts/strategy_probes/leadlag_990/oos_signrule.py` froze on
+/// 2026-09-13 (registry record `leadlag-kr-us-memory-990-oos`):
+///
+/// ```text
+/// eps = ln(kr_t1 / kr_t0) - (alpha + beta * ln(us_prev_close / us_prev_open))
+/// ```
+///
+/// where `us_prev_*` are the US primary's prices at the previous US
+/// cash session's open and close (Step 1's "proxy" control), and
+/// `alpha`/`beta` were fitted ONCE on the 67 in-sample sessions
+/// 2026-06-02..09-10 and are given to this binary as constants. Nothing
+/// is fitted here, and the threshold travels with the constants so the
+/// three cannot drift apart. The file is hashed at startup and the
+/// fingerprint logged, so the deployed rule can be matched to the
+/// record's `oos_frozen.json` by eye.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+struct ProxyFrozenSpec {
+    kr_primary: String,
+    us_primary: String,
+    alpha: f64,
+    beta: f64,
+    /// `|eps| >= threshold` fires (0.02 = 200 bps in the frozen record).
+    threshold: f64,
+    /// Free text: where the constants came from (commit, file).
+    #[serde(default)]
+    source: String,
+    /// First 12 hex chars of the sha256 of the file as loaded; filled by
+    /// `load`, ignored on input.
+    #[serde(skip_deserializing, default)]
+    fingerprint: String,
+}
+
+impl ProxyFrozenSpec {
+    fn load(path: &Path) -> Result<Self> {
+        let raw = std::fs::read(path)
+            .with_context(|| format!("reading frozen proxy spec {}", path.display()))?;
+        let mut spec: ProxyFrozenSpec =
+            serde_json::from_slice(&raw).context("parsing frozen proxy spec JSON")?;
+        if !(spec.alpha.is_finite() && spec.beta.is_finite() && spec.threshold.is_finite()) {
+            anyhow::bail!("frozen proxy spec has a non-finite alpha/beta/threshold");
+        }
+        if spec.threshold <= 0.0 {
+            anyhow::bail!(
+                "frozen proxy spec threshold must be > 0 (got {})",
+                spec.threshold
+            );
+        }
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&raw);
+        spec.fingerprint = hex_prefix(&digest, 12);
+        Ok(spec)
+    }
+
+    /// The spec must name the symbols this process trades and agree with
+    /// the operator's threshold: a spec for another pair, or an env
+    /// threshold that silently differs from the frozen one, is a config
+    /// error at startup, not a surprise at the KRX close.
+    fn check_against(&self, cfg: &EngineBLiveConfig) -> Result<()> {
+        if self.kr_primary != cfg.kr_primary_symbol || self.us_primary != cfg.us_primary_symbol {
+            anyhow::bail!(
+                "frozen proxy spec is for {}/{} but this process trades {}/{}",
+                self.kr_primary,
+                self.us_primary,
+                cfg.kr_primary_symbol,
+                cfg.us_primary_symbol
+            );
+        }
+        if (self.threshold - cfg.epsilon_threshold).abs() > 1e-12 {
+            anyhow::bail!(
+                "ENGINE_B_LIVE_EPSILON_THRESHOLD={} differs from the frozen proxy spec's threshold {} \
+                 -- the spec is authoritative; set the env to the same value (or fix the spec in a PR)",
+                cfg.epsilon_threshold,
+                self.threshold
+            );
+        }
+        Ok(())
+    }
+}
+
+fn hex_prefix(bytes: &[u8], chars: usize) -> String {
+    let mut out = String::with_capacity(chars);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+        if out.len() >= chars {
+            break;
+        }
+    }
+    out.truncate(chars);
+    out
+}
+
+/// The US primary's price at the previous US session's open and close,
+/// captured live by `maybe_capture_us_marks` and persisted in
+/// `RiskState.us_session_marks` (bot-strategy#1016). Keyed by the US
+/// session's UTC date. Both instants fall on the same UTC date (13:30 /
+/// 20:00 under EDT, 14:30 / 21:00 under EST, earlier closes on half
+/// days), so one record per date is enough.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+struct UsSessionMark {
+    /// Which symbol the marks are for, so a `us_primary` change cannot
+    /// feed one symbol's session into another's residual.
+    #[serde(default)]
+    symbol: String,
+    #[serde(default)]
+    open: Option<f64>,
+    #[serde(default)]
+    close: Option<f64>,
+    /// The instant passed without a usable price inside the grace
+    /// window; recorded so the refusal is logged once, not every tick,
+    /// and so a later restart does not backfill a mid-session price.
+    #[serde(default)]
+    open_missed: bool,
+    #[serde(default)]
+    close_missed: bool,
+}
+
+/// How many US-session mark records `RiskState` keeps (the newest
+/// dates). Only the previous session is ever read; the rest is a short
+/// audit trail in `risk_state.json`.
+const US_SESSION_MARKS_KEEP: usize = 10;
+
+/// `ln(close / open)` of the US primary over the US session `prev_date`,
+/// from the persisted marks -- `None` when either mark is missing, was
+/// captured for a different symbol, or is not a positive price. Pure so
+/// the lookup is unit-testable.
+fn proxy_control_return(
+    marks: &std::collections::BTreeMap<String, UsSessionMark>,
+    prev_date: &str,
+    us_symbol: &str,
+) -> Option<f64> {
+    let mark = marks.get(prev_date)?;
+    if mark.symbol != us_symbol {
+        return None;
+    }
+    let (open, close) = (mark.open?, mark.close?);
+    if open <= 0.0 || close <= 0.0 {
+        return None;
+    }
+    Some((close / open).ln())
+}
+
+/// `signal_model = "proxy_frozen"`: `eps = ln(kr_t1/kr_t0) - (alpha +
+/// beta * r_us_prev)`. The US primary's own t0/t1 prices play no part --
+/// that is the point of the proxy control (the concurrent US move is
+/// what the in-sample showed to be already priced in). `None` for a
+/// missing or non-positive KR price. Pure for the same reason as
+/// `compute_epsilon`.
+fn compute_epsilon_proxy_frozen(
+    kr_symbol: &str,
+    t0: &HashMap<String, f64>,
+    t1: &HashMap<String, f64>,
+    r_us_prev: f64,
+    spec: &ProxyFrozenSpec,
+) -> Option<f64> {
+    let kr0 = *t0.get(kr_symbol)?;
+    let kr1 = *t1.get(kr_symbol)?;
+    if kr0 <= 0.0 || kr1 <= 0.0 || !r_us_prev.is_finite() {
+        return None;
+    }
+    Some((kr1 / kr0).ln() - (spec.alpha + spec.beta * r_us_prev))
+}
+
 // ---------------------------------------------------------------------
 // Signal
 // ---------------------------------------------------------------------
@@ -282,8 +521,11 @@ fn compute_epsilon(
     t1: &HashMap<String, f64>,
 ) -> Option<f64> {
     if signal_model != "diff" {
+        // "proxy_frozen" is computed by `compute_epsilon_proxy_frozen`
+        // from a different set of inputs and never reaches here; any
+        // other value is a config error that must never become an order.
         log::error!(
-            "[SIGNAL] signal_model={signal_model} not implemented in this prototype -- refusing to trade"
+            "[SIGNAL] signal_model={signal_model} is not handled by compute_epsilon -- refusing to trade"
         );
         return None;
     }
@@ -368,6 +610,10 @@ struct EngineBLiveConfig {
     /// the wire and still updates promptly right after an entry or exit.
     venue_equity_refresh_secs: i64,
     trading_calendar_path: PathBuf,
+    /// The frozen `alpha`/`beta`/`threshold` for `signal_model =
+    /// "proxy_frozen"` (bot-strategy#1016), shipped by the installer next
+    /// to the calendar. Not read for any other model.
+    proxy_frozen_spec_path: PathBuf,
     kill_switch_path: PathBuf,
     risk_ack_path: PathBuf,
     state_path: PathBuf,
@@ -479,6 +725,10 @@ impl EngineBLiveConfig {
                 "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
                 &format!("{code_dir}/trading_calendar.json"),
             )),
+            proxy_frozen_spec_path: PathBuf::from(env_string(
+                "ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH",
+                &format!("{code_dir}/proxy_frozen.json"),
+            )),
             kill_switch_path: PathBuf::from(env_string(
                 "ENGINE_B_LIVE_KILL_SWITCH_PATH",
                 &format!("{base_dir}/KILL_SWITCH"),
@@ -515,6 +765,13 @@ impl EngineBLiveConfig {
     /// most one entry `sendTx` per session day, so a rejected send is a
     /// lost day, not a retry.
     fn validate(&self) -> Result<()> {
+        if !matches!(self.signal_model.as_str(), "diff" | "proxy_frozen") {
+            anyhow::bail!(
+                "ENGINE_B_LIVE_SIGNAL_MODEL={} is not implemented (diff | proxy_frozen); refusing to \
+                 start rather than refusing to trade at 06:30 UTC",
+                self.signal_model
+            );
+        }
         if !(1..=1000).contains(&self.slippage_bps) {
             anyhow::bail!(
                 "ENGINE_B_LIVE_SLIPPAGE_BPS={} is outside the connector's accepted 1..=1000 \
@@ -672,6 +929,16 @@ struct RiskState {
     /// record at all (pairtrade#300 Codex review).
     #[serde(default)]
     entry_in_flight: Option<String>,
+    /// The US primary's price at each recent US session's open and
+    /// close, keyed by that session's UTC date (bot-strategy#1016). The
+    /// `proxy_frozen` control for session day D is `ln(close/open)` of
+    /// the US session before D -- an instant that passed the day before,
+    /// so it has to be captured as it happens and survive a restart.
+    /// Written by `maybe_capture_us_marks` under every signal model
+    /// (cheap, and it means a later model swap does not lose a session
+    /// to an empty history), read only by `proxy_frozen`.
+    #[serde(default)]
+    us_session_marks: std::collections::BTreeMap<String, UsSessionMark>,
 }
 
 /// `OpenPosition` reduced to what survives a restart. Deliberately a
@@ -1895,6 +2162,18 @@ struct HanBridgeStatus {
     /// nobody can verify -- and that outcome had no signal anywhere but
     /// an e-mail and the journal.
     exit_deadline_us: Option<i64>,
+    /// Which residual the entry decision uses (`diff` | `proxy_frozen`),
+    /// and for `proxy_frozen` the fingerprint of the constants file
+    /// (bot-strategy#1016) -- so a dashboard can say which rule is live
+    /// and a reader can match it to the registry record's constants.
+    signal_model: String,
+    frozen_spec_fingerprint: Option<String>,
+    /// For `proxy_frozen`: whether the previous US session's open and
+    /// close marks are both on file for the configured US primary, i.e.
+    /// whether today *can* form a signal at the KRX close. `None` under
+    /// any other model. Answers "will today be skipped for
+    /// `no_prev_us_marks`" hours before it happens.
+    prev_us_marks_ready: Option<bool>,
     /// A position **this engine opened and manages** is open.
     ///
     /// Not the same question as the document's top-level
@@ -1920,6 +2199,10 @@ struct EngineBLiveEngine {
     cfg: EngineBLiveConfig,
     connector: std::sync::Arc<dyn DexConnector + Send + Sync>,
     calendar: TradingCalendar,
+    /// Loaded and checked in `main` when `cfg.signal_model ==
+    /// "proxy_frozen"`, `None` otherwise (bot-strategy#1016). The entry
+    /// path refuses to trade that model without it.
+    frozen_spec: Option<ProxyFrozenSpec>,
     /// Reused across `fetch_order_book_details` calls (same pattern as
     /// `bull_holder.rs`'s `Engine.http`) instead of a fresh `Client::new()`
     /// per call.
@@ -3716,6 +3999,156 @@ impl EngineBLiveEngine {
         }
     }
 
+    /// Capture the US primary's price at today's US cash open and close
+    /// into `RiskState.us_session_marks` (bot-strategy#1016), each on the
+    /// first tick at/after the instant that has a *usable* price
+    /// (`usable_prices`: fresh, current generation), and never again for
+    /// the same date. Past `t0_capture_grace_secs` after the instant the
+    /// mark is recorded as missed instead of backfilled with a
+    /// mid-session price -- the same bar `maybe_capture_t0` applies to
+    /// the KRX open, for the same reason: a boundary price captured late
+    /// is not that boundary's price, and the residual built on it would
+    /// be wrong in a way nothing downstream can detect. A missed mark
+    /// makes the next session skip with `no_prev_us_marks` rather than
+    /// trade on a guess.
+    ///
+    /// Runs under every signal model: it is one map lookup per tick
+    /// outside the two instants, and it means the history is already
+    /// there when the model is switched to `proxy_frozen`.
+    fn maybe_capture_us_marks(&mut self, now_us: i64) {
+        let Some(today) = self.current_date else {
+            return;
+        };
+        let Some(entry) = self.calendar.resolve(today) else {
+            return;
+        };
+        if !entry.us_is_open {
+            return;
+        }
+        let (Some(open_us), Some(close_us)) = (entry.us_open_utc_us, entry.us_close_utc_us) else {
+            return;
+        };
+        let key = today.to_string();
+        let symbol = self.cfg.us_primary_symbol.clone();
+        let grace_us = self.cfg.t0_capture_grace_secs * 1_000_000;
+        // A record left by a previous `us_primary` is replaced outright:
+        // its marks are for another symbol and must not be read as ours.
+        if self
+            .state
+            .us_session_marks
+            .get(&key)
+            .is_some_and(|m| m.symbol != symbol)
+        {
+            self.state.us_session_marks.remove(&key);
+        }
+        let mut changed = false;
+        for (label, instant) in [("open", open_us), ("close", close_us)] {
+            if now_us < instant {
+                continue;
+            }
+            let (have, missed) = match self.state.us_session_marks.get(&key) {
+                Some(m) if label == "open" => (m.open.is_some(), m.open_missed),
+                Some(m) => (m.close.is_some(), m.close_missed),
+                None => (false, false),
+            };
+            if have || missed {
+                continue;
+            }
+            let delay_secs = (now_us - instant) / 1_000_000;
+            if now_us > instant + grace_us {
+                log::warn!(
+                    "[US_MARK] {key} {label}: no usable {symbol} price within {}s of the US {label} \
+                     ({delay_secs}s late now); leaving it missing rather than backfilling -- {}",
+                    self.cfg.t0_capture_grace_secs,
+                    self.freshness_debug(now_us)
+                );
+                let mark = self.state.us_session_marks.entry(key.clone()).or_default();
+                mark.symbol = symbol.clone();
+                if label == "open" {
+                    mark.open_missed = true;
+                } else {
+                    mark.close_missed = true;
+                }
+                changed = true;
+                continue;
+            }
+            let Some(price) = self.usable_prices(now_us).get(&symbol).copied() else {
+                continue;
+            };
+            log::info!(
+                "[US_MARK] {key} {label}={price:.4} ({symbol}, {delay_secs}s after the US {label})"
+            );
+            let mark = self.state.us_session_marks.entry(key.clone()).or_default();
+            mark.symbol = symbol.clone();
+            if label == "open" {
+                mark.open = Some(price);
+            } else {
+                mark.close = Some(price);
+            }
+            changed = true;
+        }
+        if changed {
+            while self.state.us_session_marks.len() > US_SESSION_MARKS_KEEP {
+                let oldest = self
+                    .state
+                    .us_session_marks
+                    .keys()
+                    .next()
+                    .cloned()
+                    .expect("non-empty map has a first key");
+                self.state.us_session_marks.remove(&oldest);
+            }
+            self.persist_state();
+        }
+    }
+
+    /// The `proxy_frozen` residual for today, or the reason today cannot
+    /// have one (bot-strategy#1016). `Err` is terminal for the day -- the
+    /// previous session's marks are in the past and will not appear on a
+    /// later tick -- so the caller turns it into `skip_day`.
+    fn proxy_frozen_epsilon(
+        &self,
+        t0_prices: &HashMap<String, f64>,
+        t1_prices: &HashMap<String, f64>,
+    ) -> std::result::Result<(f64, f64, String), String> {
+        let Some(spec) = self.frozen_spec.as_ref() else {
+            return Err("proxy_frozen: no frozen spec loaded; refusing to trade".to_string());
+        };
+        let Some(today) = self.current_date else {
+            return Err("proxy_frozen: no current date".to_string());
+        };
+        let Some((prev_date, _open, _close)) = prev_us_session(&self.calendar, today) else {
+            return Err(format!(
+                "proxy_frozen: no US session within {PREV_US_SESSION_MAX_LOOKBACK_DAYS} days before {today}"
+            ));
+        };
+        let Some(r_us_prev) = proxy_control_return(
+            &self.state.us_session_marks,
+            &prev_date,
+            &self.cfg.us_primary_symbol,
+        ) else {
+            return Err(format!(
+                "no_prev_us_marks: {} open/close on {prev_date} not both captured ({:?}); the proxy \
+                 control cannot be formed",
+                self.cfg.us_primary_symbol,
+                self.state.us_session_marks.get(&prev_date)
+            ));
+        };
+        let Some(eps) = compute_epsilon_proxy_frozen(
+            &self.cfg.kr_primary_symbol,
+            t0_prices,
+            t1_prices,
+            r_us_prev,
+            spec,
+        ) else {
+            return Err(format!(
+                "proxy_frozen: {} missing or non-positive in the t0/t1 snapshot",
+                self.cfg.kr_primary_symbol
+            ));
+        };
+        Ok((eps, r_us_prev, prev_date))
+    }
+
     /// While `RiskState.position_unconfirmed` is set and nothing is
     /// tracked, read the exchange once per tick: a `us_primary` position
     /// showing up is adopted (origin = the unconfirmed send) and clears the
@@ -4449,14 +4882,45 @@ impl EngineBLiveEngine {
             );
             return;
         };
-        let Some(epsilon) = compute_epsilon(
-            &self.cfg.signal_model,
-            &self.cfg.kr_primary_symbol,
-            &self.cfg.us_primary_symbol,
-            t0_prices,
-            t1_prices,
-        ) else {
-            return;
+        let epsilon = match self.cfg.signal_model.as_str() {
+            "proxy_frozen" => match self.proxy_frozen_epsilon(t0_prices, t1_prices) {
+                Ok((eps, r_us_prev, prev_date)) => {
+                    let spec = self
+                        .frozen_spec
+                        .as_ref()
+                        .expect("checked by proxy_frozen_epsilon");
+                    log::info!(
+                        "[SIGNAL] proxy_frozen eps={eps:.5} r_kr={:.5} r_us_prev={r_us_prev:.5} \
+                         (US session {prev_date}) alpha={} beta={} threshold={} fp={}",
+                        t1_prices
+                            .get(&self.cfg.kr_primary_symbol)
+                            .zip(t0_prices.get(&self.cfg.kr_primary_symbol))
+                            .map(|(p1, p0)| (p1 / p0).ln())
+                            .unwrap_or(f64::NAN),
+                        spec.alpha,
+                        spec.beta,
+                        spec.threshold,
+                        spec.fingerprint
+                    );
+                    eps
+                }
+                Err(reason) => {
+                    self.skip_day(reason);
+                    return;
+                }
+            },
+            model => {
+                let Some(eps) = compute_epsilon(
+                    model,
+                    &self.cfg.kr_primary_symbol,
+                    &self.cfg.us_primary_symbol,
+                    t0_prices,
+                    t1_prices,
+                ) else {
+                    return;
+                };
+                eps
+            }
         };
         if epsilon.abs() < self.cfg.epsilon_threshold {
             self.skip_day(format!(
@@ -5154,6 +5618,7 @@ impl EngineBLiveEngine {
             self.reconcile_startup(now).await;
         }
         self.maybe_capture_t0(now);
+        self.maybe_capture_us_marks(now);
         if self.state.position_unconfirmed && self.position.is_none() && self.pending.is_none() {
             self.try_adopt_unconfirmed(now).await;
         }
@@ -5770,6 +6235,20 @@ impl EngineBLiveEngine {
                 .map(|v| ((now_us - v.fetched_at_us) / 1_000_000).max(0)),
             venue_equity_stale,
             unrealized_pnl_usd_mid_estimate: self.unrealized_pnl_mid_estimate(now_us),
+            signal_model: self.cfg.signal_model.clone(),
+            frozen_spec_fingerprint: self.frozen_spec.as_ref().map(|s| s.fingerprint.clone()),
+            prev_us_marks_ready: (self.cfg.signal_model == "proxy_frozen").then(|| {
+                self.current_date
+                    .and_then(|d| prev_us_session(&self.calendar, d))
+                    .and_then(|(prev, _, _)| {
+                        proxy_control_return(
+                            &self.state.us_session_marks,
+                            &prev,
+                            &self.cfg.us_primary_symbol,
+                        )
+                    })
+                    .is_some()
+            }),
             exit_deadline_us: managed_claim_exit_deadline_us,
             managed_position_open: managed_claim_open,
         };
@@ -5911,6 +6390,25 @@ async fn main() -> Result<()> {
         cfg.min_daily_volume_usd,
     );
     cfg.validate()?;
+    let frozen_spec = if cfg.signal_model == "proxy_frozen" {
+        let spec = ProxyFrozenSpec::load(&cfg.proxy_frozen_spec_path)
+            .context("failed to load the frozen proxy spec (signal_model=proxy_frozen)")?;
+        spec.check_against(&cfg)?;
+        log::info!(
+            "[FROZEN_SPEC] path={} fp={} kr={} us={} alpha={} beta={} threshold={} source={:?}",
+            cfg.proxy_frozen_spec_path.display(),
+            spec.fingerprint,
+            spec.kr_primary,
+            spec.us_primary,
+            spec.alpha,
+            spec.beta,
+            spec.threshold,
+            spec.source
+        );
+        Some(spec)
+    } else {
+        None
+    };
 
     // Mirrors robinhood_dipgrid.rs's explicit live-refusal gate: flipping
     // ENGINE_B_LIVE_DRY_RUN=false alone is not enough. This prototype has
@@ -6001,6 +6499,7 @@ async fn main() -> Result<()> {
         cfg,
         connector,
         calendar,
+        frozen_spec,
         http_client: Client::new(),
         feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
         clock: Arc::new(now_us),
@@ -6198,6 +6697,7 @@ mod tests {
             venue_equity_refresh_secs: 60,
             max_session_loss_bps: 500.0,
             trading_calendar_path: PathBuf::from("/nonexistent"),
+            proxy_frozen_spec_path: PathBuf::from("/nonexistent/proxy_frozen.json"),
             kill_switch_path: PathBuf::from("/nonexistent/KILL_SWITCH"),
             risk_ack_path: PathBuf::from("/nonexistent/RISK_ACK"),
             state_path: PathBuf::from("/nonexistent/state.json"),
@@ -6371,6 +6871,7 @@ mod tests {
                 krx_close_utc_us: Some(2),
                 us_is_open: true,
                 us_open_utc_us: Some(3),
+                us_close_utc_us: Some(4),
             },
         );
         sessions.insert(
@@ -6381,6 +6882,7 @@ mod tests {
                 krx_close_utc_us: None,
                 us_is_open: true,
                 us_open_utc_us: Some(30),
+                us_close_utc_us: Some(31),
             },
         );
         TradingCalendar {
@@ -6660,6 +7162,9 @@ mod tests {
                 venue_equity_age_secs: None,
                 venue_equity_stale: false,
                 unrealized_pnl_usd_mid_estimate: None,
+                signal_model: "diff".to_string(),
+                frozen_spec_fingerprint: None,
+                prev_us_marks_ready: None,
                 exit_deadline_us: None,
                 managed_position_open: false,
             },
@@ -7473,6 +7978,7 @@ mod tests {
         let engine = EngineBLiveEngine {
             cfg,
             connector: connector.clone(),
+            frozen_spec: None,
             calendar: TradingCalendar {
                 calendar_version: "test".to_string(),
                 // Must resolve 2026-09-08: `roll_day_if_needed` recomputes
@@ -7487,6 +7993,7 @@ mod tests {
                         krx_close_utc_us: Some(T1_US),
                         us_is_open: true,
                         us_open_utc_us: Some(T2_US),
+                        us_close_utc_us: Some(T2_US + 23_400_000_000),
                     },
                 )]),
             },
@@ -11925,5 +12432,526 @@ mod tests {
             pos.entry_price_unknown,
             "the old leg's entry must not become the new leg's basis"
         );
+    }
+
+    // -------------------------------------------------------------
+    // proxy_frozen (bot-strategy#1016)
+    // -------------------------------------------------------------
+
+    fn frozen_fixture() -> ProxyFrozenSpec {
+        ProxyFrozenSpec {
+            kr_primary: "SKHY".to_string(),
+            us_primary: "SNDK".to_string(),
+            alpha: -0.011354,
+            beta: 0.0133,
+            threshold: 0.02,
+            source: "test".to_string(),
+            fingerprint: "0123456789ab".to_string(),
+        }
+    }
+
+    #[test]
+    fn prev_us_session_walks_back_over_a_weekend_and_a_us_holiday() {
+        let mut sessions = HashMap::new();
+        let entry = |krx: bool, us: bool, base: i64| SessionEntry {
+            krx_is_open: krx,
+            krx_open_utc_us: krx.then_some(base),
+            krx_close_utc_us: krx.then_some(base + 1),
+            us_is_open: us,
+            us_open_utc_us: us.then_some(base + 2),
+            us_close_utc_us: us.then_some(base + 3),
+        };
+        sessions.insert("2026-09-04".to_string(), entry(true, true, 400)); // Friday
+        sessions.insert("2026-09-05".to_string(), entry(false, false, 500));
+        sessions.insert("2026-09-06".to_string(), entry(false, false, 600));
+        sessions.insert("2026-09-07".to_string(), entry(true, false, 700)); // Labor Day: KRX open, US closed
+        sessions.insert("2026-09-08".to_string(), entry(true, true, 800));
+        sessions.insert("2026-09-09".to_string(), entry(true, true, 900));
+        let calendar = TradingCalendar {
+            calendar_version: "test".to_string(),
+            sessions,
+        };
+        let tuesday = NaiveDate::from_ymd_opt(2026, 9, 8).unwrap();
+        assert_eq!(
+            prev_us_session(&calendar, tuesday),
+            Some(("2026-09-04".to_string(), 402, 403)),
+            "the Tuesday after Labor Day uses Friday's session, not Monday's"
+        );
+        let wednesday = NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
+        assert_eq!(
+            prev_us_session(&calendar, wednesday),
+            Some(("2026-09-08".to_string(), 802, 803))
+        );
+        // Nothing before the calendar starts, and the walk is bounded.
+        let friday = NaiveDate::from_ymd_opt(2026, 9, 4).unwrap();
+        assert_eq!(prev_us_session(&calendar, friday), None);
+        let far = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        assert_eq!(prev_us_session(&calendar, far), None);
+    }
+
+    #[test]
+    fn proxy_control_return_needs_both_marks_for_the_same_symbol() {
+        let mut marks = std::collections::BTreeMap::new();
+        marks.insert(
+            "2026-09-07".to_string(),
+            UsSessionMark {
+                symbol: "SNDK".to_string(),
+                open: Some(1700.0),
+                close: Some(1717.0),
+                ..UsSessionMark::default()
+            },
+        );
+        let r = proxy_control_return(&marks, "2026-09-07", "SNDK").unwrap();
+        assert!((r - (1717.0f64 / 1700.0).ln()).abs() < 1e-12);
+        assert_eq!(
+            proxy_control_return(&marks, "2026-09-07", "MU"),
+            None,
+            "another symbol's session"
+        );
+        assert_eq!(
+            proxy_control_return(&marks, "2026-09-08", "SNDK"),
+            None,
+            "no record"
+        );
+        marks.get_mut("2026-09-07").unwrap().close = None;
+        assert_eq!(
+            proxy_control_return(&marks, "2026-09-07", "SNDK"),
+            None,
+            "close missing"
+        );
+        marks.get_mut("2026-09-07").unwrap().close = Some(0.0);
+        assert_eq!(
+            proxy_control_return(&marks, "2026-09-07", "SNDK"),
+            None,
+            "non-positive"
+        );
+    }
+
+    #[test]
+    fn proxy_frozen_epsilon_is_the_kr_return_net_of_the_frozen_line() {
+        let spec = frozen_fixture();
+        let t0 = HashMap::from([("SKHY".to_string(), 1000.0), ("SNDK".to_string(), 1700.0)]);
+        // The US primary's own move over the KRX session is NOT in the
+        // residual: a huge concurrent US move changes nothing.
+        let t1 = HashMap::from([("SKHY".to_string(), 1030.0), ("SNDK".to_string(), 2500.0)]);
+        let eps = compute_epsilon_proxy_frozen("SKHY", &t0, &t1, 0.01, &spec).unwrap();
+        let expect = (1030.0f64 / 1000.0).ln() - (-0.011354 + 0.0133 * 0.01);
+        assert!((eps - expect).abs() < 1e-12, "{eps} vs {expect}");
+        assert!(eps > spec.threshold);
+        // The frozen alpha (-114 bps) means a flat KR session reads +114 bps.
+        let flat = HashMap::from([("SKHY".to_string(), 1000.0)]);
+        let eps0 = compute_epsilon_proxy_frozen("SKHY", &flat, &flat, 0.0, &spec).unwrap();
+        assert!((eps0 - 0.011354).abs() < 1e-12);
+        assert!(compute_epsilon_proxy_frozen("SKHY", &t0, &HashMap::new(), 0.0, &spec).is_none());
+        assert!(compute_epsilon_proxy_frozen("SKHY", &t0, &t1, f64::NAN, &spec).is_none());
+        let zero = HashMap::from([("SKHY".to_string(), 0.0)]);
+        assert!(compute_epsilon_proxy_frozen("SKHY", &zero, &t1, 0.0, &spec).is_none());
+    }
+
+    #[test]
+    fn frozen_spec_loads_with_a_fingerprint_and_refuses_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy_frozen.json");
+        std::fs::write(
+            &path,
+            r#"{"kr_primary":"SKHY","us_primary":"SNDK","alpha":-0.011354,"beta":0.0133,"threshold":0.02,"source":"t"}"#,
+        )
+        .unwrap();
+        let spec = ProxyFrozenSpec::load(&path).unwrap();
+        assert_eq!(spec.fingerprint.len(), 12);
+        assert!(spec.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            (spec.alpha, spec.beta, spec.threshold),
+            (-0.011354, 0.0133, 0.02)
+        );
+        // Same bytes, same fingerprint; one changed digit, another.
+        assert_eq!(
+            ProxyFrozenSpec::load(&path).unwrap().fingerprint,
+            spec.fingerprint
+        );
+        std::fs::write(
+            &path,
+            r#"{"kr_primary":"SKHY","us_primary":"SNDK","alpha":-0.011355,"beta":0.0133,"threshold":0.02,"source":"t"}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            ProxyFrozenSpec::load(&path).unwrap().fingerprint,
+            spec.fingerprint
+        );
+
+        let mut cfg = fixture_config();
+        cfg.epsilon_threshold = 0.02;
+        spec.check_against(&cfg).unwrap();
+        cfg.epsilon_threshold = 0.003;
+        assert!(
+            spec.check_against(&cfg).is_err(),
+            "env threshold must equal the frozen one"
+        );
+        cfg.epsilon_threshold = 0.02;
+        cfg.kr_primary_symbol = "SKHYNIXUSD".to_string();
+        assert!(spec.check_against(&cfg).is_err(), "spec for another pair");
+
+        std::fs::write(&path, r#"{"kr_primary":"SKHY","us_primary":"SNDK","alpha":-0.01,"beta":0.0133,"threshold":0}"#).unwrap();
+        assert!(
+            ProxyFrozenSpec::load(&path).is_err(),
+            "threshold must be > 0"
+        );
+        std::fs::write(
+            &path,
+            r#"{"kr_primary":"SKHY","us_primary":"SNDK","alpha":-0.01,"beta":0.0133}"#,
+        )
+        .unwrap();
+        assert!(
+            ProxyFrozenSpec::load(&path).is_err(),
+            "threshold is required"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_an_unknown_signal_model_at_startup() {
+        let mut cfg = fixture_config();
+        cfg.signal_model = "regression".to_string();
+        assert!(cfg.validate().is_err());
+        cfg.signal_model = "proxy_frozen".to_string();
+        cfg.validate().unwrap();
+        cfg.signal_model = "diff".to_string();
+        cfg.validate().unwrap();
+    }
+
+    /// The harness calendar's US session on 2026-09-08: open at T2_US,
+    /// close 6.5 h later.
+    const US_CLOSE_US: i64 = T2_US + 23_400_000_000;
+
+    #[test]
+    fn us_marks_are_captured_at_the_open_and_close_and_never_backfilled() {
+        let mut h = harness();
+        // Before the open: nothing, even with a fresh price.
+        h.observe_at("SNDK", 1700.0, T2_US - 10_000_000, 0);
+        h.engine.maybe_capture_us_marks(T2_US - 5_000_000);
+        assert!(h.engine.state.us_session_marks.is_empty());
+        // At the open with a fresh price: the open mark, and it persists.
+        h.observe_at("SNDK", 1710.0, T2_US, 0);
+        h.engine.maybe_capture_us_marks(T2_US + 3_000_000);
+        let mark = h.engine.state.us_session_marks.get("2026-09-08").unwrap();
+        assert_eq!(
+            (mark.symbol.as_str(), mark.open, mark.close),
+            ("SNDK", Some(1710.0), None)
+        );
+        assert_eq!(
+            load_state(&h.engine.cfg.state_path)
+                .us_session_marks
+                .get("2026-09-08")
+                .unwrap()
+                .open,
+            Some(1710.0),
+            "the mark is on disk the moment it is taken"
+        );
+        // A later, different price does not overwrite the open.
+        h.observe_at("SNDK", 1750.0, T2_US + 60_000_000, 0);
+        h.engine.maybe_capture_us_marks(T2_US + 60_000_000);
+        assert_eq!(
+            h.engine
+                .state
+                .us_session_marks
+                .get("2026-09-08")
+                .unwrap()
+                .open,
+            Some(1710.0)
+        );
+        // Close: a stale price (older than max_price_staleness_secs) is
+        // not usable, so nothing is captured on that tick...
+        h.engine.maybe_capture_us_marks(US_CLOSE_US + 5_000_000);
+        assert_eq!(
+            h.engine
+                .state
+                .us_session_marks
+                .get("2026-09-08")
+                .unwrap()
+                .close,
+            None
+        );
+        // ...and a fresh one inside the grace window is.
+        h.observe_at("SNDK", 1720.0, US_CLOSE_US + 100_000_000, 0);
+        h.engine.maybe_capture_us_marks(US_CLOSE_US + 100_000_000);
+        assert_eq!(
+            h.engine
+                .state
+                .us_session_marks
+                .get("2026-09-08")
+                .unwrap()
+                .close,
+            Some(1720.0)
+        );
+        assert!(
+            proxy_control_return(&h.engine.state.us_session_marks, "2026-09-08", "SNDK").is_some()
+        );
+    }
+
+    #[test]
+    fn a_us_mark_past_the_grace_window_is_recorded_as_missed_not_backfilled() {
+        let mut h = harness();
+        let grace_us = h.engine.cfg.t0_capture_grace_secs * 1_000_000;
+        let late = T2_US + grace_us + 1_000_000;
+        h.observe_at("SNDK", 1710.0, late, 0);
+        h.engine.maybe_capture_us_marks(late);
+        let mark = h.engine.state.us_session_marks.get("2026-09-08").unwrap();
+        assert_eq!(mark.open, None);
+        assert!(mark.open_missed);
+        assert!(!mark.close_missed, "the close has not happened yet");
+        // A restart with a fresh price still does not backfill it.
+        let mut h2 = harness();
+        h2.engine.state = load_state(&h.engine.cfg.state_path);
+        h2.observe_at("SNDK", 1711.0, late + 5_000_000, 0);
+        h2.engine.maybe_capture_us_marks(late + 5_000_000);
+        assert_eq!(
+            h2.engine
+                .state
+                .us_session_marks
+                .get("2026-09-08")
+                .unwrap()
+                .open,
+            None
+        );
+        // And the next session cannot form a control from it.
+        assert_eq!(
+            proxy_control_return(&h2.engine.state.us_session_marks, "2026-09-08", "SNDK"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_mark_left_by_a_former_us_primary_is_replaced_not_reused() {
+        let mut h = harness();
+        h.engine.state.us_session_marks.insert(
+            "2026-09-08".to_string(),
+            UsSessionMark {
+                symbol: "MU".to_string(),
+                open: Some(100.0),
+                close: Some(101.0),
+                ..UsSessionMark::default()
+            },
+        );
+        h.observe_at("SNDK", 1710.0, T2_US, 0);
+        h.engine.maybe_capture_us_marks(T2_US + 1_000_000);
+        let mark = h.engine.state.us_session_marks.get("2026-09-08").unwrap();
+        assert_eq!(
+            (mark.symbol.as_str(), mark.open, mark.close),
+            ("SNDK", Some(1710.0), None)
+        );
+    }
+
+    #[test]
+    fn us_marks_keep_only_the_newest_records() {
+        let mut h = harness();
+        for i in 1..=US_SESSION_MARKS_KEEP + 3 {
+            h.engine.state.us_session_marks.insert(
+                format!("2026-08-{i:02}"),
+                UsSessionMark {
+                    symbol: "SNDK".to_string(),
+                    open: Some(1.0),
+                    close: Some(1.0),
+                    ..UsSessionMark::default()
+                },
+            );
+        }
+        h.observe_at("SNDK", 1710.0, T2_US, 0);
+        h.engine.maybe_capture_us_marks(T2_US + 1_000_000);
+        assert_eq!(h.engine.state.us_session_marks.len(), US_SESSION_MARKS_KEEP);
+        assert!(
+            h.engine.state.us_session_marks.contains_key("2026-09-08"),
+            "the newest survives"
+        );
+        assert!(
+            !h.engine.state.us_session_marks.contains_key("2026-08-01"),
+            "the oldest goes"
+        );
+    }
+
+    /// Switch the harness to `proxy_frozen` with a previous US session
+    /// (2026-09-07, marks for SNDK) in the calendar and on file.
+    fn arm_proxy_frozen(h: &mut Harness, prev_open: f64, prev_close: f64) {
+        h.engine.cfg.signal_model = "proxy_frozen".to_string();
+        h.engine.cfg.epsilon_threshold = 0.02;
+        h.engine.frozen_spec = Some(frozen_fixture());
+        h.engine.calendar.sessions.insert(
+            "2026-09-07".to_string(),
+            SessionEntry {
+                krx_is_open: false,
+                krx_open_utc_us: None,
+                krx_close_utc_us: None,
+                us_is_open: true,
+                us_open_utc_us: Some(T0_US - 36_000_000_000),
+                us_close_utc_us: Some(T0_US - 12_600_000_000),
+            },
+        );
+        h.engine.state.us_session_marks.insert(
+            "2026-09-07".to_string(),
+            UsSessionMark {
+                symbol: "SNDK".to_string(),
+                open: Some(prev_open),
+                close: Some(prev_close),
+                ..UsSessionMark::default()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_frozen_enters_short_on_a_large_negative_residual_regardless_of_the_us_move() {
+        let mut h = harness();
+        arm_proxy_frozen(&mut h, 1700.0, 1700.0); // r_us_prev = 0
+                                                  // KR -5% over the KRX session; the US perp +5% concurrently. The
+                                                  // diff model would read eps = -10% (short) and so does this one,
+                                                  // but for a different reason: the concurrent US move is not an
+                                                  // input at all. eps = ln(0.95) + 0.011354 = -3.99% < -2%.
+        h.observe_all(T0_US, 1000.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 950.0, 1785.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+        let orders = h.connector.orders.lock().unwrap();
+        assert_eq!(orders[0].2, OrderSide::Short);
+        assert!(h.engine.day.skip_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn proxy_frozen_ignores_the_concurrent_us_move_where_diff_would_fire() {
+        let mut h = harness();
+        arm_proxy_frozen(&mut h, 1700.0, 1700.0);
+        // KR flat, US +5% concurrently: diff would read -5% and go short;
+        // proxy_frozen reads eps = 0 + 0.011354 = +1.14% < 2% -> no entry.
+        h.observe_all(T0_US, 1000.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 1000.0, 1785.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 0);
+        assert!(h
+            .engine
+            .day
+            .skip_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("below_threshold")));
+    }
+
+    #[tokio::test]
+    async fn proxy_frozen_uses_the_previous_us_session_return_with_the_frozen_beta() {
+        let mut h = harness();
+        // A previous US session of +50% would move eps by beta*0.405 =
+        // 0.54% -- enough to push a +1.5% KR session from below to above
+        // the 2% line only together with alpha: eps = 0.0149 + 0.011354 -
+        // 0.0133*0.405 = +2.09% > 2% -> long. With r_us_prev = 0 it is
+        // 2.63%, so this test pins the sign of beta: a positive control
+        // return LOWERS the residual.
+        arm_proxy_frozen(&mut h, 1000.0, 1500.0);
+        h.observe_all(T0_US, 1000.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 1015.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+        assert_eq!(h.connector.orders.lock().unwrap()[0].2, OrderSide::Long);
+        // Now a previous US session so strong that the frozen line eats
+        // the KR move: r_us_prev = ln(3) = 1.0986 -> eps = 0.0149 +
+        // 0.011354 - 0.0146 = +1.16% -> no entry.
+        let mut h2 = harness();
+        arm_proxy_frozen(&mut h2, 1000.0, 3000.0);
+        h2.observe_all(T0_US, 1000.0, 1700.0);
+        h2.engine.maybe_capture_t0(T0_US);
+        h2.observe_all(T1_US, 1015.0, 1700.0);
+        h2.engine.day.eligibility_confirmed = true;
+        h2.set_now(T1_US + 1_000_000);
+        h2.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h2.connector.order_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_frozen_skips_the_day_when_the_previous_us_marks_are_missing() {
+        let mut h = harness();
+        arm_proxy_frozen(&mut h, 1700.0, 1717.0);
+        h.engine
+            .state
+            .us_session_marks
+            .get_mut("2026-09-07")
+            .unwrap()
+            .close = None;
+        h.observe_all(T0_US, 1000.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 1100.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(
+            h.connector.order_count(),
+            0,
+            "a +10% KR session with no control must not trade"
+        );
+        assert!(h
+            .engine
+            .day
+            .skip_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("no_prev_us_marks")));
+        assert!(
+            h.engine.day.entered,
+            "terminal for the day: the marks will not appear later"
+        );
+        assert_eq!(
+            load_state(&h.engine.cfg.state_path)
+                .last_session_date
+                .as_deref(),
+            Some("2026-09-08")
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_frozen_refuses_to_trade_without_a_loaded_spec() {
+        let mut h = harness();
+        arm_proxy_frozen(&mut h, 1700.0, 1700.0);
+        h.engine.frozen_spec = None;
+        h.observe_all(T0_US, 1000.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 1100.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 0);
+        assert!(h
+            .engine
+            .day
+            .skip_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("proxy_frozen: no frozen spec")));
+    }
+
+    #[test]
+    fn status_reports_the_model_and_whether_the_proxy_control_is_ready() {
+        let mut h = harness();
+        h.engine.write_status_if_due(T0_US);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(v["han_bridge"]["signal_model"], "diff");
+        assert!(v["han_bridge"]["frozen_spec_fingerprint"].is_null());
+        assert!(v["han_bridge"]["prev_us_marks_ready"].is_null());
+
+        arm_proxy_frozen(&mut h, 1700.0, 1717.0);
+        h.engine.write_status_if_due(T0_US + 120_000_000);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(v["han_bridge"]["signal_model"], "proxy_frozen");
+        assert_eq!(v["han_bridge"]["frozen_spec_fingerprint"], "0123456789ab");
+        assert_eq!(v["han_bridge"]["prev_us_marks_ready"], true);
+
+        h.engine.state.us_session_marks.clear();
+        h.engine.write_status_if_due(T0_US + 240_000_000);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
+                .unwrap();
+        assert_eq!(v["han_bridge"]["prev_us_marks_ready"], false);
     }
 }

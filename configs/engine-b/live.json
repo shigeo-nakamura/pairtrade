@@ -1,5 +1,5 @@
 {
-  "_comment": "Engine B live-experiment binary config (bot-strategy#866). Read via ENGINE_B_LIVE_* environment variables, not this file directly -- systemd EnvironmentFile= is the actual config-loading path (see deploy/engine-b-live.service). This file documents the intended production values so they are reviewable in a PR diff rather than only living in an on-host env file.",
+  "_comment": "Engine B live-experiment binary config (bot-strategy#866). Read via ENGINE_B_LIVE_* environment variables, not this file directly -- systemd EnvironmentFile= is the actual config-loading path (see deploy/engine-b-live.service). This file documents the intended production values so they are reviewable in a PR diff rather than only living in an on-host env file. ENGINE_B_LIVE_SIGNAL_MODEL=proxy_frozen (bot-strategy#1016) reads alpha/beta/threshold from proxy_frozen.json next to this file; ENGINE_B_LIVE_EPSILON_THRESHOLD must equal that file's threshold or the binary refuses to start.",
   "ENGINE_B_LIVE_INSTANCE_ID": "engine-b-live",
   "ENGINE_B_LIVE_DRY_RUN": "true",
   "ENGINE_B_LIVE_KR_PRIMARY": "SKHYNIXUSD",
@@ -7,9 +7,9 @@
   "ENGINE_B_LIVE_CONTROL_SYMBOLS": "SOXL,NVDA,EWY,USDKRW",
   "ENGINE_B_LIVE_LOT_USD": "100",
   "ENGINE_B_LIVE_LEVERAGE": "2",
-  "ENGINE_B_LIVE_EPSILON_THRESHOLD": "0.003",
+  "ENGINE_B_LIVE_EPSILON_THRESHOLD": "0.02",
   "ENGINE_B_LIVE_DIRECTION_MULTIPLIER": "1.0",
-  "ENGINE_B_LIVE_SIGNAL_MODEL": "diff",
+  "ENGINE_B_LIVE_SIGNAL_MODEL": "proxy_frozen",
   "ENGINE_B_LIVE_ENTRY_DEADLINE_SECS": "180",
   "ENGINE_B_LIVE_EXIT_DEADLINE_SECS": "900",
   "ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS": "15",
