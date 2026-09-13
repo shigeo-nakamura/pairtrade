@@ -417,6 +417,17 @@ impl ProxyFrozenSpec {
                 self.threshold
             );
         }
+        // The registered rule holds sign(eps). A multiplier of -1 would
+        // run its mirror image under the same fingerprint and poison the
+        // realized-vs-paper comparison the live sample exists for (PR
+        // #329 Codex review); anything but exactly 1.0 is refused.
+        if cfg.direction_multiplier != 1.0 {
+            anyhow::bail!(
+                "ENGINE_B_LIVE_DIRECTION_MULTIPLIER={} is not allowed with signal_model=proxy_frozen: \
+                 the registered rule is sign(eps) itself (multiplier 1.0)",
+                cfg.direction_multiplier
+            );
+        }
         Ok(())
     }
 }
@@ -3619,6 +3630,23 @@ impl EngineBLiveEngine {
         }
     }
 
+    /// `symbol`'s usable mid (same bar as `usable_prices`) **received at
+    /// or after `instant`** -- the boundary-mark rule (bot-strategy#1016).
+    /// `usable_prices` alone would hand back an observation up to
+    /// `max_price_staleness_secs` *before* the boundary when no update
+    /// lands between the instant and the next tick, and a pre-boundary
+    /// mid recorded as the US open or close is not the price "at or
+    /// after" the instant the frozen record uses (PR #329 Codex review).
+    /// `None` until such an observation exists; the caller keeps waiting
+    /// inside the grace window.
+    fn usable_mid_at_or_after(&self, symbol: &str, now_us: i64, instant_us: i64) -> Option<f64> {
+        let feed = self.feed.lock().expect("price feed mutex");
+        let obs = feed.latest.get(symbol)?;
+        (obs.is_usable(now_us, feed.generation, self.cfg.max_price_staleness_secs)
+            && obs.received_at_us >= instant_us)
+            .then_some(obs.mid)
+    }
+
     /// Mid prices safe to base an *entry* decision on right now: accepted
     /// at ingest, observed on the current feed generation, and no older
     /// than `max_price_staleness_secs` (bot-strategy#916). Anything else
@@ -4001,9 +4029,10 @@ impl EngineBLiveEngine {
 
     /// Capture the US primary's price at today's US cash open and close
     /// into `RiskState.us_session_marks` (bot-strategy#1016), each on the
-    /// first tick at/after the instant that has a *usable* price
-    /// (`usable_prices`: fresh, current generation), and never again for
-    /// the same date. Past `t0_capture_grace_secs` after the instant the
+    /// first tick at/after the instant that has a *usable* observation
+    /// **received at or after the instant** (`usable_mid_at_or_after`:
+    /// fresh, current generation, not a pre-boundary quote that merely
+    /// happens to be recent), and never again for the same date. Past `t0_capture_grace_secs` after the instant the
     /// mark is recorded as missed instead of backfilled with a
     /// mid-session price -- the same bar `maybe_capture_t0` applies to
     /// the KRX open, for the same reason: a boundary price captured late
@@ -4072,7 +4101,7 @@ impl EngineBLiveEngine {
                 changed = true;
                 continue;
             }
-            let Some(price) = self.usable_prices(now_us).get(&symbol).copied() else {
+            let Some(price) = self.usable_mid_at_or_after(&symbol, now_us, instant) else {
                 continue;
             };
             log::info!(
@@ -12590,6 +12619,14 @@ mod tests {
         cfg.epsilon_threshold = 0.02;
         cfg.kr_primary_symbol = "SKHYNIXUSD".to_string();
         assert!(spec.check_against(&cfg).is_err(), "spec for another pair");
+        cfg.kr_primary_symbol = "SKHY".to_string();
+        cfg.direction_multiplier = -1.0;
+        assert!(
+            spec.check_against(&cfg).is_err(),
+            "the mirror image of the registered rule"
+        );
+        cfg.direction_multiplier = 1.0;
+        spec.check_against(&cfg).unwrap();
 
         std::fs::write(&path, r#"{"kr_primary":"SKHY","us_primary":"SNDK","alpha":-0.01,"beta":0.0133,"threshold":0}"#).unwrap();
         assert!(
@@ -12629,6 +12666,15 @@ mod tests {
         h.observe_at("SNDK", 1700.0, T2_US - 10_000_000, 0);
         h.engine.maybe_capture_us_marks(T2_US - 5_000_000);
         assert!(h.engine.state.us_session_marks.is_empty());
+        // Just after the open, but the freshest observation is from
+        // before it (13 s old, well inside max_price_staleness_secs):
+        // still nothing -- a pre-boundary quote is not the open (PR #329
+        // Codex review).
+        h.engine.maybe_capture_us_marks(T2_US + 3_000_000);
+        assert!(
+            h.engine.state.us_session_marks.is_empty(),
+            "pre-boundary quote must not become the mark"
+        );
         // At the open with a fresh price: the open mark, and it persists.
         h.observe_at("SNDK", 1710.0, T2_US, 0);
         h.engine.maybe_capture_us_marks(T2_US + 3_000_000);
