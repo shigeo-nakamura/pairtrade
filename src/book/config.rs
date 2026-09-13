@@ -698,6 +698,31 @@ mod tests {
         assert_eq!(cfg.fingerprint().len(), 12);
     }
 
+    /// The committed xsmom-695 config must load under the runtime's own
+    /// rules, and its universe must be the whole candidate pool the shadow
+    /// screen selects from, not the last few books: a symbol that crossed
+    /// the volume bar on a decision morning made the runtime skip the key
+    /// (2026-09-11, ARB/OP; bot-strategy#941). `scripts/xsmom_universe_pool.py
+    /// --check` refreshes the list against the live venues; this only pins
+    /// the two names that were missed and the shape the fetcher relies on.
+    #[cfg(feature = "lighter-sdk")] // venue: lighter fails validate() in a build without it
+    #[test]
+    fn committed_xsmom_config_loads_and_covers_the_missed_names() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cfg = BookConfig::load(&root.join("configs/book/xsmom-695.yaml")).unwrap();
+        assert_eq!(cfg.instance_id, "xsmom-695");
+        for s in ["ARB", "OP", "BTC", "ETH"] {
+            assert!(cfg.universe.symbols.iter().any(|x| x == s), "{s} missing");
+        }
+        // The installer passes the list to the fetcher as a comma-joined
+        // env var, so a symbol must never carry a comma or whitespace.
+        assert!(cfg
+            .universe
+            .symbols
+            .iter()
+            .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')));
+    }
+
     #[test]
     fn fingerprint_changes_with_any_field() {
         let a = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
