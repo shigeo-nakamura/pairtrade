@@ -1,0 +1,8 @@
+{
+  "kr_primary": "SKHYNIXUSD",
+  "us_primary": "SNDK",
+  "alpha": -0.011354,
+  "beta": 0.0133,
+  "threshold": 0.02,
+  "source": "bot-strategy scripts/strategy_probes/leadlag_990/oos_frozen.json (main 5dbb8e5, frozen 2026-09-13): alpha/beta of r_kr on r_us_prev fitted once on the 67 Hyperliquid xyz:SKHX/xyz:SNDK 30m sessions 2026-06-02..09-10 (xyz:SKHX = Lighter SKHYNIXUSD, same price); threshold = #989's frozen 200 bps. Registry record leadlag-kr-us-memory-990-oos (holdout 2026-09-11..11-30, readout 2026-12-01). Never refit here; change only through a PR that names the record."
+}

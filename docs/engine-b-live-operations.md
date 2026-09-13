@@ -14,9 +14,63 @@ implementation the requirements doc (`engine_b_requirements_0.3.md`)
 describes.
 
 See `src/bin/engine_b_live.rs`'s module doc for the exact strategy shape
-(single-symbol directional bet on the US primary, driven by an unvalidated
-`epsilon = ln(kr_t1/kr_t0) - ln(us_t1/us_t0)` diff signal) and its KNOWN
-GAPS section -- do not duplicate that list here; read it there.
+(single-symbol directional bet on the US primary) and its KNOWN GAPS
+section -- do not duplicate that list here; read it there.
+
+## Signal model: `proxy_frozen` (bot-strategy#1016, since 2026-09-13)
+
+`ENGINE_B_LIVE_SIGNAL_MODEL=proxy_frozen` makes the live rule the one the
+registry record `leadlag-kr-us-memory-990-oos` (bot-strategy
+`scripts/strategy_probes/leadlag_990/oos_signrule.py`) scores out of sample
+on 2026-09-11..11-30:
+
+```text
+eps = ln(kr_t1 / kr_t0) - (alpha + beta * ln(us_prev_close / us_prev_open))
+enter sign(eps) on the US primary at the KRX close if |eps| >= threshold
+exit at the US cash open
+```
+
+- `alpha`, `beta`, `threshold` come from `configs/engine-b/proxy_frozen.json`,
+  installed as `/opt/engine-b-live/proxy_frozen.json` (read-only, beside the
+  calendar). The binary hashes the file at start and logs
+  `[FROZEN_SPEC] path=... fp=<sha256-12> kr= us= alpha= beta= threshold=`;
+  the same fingerprint is published as `han_bridge.frozen_spec_fingerprint`.
+  **Nothing is fitted on the host.** Changing the constants is a PR that
+  names the registry record it comes from. `ENGINE_B_LIVE_EPSILON_THRESHOLD`
+  must equal the file's `threshold` (0.02 = 200 bps) or startup fails; the
+  spec must name the configured `kr_primary`/`us_primary` too.
+- `us_prev_*` are the US primary's mid at the **previous US cash session's
+  open and close** (13:30/20:00 UTC under EDT, 14:30/21:00 under EST, earlier
+  closes on half days -- all from the frozen calendar, which now carries
+  `us_close_utc_us`). The binary captures them live (`[US_MARK] <date>
+  open=... / close=...`, first usable price at/after the instant, same
+  `ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS` bound as t0) and persists them in
+  `risk_state.json` under `us_session_marks` (newest 10 dates). A mark that
+  is not captured inside the grace window is recorded as *missed*, never
+  backfilled, and the next session skips with `no_prev_us_marks`.
+- **Consequence for restarts.** A restart that spans a US open or close
+  loses that mark unless the process is back inside the grace window
+  (300 s). The restart band is still 13:30-24:00 UTC when flat, but inside
+  it prefer **13:36-19:55 UTC** (after the exit's fill confirmation and the
+  open mark, before the close mark) or **20:06-24:00 UTC**; a restart across
+  20:00 costs the next session. `status.json`'s
+  `han_bridge.prev_us_marks_ready` (true/false under this model) says
+  whether the coming session can form a signal.
+- **First session after the swap.** The first process running this model
+  has no marks for the session before it started, so its first session
+  day is skipped by design; sessions count from the second US session
+  after the restart.
+- The US primary's own move over the KRX session is not an input (that is
+  the point of the proxy control -- Step 2 found the concurrent-control
+  residual has no power on the held leg). Under `proxy_frozen` the `[SIGNAL]`
+  line prints `eps`, `r_kr`, `r_us_prev` and the session it came from, so a
+  day's decision can be recomputed by hand from the two marks and the two
+  KR snapshots.
+- What the live sample is for: the registry record is scored from
+  Hyperliquid xyz bars whether or not this process runs; the live process
+  adds, per session, the realized Lighter fill for the same decision, so
+  on the readout (2026-12-01) paper and realized can be set side by side.
+  PnL here is still not a verdict on the rule (n = 1/day).
 
 The order path itself (Lighter decimals / minimum sizes, rate limits, IOC
 / reduce-only / cancel / client-order-ID semantics, and the gaps between
