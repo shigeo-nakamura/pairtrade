@@ -96,6 +96,8 @@ jobs:
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
           systemd-analyze verify debot/deploy/book-signal-fetch-xsmom-695.timer
           systemd-analyze verify debot/deploy/book-signal-fetch-exdiv-lighter.timer
+          systemd-analyze verify debot/deploy/robinhood-points-snapshot.service
+          systemd-analyze verify debot/deploy/robinhood-points-snapshot.timer
 
   deploy-configs:
     needs: validate-config-artifacts
@@ -163,6 +165,12 @@ jobs:
           # install after gate G1 reads them from /opt/debot/deploy.
           for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer \
                    book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do
+            aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
+          done
+          # Robinhood points snapshot units (bot-strategy#938): published and
+          # delivered to /opt/debot/deploy on the host; installed once by the
+          # owner with install_robinhood_points_snapshot.sh, never by CI.
+          for u in robinhood-points-snapshot.service robinhood-points-snapshot.timer; do
             aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
           done
           ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
@@ -265,6 +273,8 @@ jobs:
               "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-units-__GITHUB_SHA__/$u; done",
               "# exdiv-lighter (bot-strategy#948): delivered to the persistent deploy dir that install_book_runtime.sh reads by default, so the post-G1 manual install has its units. NOT installed and NOT started here -- only xsmom-695 is installed below.",
               "for u in book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
+              "# Robinhood points snapshot units (bot-strategy#938): delivered only; the owner installs the timer once with install_robinhood_points_snapshot.sh. The frozen pairtrade service is not involved.",
+              "for u in robinhood-points-snapshot.service robinhood-points-snapshot.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
               "# Both install paths stage everything from S3 into a per-run dir, so neither depends on the other having run first: ci.yml owns the binary object, this job owns the config and unit objects, and whichever installs last promotes the newest of both under install_book_runtime.sh's flock.",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",

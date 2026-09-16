@@ -1,0 +1,25 @@
+[Unit]
+Description=Snapshot the Robinhood Chain Lighter points tallies per arm (bot-strategy#938)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# ec2-user: the arm credential files under /opt/debot/scripts are 0600
+# ec2-user, and the frozen pairtrade service reads them as the same user.
+# This unit only reads them; it never touches that service.
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user
+Environment=ROBINHOOD_POINTS_S3_URI=s3://debot-dashboard/debot/status/robinhood-lighter/points_history.jsonl
+ExecStart=/usr/bin/python3 /opt/debot/scripts/robinhood_points_collector.py \
+  --arm freq:/opt/debot/scripts/debot-pair-robinhood-lighter.env \
+  --arm b:/opt/debot/scripts/debot-pair-robinhood-lighter-b.env \
+  --common /opt/debot/scripts/debot_secrets_common.env \
+  --env /opt/debot/scripts/debot.env \
+  --libsigner /opt/debot/lib/libsigner.so \
+  --out /home/ec2-user/debot_status/robinhood-points/points_history.jsonl
+ProtectSystem=strict
+ReadWritePaths=/home/ec2-user/debot_status/robinhood-points
+PrivateTmp=true
+NoNewPrivileges=true
