@@ -28,10 +28,12 @@ written today, and is not guessed at here.
 
 The denominator
 ---------------
-The points a program awards are not readable from any endpoint reachable
-here (`api.rh.lighter.xyz` answers 403 on the points routes), so points
-are an operator-supplied input: export them and pass `--points`. Rows
-without them keep `points: null` and no cost-per-point.
+Points are read from the venue by `robinhood_points_collector.py` (hourly
+timer on the host; `/api/v1/livePoints/total` and `/api/v1/referral/points`
+behind the SDK's bearer token -- the 403 an earlier revision saw was a
+route that does not exist) and turned into the per-day rows this script
+takes by `robinhood_points_daily.py --tally ...`; pass that file as
+`--points`. Rows without them keep `points: null` and no cost-per-point.
 
 A cycle that crosses UTC midnight is the one attribution the two
 ledgers genuinely disagree on: `load_execution` files each fill under

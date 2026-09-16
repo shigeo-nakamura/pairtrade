@@ -1,0 +1,13 @@
+[Unit]
+Description=Hourly Robinhood Chain Lighter points snapshot (bot-strategy#938)
+
+[Timer]
+# Hourly is plenty for a day-level KPI and keeps the day boundary
+# within an hour of 00:00Z; the two reads per arm are cheap.
+OnCalendar=*-*-* *:05:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+Unit=robinhood-points-snapshot.service
+
+[Install]
+WantedBy=timers.target
