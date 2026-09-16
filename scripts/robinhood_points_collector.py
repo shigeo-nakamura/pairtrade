@@ -280,11 +280,14 @@ def parse_tally(value: Any, field: str) -> Decimal:
 def check_envelope(endpoint: str, status: int, body: Any) -> dict:
     """Lighter answers application errors as HTTP 200 with `code != 200`,
     and auth failures as 400/401 with the same envelope; both are errors
-    that carry the venue's message."""
+    that carry the venue's message. A 200 whose body carries no `code` at
+    all is a plain success body: `referral/points` answers that way (seen
+    on the first live run, 2026-09-16), while `livePoints/total` wraps
+    its tally in the envelope."""
     if not isinstance(body, dict):
         raise CollectorError(f"{endpoint}: HTTP {status}, body is not an object")
     code = body.get("code")
-    if status != 200 or code != 200:
+    if status != 200 or (code is not None and code != 200):
         raise CollectorError(
             f"{endpoint}: HTTP {status}, code {code}: {body.get('message', 'no message')}")
     return body
