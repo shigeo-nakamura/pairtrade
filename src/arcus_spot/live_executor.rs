@@ -1354,6 +1354,46 @@ mod tests {
         assert!(hold.detail.contains("NO_QUOTES"), "{hold}");
     }
 
+    /// The router answered 200 but had no quote from the venue this plan
+    /// was built on. That is the venue declining to price right now, the
+    /// same market outcome as a retryable refusal, and it must hold too:
+    /// on 2026-09-15 15:32Z it failed the live-tick unit instead and the
+    /// rotation was only picked up by the next tick (bot-strategy#1034).
+    #[test]
+    fn a_venue_with_no_signable_quote_is_a_hold() {
+        let error = fresh_quote_failure(
+            "rialto",
+            ArcusSpotError::VenueNotQuoting {
+                venue: "rialto".to_string(),
+                endpoint: "v1/quote".to_string(),
+            },
+        );
+        let hold = error
+            .downcast_ref::<ArcusSpotQuoteUnavailable>()
+            .expect("a venue with no quote is a hold, not a fault");
+        assert_eq!(hold.venue, "rialto");
+        assert!(hold.detail.contains("no signable quote"), "{hold}");
+    }
+
+    /// Two quotes for one venue is a defect of the response, not the venue
+    /// declining; it stays a hard error so it cannot be retried away.
+    #[test]
+    fn a_duplicate_venue_quote_is_still_an_error() {
+        let error = fresh_quote_failure(
+            "rialto",
+            ArcusSpotError::InvalidResponse(
+                "expected exactly one rialto signable quote, found 2".to_string(),
+            ),
+        );
+        assert!(error.downcast_ref::<ArcusSpotQuoteUnavailable>().is_none());
+        assert!(
+            error
+                .to_string()
+                .contains("rialto fresh signable quote failed"),
+            "{error}"
+        );
+    }
+
     /// A permanent refusal is a genuine fault -- a malformed request, a
     /// misconfigured taker -- and must keep failing the run rather than
     /// being retried forever, one silent hold per tick.
