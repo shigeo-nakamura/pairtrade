@@ -25,8 +25,11 @@ later revises. The choice is the operator's, per run, and is echoed
 into every output row as `tally` so the ledger's input says what it is.
 
 A negative day (the venue revised a tally downward, T&C section 4) is
-written as-is and flagged on stderr. It is real -- points were taken
-away -- and hiding it would overstate what the cost bought.
+skipped and flagged on stderr rather than written: the ledger rejects a
+negative points row outright (it would make the file unreadable), and a
+day whose points were revoked has no honest price -- the cost stayed and
+the points went. The revised tally still becomes the next day's baseline,
+so the revision is not lost, only not priced.
 """
 
 from __future__ import annotations
@@ -112,7 +115,14 @@ def daily_points(latest: dict[str, dict[str, tuple[int, float]]], tally: str
                 continue
             points = by_date[date][1] - by_date[prev][1]
             if points < 0:
-                notes.append(f"{arm} {date}: {tally} fell by {-points}; written as negative")
+                # The ledger refuses a negative points row (a hand-typed
+                # file's typo, in its world), and a day whose points were
+                # revoked has no honest price anyway: the cost stayed, the
+                # points went. Skip it and say so; the closing tally still
+                # carries the revision into the next day's baseline.
+                notes.append(
+                    f"{arm} {date}: {tally} fell by {-points} (venue revision); day skipped")
+                continue
             out.append({"date": date, "arm": arm, "points": points, "tally": tally,
                         "closing_ts_unix": by_date[date][0]})
     return out, notes

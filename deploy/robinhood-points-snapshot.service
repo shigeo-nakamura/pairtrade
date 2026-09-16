@@ -16,6 +16,7 @@ ExecStart=/usr/bin/python3 /opt/debot/scripts/robinhood_points_collector.py \
   --arm freq:/opt/debot/scripts/debot-pair-robinhood-lighter.env \
   --arm b:/opt/debot/scripts/debot-pair-robinhood-lighter-b.env \
   --common /opt/debot/scripts/debot_secrets_common.env \
+  --env /opt/debot/scripts/debot.env \
   --libsigner /opt/debot/lib/libsigner.so \
   --out /home/ec2-user/debot_status/robinhood-points/points_history.jsonl
 ProtectSystem=strict

@@ -192,7 +192,10 @@ class MainTests(unittest.TestCase):
                          "LIGHTER_API_KEY_INDEX=5\nLIGHTER_ACCOUNT_INDEX=281474976710500\n")
             out = Path(tmp, "points_history.jsonl")
 
+            fetch_calls = []
+
             def fake_fetch(base_url, token, api_key_public, account_index):
+                fetch_calls.append((base_url, token, api_key_public, account_index))
                 if account_index == 3209:
                     return bodies(live=10)
                 raise collector.CollectorError("livePoints/total: HTTP 401, code 20013: bad")
@@ -219,6 +222,24 @@ class MainTests(unittest.TestCase):
             collector.DEFAULT_BASE_URL, ("p" * 40).encode().hex(),
             collector.ROBINHOOD_SIGNING_CHAIN_ID, 4, 3209)
         fake_signer.auth_token.assert_any_call(1_789_534_395 + collector.TOKEN_TTL_SECS, 4, 3209)
+        # Both keys reach the venue hex-encoded, as the bot's
+        # decrypt_data_with_kms(.., output_as_hex=true) produces them.
+        self.assertEqual(fetch_calls[0][2], ("p" * 40).encode().hex())
+
+    def test_region_follows_the_launcher_source_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            common = Path(tmp, "common.env"); common.write_text("AWS_REGION=eu-central-1\n")
+            debot = Path(tmp, "debot.env"); debot.write_text("AWS_REGION=ap-northeast-1\n")
+            arm = Path(tmp, "arm.env"); arm.write_text("LIGHTER_ACCOUNT_INDEX=1\n")
+            missing = Path(tmp, "nope.env")
+            self.assertEqual(collector.resolve_region([common, debot, arm], {}), "ap-northeast-1")
+            self.assertEqual(collector.resolve_region([common], {}), "eu-central-1")
+            self.assertEqual(collector.resolve_region([arm, missing], {}), "eu-central-1")
+            self.assertEqual(collector.resolve_region([arm], {"AWS_REGION": "us-east-1"}),
+                             "us-east-1")
+            # A file's setting overrides the process env, as `set -a; source` does.
+            self.assertEqual(collector.resolve_region([debot], {"AWS_REGION": "us-east-1"}),
+                             "ap-northeast-1")
 
 
 class DailyTests(unittest.TestCase):
@@ -262,14 +283,18 @@ class DailyTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertTrue(any("2026-09-17: no snapshot on 2026-09-16" in n for n in notes))
 
-    def test_a_negative_day_is_kept_and_flagged(self):
+    def test_a_negative_day_is_skipped_and_flagged_and_rebaselines(self):
+        # The ledger's load_points rejects a negative row and with it the
+        # whole file, so a revoked day must not be written; the revised
+        # tally is still the next day's opening.
         day = 86_400
         d0 = 1_789_430_400
-        rows = [self.snap("freq", d0 + 10, 100, 0), self.snap("freq", d0 + day + 10, 90, 0)]
+        rows = [self.snap("freq", d0 + 10, 100, 0), self.snap("freq", d0 + day + 10, 90, 0),
+                self.snap("freq", d0 + 2 * day + 10, 95, 0)]
         out, notes = daily.daily_points(
             daily.last_snapshot_per_day(rows, "live_points_total"), "live_points_total")
-        self.assertEqual(out[0]["points"], -10.0)
-        self.assertTrue(any("fell by 10" in n for n in notes))
+        self.assertEqual([(r["date"], r["points"]) for r in out], [("2026-09-17", 5.0)])
+        self.assertTrue(any("2026-09-16" in n and "fell by 10" in n for n in notes))
 
     def test_damaged_snapshots_are_errors(self):
         with self.assertRaises(daily.PointsDailyError):

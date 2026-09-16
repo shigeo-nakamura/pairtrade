@@ -134,6 +134,20 @@ def require(env: dict[str, str], key: str, path: Path) -> str:
     return value
 
 
+def resolve_region(env_files: list[Path], process_env: dict[str, str]) -> str:
+    """The region `debot_utils::decrypt_data_with_kms` would use in the
+    bot's process: `AWS_REGION` after the launcher has `set -a; source`d
+    its env files in order (a later file overwrites an earlier one and the
+    inherited environment), else the library's `eu-central-1` default.
+    A file that does not exist is skipped, not an error: only the common
+    file is required to exist, and that is checked by its own reader."""
+    region = process_env.get("AWS_REGION", "")
+    for path in env_files:
+        if path.is_file():
+            region = load_env(path).get("AWS_REGION", region) or region
+    return region or "eu-central-1"
+
+
 def kms_decrypt_data_key(encrypted_data_key_b64: str, region: str) -> bytes:
     """The AES data key, via the instance role. AWS CLI v2 takes blob
     parameters as base64 text, which is the form the env file holds."""
@@ -366,10 +380,13 @@ def collect_arm(arm: Arm, data_key: bytes, signer: Signer, base_url: str,
     env = load_env(arm.env_path)
     api_key_index = int(require(env, "LIGHTER_API_KEY_INDEX", arm.env_path))
     account_index = int(require(env, "LIGHTER_ACCOUNT_INDEX", arm.env_path))
+    # Both keys the way the bot reads them: `decrypt_data_with_kms(..,
+    # output_as_hex=true)` hex-encodes the decrypted bytes, and the
+    # connector sends that hex as X-API-KEY and hands it to CreateClient.
     private_key_hex = aes_cbc_decrypt(
         data_key, require(env, "LIGHTER_PRIVATE_API_KEY", arm.env_path)).hex()
     api_key_public = aes_cbc_decrypt(
-        data_key, require(env, "LIGHTER_PUBLIC_API_KEY", arm.env_path)).decode("utf-8")
+        data_key, require(env, "LIGHTER_PUBLIC_API_KEY", arm.env_path)).hex()
     signer.create_client(base_url, private_key_hex, ROBINHOOD_SIGNING_CHAIN_ID,
                          api_key_index, account_index)
     token = signer.auth_token(now_unix + TOKEN_TTL_SECS, api_key_index, account_index)
@@ -384,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--common", type=Path,
                         default=Path("/opt/debot/scripts/debot_secrets_common.env"),
                         help="env file holding ENCRYPTED_DATA_KEY (and optionally AWS_REGION)")
+    parser.add_argument("--env", action="append", type=Path, default=[],
+                        help="extra env file the launcher sources (debot.env); read for AWS_REGION")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--libsigner", default=DEFAULT_LIBSIGNER)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
@@ -393,7 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     common = load_env(args.common)
-    region = common.get("AWS_REGION") or os.environ.get("AWS_REGION") or "eu-central-1"
+    region = resolve_region(
+        [args.common, *args.env, *(arm.env_path for arm in args.arm)], os.environ)
     data_key = kms_decrypt_data_key(require(common, "ENCRYPTED_DATA_KEY", args.common), region)
     signer = Signer(args.libsigner)
     now_unix = int(time.time())
