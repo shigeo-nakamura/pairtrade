@@ -146,6 +146,14 @@ class EnvelopeTests(unittest.TestCase):
                  "message": "invalid param : auth query param and Authorization header are empty"})
         self.assertIn("auth query param", str(ctx.exception))
 
+    def test_http_200_without_a_code_is_a_plain_success_body(self):
+        # referral/points answers without the {code, message} envelope
+        # (first live run, 2026-09-16); livePoints/total answers with it.
+        body = {"user_total_points": 1, "user_last_week_points": 0}
+        self.assertIs(collector.check_envelope("referral/points", 200, body), body)
+        with self.assertRaises(collector.CollectorError):
+            collector.check_envelope("referral/points", 500, body)
+
     def test_non_object_is_an_error(self):
         with self.assertRaises(collector.CollectorError):
             collector.check_envelope("x", 200, [1, 2])
