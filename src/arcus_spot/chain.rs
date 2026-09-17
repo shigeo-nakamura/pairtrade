@@ -30,6 +30,79 @@ abigen!(
     ]"#
 );
 
+// The SwapShell at 0x4262efBd... is an EIP-1967 proxy. Between 2026-09-16
+// 07:32Z and 2026-09-17 06:02Z its implementation changed and `SwapExecuted`
+// gained a string (observed value "anonymous") between `routeTag` and
+// `success`; the legacy layout above stopped decoding, every receipt read
+// "0 matching SwapExecuted events", and ledger seq 36 sat in `confirmed`
+// while every tick failed (bot-strategy#1040). Both layouts are accepted;
+// they carry the same checked fields. The extra string's meaning is not
+// documented by Arcus and is not used for any decision.
+abigen!(
+    ArcusSpotSwapShellV2,
+    r#"[
+        event SwapExecuted(address indexed taker, address indexed tokenIn, address indexed tokenOut, uint256 minAmountOut, uint256 amountIn, uint256 quotedAmountIn, uint256 quotedAmountOut, uint256 amountOut, uint256 tokenInBenchmarkPrice, uint256 tokenOutBenchmarkPrice, address router, bytes32 routeTag, string source, bool success, string reason)
+    ]"#
+);
+
+/// The fields of a `SwapExecuted` event that settlement validation checks,
+/// independent of which layout the SwapShell implementation emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwapExecutedFields {
+    taker: Address,
+    token_in: Address,
+    token_out: Address,
+    min_amount_out: U256,
+    amount_in: U256,
+    quoted_amount_in: U256,
+    quoted_amount_out: U256,
+    amount_out: U256,
+    router: Address,
+    route_tag: [u8; 32],
+    success: bool,
+}
+
+/// Decode one log as either `SwapExecuted` layout. `decode_log` matches on
+/// the event signature topic, so a log can decode as at most one of them;
+/// an unrelated log decodes as neither.
+fn decode_swap_executed(log: &ethers::types::Log) -> Option<SwapExecutedFields> {
+    let raw = RawLog {
+        topics: log.topics.clone(),
+        data: log.data.to_vec(),
+    };
+    if let Ok(e) = arcus_spot_swap_shell::SwapExecutedFilter::decode_log(&raw) {
+        return Some(SwapExecutedFields {
+            taker: e.taker,
+            token_in: e.token_in,
+            token_out: e.token_out,
+            min_amount_out: e.min_amount_out,
+            amount_in: e.amount_in,
+            quoted_amount_in: e.quoted_amount_in,
+            quoted_amount_out: e.quoted_amount_out,
+            amount_out: e.amount_out,
+            router: e.router,
+            route_tag: e.route_tag,
+            success: e.success,
+        });
+    }
+    if let Ok(e) = arcus_spot_swap_shell_v2::SwapExecutedFilter::decode_log(&raw) {
+        return Some(SwapExecutedFields {
+            taker: e.taker,
+            token_in: e.token_in,
+            token_out: e.token_out,
+            min_amount_out: e.min_amount_out,
+            amount_in: e.amount_in,
+            quoted_amount_in: e.quoted_amount_in,
+            quoted_amount_out: e.quoted_amount_out,
+            amount_out: e.amount_out,
+            router: e.router,
+            route_tag: e.route_tag,
+            success: e.success,
+        });
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArcusSpotChainConfig {
     /// Tried in order on every call; a later entry is only used when every
@@ -370,13 +443,7 @@ fn validate_settlement_receipt(
         .logs
         .iter()
         .filter(|log| log.address == expected.swap_shell)
-        .filter_map(|log| {
-            SwapExecutedFilter::decode_log(&RawLog {
-                topics: log.topics.clone(),
-                data: log.data.to_vec(),
-            })
-            .ok()
-        })
+        .filter_map(decode_swap_executed)
         .filter(|event| {
             event.taker == expected.taker
                 && event.token_in == expected.sell_token
@@ -1533,6 +1600,178 @@ mod tests {
             validate_settlement_receipt(&receipt, H256::from_low_u64_be(0x818), expectation)
                 .unwrap();
         }
+    }
+
+    /// Rewrite a legacy `SwapExecuted` log into the post-2026-09-16 layout
+    /// (a string inserted before `success`; bot-strategy#1040), keeping
+    /// every checked field, so each legacy fixture can be replayed as v2.
+    fn as_v2_swap_executed(log: &Log) -> Log {
+        let legacy = arcus_spot_swap_shell::SwapExecutedFilter::decode_log(&RawLog {
+            topics: log.topics.clone(),
+            data: log.data.to_vec(),
+        })
+        .expect("fixture is a legacy SwapExecuted log");
+        let signature = keccak256(
+            "SwapExecuted(address,address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,address,bytes32,string,bool,string)",
+        );
+        let data = encode(&[
+            Token::Uint(legacy.min_amount_out),
+            Token::Uint(legacy.amount_in),
+            Token::Uint(legacy.quoted_amount_in),
+            Token::Uint(legacy.quoted_amount_out),
+            Token::Uint(legacy.amount_out),
+            Token::Uint(legacy.token_in_benchmark_price),
+            Token::Uint(legacy.token_out_benchmark_price),
+            Token::Address(legacy.router),
+            Token::FixedBytes(legacy.route_tag.to_vec()),
+            Token::String("anonymous".to_string()),
+            Token::Bool(legacy.success),
+            Token::String(legacy.reason.clone()),
+        ]);
+        let mut topics = log.topics.clone();
+        topics[0] = H256::from(signature);
+        Log {
+            topics,
+            data: Bytes::from(data),
+            ..log.clone()
+        }
+    }
+
+    fn with_v2_swap_shell_logs(mut receipt: TransactionReceipt) -> TransactionReceipt {
+        let swap_shell = Address::from_str("0x4262efBd176F02824af27010bEa218429c33c7E8").unwrap();
+        for log in receipt.logs.iter_mut() {
+            if log.address == swap_shell {
+                *log = as_v2_swap_executed(log);
+            }
+        }
+        receipt
+    }
+
+    /// The SwapShell proxy's new implementation emits `SwapExecuted` with
+    /// a string before `success` (bot-strategy#1040). Every check that
+    /// passes on the legacy layout must pass on the new one with the same
+    /// settled amounts, and every rejection must still reject.
+    #[test]
+    fn accepts_the_post_upgrade_swap_executed_layout() {
+        let router = Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap();
+        let legacy = settlement_receipt("RIALTO", router, true, 985);
+        let v2 = with_v2_swap_shell_logs(legacy.clone());
+        assert_ne!(
+            legacy.logs[0].topics[0], v2.logs[0].topics[0],
+            "the fixture must really change layout"
+        );
+        assert!(
+            arcus_spot_swap_shell::SwapExecutedFilter::decode_log(&RawLog {
+                topics: v2.logs[0].topics.clone(),
+                data: v2.logs[0].data.to_vec(),
+            })
+            .is_err(),
+            "the legacy ABI alone must NOT decode the new layout (that is the bug)"
+        );
+        let expectation = settlement_expectation("rialto", router).validate().unwrap();
+        let want = validate_settlement_receipt(&legacy, H256::from_low_u64_be(0x818), expectation)
+            .unwrap();
+        let got =
+            validate_settlement_receipt(&v2, H256::from_low_u64_be(0x818), expectation).unwrap();
+        assert_eq!(got, want);
+        // rejections survive the layout change: unsuccessful swap, wrong venue
+        let failed = with_v2_swap_shell_logs(settlement_receipt("RIALTO", router, false, 985));
+        let error = validate_settlement_receipt(&failed, H256::from_low_u64_be(0x818), expectation)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsuccessful"), "{error}");
+        let arcus_router = Address::from_str("0x006102b16A04c20306A28b652745D3973D7D24fa").unwrap();
+        let wrong = with_v2_swap_shell_logs(settlement_receipt("ARCUS", arcus_router, true, 985));
+        let error = validate_settlement_receipt(&wrong, H256::from_low_u64_be(0x818), expectation)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("router does not match"),
+            "{error}"
+        );
+        // a third, unknown signature decodes as neither and is not counted
+        let mut unknown = v2.clone();
+        unknown.logs[0].topics[0] = H256::from(keccak256("SwapExecuted(address)"));
+        let error =
+            validate_settlement_receipt(&unknown, H256::from_low_u64_be(0x818), expectation)
+                .unwrap_err();
+        assert!(error.to_string().contains("0 matching"), "{error}");
+    }
+
+    /// The exact log the SwapShell emitted for ledger seq 36 (tx
+    /// 0xf85e93cf..dd0ac, block 65136779, 2026-09-17 06:02:25Z), the swap
+    /// that stalled the bot. It must decode to the values the on-chain
+    /// transfers showed.
+    #[test]
+    fn decodes_the_seq_36_swap_executed_log_verbatim() {
+        let swap_shell = Address::from_str("0x4262efBd176F02824af27010bEa218429c33c7E8").unwrap();
+        let topics = [
+            "0x824a7dbfc9f746ced98e93f691f8e5c68d0a549b6999eeaa16192f903e39aa27",
+            "0x000000000000000000000000812b6a6da8e0df1fbca7939ae32089cf85c5df05",
+            "0x000000000000000000000000117cc2133c37b721f49de2a7a74833232b3b4c0c",
+            "0x000000000000000000000000d5f3879160bc7c32ebb4dc785f8a4f505888de68",
+        ]
+        .iter()
+        .map(|t| H256::from_str(t).unwrap())
+        .collect::<Vec<_>>();
+        let data = hex::decode(concat!(
+            "00000000000000000000000000000000000000000000000008ec781972cbb668",
+            "000000000000000000000000000000000000000000000000086439fb2b9b1131",
+            "000000000000000000000000000000000000000000000000086439fb2b9b1131",
+            "00000000000000000000000000000000000000000000000008f7f2e9fa72af9b",
+            "00000000000000000000000000000000000000000000000008f7f2e2b0b74874",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000c94135b63772b91d79d0a2daab2a8801f32359bd",
+            "5249414c544f0000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000180",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "00000000000000000000000000000000000000000000000000000000000001c0",
+            "0000000000000000000000000000000000000000000000000000000000000009",
+            "616e6f6e796d6f75730000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ))
+        .unwrap();
+        let log = Log {
+            address: swap_shell,
+            topics,
+            data: Bytes::from(data),
+            ..Default::default()
+        };
+        let fields = decode_swap_executed(&log).expect("the seq 36 log must decode");
+        assert_eq!(
+            fields.taker,
+            Address::from_str("0x812B6A6da8E0dF1fBCA7939ae32089Cf85c5DF05").unwrap()
+        );
+        assert_eq!(
+            fields.token_in,
+            Address::from_str("0x117cc2133c37B721F49dE2A7a74833232B3B4C0C").unwrap()
+        );
+        assert_eq!(
+            fields.token_out,
+            Address::from_str("0xD5f3879160bc7c32ebb4dC785F8a4F505888de68").unwrap()
+        );
+        assert_eq!(
+            fields.amount_in,
+            U256::from_dec_str("604672000905646385").unwrap()
+        );
+        assert_eq!(fields.quoted_amount_in, fields.amount_in);
+        assert_eq!(
+            fields.min_amount_out,
+            U256::from_dec_str("643020897502606952").unwrap()
+        );
+        assert_eq!(
+            fields.quoted_amount_out,
+            U256::from_dec_str("646252158294077339").unwrap()
+        );
+        assert_eq!(
+            fields.amount_out,
+            U256::from_dec_str("646252126992287860").unwrap()
+        );
+        assert_eq!(
+            fields.router,
+            Address::from_str("0xC94135b63772b91D79d0A2DaAb2a8801f32359bD").unwrap()
+        );
+        assert_eq!(&fields.route_tag[..6], b"RIALTO");
+        assert!(fields.success);
     }
 
     #[test]
