@@ -823,6 +823,33 @@ struct State {
 /// settlement without re-reading the whole holding period every time.
 const FUNDING_REREAD_SECS: u64 = 6 * 3600;
 
+/// How long after EXIT the funding history keeps being read. The perp leg
+/// is closed at EXIT, so only settlements already accrued can still land;
+/// a day covers the venue's hourly cycle with margin, after which polling
+/// a flat book is just load on the account endpoint.
+const FUNDING_POLL_AFTER_EXIT_SECS: u64 = 24 * 3600;
+
+/// Whether the funding history is due for a read: only once ARMed (the
+/// total is per holding period), on the reconcile cadence, and not
+/// indefinitely after EXIT (`armed_at` is never cleared).
+fn funding_poll_due(
+    armed_at: Option<u64>,
+    exited_at: Option<u64>,
+    now: u64,
+    last_poll: u64,
+    every_secs: u64,
+) -> bool {
+    if armed_at.is_none() {
+        return false;
+    }
+    if let Some(exited) = exited_at {
+        if now.saturating_sub(exited) > FUNDING_POLL_AFTER_EXIT_SECS {
+            return false;
+        }
+    }
+    now.saturating_sub(last_poll) >= every_secs
+}
+
 /// Fold newly settled payments into the running total. Pure so the dedupe
 /// and the symbol filter can be asserted without a venue: counts a payment
 /// once (by venue id), only on configured symbols, only at or after `since`.
@@ -2099,12 +2126,16 @@ impl Engine {
                 self.reconcile().await;
             }
         }
-        // Read-only, so it runs while halted and after EXIT too (the last
-        // settlements land after the perp leg is closed); gated on ARM
+        // Read-only, so it runs while halted and for a day after EXIT (the
+        // last settlements land after the perp leg is closed); gated on ARM
         // because the total is per holding period.
-        if self.state.armed_at.is_some()
-            && now.saturating_sub(self.last_funding_poll) >= self.cfg.reconcile_every_secs
-        {
+        if funding_poll_due(
+            self.state.armed_at,
+            self.state.exited_at,
+            now,
+            self.last_funding_poll,
+            self.cfg.reconcile_every_secs,
+        ) {
             self.last_funding_poll = now;
             self.poll_funding(now).await;
         }
@@ -2345,6 +2376,42 @@ mod tests {
         let mut fresh = State::default();
         apply_funding_payments(&mut fresh, &[], &symbols, since);
         assert_eq!(fresh.cum_funding_usdc, Some(0.0));
+    }
+
+    #[test]
+    fn funding_poll_runs_only_while_armed_and_for_a_day_after_exit() {
+        let every = 600;
+        // Never ARMed: nothing to attribute the total to.
+        assert!(!funding_poll_due(None, None, 10_000, 0, every));
+        // ARMed: on the cadence.
+        assert!(funding_poll_due(Some(1_000), None, 10_000, 0, every));
+        assert!(!funding_poll_due(Some(1_000), None, 10_000, 9_500, every));
+        assert!(funding_poll_due(Some(1_000), None, 10_000, 9_400, every));
+        // After EXIT the settlements already accrued still land, so keep
+        // reading for a day; `armed_at` is never cleared, so without the
+        // exit cutoff a flat book would be polled forever.
+        let exited = 50_000;
+        assert!(funding_poll_due(
+            Some(1_000),
+            Some(exited),
+            exited + 3_600,
+            0,
+            every
+        ));
+        assert!(funding_poll_due(
+            Some(1_000),
+            Some(exited),
+            exited + FUNDING_POLL_AFTER_EXIT_SECS,
+            0,
+            every
+        ));
+        assert!(!funding_poll_due(
+            Some(1_000),
+            Some(exited),
+            exited + FUNDING_POLL_AFTER_EXIT_SECS + 1,
+            0,
+            every
+        ));
     }
 
     #[test]
