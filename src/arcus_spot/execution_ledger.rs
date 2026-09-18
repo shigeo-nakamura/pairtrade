@@ -713,7 +713,21 @@ impl ArcusSpotExecutionLedger {
     /// any transaction went out, so this is a belt-and-suspenders check
     /// that there is nothing to reconcile financially, not just a phase
     /// check.
-    pub fn archive_rejected(&mut self) -> Result<()> {
+    ///
+    /// The absent `tx_hash` is necessary but not sufficient: it says the
+    /// *router* reported no transaction, not that none was mined. On
+    /// 2026-09-10 sequence 20 came back HTTP 422 `SHELL_SUBMIT_FAILED` with
+    /// no hash, was archived as nothing-happened, and had in fact settled
+    /// on chain (tx `0x11bd6a46…`, block 59004254, the exact
+    /// `sell_amount_raw`); the runtime re-sent the same rotation and its
+    /// inventory has been one rotation away from the wallet ever since
+    /// (bot-strategy#1043). So archiving also requires `wallet`: a read of
+    /// the taker's balances taken *after* the dispatch, which must still
+    /// equal the pre-dispatch snapshot exactly. Anything else -- the sell
+    /// leg down, the buy leg up, either token moved for any reason -- is
+    /// left for an operator, because "nothing to reconcile" is precisely
+    /// what can no longer be assumed.
+    pub fn archive_rejected(&mut self, wallet: &ArcusSpotBalanceSnapshot) -> Result<()> {
         let active = self
             .active
             .take()
@@ -728,6 +742,10 @@ impl ArcusSpotExecutionLedger {
                 "refusing to archive: a Rejected attempt with a tx_hash may have reached the \
                  chain -- use repair-report/manual-reconcile instead"
             );
+        }
+        if let Err(error) = require_wallet_untouched_since_dispatch(&active, wallet) {
+            self.active = Some(active);
+            return Err(error);
         }
         self.history.push(active);
         Ok(())
@@ -1004,6 +1022,70 @@ impl ArcusSpotExecutionLedgerStore {
     }
 }
 
+/// Proof that a rejected attempt left the wallet alone, or why it cannot be
+/// taken as such (bot-strategy#1043).
+///
+/// `wallet` must be a read of the taker's sell/buy token balances taken
+/// after the attempt was dispatched (after it was prepared, for a rejection
+/// that never reached dispatch): the attempt's own `pre_balances` -- or any
+/// read from before the dispatch -- proves nothing about what the venue did
+/// with the submission, and is refused as stale rather than compared. Both
+/// token balances must then equal the pre-dispatch snapshot to the wei.
+///
+/// A sell balance that fell by exactly the attempt's `sell_amount_raw` is
+/// named as such in the error: it is the signature of the "rejected" swap
+/// having settled anyway, and the operator should go looking for the
+/// transaction (a `Transfer` of that amount from the taker on the sell
+/// token, after `dispatched_at`) rather than for a deposit or withdrawal.
+pub fn require_wallet_untouched_since_dispatch(
+    attempt: &ArcusSpotExecutionAttempt,
+    wallet: &ArcusSpotBalanceSnapshot,
+) -> Result<()> {
+    let (sell_token, buy_token, sell_amount, _) = attempt.intent.validate()?;
+    let (pre_sell, pre_buy, _) = attempt.pre_balances.validate_for(sell_token, buy_token)?;
+    let (now_sell, now_buy, _) = wallet
+        .validate_for(sell_token, buy_token)
+        .context("wallet read does not describe the rejected attempt's tokens")?;
+    let sent_at = attempt.dispatched_at.unwrap_or(attempt.prepared_at);
+    if wallet.observed_at <= sent_at {
+        bail!(
+            "refusing to archive rejected sequence {}: the wallet read at {} predates the \
+             dispatch at {sent_at}, so it cannot show what the venue did with the submission",
+            attempt.sequence,
+            wallet.observed_at,
+        );
+    }
+    if now_sell == pre_sell && now_buy == pre_buy {
+        return Ok(());
+    }
+    let sell_shortfall = pre_sell.checked_sub(now_sell);
+    let diagnosis = if sell_shortfall == Some(sell_amount) {
+        format!(
+            "the sell-token balance fell by exactly the rejected submission's sell amount \
+             ({sell_amount}), consistent with that submission having been mined despite the \
+             router's rejection (bot-strategy#1043, sequence 20 on 2026-09-10)"
+        )
+    } else {
+        "the wallet no longer matches the pre-dispatch snapshot".to_string()
+    };
+    bail!(
+        "refusing to archive rejected sequence {}: {diagnosis}; sell token {} {} -> {}, buy \
+         token {} {} -> {} (pre-dispatch {} -> wallet read {}). Nothing reached the ledger for \
+         this move, so the runtime checkpoint does not include it: find the transaction (a \
+         Transfer of the sell token from the taker after the dispatch) and reconcile the \
+         runtime to the wallet before clearing this attempt",
+        attempt.sequence,
+        attempt.intent.sell_symbol,
+        pre_sell,
+        now_sell,
+        attempt.intent.buy_symbol,
+        pre_buy,
+        now_buy,
+        attempt.pre_balances.observed_at,
+        wallet.observed_at,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,7 +1265,9 @@ mod tests {
             .unwrap();
         ledger.cancel_prepared("plan expired", now).unwrap();
 
-        ledger.archive_rejected().unwrap();
+        ledger
+            .archive_rejected(&balances("5000", "2000", later(now)))
+            .unwrap();
 
         assert!(ledger.active.is_none());
         assert_eq!(ledger.history.len(), 1);
@@ -1218,7 +1302,9 @@ mod tests {
             )
             .unwrap();
 
-        ledger.archive_rejected().unwrap();
+        ledger
+            .archive_rejected(&balances("5000", "2000", later(now)))
+            .unwrap();
 
         assert!(ledger.active.is_none());
         assert_eq!(ledger.history.len(), 1);
@@ -1244,7 +1330,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(ledger.archive_rejected().is_err());
+        assert!(ledger
+            .archive_rejected(&balances("5000", "2000", later(now)))
+            .is_err());
         // Refusing must not have taken the active attempt out from under it.
         assert!(ledger.active.is_some());
     }
@@ -1270,8 +1358,170 @@ mod tests {
         ledger.cancel_prepared("plan expired", now).unwrap();
         ledger.active.as_mut().unwrap().tx_hash = Some(format!("{:#x}", H256::from_low_u64_be(1)));
 
-        assert!(ledger.archive_rejected().is_err());
+        assert!(ledger
+            .archive_rejected(&balances("5000", "2000", later(now)))
+            .is_err());
         assert!(ledger.active.is_some());
+    }
+
+    /// A router-rejected dispatch, as `record_submit_rejected` writes it:
+    /// pre-dispatch balances 5000 sell / 2000 buy, `intent().sell_amount_raw`
+    /// = 1000.
+    fn router_rejected_ledger(now: DateTime<Utc>) -> ArcusSpotExecutionLedger {
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.mark_dispatching(now).unwrap();
+        ledger
+            .record_submit_rejected(
+                "HTTP 422 SHELL_SUBMIT_FAILED",
+                now,
+                ArcusSpotRejectionOrigin::Venue,
+            )
+            .unwrap();
+        ledger
+    }
+
+    fn later(now: DateTime<Utc>) -> DateTime<Utc> {
+        now + chrono::Duration::minutes(15)
+    }
+
+    #[test]
+    fn archive_rejected_refuses_when_the_sell_leg_left_the_wallet_anyway() {
+        // bot-strategy#1043: sequence 20 on 2026-09-10 was HTTP 422 with no
+        // tx_hash and settled on chain regardless. The wallet read 15
+        // minutes later shows exactly the sell amount gone and the buy leg
+        // arrived: that is a fill the ledger never recorded, not a
+        // rejection with nothing to reconcile.
+        let now = Utc::now();
+        let mut ledger = router_rejected_ledger(now);
+
+        let error = ledger
+            .archive_rejected(&balances("4000", "2990", later(now)))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("refusing to archive rejected sequence 1"),
+            "{error}"
+        );
+        assert!(
+            error.contains("fell by exactly the rejected submission's sell amount (1000)"),
+            "{error}"
+        );
+        assert!(error.contains("having been mined"), "{error}");
+        assert!(error.contains("NVDA 5000 -> 4000"), "{error}");
+        assert!(error.contains("AMD 2000 -> 2990"), "{error}");
+        assert!(ledger.active.is_some(), "the attempt stays for an operator");
+        assert!(ledger.history.is_empty());
+    }
+
+    #[test]
+    fn archive_rejected_refuses_any_other_wallet_movement_too() {
+        // Not only the exact-sell-amount signature: a partial move, or one
+        // on the buy leg alone, is equally not "nothing happened". The
+        // diagnosis just does not claim to know what it was.
+        let now = Utc::now();
+        for (sell, buy) in [
+            ("4999", "2000"),
+            ("5000", "2001"),
+            ("5000", "1999"),
+            ("5001", "2000"),
+        ] {
+            let mut ledger = router_rejected_ledger(now);
+            let error = ledger
+                .archive_rejected(&balances(sell, buy, later(now)))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("no longer matches the pre-dispatch snapshot"),
+                "{sell}/{buy}: {error}"
+            );
+            assert!(
+                !error.contains("having been mined"),
+                "{sell}/{buy}: {error}"
+            );
+            assert!(ledger.active.is_some(), "{sell}/{buy}");
+        }
+    }
+
+    #[test]
+    fn archive_rejected_refuses_a_wallet_read_that_predates_the_dispatch() {
+        // The attempt's own pre_balances, or any read from before the
+        // dispatch, trivially "matches" -- it is what the comparison is
+        // against. Only a read after the venue had the submission counts.
+        let now = Utc::now();
+        let mut ledger = router_rejected_ledger(now);
+        let pre = ledger.active.as_ref().unwrap().pre_balances.clone();
+
+        let error = ledger.archive_rejected(&pre).unwrap_err().to_string();
+        assert!(error.contains("predates the dispatch"), "{error}");
+        assert!(ledger.active.is_some());
+
+        let error = ledger
+            .archive_rejected(&balances(
+                "5000",
+                "2000",
+                now - chrono::Duration::seconds(1),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("predates the dispatch"), "{error}");
+        assert!(ledger.active.is_some());
+    }
+
+    #[test]
+    fn archive_rejected_refuses_a_wallet_read_of_other_tokens() {
+        let now = Utc::now();
+        let mut ledger = router_rejected_ledger(now);
+        let mut wallet = balances("5000", "2000", later(now));
+        wallet.sell_token = intent().buy_token;
+        wallet.buy_token = intent().sell_token;
+
+        let error = ledger.archive_rejected(&wallet).unwrap_err().to_string();
+        assert!(
+            error.contains("does not describe the rejected attempt's tokens"),
+            "{error}"
+        );
+        assert!(ledger.active.is_some());
+    }
+
+    #[test]
+    fn a_never_dispatched_rejection_is_judged_from_its_preparation_time() {
+        // cancel_prepared never reaches mark_dispatching, so dispatched_at
+        // is None; the read still has to postdate the attempt.
+        let now = Utc::now();
+        let mut ledger = ArcusSpotExecutionLedger::default();
+        ledger
+            .prepare(
+                4663,
+                "0x7600000000000000000000000000000000000001".to_string(),
+                format!("sha256:{}", "a".repeat(64)),
+                intent(),
+                balances("5000", "2000", now),
+                now,
+            )
+            .unwrap();
+        ledger.cancel_prepared("plan expired", now).unwrap();
+        assert!(ledger.active.as_ref().unwrap().dispatched_at.is_none());
+
+        assert!(ledger
+            .archive_rejected(&balances("5000", "2000", now))
+            .unwrap_err()
+            .to_string()
+            .contains("predates the dispatch"));
+        ledger
+            .archive_rejected(&balances("5000", "2000", later(now)))
+            .unwrap();
+        assert!(ledger.active.is_none());
     }
 
     #[test]

@@ -749,9 +749,10 @@ touch the KMS signer or the submission network.
 ### Clearing a router rejection (bot-strategy#986)
 
 A submission the router refuses (`HTTP 422 SHELL_SUBMIT_FAILED`) leaves the
-ledger's active attempt in phase `Rejected`. Nothing reached the chain --
-the refusal happens before a transaction exists -- but the single `active`
-slot stays occupied, and every later tick used to exit 1 on
+ledger's active attempt in phase `Rejected` with no `tx_hash`. Usually
+nothing reached the chain -- but see "The wallet has the last word" below:
+that is checked, not assumed. The single `active` slot stays occupied, and
+every later tick used to exit 1 on
 
     Error: Arcus status resume is not allowed in phase Some(Rejected)
 
@@ -769,7 +770,8 @@ that follows builds a new one from a fresh observation or decides not to
 trade.
 
     [arcus-rejected] sequence=20 run=1 cleared automatically: the router
-    refused the submission and no transaction was sent, ...
+    refused the submission, and the wallet still holds exactly its
+    pre-dispatch balances, ...
 
 Still held for an operator, unchanged:
 
@@ -797,6 +799,50 @@ Still held for an operator, unchanged:
 Every cleared rejection stays in the ledger's `history`, so the record of
 what the router refused is not lost -- `archive-rejected-report` remains
 the way to inspect one before acting on it manually.
+
+#### The wallet has the last word (bot-strategy#1043)
+
+"No `tx_hash`" is the router's account of what happened, and it has been
+wrong. On 2026-09-10 sequence 20 (rialto, SPY -> QQQ, 0.524414785874887742
+SPY) came back `HTTP 422 SHELL_SUBMIT_FAILED` with no hash and was cleared
+as nothing-happened. It had settled: tx `0x11bd6a46…f74cb`, block
+59004254, mined at 01:17:24Z -- one second before the 422 -- moving exactly
+the attempt's `sell_amount_raw` out of the taker. The runtime, still
+believing itself neutral, re-sent the same rotation as sequence 21 at
+08:17Z, and its inventory has been one rotation away from the wallet ever
+since (the checkpoint's "neutral" 1.93 SPY / 2.07 QQQ is the wallet's 1.41
+/ 2.64). Nothing in the ledger, the checkpoint, or the event stream could
+show it; only the balances could.
+
+So `archive_rejected` -- the one method every clearance goes through,
+automatic or manual -- now requires a **read of the taker's sell/buy token
+balances taken after the dispatch**, and archives only when both still
+equal the attempt's `pre_balances` to the wei. The read is made under the
+same lock as the archive, only when there is a venue rejection to judge
+(a flat ledger, a `tx_hash`, this bot's own refusal, or another phase never
+costs the RPC round trip), and:
+
+- a **match** clears the rejection exactly as before;
+- a **sell balance down by exactly `sell_amount_raw`** fails the tick with
+  the diagnosis (`... consistent with that submission having been mined
+  despite the router's rejection ...`) and leaves the attempt active. This
+  is a fill the ledger never recorded and the checkpoint does not contain;
+  find the transaction (a `Transfer` of the sell token from the taker after
+  `dispatched_at`), then reconcile the runtime to the wallet
+  (`reset-window` with the on-chain inventory) before clearing it. The
+  attempt stays, and the timer keeps failing on it, until then;
+- **any other movement** of either balance fails the same way, without
+  claiming to know what it was;
+- a read from **before the dispatch** (the attempt's own `pre_balances`
+  trivially matches; it is what the comparison is against) or of **other
+  tokens** is refused as evidence at all;
+- an **unreadable chain** fails the tick with `could not read the wallet`
+  rather than archiving on the router's word. The next tick tries again.
+
+`archive-rejected-report` makes the same read and prints both snapshots
+(`pre_balances`, `wallet`) beside its verdict; `archive-rejected-apply`
+reads again under its own lock and records the read in its audit output.
+Neither can be argued past by an operator who has reviewed only the 422.
 
 ### Exit sizing: the open-quantity row (bot-strategy#906)
 
