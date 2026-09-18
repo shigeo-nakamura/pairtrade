@@ -76,7 +76,7 @@ use debot::directional::{
     append_jsonl, config_fingerprint, load_json, persist_json, refuse_live, Sentinels,
 };
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
-use dex_connector::{DexConnector, OrderSide, TpSl, TriggerOrderStyle};
+use dex_connector::{DexConnector, FundingPayment, OrderSide, TpSl, TriggerOrderStyle};
 use env_logger::Builder;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
@@ -802,6 +802,80 @@ struct State {
     /// Empty when no attempt is in flight.
     #[serde(default)]
     tranche_progress: BTreeMap<String, LegProgress>,
+    /// Settled Lighter funding on the configured perp legs since ARM, USD,
+    /// signed as the venue netted it (negative = paid). `None` until the
+    /// account history has been read at least once after ARM: a carry cost
+    /// that is unknown must not read as zero (bot-strategy#963).
+    #[serde(default)]
+    cum_funding_usdc: Option<f64>,
+    /// Unix seconds of the last successful funding-history read.
+    #[serde(default)]
+    cum_funding_as_of: Option<u64>,
+    /// Venue payment ids already counted, with their settlement time, so a
+    /// re-read of an overlapping window never double-counts. Pruned to the
+    /// re-read window (`FUNDING_REREAD_SECS`).
+    #[serde(default)]
+    funding_seen: BTreeMap<i64, i64>,
+}
+
+/// How far behind the last successful read the next funding-history read
+/// starts. Lighter settles hourly; six hours absorbs a late-appearing
+/// settlement without re-reading the whole holding period every time.
+const FUNDING_REREAD_SECS: u64 = 6 * 3600;
+
+/// How long after EXIT the funding history keeps being read. The perp leg
+/// is closed at EXIT, so only settlements already accrued can still land;
+/// a day covers the venue's hourly cycle with margin, after which polling
+/// a flat book is just load on the account endpoint.
+const FUNDING_POLL_AFTER_EXIT_SECS: u64 = 24 * 3600;
+
+/// Whether the funding history is due for a read: only once ARMed (the
+/// total is per holding period), on the reconcile cadence, and not
+/// indefinitely after EXIT (`armed_at` is never cleared).
+fn funding_poll_due(
+    armed_at: Option<u64>,
+    exited_at: Option<u64>,
+    now: u64,
+    last_poll: u64,
+    every_secs: u64,
+) -> bool {
+    if armed_at.is_none() {
+        return false;
+    }
+    if let Some(exited) = exited_at {
+        if now.saturating_sub(exited) > FUNDING_POLL_AFTER_EXIT_SECS {
+            return false;
+        }
+    }
+    now.saturating_sub(last_poll) >= every_secs
+}
+
+/// Fold newly settled payments into the running total. Pure so the dedupe
+/// and the symbol filter can be asserted without a venue: counts a payment
+/// once (by venue id), only on configured symbols, only at or after `since`.
+/// Returns the amount added.
+fn apply_funding_payments(
+    state: &mut State,
+    payments: &[FundingPayment],
+    symbols: &[String],
+    since: u64,
+) -> f64 {
+    let mut added = 0.0;
+    for p in payments {
+        if p.timestamp_secs < since as i64 || !symbols.iter().any(|s| s == &p.symbol) {
+            continue;
+        }
+        if state.funding_seen.contains_key(&p.payment_id) {
+            continue;
+        }
+        let amount = p.amount_usdc.to_string().parse::<f64>().unwrap_or(0.0);
+        state.funding_seen.insert(p.payment_id, p.timestamp_secs);
+        added += amount;
+    }
+    let total = state.cum_funding_usdc.unwrap_or(0.0) + added;
+    state.cum_funding_usdc = Some(total);
+    state.funding_seen.retain(|_, ts| *ts >= since as i64);
+    added
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -827,6 +901,8 @@ struct Engine {
     last_margin_check: u64,
     /// Last runtime collateral-guard evaluation (status.json `margin`).
     last_margin: Option<MarginSnapshot>,
+    /// When the Lighter funding history was last polled (bot-strategy#963).
+    last_funding_poll: u64,
 }
 
 /// Result of one runtime collateral-guard evaluation (bot-strategy#909).
@@ -1515,6 +1591,11 @@ impl Engine {
                 self.state.exited_at = None;
                 self.state.exit_reason = None;
                 self.state.cycles += 1;
+                // Funding is reported per holding period: a fresh ARM
+                // starts a fresh total, unknown until the first read.
+                self.state.cum_funding_usdc = None;
+                self.state.cum_funding_as_of = None;
+                self.state.funding_seen.clear();
             }
             self.persist();
             let mut fp = 0.0;
@@ -2045,7 +2126,54 @@ impl Engine {
                 self.reconcile().await;
             }
         }
+        // Read-only, so it runs while halted and for a day after EXIT (the
+        // last settlements land after the perp leg is closed); gated on ARM
+        // because the total is per holding period.
+        if funding_poll_due(
+            self.state.armed_at,
+            self.state.exited_at,
+            now,
+            self.last_funding_poll,
+            self.cfg.reconcile_every_secs,
+        ) {
+            self.last_funding_poll = now;
+            self.poll_funding(now).await;
+        }
         self.write_status_if_due(now, kill);
+    }
+
+    /// Fold the venue's settled funding since ARM into `cum_funding_usdc`
+    /// (bot-strategy#963). A failed read keeps the last known total and its
+    /// `as_of`, so staleness is visible rather than papered over with a zero.
+    async fn poll_funding(&mut self, now: u64) {
+        let Some(armed_at) = self.state.armed_at else {
+            return;
+        };
+        let since = match self.state.cum_funding_as_of {
+            Some(as_of) => as_of.saturating_sub(FUNDING_REREAD_SECS).max(armed_at),
+            None => armed_at,
+        };
+        match self.lt.get_funding_payments(since as i64).await {
+            Ok(payments) => {
+                let added =
+                    apply_funding_payments(&mut self.state, &payments, &self.cfg.symbols, since);
+                self.state.cum_funding_as_of = Some(now);
+                if added != 0.0 {
+                    log::info!(
+                        "[FUNDING] +{added:.4} USD settled since {since} -> cum {:.4}",
+                        self.state.cum_funding_usdc.unwrap_or(0.0)
+                    );
+                }
+                self.persist();
+            }
+            Err(e) => {
+                log::warn!(
+                    "[FUNDING] history read failed (cum stays {:?}, as_of {:?}): {e:?}",
+                    self.state.cum_funding_usdc,
+                    self.state.cum_funding_as_of
+                );
+            }
+        }
     }
 
     fn write_status_if_due(&mut self, now: u64, kill: bool) {
@@ -2095,6 +2223,13 @@ fn status_value(
         "last_tranche_date": state.last_tranche_date,
         "config_fp": cfg.fingerprint(),
         "margin": margin,
+        // Settled funding on the perp legs since ARM (null = not read yet),
+        // and its read time. Fees stay unreported: Lighter is 0-fee on this
+        // account and the HL spot taker fee is a one-off the connector does
+        // not surface per fill (bot-strategy#963).
+        "cum_funding_usdc": state.cum_funding_usdc,
+        "cum_funding_as_of": state.cum_funding_as_of,
+        "cum_fees_usdc": serde_json::Value::Null,
         // The configured book, which `legs` only describes once a tranche
         // has filled. A monitor checking that its buy & hold anchor covers
         // the whole book has nothing to check against before ARM
@@ -2164,6 +2299,7 @@ async fn main() -> Result<()> {
         last_reconcile: 0,
         last_margin_check: 0,
         last_margin: None,
+        last_funding_poll: 0,
         cfg,
     };
     // A restart while On must re-verify the book before doing anything else.
@@ -2184,6 +2320,119 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+
+    fn payment(symbol: &str, id: i64, ts: i64, usd: &str) -> FundingPayment {
+        FundingPayment {
+            symbol: symbol.into(),
+            timestamp_secs: ts,
+            amount_usdc: usd.parse::<Decimal>().unwrap(),
+            payment_id: id,
+        }
+    }
+
+    #[test]
+    fn funding_total_counts_each_settlement_once_on_the_book_only() {
+        let symbols = vec!["BTC".to_string(), "ETH".to_string()];
+        let mut state = State::default();
+        let since = 1_000_000u64;
+
+        // Unknown until the first read; then the settled amounts, signed as
+        // the venue netted them (bot-strategy#963).
+        assert_eq!(state.cum_funding_usdc, None);
+        let first = [
+            payment("BTC", 11, 1_003_600, "-0.25"),
+            payment("ETH", 12, 1_003_600, "-0.10"),
+            payment("SOL", 13, 1_003_600, "-9.00"), // not a configured leg
+            payment("BTC", 10, 999_999, "-5.00"),   // before ARM
+        ];
+        let added = apply_funding_payments(&mut state, &first, &symbols, since);
+        assert!((added - -0.35).abs() < 1e-9, "added {added}");
+        assert!((state.cum_funding_usdc.unwrap() - -0.35).abs() < 1e-9);
+
+        // An overlapping re-read (newest first, ids already seen) adds only
+        // the genuinely new settlement.
+        let second = [
+            payment("BTC", 21, 1_007_200, "0.05"),
+            payment("BTC", 11, 1_003_600, "-0.25"),
+            payment("ETH", 12, 1_003_600, "-0.10"),
+        ];
+        let added = apply_funding_payments(&mut state, &second, &symbols, since);
+        assert!((added - 0.05).abs() < 1e-9, "added {added}");
+        assert!((state.cum_funding_usdc.unwrap() - -0.30).abs() < 1e-9);
+        assert_eq!(state.funding_seen.len(), 3);
+
+        // Pruning follows the re-read window: ids that can no longer be
+        // re-read are dropped, the total keeps them.
+        let added = apply_funding_payments(&mut state, &[], &symbols, 1_005_000);
+        assert_eq!(added, 0.0);
+        assert_eq!(
+            state.funding_seen.keys().copied().collect::<Vec<_>>(),
+            vec![21]
+        );
+        assert!((state.cum_funding_usdc.unwrap() - -0.30).abs() < 1e-9);
+
+        // An empty read after ARM is a known zero, not an unknown.
+        let mut fresh = State::default();
+        apply_funding_payments(&mut fresh, &[], &symbols, since);
+        assert_eq!(fresh.cum_funding_usdc, Some(0.0));
+    }
+
+    #[test]
+    fn funding_poll_runs_only_while_armed_and_for_a_day_after_exit() {
+        let every = 600;
+        // Never ARMed: nothing to attribute the total to.
+        assert!(!funding_poll_due(None, None, 10_000, 0, every));
+        // ARMed: on the cadence.
+        assert!(funding_poll_due(Some(1_000), None, 10_000, 0, every));
+        assert!(!funding_poll_due(Some(1_000), None, 10_000, 9_500, every));
+        assert!(funding_poll_due(Some(1_000), None, 10_000, 9_400, every));
+        // After EXIT the settlements already accrued still land, so keep
+        // reading for a day; `armed_at` is never cleared, so without the
+        // exit cutoff a flat book would be polled forever.
+        let exited = 50_000;
+        assert!(funding_poll_due(
+            Some(1_000),
+            Some(exited),
+            exited + 3_600,
+            0,
+            every
+        ));
+        assert!(funding_poll_due(
+            Some(1_000),
+            Some(exited),
+            exited + FUNDING_POLL_AFTER_EXIT_SECS,
+            0,
+            every
+        ));
+        assert!(!funding_poll_due(
+            Some(1_000),
+            Some(exited),
+            exited + FUNDING_POLL_AFTER_EXIT_SECS + 1,
+            0,
+            every
+        ));
+    }
+
+    #[test]
+    fn status_reports_funding_as_null_until_read_then_as_the_total() {
+        let cfg = test_config();
+        let mut state = State::default();
+        let before = status_value(&cfg, &state, &None, 1_788_810_248, false);
+        assert!(before["cum_funding_usdc"].is_null());
+        assert!(before["cum_funding_as_of"].is_null());
+        assert!(before["cum_fees_usdc"].is_null());
+
+        state.cum_funding_usdc = Some(-1.25);
+        state.cum_funding_as_of = Some(1_788_810_000);
+        let after = status_value(&cfg, &state, &None, 1_788_810_248, false);
+        assert_eq!(after["cum_funding_usdc"], serde_json::json!(-1.25));
+        assert_eq!(
+            after["cum_funding_as_of"],
+            serde_json::json!(1_788_810_000u64)
+        );
+        assert!(after["cum_fees_usdc"].is_null());
+    }
 
     #[test]
     fn status_reports_the_configured_book_before_any_leg_exists() {
