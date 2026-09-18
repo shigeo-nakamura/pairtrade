@@ -816,33 +816,67 @@ show it; only the balances could.
 
 So `archive_rejected` -- the one method every clearance goes through,
 automatic or manual -- now requires a **read of the taker's sell/buy token
-balances taken after the dispatch**, and archives only when both still
-equal the attempt's `pre_balances` to the wei. The read is made under the
-same lock as the archive, only when there is a venue rejection to judge
-(a flat ledger, a `tx_hash`, this bot's own refusal, or another phase never
-costs the RPC round trip), and:
+balances taken at least `REJECTED_WALLET_READ_MIN_AGE_SECS` (300 s) after
+the dispatch**, and archives only when both still equal the attempt's
+`pre_balances` to the wei. The read is made under the same lock as the
+archive, only when there is a venue rejection to judge (a flat ledger, a
+`tx_hash`, this bot's own refusal, or another phase never costs the RPC
+round trip), and:
 
 - a **match** clears the rejection exactly as before;
+- a **read less than 300 s after the dispatch** is not evidence at all: a
+  submission the router disowned can still be in a mempool, and the first
+  provider to answer a `latest` read can lag, so an overlapping tick's
+  recheck seconds after the 422 (or an operator running the report at
+  once) would clear exactly the case this exists to catch. The next
+  scheduled tick's read always qualifies; nothing sooner does;
 - a **sell balance down by exactly `sell_amount_raw`** fails the tick with
   the diagnosis (`... consistent with that submission having been mined
   despite the router's rejection ...`) and leaves the attempt active. This
-  is a fill the ledger never recorded and the checkpoint does not contain;
-  find the transaction (a `Transfer` of the sell token from the taker after
-  `dispatched_at`), then reconcile the runtime to the wallet
-  (`reset-window` with the on-chain inventory) before clearing it. The
-  attempt stays, and the timer keeps failing on it, until then;
+  is a fill the ledger never recorded and the checkpoint does not contain
+  -- see the recovery below;
 - **any other movement** of either balance fails the same way, without
   claiming to know what it was;
-- a read from **before the dispatch** (the attempt's own `pre_balances`
-  trivially matches; it is what the comparison is against) or of **other
-  tokens** is refused as evidence at all;
+- a read of **other tokens** is refused as evidence;
 - an **unreadable chain** fails the tick with `could not read the wallet`
-  rather than archiving on the router's word. The next tick tries again.
+  rather than archiving on the router's word. The next tick tries again;
+- a rejection **this bot wrote itself** (`rejection_origin: client` -- a
+  submit-seam or plan-age refusal, a client-side preflight failure) never
+  asked the venue, so the wallet is not evidence about it either way and is
+  not consulted. A legacy attempt with no recorded origin is judged by the
+  wallet like a venue rejection.
 
 `archive-rejected-report` makes the same read and prints both snapshots
 (`pre_balances`, `wallet`) beside its verdict; `archive-rejected-apply`
 reads again under its own lock and records the read in its audit output.
 Neither can be argued past by an operator who has reviewed only the 422.
+
+**Recovery when the wallet moved.** The attempt stays active and the timer
+keeps failing on it (health-watch files the issue). The way out is
+explicit, ordered so that no tick can run against a checkpoint that does
+not know about the fill:
+
+1. `systemctl stop arcus-spot-live-tick.timer`.
+2. `archive-rejected-report` -- note `wallet.sell_balance_raw` /
+   `wallet.buy_balance_raw`; it also prints the exact apply invocation
+   under `acknowledge_with_after_reconciling_the_runtime`. Find the
+   transaction (`eth_getLogs`: a `Transfer` of the sell token from the
+   taker after `dispatched_at`; #1043 has a worked example) so the
+   incident is understood, not just cleared.
+3. `archive-rejected-apply CONFIG_YAML SEQUENCE acknowledge-wallet-moved
+   SELL_BALANCE_RAW BUY_BALANCE_RAW` with exactly those balances. It
+   re-reads the wallet and archives only if it still reads those -- an
+   acknowledgement is bound to a reviewed state, not a blanket override --
+   appends the diagnosis to the attempt's `detail` in `history`, and moves
+   that dispatch's `live-tick-pending-plan.json` aside (suffixed
+   `.rejected-seq<N>-wallet-moved.<ns>`, never deleted), because
+   `reset-window` refuses while it exists. The automatic clearance never
+   acknowledges anything.
+4. `state-backup`, then `reset-window` with the on-chain balances as
+   `initial_inventory` (the checkpoint's inventory is one fill away from
+   the wallet and nothing else can move it; `reconcile-position` is for
+   corporate-action windows only).
+5. `systemctl start arcus-spot-live-tick.timer`.
 
 ### Exit sizing: the open-quantity row (bot-strategy#906)
 

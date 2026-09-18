@@ -31,6 +31,9 @@ use debot::arcus_spot::{
 };
 // `reconcile-position` (bot-strategy#977) builds both of these at runtime.
 use debot::arcus_spot::{ArcusSpotBalanceSnapshot, ArcusSpotExecutionIntent};
+// `archive-rejected-*` (bot-strategy#1043): the wallet-moved acknowledgement
+// and the refusal it answers.
+use debot::arcus_spot::{ArcusSpotWalletMoveAcknowledgement, WalletEvidenceRefusal};
 // Test-only since bot-strategy#853's cutoff rule moved to a shared helper:
 // nothing outside the tests names these types here any more.
 #[cfg(test)]
@@ -607,7 +610,9 @@ fn auto_archive_router_rejection(
     }
     // Delegates the phase/tx_hash/wallet invariants rather than restating
     // them, so this path can never be looser than the manual command's.
-    ledger.archive_rejected(wallet)?;
+    // Never with an acknowledgement: only an operator can say the runtime
+    // has been reconciled to a wallet that moved.
+    ledger.archive_rejected(wallet, None)?;
     // Deliberately no log here: the ledger is still only changed in memory,
     // and a persist that then fails would leave the journal claiming a
     // clearance the on-disk ledger does not have (Codex, pairtrade#317).
@@ -768,8 +773,25 @@ async fn build_archive_rejected_report(
     // apply would then refuse (matching how manual_reconcile_report runs
     // the real commit logic against a clone to derive "ready", not a
     // hand-written approximation of it).
-    let ineligible_reason = ledger.clone().archive_rejected(&wallet).err();
+    let ineligible_reason = ledger.clone().archive_rejected(&wallet, None).err();
     let eligible = ineligible_reason.is_none();
+    // When the only thing in the way is that the wallet moved, print the
+    // exact apply invocation that archives past it once the runtime has
+    // been reconciled -- with these balances, so a wallet that moves again
+    // before the operator gets to it makes the acknowledgement stale.
+    let acknowledge_with = (!eligible
+        && active.phase == ArcusSpotExecutionPhase::Rejected
+        && active.tx_hash.is_none()
+        && matches!(
+            debot::arcus_spot::require_wallet_untouched_since_dispatch(&active, &wallet),
+            Err(WalletEvidenceRefusal::Moved(_))
+        ))
+    .then(|| {
+        format!(
+            "archive-rejected-apply CONFIG_YAML {} acknowledge-wallet-moved {} {}",
+            active.sequence, wallet.sell_balance_raw, wallet.buy_balance_raw
+        )
+    });
     Ok(serde_json::json!({
         "status": if eligible { "eligible_to_archive" } else { "not_eligible" },
         "sequence": active.sequence,
@@ -780,6 +802,7 @@ async fn build_archive_rejected_report(
         "pre_balances": active.pre_balances,
         "wallet": wallet,
         "reason_if_ineligible": ineligible_reason.map(|error| format!("{error:#}")),
+        "acknowledge_with_after_reconciling_the_runtime": acknowledge_with,
     }))
 }
 
@@ -788,7 +811,11 @@ async fn build_archive_rejected_report(
 /// (bot-strategy#898). SEQUENCE must match the report's `sequence` exactly,
 /// so a concurrent tick that started a new attempt between the report and
 /// this call is refused rather than silently archiving the wrong one.
-async fn archive_rejected_apply(config_path: &Path, sequence: &str) -> Result<()> {
+async fn archive_rejected_apply(
+    config_path: &Path,
+    sequence: &str,
+    acknowledged: Option<ArcusSpotWalletMoveAcknowledgement>,
+) -> Result<()> {
     let sequence: u64 = sequence
         .trim()
         .parse()
@@ -805,7 +832,8 @@ async fn archive_rejected_apply(config_path: &Path, sequence: &str) -> Result<()
     require_config_within_auto_execute_policy(&config, &policy)?;
 
     let wallet_reader = ChainWalletReader::from_config(&config)?;
-    let result = commit_archive_rejected(&config, &wallet_reader, sequence).await?;
+    let result =
+        commit_archive_rejected(&config, &wallet_reader, sequence, acknowledged.as_ref()).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&result)
@@ -818,6 +846,7 @@ async fn commit_archive_rejected(
     config: &ArcusSpotExecuteOnceConfig,
     wallet_reader: &dyn RejectedAttemptWalletReader,
     sequence: u64,
+    acknowledged: Option<&ArcusSpotWalletMoveAcknowledgement>,
 ) -> Result<serde_json::Value> {
     let ledger_store = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone());
     let _lock = ledger_store.acquire_existing_exclusive_lock(&config.runtime_state_path)?;
@@ -838,8 +867,24 @@ async fn commit_archive_rejected(
     // Read under the lock, like the tick's own clearance, so the balances
     // that license this archive are the ones this attempt is judged by.
     let wallet = wallet_reader.wallet_after(&active).await?;
-    ledger.archive_rejected(&wallet)?;
+    ledger.archive_rejected(&wallet, acknowledged)?;
     ledger_store.persist(&ledger)?;
+    // The ledger annotates the archived attempt when, and only when, an
+    // acknowledgement carried it past a moved wallet.
+    let wallet_move_acknowledged = ledger
+        .history
+        .last()
+        .is_some_and(|archived| archived.sequence == sequence && archived.detail != active.detail);
+    // That dispatch's pending-plan evidence would otherwise stop
+    // `reset-window` -- the very next step of the documented recovery --
+    // as a dispatch the reset would orphan. It has been: the swap settled
+    // outside the ledger. Move it aside (never delete) when it is this
+    // attempt's; anything else there is left alone and reported.
+    let pending_plan_retired_to = if wallet_move_acknowledged {
+        retire_pending_plan_of(config, &active)?
+    } else {
+        None
+    };
 
     // Printed rather than merely done: this is the audit record of a
     // stuck, operator-reviewed attempt being cleared, and it lands in the
@@ -858,8 +903,34 @@ async fn commit_archive_rejected(
             "pre_balances": active.pre_balances,
         },
         "wallet": wallet,
+        "wallet_move_acknowledged": wallet_move_acknowledged,
+        "pending_plan_retired_to": pending_plan_retired_to,
         "ledger_path": config.ledger_path,
     }))
+}
+
+/// Move aside the live-tick pending plan if it is `attempt`'s (its approval
+/// digest matches the attempt's), returning where it went; `None` when
+/// there is no file or it belongs to some other dispatch.
+fn retire_pending_plan_of(
+    config: &ArcusSpotExecuteOnceConfig,
+    attempt: &ArcusSpotExecutionAttempt,
+) -> Result<Option<PathBuf>> {
+    let path = live_tick_pending_plan_path(config)?;
+    let bytes = match read_private_regular_file(&path, "Arcus live-tick pending plan") {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let Ok(plan) = plan_from_document(&bytes, "Arcus live-tick pending plan") else {
+        return Ok(None);
+    };
+    if approval_digest(config, &plan)? != attempt.intent.plan_config_digest {
+        return Ok(None);
+    }
+    retire_replaced_state_file(
+        &path,
+        &format!("rejected-seq{}-wallet-moved", attempt.sequence),
+    )
 }
 
 /// Read-only diagnostic for an active execution attempt whose live-tick
@@ -5215,6 +5286,8 @@ fn usage() -> &'static str {
       EXPECTED_SELL_AMOUNT_RAW EXPECTED_BUY_AMOUNT_RAW SEQUENCE IDEMPOTENCY_KEY TX_HASH
   arcus-spot-execute-once archive-rejected-report CONFIG_YAML
   arcus-spot-execute-once archive-rejected-apply CONFIG_YAML SEQUENCE
+  arcus-spot-execute-once archive-rejected-apply CONFIG_YAML SEQUENCE \
+      acknowledge-wallet-moved SELL_BALANCE_RAW BUY_BALANCE_RAW
 
 archive-rejected-report/archive-rejected-apply are the recovery path for an
 active attempt stuck in phase Rejected (bot-strategy#898): the router
@@ -5244,9 +5317,24 @@ from the chain first and only archive when they still equal the attempt's
 pre_balances exactly; -report prints both, and a mismatch is
 `not_eligible` with the diagnosis (a sell balance down by exactly the
 attempt's sell_amount_raw is named as the rejected swap having been mined).
-An attempt that fails this check stays active, and the timer keeps failing
-on it, until the runtime has been reconciled to the wallet (find the
-transaction, then reset-window with the on-chain inventory).
+The read must be at least REJECTED_WALLET_READ_MIN_AGE_SECS (300 s) after
+the dispatch -- a disowned submission can still settle, or surface on a
+lagging provider, later than a read taken at once -- so the next scheduled
+tick's read qualifies and nothing sooner does. A rejection this bot wrote
+itself (rejection_origin=client: a submit-seam or plan-age refusal, a
+client-side preflight failure) never asked the venue and is not judged by
+the wallet. An attempt that fails the check stays active, and the timer
+keeps failing on it, until an operator: (1) stops the timer, (2) runs
+-report, notes the wallet balances it printed, and finds the transaction,
+(3) runs `archive-rejected-apply CONFIG_YAML SEQUENCE
+acknowledge-wallet-moved SELL_BALANCE_RAW BUY_BALANCE_RAW` with exactly
+those balances -- it re-reads the wallet and archives only if it still
+reads those, appends the diagnosis to the attempt's detail, and moves that
+dispatch's live-tick-pending-plan.json aside (never deleted), (4) takes a
+state-backup and reconciles the runtime to the wallet with reset-window
+(on-chain balances as initial_inventory; it refuses while an attempt is
+active or a pending plan exists, which is why (3) comes first), (5) starts
+the timer. The automatic clearance never acknowledges anything.
 
 reset-window starts a fresh signal window when a state-invalidating
 `runtime:` field changed (`mode`, `chain_id`, `pair`, `initial_inventory`,
@@ -6095,7 +6183,20 @@ async fn main() -> Result<()> {
             archive_rejected_report(Path::new(config_path)).await
         }
         [command, config_path, sequence] if command == "archive-rejected-apply" => {
-            archive_rejected_apply(Path::new(config_path), sequence).await
+            archive_rejected_apply(Path::new(config_path), sequence, None).await
+        }
+        [command, config_path, sequence, acknowledge, sell_balance_raw, buy_balance_raw]
+            if command == "archive-rejected-apply" && acknowledge == "acknowledge-wallet-moved" =>
+        {
+            archive_rejected_apply(
+                Path::new(config_path),
+                sequence,
+                Some(ArcusSpotWalletMoveAcknowledgement {
+                    sell_balance_raw: sell_balance_raw.clone(),
+                    buy_balance_raw: buy_balance_raw.clone(),
+                }),
+            )
+            .await
         }
         [command, config_path, events_jsonl_path, expected_sell_amount_raw, expected_buy_amount_raw]
             if command == "manual-reconcile-report" =>
@@ -11627,12 +11728,15 @@ runtime:
         let wallet = untouched_wallet(&attempt);
         persist_repair_report_ledger_state(&config, Some(attempt));
 
-        let result = commit_archive_rejected(&config, &CannedWallet::of(wallet.clone()), sequence)
-            .await
-            .unwrap();
+        let result =
+            commit_archive_rejected(&config, &CannedWallet::of(wallet.clone()), sequence, None)
+                .await
+                .unwrap();
         assert_eq!(result["archived"]["sequence"], sequence);
         // The audit record carries the read that licensed the archive.
         assert_eq!(result["wallet"], serde_json::to_value(&wallet).unwrap());
+        assert_eq!(result["wallet_move_acknowledged"], false);
+        assert_eq!(result["pending_plan_retired_to"], serde_json::Value::Null);
 
         let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
             .load_existing()
@@ -11656,7 +11760,7 @@ runtime:
         let chain = CannedWallet::of(untouched_wallet(&attempt));
         persist_repair_report_ledger_state(&config, Some(attempt));
 
-        let error = commit_archive_rejected(&config, &chain, real_sequence + 1)
+        let error = commit_archive_rejected(&config, &chain, real_sequence + 1, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("refusing to archive"));
@@ -11685,7 +11789,7 @@ runtime:
         persist_repair_report_ledger_state(&config, Some(attempt));
 
         assert!(
-            commit_archive_rejected(&config, &CannedWallet::of(wallet), sequence)
+            commit_archive_rejected(&config, &CannedWallet::of(wallet), sequence, None)
                 .await
                 .is_err()
         );
@@ -11709,7 +11813,7 @@ runtime:
         let chain = CannedWallet::of(wallet_after_the_rejected_swap_settled(&attempt));
         persist_repair_report_ledger_state(&config, Some(attempt));
 
-        let error = commit_archive_rejected(&config, &chain, sequence)
+        let error = commit_archive_rejected(&config, &chain, sequence, None)
             .await
             .unwrap_err()
             .to_string();
@@ -11720,6 +11824,150 @@ runtime:
             .unwrap();
         assert_eq!(ledger.active.map(|active| active.sequence), Some(sequence));
         assert!(ledger.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_acknowledged_wallet_move_archives_and_retires_the_pending_plan() {
+        // The documented way out (bot-strategy#1043): timer stopped, the
+        // operator names the balances the report showed; the attempt is
+        // archived with the diagnosis on it, and that dispatch's pending
+        // plan is moved aside so `reset-window` can follow.
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = rejected_attempt_no_tx(&config, &plan, at);
+        attempt.rejection_origin = Some(ArcusSpotRejectionOrigin::Venue);
+        let sequence = attempt.sequence;
+        let wallet = wallet_after_the_rejected_swap_settled(&attempt);
+        persist_repair_report_ledger_state(&config, Some(attempt.clone()));
+        persist_test_live_tick_plan(&config, &plan);
+        let pending_plan_path = live_tick_pending_plan_path(&config).unwrap();
+        let pending_plan_bytes = std::fs::read(&pending_plan_path).unwrap();
+
+        // The report says exactly what to run.
+        let report = build_archive_rejected_report(&config, &CannedWallet::of(wallet.clone()))
+            .await
+            .unwrap();
+        assert_eq!(report["status"], "not_eligible");
+        assert_eq!(
+            report["acknowledge_with_after_reconciling_the_runtime"],
+            format!(
+                "archive-rejected-apply CONFIG_YAML {sequence} acknowledge-wallet-moved {} {}",
+                wallet.sell_balance_raw, wallet.buy_balance_raw
+            )
+        );
+
+        // A stale acknowledgement (the wallet moved again) is refused and
+        // changes nothing.
+        let stale = ArcusSpotWalletMoveAcknowledgement {
+            sell_balance_raw: wallet.sell_balance_raw.clone(),
+            buy_balance_raw: attempt.pre_balances.buy_balance_raw.clone(),
+        };
+        let error = commit_archive_rejected(
+            &config,
+            &CannedWallet::of(wallet.clone()),
+            sequence,
+            Some(&stale),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("are not what the wallet reads now"),
+            "{error}"
+        );
+        assert!(pending_plan_path.is_file(), "nothing retired on a refusal");
+        assert!(
+            ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+                .load_existing()
+                .unwrap()
+                .active
+                .is_some()
+        );
+
+        let acknowledgement = ArcusSpotWalletMoveAcknowledgement {
+            sell_balance_raw: wallet.sell_balance_raw.clone(),
+            buy_balance_raw: wallet.buy_balance_raw.clone(),
+        };
+        let result = commit_archive_rejected(
+            &config,
+            &CannedWallet::of(wallet.clone()),
+            sequence,
+            Some(&acknowledgement),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["archived"]["sequence"], sequence);
+        assert_eq!(result["wallet_move_acknowledged"], true);
+        let ledger = ArcusSpotExecutionLedgerStore::new(config.ledger_path.clone())
+            .load_existing()
+            .unwrap();
+        assert!(ledger.active.is_none());
+        let archived = &ledger.history[0];
+        assert_eq!(archived.sequence, sequence);
+        let detail = archived.detail.clone().unwrap();
+        assert!(
+            detail.starts_with("HTTP 422 SHELL_SUBMIT_FAILED | "),
+            "{detail}"
+        );
+        assert!(detail.contains("having been mined"), "{detail}");
+        // The pending plan is moved aside, byte for byte, never deleted.
+        assert!(!pending_plan_path.exists());
+        let retired = PathBuf::from(result["pending_plan_retired_to"].as_str().unwrap());
+        assert!(retired
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(&format!(
+                "live-tick-pending-plan.json.rejected-seq{sequence}-wallet-moved."
+            )));
+        assert_eq!(std::fs::read(&retired).unwrap(), pending_plan_bytes);
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_leaves_another_dispatch_s_pending_plan_alone() {
+        // The pending plan on disk belongs to whichever dispatch wrote it
+        // last; only this attempt's own evidence is retired.
+        let dir = tempdir().unwrap();
+        let config = execute_once_config(
+            dir.path().join("ledger.json").to_str().unwrap(),
+            dir.path().join("runtime.json").to_str().unwrap(),
+            "100000000000000000",
+        );
+        let at = fixture_now();
+        let plan = rotation_plan("entry_signal");
+        let mut attempt = rejected_attempt_no_tx(&config, &plan, at);
+        attempt.rejection_origin = Some(ArcusSpotRejectionOrigin::Venue);
+        attempt.intent.plan_config_digest = format!("sha256:{}", "e".repeat(64));
+        let sequence = attempt.sequence;
+        let wallet = wallet_after_the_rejected_swap_settled(&attempt);
+        persist_repair_report_ledger_state(&config, Some(attempt));
+        persist_test_live_tick_plan(&config, &plan);
+        let pending_plan_path = live_tick_pending_plan_path(&config).unwrap();
+
+        let acknowledgement = ArcusSpotWalletMoveAcknowledgement {
+            sell_balance_raw: wallet.sell_balance_raw.clone(),
+            buy_balance_raw: wallet.buy_balance_raw.clone(),
+        };
+        let result = commit_archive_rejected(
+            &config,
+            &CannedWallet::of(wallet),
+            sequence,
+            Some(&acknowledgement),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["wallet_move_acknowledged"], true);
+        assert_eq!(result["pending_plan_retired_to"], serde_json::Value::Null);
+        assert!(pending_plan_path.is_file());
     }
 
     /// `repair_report_active_submitted_attempt` plus a `Reconciled` phase
