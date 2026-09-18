@@ -732,7 +732,9 @@ impl ArcusSpotExecutionLedger {
     /// A rejection this bot wrote itself (`rejection_origin == Client`:
     /// `cancel_prepared`, or a client-side preflight failure) never asked
     /// the venue, so the wallet is not evidence about it either way and is
-    /// not consulted; the ordinary phase/tx_hash checks still apply.
+    /// not consulted -- `wallet` may be `None` for those, and a caller
+    /// need not read the chain to archive one; the ordinary phase/tx_hash
+    /// checks still apply. For every other rejection `None` is refused.
     ///
     /// `acknowledged` is the operator's way out once the wallet *has*
     /// moved (bot-strategy#1043): with the timer stopped and the runtime
@@ -745,7 +747,7 @@ impl ArcusSpotExecutionLedger {
     /// supplies one.
     pub fn archive_rejected(
         &mut self,
-        wallet: &ArcusSpotBalanceSnapshot,
+        wallet: Option<&ArcusSpotBalanceSnapshot>,
         acknowledged: Option<&ArcusSpotWalletMoveAcknowledgement>,
     ) -> Result<()> {
         let active = self
@@ -764,7 +766,16 @@ impl ArcusSpotExecutionLedger {
             );
         }
         let mut active = active;
-        if active.rejection_origin != Some(ArcusSpotRejectionOrigin::Client) {
+        if wallet_evidence_required(&active) {
+            let Some(wallet) = wallet else {
+                let sequence = active.sequence;
+                self.active = Some(active);
+                bail!(
+                    "refusing to archive rejected sequence {sequence}: a rejection the venue \
+                     gave (or one of unknown origin) is archived only against a read of the \
+                     wallet, and none was supplied"
+                );
+            };
             match require_wallet_untouched_since_dispatch(&active, wallet) {
                 Ok(()) => {}
                 Err(WalletEvidenceRefusal::Moved(diagnosis)) => match acknowledged {
@@ -1114,6 +1125,15 @@ impl ArcusSpotWalletMoveAcknowledgement {
     }
 }
 
+/// Whether archiving `attempt` as a rejection needs the wallet's word: it
+/// does unless this bot itself refused to send (`rejection_origin ==
+/// Client`), in which case the venue was never asked and the wallet says
+/// nothing either way. An attempt with no recorded origin cannot say who
+/// refused, and is judged by the wallet like a venue rejection.
+pub fn wallet_evidence_required(attempt: &ArcusSpotExecutionAttempt) -> bool {
+    attempt.rejection_origin != Some(ArcusSpotRejectionOrigin::Client)
+}
+
 /// Why a wallet read did not clear a rejected attempt.
 #[derive(Debug)]
 pub enum WalletEvidenceRefusal {
@@ -1383,7 +1403,7 @@ mod tests {
         ledger.cancel_prepared("plan expired", now).unwrap();
 
         ledger
-            .archive_rejected(&balances("5000", "2000", later(now)), None)
+            .archive_rejected(Some(&balances("5000", "2000", later(now))), None)
             .unwrap();
 
         assert!(ledger.active.is_none());
@@ -1420,7 +1440,7 @@ mod tests {
             .unwrap();
 
         ledger
-            .archive_rejected(&balances("5000", "2000", later(now)), None)
+            .archive_rejected(Some(&balances("5000", "2000", later(now))), None)
             .unwrap();
 
         assert!(ledger.active.is_none());
@@ -1448,7 +1468,7 @@ mod tests {
             .unwrap();
 
         assert!(ledger
-            .archive_rejected(&balances("5000", "2000", later(now)), None)
+            .archive_rejected(Some(&balances("5000", "2000", later(now))), None)
             .is_err());
         // Refusing must not have taken the active attempt out from under it.
         assert!(ledger.active.is_some());
@@ -1476,7 +1496,7 @@ mod tests {
         ledger.active.as_mut().unwrap().tx_hash = Some(format!("{:#x}", H256::from_low_u64_be(1)));
 
         assert!(ledger
-            .archive_rejected(&balances("5000", "2000", later(now)), None)
+            .archive_rejected(Some(&balances("5000", "2000", later(now))), None)
             .is_err());
         assert!(ledger.active.is_some());
     }
@@ -1522,7 +1542,7 @@ mod tests {
         let mut ledger = router_rejected_ledger(now);
 
         let error = ledger
-            .archive_rejected(&balances("4000", "2990", later(now)), None)
+            .archive_rejected(Some(&balances("4000", "2990", later(now))), None)
             .unwrap_err()
             .to_string();
 
@@ -1555,7 +1575,7 @@ mod tests {
         ] {
             let mut ledger = router_rejected_ledger(now);
             let error = ledger
-                .archive_rejected(&balances(sell, buy, later(now)), None)
+                .archive_rejected(Some(&balances(sell, buy, later(now))), None)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1579,13 +1599,20 @@ mod tests {
         let mut ledger = router_rejected_ledger(now);
         let pre = ledger.active.as_ref().unwrap().pre_balances.clone();
 
-        let error = ledger.archive_rejected(&pre, None).unwrap_err().to_string();
+        let error = ledger
+            .archive_rejected(Some(&pre), None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("after the dispatch is required"), "{error}");
         assert!(ledger.active.is_some());
 
         let error = ledger
             .archive_rejected(
-                &balances("5000", "2000", now - chrono::Duration::seconds(1)),
+                Some(&balances(
+                    "5000",
+                    "2000",
+                    now - chrono::Duration::seconds(1),
+                )),
                 None,
             )
             .unwrap_err()
@@ -1603,7 +1630,7 @@ mod tests {
         wallet.buy_token = intent().sell_token;
 
         let error = ledger
-            .archive_rejected(&wallet, None)
+            .archive_rejected(Some(&wallet), None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1635,12 +1662,12 @@ mod tests {
         assert!(ledger.active.as_ref().unwrap().dispatched_at.is_none());
 
         assert!(ledger
-            .archive_rejected(&balances("5000", "2000", now), None)
+            .archive_rejected(Some(&balances("5000", "2000", now)), None)
             .unwrap_err()
             .to_string()
             .contains("after the dispatch is required"));
         ledger
-            .archive_rejected(&balances("5000", "2000", later(now)), None)
+            .archive_rejected(Some(&balances("5000", "2000", later(now))), None)
             .unwrap();
         assert!(ledger.active.is_none());
     }
@@ -1655,7 +1682,7 @@ mod tests {
         let mut ledger = router_rejected_ledger(now);
         let too_soon = now + chrono::Duration::seconds(REJECTED_WALLET_READ_MIN_AGE_SECS - 1);
         let error = ledger
-            .archive_rejected(&balances("5000", "2000", too_soon), None)
+            .archive_rejected(Some(&balances("5000", "2000", too_soon)), None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("299s after the dispatch"), "{error}");
@@ -1668,7 +1695,10 @@ mod tests {
             buy_balance_raw: "2990".to_string(),
         };
         let error = ledger
-            .archive_rejected(&balances("4000", "2990", too_soon), Some(&acknowledgement))
+            .archive_rejected(
+                Some(&balances("4000", "2990", too_soon)),
+                Some(&acknowledgement),
+            )
             .unwrap_err()
             .to_string();
         assert!(error.contains("after the dispatch is required"), "{error}");
@@ -1676,7 +1706,7 @@ mod tests {
 
         let just_old_enough = now + chrono::Duration::seconds(REJECTED_WALLET_READ_MIN_AGE_SECS);
         ledger
-            .archive_rejected(&balances("5000", "2000", just_old_enough), None)
+            .archive_rejected(Some(&balances("5000", "2000", just_old_enough)), None)
             .unwrap();
         assert!(ledger.active.is_none());
     }
@@ -1703,9 +1733,10 @@ mod tests {
             ledger.active.as_ref().unwrap().rejection_origin,
             Some(ArcusSpotRejectionOrigin::Client)
         );
-        ledger
-            .archive_rejected(&balances("4000", "2990", now), None)
-            .unwrap();
+        assert!(!wallet_evidence_required(ledger.active.as_ref().unwrap()));
+        // No read at all is fine for one of these -- the chain need not
+        // even be reachable to archive it.
+        ledger.archive_rejected(None, None).unwrap();
         assert!(ledger.active.is_none());
         assert_eq!(ledger.history.len(), 1);
         assert_eq!(
@@ -1714,11 +1745,18 @@ mod tests {
             "no acknowledgement note: nothing was acknowledged"
         );
 
+        // A venue rejection cannot be archived without a read.
+        let mut ledger = router_rejected_ledger(now);
+        assert!(wallet_evidence_required(ledger.active.as_ref().unwrap()));
+        let error = ledger.archive_rejected(None, None).unwrap_err().to_string();
+        assert!(error.contains("none was supplied"), "{error}");
+        assert!(ledger.active.is_some());
+
         // A venue rejection with the same read is refused, so the exemption
         // is the origin, not a weakening of the check.
         let mut ledger = router_rejected_ledger(now);
         assert!(ledger
-            .archive_rejected(&balances("4000", "2990", later(now)), None)
+            .archive_rejected(Some(&balances("4000", "2990", later(now))), None)
             .is_err());
     }
 
@@ -1737,7 +1775,7 @@ mod tests {
 
         ledger
             .archive_rejected(
-                &balances("4000", "2990", later(now)),
+                Some(&balances("4000", "2990", later(now))),
                 Some(&acknowledgement),
             )
             .unwrap();
@@ -1769,7 +1807,7 @@ mod tests {
         };
 
         let error = ledger
-            .archive_rejected(&balances("4000", "2991", later(now)), Some(&stale))
+            .archive_rejected(Some(&balances("4000", "2991", later(now))), Some(&stale))
             .unwrap_err()
             .to_string();
         assert!(error.contains("acknowledged wallet balances"), "{error}");
@@ -1786,7 +1824,10 @@ mod tests {
             buy_balance_raw: "2990".to_string(),
         };
         assert!(ledger
-            .archive_rejected(&balances("4000", "2990", later(now)), Some(&malformed))
+            .archive_rejected(
+                Some(&balances("4000", "2990", later(now))),
+                Some(&malformed)
+            )
             .is_err());
         assert!(ledger.active.is_some());
     }
@@ -1801,7 +1842,7 @@ mod tests {
         };
         ledger
             .archive_rejected(
-                &balances("5000", "2000", later(now)),
+                Some(&balances("5000", "2000", later(now))),
                 Some(&acknowledgement),
             )
             .unwrap();

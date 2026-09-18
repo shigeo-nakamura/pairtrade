@@ -849,7 +849,9 @@ round trip), and:
 `archive-rejected-report` makes the same read and prints both snapshots
 (`pre_balances`, `wallet`) beside its verdict; `archive-rejected-apply`
 reads again under its own lock and records the read in its audit output.
-Neither can be argued past by an operator who has reviewed only the 422.
+Neither reads the chain for a client-origin rejection (`wallet: null`), so
+an unreachable RPC never keeps one of those stuck. Neither can be argued
+past by an operator who has reviewed only the 422.
 
 **Recovery when the wallet moved.** The attempt stays active and the timer
 keeps failing on it (health-watch files the issue). The way out is
@@ -870,7 +872,12 @@ not know about the fill:
    appends the diagnosis to the attempt's `detail` in `history`, and moves
    that dispatch's `live-tick-pending-plan.json` aside (suffixed
    `.rejected-seq<N>-wallet-moved.<ns>`, never deleted), because
-   `reset-window` refuses while it exists. The automatic clearance never
+   `reset-window` refuses while it exists. If the output shows
+   `pending_plan_retire_error` instead of `pending_plan_retired_to` --
+   the file on disk is another dispatch's, or the config was re-approved
+   since this plan was dispatched (the digest binds a plan to its config),
+   or it could not be moved -- the archive still happened; move the file
+   aside by hand before step 4. The automatic clearance never
    acknowledges anything.
 4. `state-backup`, then `reset-window` with the on-chain balances as
    `initial_inventory` (the checkpoint's inventory is one fill away from
