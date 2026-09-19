@@ -51,15 +51,20 @@ Instance suffixes: `_RH` / `_CORE` on `LIGHTER_*`, `REST_ENDPOINT`,
 
 ## Going live (after G0 PASS)
 
-1. `touch hedge/DISARM` in DRY_RUN and confirm `mode: "Off"` (the DRY_RUN
-   book is state only; nothing is on the venues).
-2. Flatten the manual G0 position first if it is still open (the bot treats
-   an existing long on RH / short on Core as *its* book and would simply
-   top it up to target — fine if that is intended, but the entry price of
-   the manual leg is then not in `events.jsonl`).
-3. Set `HEDGE_DRY_RUN=false` **and** `HEDGE_LIVE_CONFIRM=1046-G0-PASSED`,
-   restart, `touch ARM`. First tick: `[FILL] long Long BTC ...` then
-   `[FILL] short Short BTC ...`, one clip each; the book completes over
+1. Set `HEDGE_DRY_RUN=false` **and** `HEDGE_LIVE_CONFIRM=1046-G0-PASSED`,
+   restart. A `state.json` armed under DRY_RUN is dropped to `Off` at this
+   start (logged `[STARTUP] state.json was written with dry_run=true ...`),
+   so nothing trades until the next ARM.
+2. **`Off` never sends an order.** A position the venues already hold (the
+   manual G0 hedge, or a live book whose `state.json` was lost) is left
+   alone and logged `[OFF] venues hold ...`. `touch ARM` **adopts** it: the
+   legs are topped up or trimmed to the new target from there (the manual
+   entry price is then not in `events.jsonl`; the `arm` event records the
+   adopted sizes). To start clean instead, close the manual position by
+   hand first.
+3. `touch ARM`. First tick: `[FILL] long Long BTC ...` then
+   `[FILL] short Short BTC ...`, one clip each (the second leg is cut to
+   what the first actually filled); the book completes over
    `ceil(target/clip)` ticks.
 
 ## Operator files
@@ -76,7 +81,7 @@ Instance suffixes: `_RH` / `_CORE` on `LIGHTER_*`, `REST_ENDPOINT`,
 | reason | what happened | remedy |
 |---|---|---|
 | `net exposure ...` | legs unequal by > `HEDGE_NET_TOLERANCE_USD` for `HEDGE_NET_BREACH_TICKS` ticks (an IOC keeps failing on one venue) | check the failing venue / book; while halted the bot only *reduces* the larger leg; `RISK_ACK` |
-| `leverage: ...` | growth would exceed `HEDGE_MAX_LEVERAGE` × that venue's equity (also what fires after a liquidation) | deposit, `RISK_ACK`, re-`ARM` |
+| `leverage: ...` | a growth order this tick would exceed `HEDGE_MAX_LEVERAGE` × that venue's equity; nothing was sent (checked before the first leg) — also what fires after a liquidation | deposit, `RISK_ACK`, re-`ARM` |
 | `liq_guard: ...` | a venue's headroom fell under `HEDGE_LIQ_GUARD_PCT`; **both legs were closed** | rebalance collateral, `RISK_ACK`, re-`ARM` |
 
 A halt never leaves the book lopsided on purpose: the tick loop keeps
@@ -99,6 +104,13 @@ Everything hedge-specific is under `hedge_holder`: `mode`,
 (RH mark vs Core mark), `equity_total_usd`, `equity_at_arm_usd`,
 `pnl_since_arm_usd`, `points_at_arm`, and per leg `qty`, `notional_usd`,
 `mark`, `equity_usd`, `liq_headroom_pct`.
+
+## Feed divergence
+
+While the two venues' marks differ by more than 2 % (one feed on a REST
+fallback or a placeholder ticker) the bot sends nothing, keeps writing
+`status.json` with `hedge_holder.feed_problem`, and still consumes
+`DISARM` (acted on once the feed agrees again).
 
 ## Restart / stop
 

@@ -42,8 +42,15 @@
 //!    not shared: a long-side gain cannot rescue a short-side liquidation,
 //!    so a lopsided liquidation is the one way this book can lose real
 //!    money, and the guard fires well before the venue would.
-//! 3. **Leverage guard**: growth is refused (halt `leverage`) when the leg's
+//! 3. **Leverage guard**: growth is refused (halt `leverage`) when a leg's
 //!    notional after the order would exceed `HEDGE_MAX_LEVERAGE` × equity.
+//!    Checked for the whole tick's orders before the first is sent.
+//!
+//! `Off` never trades: whatever the venues hold in `Off` (an operator's
+//! own position, a live book whose `state.json` was lost) is left alone
+//! until an ARM adopts it. A `state.json` written in the other mode
+//! (DRY_RUN ↔ live) is dropped to `Off` at startup. While the two venues'
+//! marks disagree by more than 2 % nothing is sent and status says why.
 //!
 //! DRY_RUN (default) never sends an order: fills are assumed at the mark and
 //! the book is kept in `state.json`; venue equity is `HEDGE_DRY_RUN_EQUITY_USD`.
@@ -199,7 +206,7 @@ impl Config {
             net_breach_ticks: env_u32("HEDGE_NET_BREACH_TICKS", 3),
             mmr_pct: env_f64("HEDGE_MMR_PCT", 1.2),
             liq_guard_pct: env_f64("HEDGE_LIQ_GUARD_PCT", 8.0),
-            max_leverage: env_f64("HEDGE_MAX_LEVERAGE", 5.0),
+            max_leverage: env_f64("HEDGE_MAX_LEVERAGE", 6.0),
             dry_run_equity_usd: env_f64("HEDGE_DRY_RUN_EQUITY_USD", 4_000.0),
             tick_secs: env_u64("HEDGE_TICK_SECS", 30),
             status_s3_uri: env_string("HEDGE_STATUS_S3_URI", ""),
@@ -321,6 +328,9 @@ struct State {
     day_key: Option<String>,
     equity_day_start_usd: Option<f64>,
     process_started_at: Option<u64>,
+    /// The mode this state was written in. A state armed under DRY_RUN
+    /// must not carry its target into a live start (or vice versa).
+    dry_run: Option<bool>,
 }
 
 // --------------------------------------------------------------- planning
@@ -423,6 +433,43 @@ fn plan_orders(
         }
     }
     out
+}
+
+/// A persisted book from the other mode (DRY_RUN ↔ live) is dropped to
+/// `Off`: the live venues never held a DRY_RUN book, and a live book must
+/// be re-adopted by an explicit ARM after a flip back. Nothing is traded
+/// by this — `Off` sends no orders.
+fn reconcile_state_mode(mut state: State, dry_run: bool) -> State {
+    if let Some(was) = state.dry_run {
+        if was != dry_run && state.mode != Mode::Off {
+            log::warn!(
+                "[STARTUP] state.json was written with dry_run={was}, now dry_run={dry_run}: dropping mode {:?} / target {} to Off — ARM again to (re)build or adopt the book",
+                state.mode, state.target_qty
+            );
+            state.mode = Mode::Off;
+            state.target_qty = 0.0;
+            state.halted = false;
+            state.halt_reason = None;
+        }
+    }
+    state.dry_run = Some(dry_run);
+    state
+}
+
+/// The second order of a pair, cut to the first leg's actual fill so the
+/// book is never more lopsided than what really traded.
+fn size_second_leg(next: &Order, first_filled: f64) -> Order {
+    let q = next.qty.abs().min(first_filled.max(0.0));
+    Order {
+        leg: next.leg,
+        qty: if next.qty < 0.0 { -q } else { q },
+    }
+}
+
+/// Growth guard: the leg's notional after the order must stay within
+/// `max_leverage` × the venue's equity.
+fn leverage_ok(held: f64, add: f64, mark: f64, equity_usd: f64, max_leverage: f64) -> bool {
+    (held + add) * mark <= max_leverage * equity_usd
 }
 
 /// Base-unit size for `notional_usd` at `mark`, floored to `size_decimals`.
@@ -582,6 +629,8 @@ struct Engine {
     min_qty: f64,
     last_s3_mirror: u64,
     last_snapshot: (VenueSnapshot, VenueSnapshot),
+    /// Set while the two venue marks disagree; reported in status.
+    feed_problem: Option<String>,
 }
 
 impl Engine {
@@ -770,15 +819,10 @@ impl Engine {
             self.state.equity_day_start_usd = Some(l.equity_usd + s.equity_usd);
             self.persist();
         }
-        if (l.mark / s.mark - 1.0).abs() > 0.02 {
-            bail!(
-                "venue marks diverge: long {} vs short {} — not trading on a broken feed",
-                l.mark,
-                s.mark
-            );
-        }
 
-        // Operator files.
+        // Operator files first: a DISARM must register even on a tick that
+        // ends up sending nothing (feed check below), so it is acted on as
+        // soon as the venues are readable again.
         let (arm, disarm) = self.take_operator_files();
         if disarm && self.state.mode != Mode::Off {
             log::warn!("[DISARM] closing both legs");
@@ -806,9 +850,12 @@ impl Engine {
                         "[ARM] ignored: ${notional:.0} at {mark:.1} is below the venue minimum"
                     );
                 } else {
+                    // A book the venues already hold (e.g. one opened by
+                    // hand) is adopted: the legs are only topped up or
+                    // trimmed to `qty` from here on.
                     log::info!(
-                        "[ARM] target ${notional:.0}/leg = {qty} {} at {mark:.1}",
-                        self.cfg.symbol
+                        "[ARM] target ${notional:.0}/leg = {qty} {} at {mark:.1} (venues hold long {} / short {})",
+                        self.cfg.symbol, book.long, book.short
                     );
                     self.state.mode = Mode::On;
                     self.state.target_qty = qty;
@@ -823,11 +870,46 @@ impl Engine {
                     self.state.cycles += 1;
                     self.event(
                         "arm",
-                        serde_json::json!({ "notional_usd": notional, "qty": qty, "mark": mark }),
+                        serde_json::json!({ "notional_usd": notional, "qty": qty, "mark": mark,
+                            "adopted_long": book.long, "adopted_short": book.short }),
                     );
                     self.persist();
                 }
             }
+        }
+
+        // Feed sanity: with one venue's mark off (REST fallback, placeholder
+        // ticker) neither the guards nor the sizes can be trusted, so no
+        // order goes out. Status still gets written, with the reason, so
+        // the card says why the bot is idle instead of going stale.
+        let divergence = (l.mark / s.mark - 1.0).abs();
+        if divergence > 0.02 {
+            let reason = format!(
+                "venue marks diverge {:.2}%: long {} vs short {} — no orders on a broken feed",
+                divergence * 100.0,
+                l.mark,
+                s.mark
+            );
+            log::error!("[FEED] {reason}");
+            self.feed_problem = Some(reason);
+            self.write_status(now, kill, &[]);
+            return Ok(());
+        }
+        self.feed_problem = None;
+
+        // `Off` never trades. Whatever the venues hold in this mode is not
+        // the bot's book: an operator's own position, or a live book whose
+        // state.json was lost — either way it waits for an ARM (adopt) or
+        // is closed by hand, never unwound because a default target is 0.
+        if self.state.mode == Mode::Off {
+            if book.long >= self.min_qty || book.short >= self.min_qty {
+                log::info!(
+                    "[OFF] venues hold long {} / short {} {}; not touched while Off (ARM adopts it)",
+                    book.long, book.short, self.cfg.symbol
+                );
+            }
+            self.write_status(now, kill, &[]);
+            return Ok(());
         }
 
         // Liquidation guard: either venue short of headroom → close both.
@@ -876,12 +958,12 @@ impl Engine {
             self.state.net_breach_ticks = 0;
         }
 
-        // Plan and execute (at most one clip per leg per tick).
+        // Plan (at most one clip per leg per tick).
         let restricted = self.state.halted || kill;
         let clip_qty =
             qty_for_notional(self.cfg.clip_usd, mark, self.size_decimals).max(self.min_qty);
         let net_tol_qty = self.cfg.net_tolerance_usd / mark;
-        let orders = plan_orders(
+        let mut orders = plan_orders(
             self.state.target_qty,
             book,
             clip_qty,
@@ -889,37 +971,71 @@ impl Engine {
             net_tol_qty,
             restricted,
         );
-        for order in &orders {
-            if order.qty > 0.0 {
-                // Leverage guard on growth.
-                let (snap, held) = match order.leg {
-                    Leg::Long => (&l, book.long),
-                    Leg::Short => (&s, book.short),
-                };
-                let after = (held + order.qty) * mark;
-                if !self.cfg.dry_run && after > self.cfg.max_leverage * snap.equity_usd {
-                    self.halt(format!(
-                        "leverage: {:?} leg ${after:.0} after order > {}x equity ${:.2} — deposit, then RISK_ACK",
-                        order.leg, self.cfg.max_leverage, snap.equity_usd
-                    ));
-                    break;
-                }
+
+        // Leverage guard on every growth order BEFORE anything is sent: a
+        // pair whose second leg would be refused must not have its first
+        // leg bought (that first leg would only be sold back next tick).
+        if !self.cfg.dry_run {
+            let equity = |leg: Leg| match leg {
+                Leg::Long => l.equity_usd,
+                Leg::Short => s.equity_usd,
+            };
+            let held = |leg: Leg| match leg {
+                Leg::Long => book.long,
+                Leg::Short => book.short,
+            };
+            if let Some(o) = orders.iter().find(|o| {
+                o.qty > 0.0
+                    && !leverage_ok(
+                        held(o.leg),
+                        o.qty,
+                        mark,
+                        equity(o.leg),
+                        self.cfg.max_leverage,
+                    )
+            }) {
+                self.halt(format!(
+                    "leverage: {:?} leg ${:.0} after order > {}x equity ${:.2} — deposit, then RISK_ACK",
+                    o.leg,
+                    (held(o.leg) + o.qty) * mark,
+                    self.cfg.max_leverage,
+                    equity(o.leg)
+                ));
+                orders.clear();
             }
-            match self.execute(order, mark).await {
-                Ok(filled) if filled <= 0.0 => {
+        }
+
+        // Execute. The second order of a pair is cut to what the first
+        // actually filled, so a partial on the thin RH book never leaves a
+        // full-clip naked leg on the other venue.
+        let mut i = 0;
+        while i < orders.len() {
+            let order = orders[i].clone();
+            match self.execute(&order, mark).await {
+                Ok(filled) if filled < self.min_qty => {
                     log::warn!(
-                        "[EXEC] {:?} {} unfilled — will retry next tick",
+                        "[EXEC] {:?} {} unfilled (got {filled}) — will retry next tick",
                         order.leg,
                         order.qty
                     );
-                    break; // do not send the second leg against an unfilled first
+                    orders.truncate(i + 1);
+                    break;
                 }
-                Ok(_) => {}
+                Ok(filled) => {
+                    if let Some(next) = orders.get_mut(i + 1) {
+                        *next = size_second_leg(next, filled);
+                        if next.qty.abs() < self.min_qty {
+                            orders.truncate(i + 1);
+                        }
+                    }
+                }
                 Err(e) => {
                     log::error!("[EXEC] {:?} {} failed: {e:?}", order.leg, order.qty);
+                    orders.truncate(i + 1);
                     break;
                 }
             }
+            i += 1;
         }
 
         // Settle Exited → Off once flat.
@@ -1133,6 +1249,7 @@ async fn main() -> Result<()> {
     let size_decimals = size_decimals.min(sd2);
     let min_qty = min_qty.max(min2);
     let mut state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    state = reconcile_state_mode(state, cfg.dry_run);
     state.process_started_at = Some(now_secs());
     log::info!(
         "[STARTUP] mode={:?} target_qty={} halted={} mark={mark:.1} size_decimals={size_decimals} min_qty={min_qty}",
@@ -1148,6 +1265,7 @@ async fn main() -> Result<()> {
         min_qty,
         last_s3_mirror: 0,
         last_snapshot: Default::default(),
+        feed_problem: None,
     };
     let tick = Duration::from_secs(engine.cfg.tick_secs);
     loop {
@@ -1304,6 +1422,72 @@ mod tests {
             ]
         );
         assert!(plan_orders(0.0, book(0.0, 0.0), 0.12, 0.0002, 0.006, false).is_empty());
+    }
+
+    #[test]
+    fn second_leg_is_cut_to_the_first_fill() {
+        let short = Order {
+            leg: Leg::Short,
+            qty: 0.12,
+        };
+        assert_eq!(size_second_leg(&short, 0.12), short);
+        assert_eq!(
+            size_second_leg(&short, 0.001),
+            Order {
+                leg: Leg::Short,
+                qty: 0.001
+            }
+        );
+        assert_eq!(size_second_leg(&short, 0.5), short);
+        let unwind = Order {
+            leg: Leg::Long,
+            qty: -0.12,
+        };
+        assert_eq!(
+            size_second_leg(&unwind, 0.05),
+            Order {
+                leg: Leg::Long,
+                qty: -0.05
+            }
+        );
+        assert_eq!(size_second_leg(&unwind, -1.0).qty, 0.0);
+    }
+
+    #[test]
+    fn leverage_guard_uses_notional_after_the_order() {
+        // $20k leg on $4,000: 5.0x — refused at 5x, allowed at 6x.
+        assert!(!leverage_ok(0.0, 0.247, 81_000.0, 4_000.0, 5.0));
+        assert!(leverage_ok(0.0, 0.247, 81_000.0, 4_000.0, 6.0));
+        // Held 0.12, adding 0.12 at 81k = $19.4k on $4k → 4.86x ok at 5x.
+        assert!(leverage_ok(0.12, 0.12, 81_000.0, 4_000.0, 5.0));
+    }
+
+    #[test]
+    fn state_from_the_other_mode_is_dropped_to_off() {
+        let armed = State {
+            mode: Mode::On,
+            target_qty: 0.247,
+            dry_run: Some(true),
+            ..Default::default()
+        };
+        let live = reconcile_state_mode(armed.clone(), false);
+        assert_eq!(live.mode, Mode::Off);
+        assert_eq!(live.target_qty, 0.0);
+        assert_eq!(live.dry_run, Some(false));
+        // Same mode: untouched.
+        let same = reconcile_state_mode(armed.clone(), true);
+        assert_eq!(same.mode, Mode::On);
+        assert_eq!(same.target_qty, 0.247);
+        // Pre-field state (no dry_run recorded): kept, now stamped.
+        let legacy = State {
+            mode: Mode::On,
+            target_qty: 0.1,
+            dry_run: None,
+            ..Default::default()
+        };
+        let kept = reconcile_state_mode(legacy, false);
+        assert_eq!(kept.mode, Mode::On);
+        assert_eq!(kept.dry_run, Some(false));
     }
 
     #[test]
