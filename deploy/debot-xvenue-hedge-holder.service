@@ -1,0 +1,24 @@
+[Unit]
+Description="debot-xvenue-hedge-holder (bot-strategy#1046: Robinhood-chain Lighter BTC long + Lighter Core BTC short, operator-armed points hedge)"
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=-/opt/debot-hedge-holder
+# Two Lighter WS connections boot here; stagger behind the other Lighter
+# consumers on this host (points collector is a timer, book-runtime 30s).
+ExecStartPre=/bin/sleep 45
+ExecStart=/bin/bash /opt/debot/scripts/debot-xvenue-hedge-holder.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+TimeoutStartSec=300
+# The holder does NOT close on stop: both legs are meant to persist across
+# restarts (a delta-neutral book needs no supervision while down).
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
