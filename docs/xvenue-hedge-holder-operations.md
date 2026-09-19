@@ -84,11 +84,21 @@ reducing the larger leg toward the smaller one while halted.
 
 ## Status (`status.json`, mirrored to `HEDGE_STATUS_S3_URI`)
 
-`mode`, `halted`/`halt_reason`, `target_qty`, `net_qty`/`net_usd`,
-`basis_bps` (RH mark vs Core mark), `equity_total_usd`,
-`pnl_since_arm_usd`, and per leg `qty`, `notional_usd`, `mark`,
-`equity_usd`, `liq_headroom_pct`. The dashboard's Robinhood card reads
-this file next to the points collector's `points_history.jsonl`.
+The top level is the pairtrade-like shape debot-dashboard already renders:
+`ts` / `updated_at`, `pnl_total` (= both venues' equity), `pnl_today`
+(equity change since 00:00 UTC), `positions` (one per leg, symbol
+`BTC (rh)` / `BTC (core)`), `kill_switch_active`, and the dashboard's
+`subsidy` block (`deploy/subsidy-kpi.md` there): `units_total` = the long
+account's live points since ARM (from the points collector's
+`points_history.jsonl`, `HEDGE_POINTS_HISTORY_PATH`), `units_7d`,
+`cost_total_usd` = −(equity change since ARM), `as_of_ts` = the newest
+collector row. Absent until the book is armed with a points baseline.
+
+Everything hedge-specific is under `hedge_holder`: `mode`,
+`halted`/`halt_reason`, `target_qty`, `net_qty`/`net_usd`, `basis_bps`
+(RH mark vs Core mark), `equity_total_usd`, `equity_at_arm_usd`,
+`pnl_since_arm_usd`, `points_at_arm`, and per leg `qty`, `notional_usd`,
+`mark`, `equity_usd`, `liq_headroom_pct`.
 
 ## Restart / stop
 

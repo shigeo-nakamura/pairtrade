@@ -166,6 +166,12 @@ struct Config {
     tick_secs: u64,
     status_s3_uri: String,
     status_s3_every_secs: u64,
+    /// The points collector's history file (bot-strategy#938); the row
+    /// series for the long leg's account feeds the `subsidy` block.
+    points_history_path: PathBuf,
+    /// Account index of the long leg (`LIGHTER_ACCOUNT_INDEX_<LONG>`),
+    /// used only to pick that account's rows out of the points history.
+    long_account_index: Option<u64>,
     arm_path: PathBuf,
     disarm_path: PathBuf,
     kill_switch_path: PathBuf,
@@ -198,6 +204,18 @@ impl Config {
             tick_secs: env_u64("HEDGE_TICK_SECS", 30),
             status_s3_uri: env_string("HEDGE_STATUS_S3_URI", ""),
             status_s3_every_secs: env_u64("HEDGE_STATUS_S3_EVERY_SECS", 60),
+            points_history_path: PathBuf::from(env_string(
+                "HEDGE_POINTS_HISTORY_PATH",
+                "/home/ec2-user/debot_status/robinhood-points/points_history.jsonl",
+            )),
+            long_account_index: {
+                let suffix = env_string("HEDGE_LONG_INSTANCE", "rh")
+                    .to_uppercase()
+                    .replace('-', "_");
+                std::env::var(format!("LIGHTER_ACCOUNT_INDEX_{suffix}"))
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+            },
             arm_path: dir.join("ARM"),
             disarm_path: dir.join("DISARM"),
             kill_switch_path: dir.join("KILL_SWITCH"),
@@ -296,6 +314,13 @@ struct State {
     equity_at_arm_usd: Option<f64>,
     cycles: u64,
     net_breach_ticks: u32,
+    /// Long-leg live points when the current book was armed (from the
+    /// collector's history), so `subsidy.units_total` counts this book only.
+    points_at_arm: Option<f64>,
+    /// UTC day the day-start equity below belongs to, and that equity.
+    day_key: Option<String>,
+    equity_day_start_usd: Option<f64>,
+    process_started_at: Option<u64>,
 }
 
 // --------------------------------------------------------------- planning
@@ -416,6 +441,68 @@ fn liq_headroom_pct(equity_usd: f64, notional_usd: f64, mmr_pct: f64) -> Option<
         return None;
     }
     Some(equity_usd / notional_usd * 100.0 - mmr_pct)
+}
+
+/// One account's live-points series out of the collector's JSONL
+/// (`robinhood_points_collector.py`): `(ts_unix, live_points_total)` in
+/// file order. Rows of other accounts and unparsable lines are skipped.
+fn points_series(lines: &str, account_index: u64) -> Vec<(u64, f64)> {
+    lines
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("account_index").and_then(|a| a.as_u64()) == Some(account_index))
+        .filter_map(|v| {
+            Some((
+                v.get("ts_unix")?.as_u64()?,
+                v.get("live_points_total")?.as_f64()?,
+            ))
+        })
+        .collect()
+}
+
+/// Latest value, and the value in force at `at` (last row at or before
+/// it), of a points series.
+fn points_latest_and_at(series: &[(u64, f64)], at: u64) -> (Option<(u64, f64)>, Option<f64>) {
+    let latest = series.last().copied();
+    let at_val = series
+        .iter()
+        .rev()
+        .find(|(ts, _)| *ts <= at)
+        .map(|(_, v)| *v);
+    (latest, at_val)
+}
+
+/// The dashboard's `subsidy` block (debot-dashboard `deploy/subsidy-kpi.md`):
+/// units and cost since ARM, both counted for this book only. Cost is
+/// positive when money was given up. `None` until armed with a points
+/// baseline.
+fn subsidy_block(
+    series: &[(u64, f64)],
+    points_at_arm: Option<f64>,
+    armed_at: Option<u64>,
+    pnl_since_arm_usd: Option<f64>,
+    now: u64,
+) -> Option<serde_json::Value> {
+    let (latest, _) = points_latest_and_at(series, now);
+    let (as_of, latest_pts) = latest?;
+    let base = points_at_arm?;
+    let armed_at = armed_at?;
+    let week_ago = now.saturating_sub(7 * 86_400).max(armed_at);
+    let (_, at_week) = points_latest_and_at(series, week_ago);
+    let units_7d = at_week.map(|v| latest_pts - v.max(base));
+    Some(serde_json::json!({
+        "unit": "points",
+        "units_total": latest_pts - base,
+        "units_7d": units_7d,
+        "cost_total_usd": pnl_since_arm_usd.map(|p| -p),
+        "as_of_ts": as_of,
+    }))
+}
+
+fn utc_day_key(now: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(now))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn decimal(v: f64, field: &str) -> Result<Decimal> {
@@ -677,6 +764,12 @@ impl Engine {
         let (book, l, s) = self.book().await?;
         self.last_snapshot = (l, s);
         let mark = l.mark;
+        let day = utc_day_key(now);
+        if self.state.day_key.as_deref() != Some(day.as_str()) {
+            self.state.day_key = Some(day);
+            self.state.equity_day_start_usd = Some(l.equity_usd + s.equity_usd);
+            self.persist();
+        }
         if (l.mark / s.mark - 1.0).abs() > 0.02 {
             bail!(
                 "venue marks diverge: long {} vs short {} — not trading on a broken feed",
@@ -724,6 +817,9 @@ impl Engine {
                     self.state.exited_at = None;
                     self.state.exit_reason = None;
                     self.state.equity_at_arm_usd = Some(l.equity_usd + s.equity_usd);
+                    self.state.points_at_arm = points_latest_and_at(&self.points_series(), now)
+                        .0
+                        .map(|(_, v)| v);
                     self.state.cycles += 1;
                     self.event(
                         "arm",
@@ -843,9 +939,29 @@ impl Engine {
         Ok(())
     }
 
+    fn points_series(&self) -> Vec<(u64, f64)> {
+        let Some(idx) = self.cfg.long_account_index else {
+            return vec![];
+        };
+        match std::fs::read_to_string(&self.cfg.points_history_path) {
+            Ok(text) => points_series(&text, idx),
+            Err(_) => vec![],
+        }
+    }
+
     fn write_status(&mut self, now: u64, kill: bool, orders: &[Order]) {
         let (l, s) = self.last_snapshot;
-        let status = status_value(&self.cfg, &self.state, &l, &s, now, kill, orders.len());
+        let series = self.points_series();
+        let status = status_value(
+            &self.cfg,
+            &self.state,
+            &l,
+            &s,
+            &series,
+            now,
+            kill,
+            orders.len(),
+        );
         if let Err(e) = persist_json(&self.cfg.status_path, &status) {
             log::warn!("[STATUS] write failed: {e:?}");
             return;
@@ -875,12 +991,17 @@ impl Engine {
     }
 }
 
-/// The monitoring projection (what debot-dashboard reads).
+/// The monitoring projection. Top level follows the pairtrade-like shape
+/// debot-dashboard already renders (`ts`/`updated_at`, `pnl_total` =
+/// venue equity, `positions`, `subsidy`); everything hedge-specific sits
+/// under `hedge_holder`.
+#[allow(clippy::too_many_arguments)] // one projection, all of its inputs
 fn status_value(
     cfg: &Config,
     state: &State,
     l: &VenueSnapshot,
     s: &VenueSnapshot,
+    points: &[(u64, f64)],
     now: u64,
     kill: bool,
     orders_this_tick: usize,
@@ -888,6 +1009,7 @@ fn status_value(
     let long_qty = l.qty.max(0.0);
     let short_qty = (-s.qty).max(0.0);
     let equity_total = l.equity_usd + s.equity_usd;
+    let pnl_since_arm = state.equity_at_arm_usd.map(|e0| equity_total - e0);
     let leg = |name: &str, instance: &str, held: f64, snap: &VenueSnapshot| {
         serde_json::json!({
             "instance": instance,
@@ -899,33 +1021,60 @@ fn status_value(
             "liq_headroom_pct": liq_headroom_pct(snap.equity_usd, held * snap.mark, cfg.mmr_pct),
         })
     };
+    let mut positions = Vec::new();
+    if long_qty > 0.0 {
+        positions.push(serde_json::json!({
+            "symbol": format!("{} ({})", cfg.symbol, cfg.long_instance), "side": "long",
+            "size": format!("{long_qty}"), "entry_price": serde_json::Value::Null }));
+    }
+    if short_qty > 0.0 {
+        positions.push(serde_json::json!({
+            "symbol": format!("{} ({})", cfg.symbol, cfg.short_instance), "side": "short",
+            "size": format!("{short_qty}"), "entry_price": serde_json::Value::Null }));
+    }
     serde_json::json!({
         "ts": now,
+        "updated_at": chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(now)).to_rfc3339(),
+        "process_started_at": state.process_started_at,
         "bot": BOT,
+        "id": BOT,
+        "dex": "Lighter (Robinhood Chain) / Lighter Core",
         "symbol": cfg.symbol,
         "dry_run": cfg.dry_run,
-        "mode": state.mode,
-        "halted": state.halted,
-        "halt_reason": state.halt_reason,
-        "kill_switch": kill,
-        "target_qty": state.target_qty,
-        "target_notional_usd": state.target_notional_usd,
-        "armed_at": state.armed_at,
-        "exited_at": state.exited_at,
-        "exit_reason": state.exit_reason,
-        "cycles": state.cycles,
-        "net_qty": long_qty - short_qty,
-        "net_usd": (long_qty - short_qty) * l.mark,
-        "net_tolerance_usd": cfg.net_tolerance_usd,
-        "basis_bps": if l.mark > 0.0 && s.mark > 0.0 { (l.mark / s.mark - 1.0) * 1e4 } else { 0.0 },
-        "equity_total_usd": equity_total,
-        "equity_at_arm_usd": state.equity_at_arm_usd,
-        "pnl_since_arm_usd": state.equity_at_arm_usd.map(|e0| equity_total - e0),
-        "orders_this_tick": orders_this_tick,
-        "config_fp": cfg.fingerprint(),
-        "legs": {
-            "long": leg("long", &cfg.long_instance, long_qty, l),
-            "short": leg("short", &cfg.short_instance, short_qty, s),
+        "kill_switch_active": kill,
+        "pnl_total": equity_total,
+        "pnl_today": state.equity_day_start_usd.map(|e| equity_total - e).unwrap_or(0.0),
+        "pnl_source": "equity",
+        "positions_ready": true,
+        "position_count": positions.len(),
+        "has_position": !positions.is_empty(),
+        "positions": positions,
+        "subsidy": subsidy_block(points, state.points_at_arm, state.armed_at, pnl_since_arm, now),
+        "hedge_holder": {
+            "mode": state.mode,
+            "halted": state.halted,
+            "halt_reason": state.halt_reason,
+            "kill_switch": kill,
+            "target_qty": state.target_qty,
+            "target_notional_usd": state.target_notional_usd,
+            "armed_at": state.armed_at,
+            "exited_at": state.exited_at,
+            "exit_reason": state.exit_reason,
+            "cycles": state.cycles,
+            "net_qty": long_qty - short_qty,
+            "net_usd": (long_qty - short_qty) * l.mark,
+            "net_tolerance_usd": cfg.net_tolerance_usd,
+            "basis_bps": if l.mark > 0.0 && s.mark > 0.0 { (l.mark / s.mark - 1.0) * 1e4 } else { 0.0 },
+            "equity_total_usd": equity_total,
+            "equity_at_arm_usd": state.equity_at_arm_usd,
+            "pnl_since_arm_usd": pnl_since_arm,
+            "points_at_arm": state.points_at_arm,
+            "orders_this_tick": orders_this_tick,
+            "config_fp": cfg.fingerprint(),
+            "legs": {
+                "long": leg("long", &cfg.long_instance, long_qty, l),
+                "short": leg("short", &cfg.short_instance, short_qty, s),
+            },
         },
     })
 }
@@ -983,7 +1132,8 @@ async fn main() -> Result<()> {
         .context("initial short-leg quote")?;
     let size_decimals = size_decimals.min(sd2);
     let min_qty = min_qty.max(min2);
-    let state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    let mut state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    state.process_started_at = Some(now_secs());
     log::info!(
         "[STARTUP] mode={:?} target_qty={} halted={} mark={mark:.1} size_decimals={size_decimals} min_qty={min_qty}",
         state.mode, state.target_qty, state.halted
@@ -1193,6 +1343,8 @@ mod tests {
             tick_secs: 30,
             status_s3_uri: String::new(),
             status_s3_every_secs: 60,
+            points_history_path: dir.join("points_history.jsonl"),
+            long_account_index: Some(3209),
             arm_path: dir.join("ARM"),
             disarm_path: dir.join("DISARM"),
             kill_switch_path: dir.join("KILL_SWITCH"),
@@ -1239,17 +1391,70 @@ mod tests {
             equity_usd: 4_010.0,
             mark: 81_324.2,
         };
-        let v = status_value(&cfg, &state, &l, &s, 1_789_812_142, false, 0);
-        assert_eq!(v["mode"], "On");
-        assert!((v["net_qty"].as_f64().unwrap()).abs() < 1e-12);
-        assert!((v["basis_bps"].as_f64().unwrap() - 3.0987).abs() < 0.01);
-        assert!((v["pnl_since_arm_usd"].as_f64().unwrap() - (-4.0)).abs() < 1e-9);
-        assert_eq!(v["legs"]["short"]["qty"], 0.247);
+        let v = status_value(&cfg, &state, &l, &s, &[], 1_789_812_142, false, 0);
+        let h = &v["hedge_holder"];
+        assert_eq!(h["mode"], "On");
+        assert!((h["net_qty"].as_f64().unwrap()).abs() < 1e-12);
+        assert!((h["basis_bps"].as_f64().unwrap() - 3.0987).abs() < 0.01);
+        assert!((h["pnl_since_arm_usd"].as_f64().unwrap() - (-4.0)).abs() < 1e-9);
+        assert_eq!(h["legs"]["short"]["qty"], 0.247);
         assert!(
-            (v["legs"]["short"]["liq_headroom_pct"].as_f64().unwrap()
+            (h["legs"]["short"]["liq_headroom_pct"].as_f64().unwrap()
                 - (4_010.0 / (0.247 * 81_324.2) * 100.0 - 1.2))
                 .abs()
                 < 1e-9
         );
+        // Dashboard-generic top level: equity as pnl_total, two positions,
+        // no subsidy block without a points baseline.
+        assert!((v["pnl_total"].as_f64().unwrap() - 8_490.0).abs() < 1e-9);
+        assert_eq!(v["position_count"], 2);
+        assert_eq!(v["positions"][0]["symbol"], "BTC (rh)");
+        assert_eq!(v["positions"][1]["side"], "short");
+        assert!(v["subsidy"].is_null());
+        assert_eq!(v["updated_at"], "2026-09-19T10:02:22+00:00");
+    }
+
+    const POINTS: &str = concat!(
+        "{\"account_index\":3209,\"arm\":\"freq\",\"ts_unix\":100,\"live_points_total\":72.0}\n",
+        "{\"account_index\":281474976710500,\"arm\":\"b\",\"ts_unix\":100,\"live_points_total\":4.4}\n",
+        "not json\n",
+        "{\"account_index\":3209,\"arm\":\"freq\",\"ts_unix\":200,\"live_points_total\":72.5}\n",
+        "{\"account_index\":3209,\"arm\":\"freq\",\"ts_unix\":300,\"live_points_total\":79.0}\n",
+    );
+
+    #[test]
+    fn points_series_picks_one_account_and_skips_junk() {
+        let s = points_series(POINTS, 3209);
+        assert_eq!(s, vec![(100, 72.0), (200, 72.5), (300, 79.0)]);
+        assert_eq!(points_series(POINTS, 281474976710500), vec![(100, 4.4)]);
+        assert!(points_series(POINTS, 1).is_empty());
+        let (latest, at) = points_latest_and_at(&s, 250);
+        assert_eq!(latest, Some((300, 79.0)));
+        assert_eq!(at, Some(72.5));
+        assert_eq!(points_latest_and_at(&s, 50).1, None);
+    }
+
+    #[test]
+    fn subsidy_block_counts_points_and_cost_since_arm_only() {
+        let s = points_series(POINTS, 3209);
+        // Armed at ts 150 with baseline 72.0 (the row in force then); equity −$4 since.
+        let v = subsidy_block(&s, Some(72.0), Some(150), Some(-4.0), 300).unwrap();
+        assert_eq!(v["unit"], "points");
+        assert!((v["units_total"].as_f64().unwrap() - 7.0).abs() < 1e-9);
+        assert!((v["cost_total_usd"].as_f64().unwrap() - 4.0).abs() < 1e-9);
+        assert_eq!(v["as_of_ts"], 300);
+        // 7d window starts at max(now − 7d, armed_at) = armed_at here → same as total.
+        assert!((v["units_7d"].as_f64().unwrap() - 7.0).abs() < 1e-9);
+        // No baseline (never armed / no collector rows at ARM) → no block.
+        assert!(subsidy_block(&s, None, Some(150), Some(-4.0), 300).is_none());
+        assert!(subsidy_block(&[], Some(72.0), Some(150), Some(-4.0), 300).is_none());
+        // A profitable book reports a negative cost.
+        let v = subsidy_block(&s, Some(72.0), Some(150), Some(2.5), 300).unwrap();
+        assert!((v["cost_total_usd"].as_f64().unwrap() + 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn utc_day_key_formats_the_date() {
+        assert_eq!(utc_day_key(1_789_812_142), "2026-09-19");
     }
 }
