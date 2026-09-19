@@ -171,11 +171,15 @@ pub async fn get_lighter_config_from_env(
         (api_key, private_key, evm_wallet_key)
     };
 
-    let base_url = env::var("REST_ENDPOINT")
-        .unwrap_or_else(|_| "https://mainnet.zklighter.elliot.ai/".to_string());
+    // Endpoints honour the instance suffix too (bot-strategy#1046): one
+    // process holding a leg on Robinhood-chain Lighter and the other on
+    // Lighter Core needs `REST_ENDPOINT_RH` next to `REST_ENDPOINT_CORE`.
+    // Unsuffixed values keep working as the shared default.
+    let base_url = lighter_env("REST_ENDPOINT", instance_id)
+        .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai/".to_string());
 
-    let websocket_url = env::var("WEB_SOCKET_ENDPOINT")
-        .unwrap_or_else(|_| "wss://mainnet.zklighter.elliot.ai/stream".to_string());
+    let websocket_url = lighter_env("WEB_SOCKET_ENDPOINT", instance_id)
+        .unwrap_or_else(|| "wss://mainnet.zklighter.elliot.ai/stream".to_string());
 
     // Read additional configuration (instance-suffixed values win over the
     // unsuffixed defaults so each strategy variant can point at its own
