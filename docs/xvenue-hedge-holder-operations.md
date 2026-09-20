@@ -117,12 +117,22 @@ Everything hedge-specific is under `hedge_holder`: `mode`,
 `pnl_since_arm_usd`, `points_at_arm`, and per leg `qty`, `notional_usd`,
 `mark`, `equity_usd`, `liq_headroom_pct`.
 
-## Feed divergence
+## Feed problems (`hedge_holder.feed_problem`)
 
 While the two venues' marks differ by more than 2 % (one feed on a REST
 fallback or a placeholder ticker) the bot sends nothing, keeps writing
 `status.json` with `hedge_holder.feed_problem`, and still consumes
 `DISARM` (acted on once the feed agrees again).
+
+While a venue cannot be read at all (REST 5xx, WebSocket down — Lighter
+Core answered 502/503 for ten minutes on 2026-09-20 11:02–11:12Z) the
+tick is skipped the same way: no order, no guard evaluation, and
+`status.json` is still written from the **last good snapshot** with
+`feed_problem = "venue unreachable: …"`. `hedge_holder.snapshot_at`
+dates that snapshot (the top-level `ts` is the write time), so the card
+can show how old the marks and headroom figures are. `ARM`/`DISARM`
+files are left in place and register on the next readable tick.
+`feed_problem` is `null` on a healthy tick.
 
 ## Restart / stop
 

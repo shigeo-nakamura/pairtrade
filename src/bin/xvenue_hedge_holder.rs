@@ -629,7 +629,12 @@ struct Engine {
     min_qty: f64,
     last_s3_mirror: u64,
     last_snapshot: (VenueSnapshot, VenueSnapshot),
-    /// Set while the two venue marks disagree; reported in status.
+    /// When `last_snapshot` was read from the venues; `None` until the
+    /// first successful read. Status carries it so marks frozen by an
+    /// outage are datable from the card.
+    last_snapshot_at: Option<u64>,
+    /// Set while a venue is unreachable or the two marks disagree;
+    /// reported in status (`hedge_holder.feed_problem`).
     feed_problem: Option<String>,
 }
 
@@ -810,8 +815,24 @@ impl Engine {
             self.persist();
         }
 
-        let (book, l, s) = self.book().await?;
+        // A venue that cannot be read (REST 5xx, WS down — Lighter Core
+        // was 502/503 for ten minutes on 2026-09-20) leaves the book
+        // untouched: no guard can be evaluated, so nothing is sent. Status
+        // is still written, from the last good snapshot and with the
+        // reason, so the card says why the bot is idle instead of going
+        // stale. Operator files stay on disk for the next readable tick.
+        let (book, l, s) = match self.book().await {
+            Ok(v) => v,
+            Err(e) => {
+                let reason = format!("venue unreachable: {e}");
+                log::error!("[FEED] {reason}");
+                self.feed_problem = Some(reason);
+                self.write_status(now, kill, &[]);
+                return Ok(());
+            }
+        };
         self.last_snapshot = (l, s);
+        self.last_snapshot_at = Some(now);
         let mark = l.mark;
         let day = utc_day_key(now);
         if self.state.day_key.as_deref() != Some(day.as_str()) {
@@ -1068,12 +1089,17 @@ impl Engine {
     fn write_status(&mut self, now: u64, kill: bool, orders: &[Order]) {
         let (l, s) = self.last_snapshot;
         let series = self.points_series();
+        let feed = FeedStatus {
+            problem: self.feed_problem.as_deref(),
+            snapshot_at: self.last_snapshot_at,
+        };
         let status = status_value(
             &self.cfg,
             &self.state,
             &l,
             &s,
             &series,
+            feed,
             now,
             kill,
             orders.len(),
@@ -1111,6 +1137,15 @@ impl Engine {
 /// debot-dashboard already renders (`ts`/`updated_at`, `pnl_total` =
 /// venue equity, `positions`, `subsidy`); everything hedge-specific sits
 /// under `hedge_holder`.
+/// Whether the venue reads behind `l`/`s` are current: `problem` is set
+/// while a venue is unreachable or the marks diverge (no orders go out),
+/// `snapshot_at` dates the snapshot the legs/marks come from.
+#[derive(Debug, Clone, Copy, Default)]
+struct FeedStatus<'a> {
+    problem: Option<&'a str>,
+    snapshot_at: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)] // one projection, all of its inputs
 fn status_value(
     cfg: &Config,
@@ -1118,6 +1153,7 @@ fn status_value(
     l: &VenueSnapshot,
     s: &VenueSnapshot,
     points: &[(u64, f64)],
+    feed: FeedStatus<'_>,
     now: u64,
     kill: bool,
     orders_this_tick: usize,
@@ -1148,6 +1184,36 @@ fn status_value(
             "symbol": format!("{} ({})", cfg.symbol, cfg.short_instance), "side": "short",
             "size": format!("{short_qty}"), "entry_price": serde_json::Value::Null }));
     }
+    // Split from the top-level literal: one `json!` this deep trips the
+    // macro recursion limit.
+    let hedge_holder = serde_json::json!({
+        "mode": state.mode,
+        "halted": state.halted,
+        "halt_reason": state.halt_reason,
+        "kill_switch": kill,
+        "target_qty": state.target_qty,
+        "target_notional_usd": state.target_notional_usd,
+        "armed_at": state.armed_at,
+        "exited_at": state.exited_at,
+        "exit_reason": state.exit_reason,
+        "cycles": state.cycles,
+        "net_qty": long_qty - short_qty,
+        "net_usd": (long_qty - short_qty) * l.mark,
+        "net_tolerance_usd": cfg.net_tolerance_usd,
+        "basis_bps": if l.mark > 0.0 && s.mark > 0.0 { (l.mark / s.mark - 1.0) * 1e4 } else { 0.0 },
+        "equity_total_usd": equity_total,
+        "equity_at_arm_usd": state.equity_at_arm_usd,
+        "pnl_since_arm_usd": pnl_since_arm,
+        "points_at_arm": state.points_at_arm,
+        "orders_this_tick": orders_this_tick,
+        "feed_problem": feed.problem,
+        "snapshot_at": feed.snapshot_at,
+        "config_fp": cfg.fingerprint(),
+        "legs": {
+            "long": leg("long", &cfg.long_instance, long_qty, l),
+            "short": leg("short", &cfg.short_instance, short_qty, s),
+        },
+    });
     serde_json::json!({
         "ts": now,
         "updated_at": chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(now)).to_rfc3339(),
@@ -1166,32 +1232,7 @@ fn status_value(
         "has_position": !positions.is_empty(),
         "positions": positions,
         "subsidy": subsidy_block(points, state.points_at_arm, state.armed_at, pnl_since_arm, now),
-        "hedge_holder": {
-            "mode": state.mode,
-            "halted": state.halted,
-            "halt_reason": state.halt_reason,
-            "kill_switch": kill,
-            "target_qty": state.target_qty,
-            "target_notional_usd": state.target_notional_usd,
-            "armed_at": state.armed_at,
-            "exited_at": state.exited_at,
-            "exit_reason": state.exit_reason,
-            "cycles": state.cycles,
-            "net_qty": long_qty - short_qty,
-            "net_usd": (long_qty - short_qty) * l.mark,
-            "net_tolerance_usd": cfg.net_tolerance_usd,
-            "basis_bps": if l.mark > 0.0 && s.mark > 0.0 { (l.mark / s.mark - 1.0) * 1e4 } else { 0.0 },
-            "equity_total_usd": equity_total,
-            "equity_at_arm_usd": state.equity_at_arm_usd,
-            "pnl_since_arm_usd": pnl_since_arm,
-            "points_at_arm": state.points_at_arm,
-            "orders_this_tick": orders_this_tick,
-            "config_fp": cfg.fingerprint(),
-            "legs": {
-                "long": leg("long", &cfg.long_instance, long_qty, l),
-                "short": leg("short", &cfg.short_instance, short_qty, s),
-            },
-        },
+        "hedge_holder": hedge_holder,
     })
 }
 
@@ -1265,6 +1306,7 @@ async fn main() -> Result<()> {
         min_qty,
         last_s3_mirror: 0,
         last_snapshot: Default::default(),
+        last_snapshot_at: None,
         feed_problem: None,
     };
     let tick = Duration::from_secs(engine.cfg.tick_secs);
@@ -1575,7 +1617,11 @@ mod tests {
             equity_usd: 4_010.0,
             mark: 81_324.2,
         };
-        let v = status_value(&cfg, &state, &l, &s, &[], 1_789_812_142, false, 0);
+        let feed = FeedStatus {
+            problem: None,
+            snapshot_at: Some(1_789_812_142),
+        };
+        let v = status_value(&cfg, &state, &l, &s, &[], feed, 1_789_812_142, false, 0);
         let h = &v["hedge_holder"];
         assert_eq!(h["mode"], "On");
         assert!((h["net_qty"].as_f64().unwrap()).abs() < 1e-12);
@@ -1596,6 +1642,71 @@ mod tests {
         assert_eq!(v["positions"][1]["side"], "short");
         assert!(v["subsidy"].is_null());
         assert_eq!(v["updated_at"], "2026-09-19T10:02:22+00:00");
+        // A healthy feed: no problem, snapshot dated by this tick.
+        assert!(h["feed_problem"].is_null());
+        assert_eq!(h["snapshot_at"], 1_789_812_142);
+    }
+
+    #[test]
+    fn status_carries_the_feed_problem_and_dates_the_frozen_snapshot() {
+        // A venue outage (Core 502/503, 2026-09-20 11:02–11:12Z): the tick
+        // sends nothing but still publishes, from the last good snapshot,
+        // with the reason and the snapshot's own timestamp so the card can
+        // say "idle: venue unreachable, marks as of 11:01Z" instead of
+        // going stale without a word.
+        let cfg = cfg_for_test();
+        let state = State {
+            mode: Mode::On,
+            target_qty: 0.247,
+            ..Default::default()
+        };
+        let l = VenueSnapshot {
+            qty: 0.247,
+            equity_usd: 4_480.0,
+            mark: 81_349.4,
+        };
+        let s = VenueSnapshot {
+            qty: -0.247,
+            equity_usd: 4_010.0,
+            mark: 81_324.2,
+        };
+        let reason =
+            "venue unreachable: short get_ticker BTC: Transient(\"recentTrades HTTP 503\")";
+        let feed = FeedStatus {
+            problem: Some(reason),
+            snapshot_at: Some(1_789_812_142),
+        };
+        let v = status_value(&cfg, &state, &l, &s, &[], feed, 1_789_812_742, false, 0);
+        let h = &v["hedge_holder"];
+        assert_eq!(h["feed_problem"], reason);
+        // The frozen snapshot keeps its own date; `ts` is the write.
+        assert_eq!(h["snapshot_at"], 1_789_812_142);
+        assert_eq!(v["ts"], 1_789_812_742);
+        // The legs shown are the last good read, not zeros.
+        assert_eq!(h["legs"]["long"]["qty"], 0.247);
+        assert_eq!(h["orders_this_tick"], 0);
+
+        // Before any successful read there is nothing to date.
+        let never = FeedStatus {
+            problem: Some("venue unreachable: long get_positions"),
+            snapshot_at: None,
+        };
+        let v0 = status_value(
+            &cfg,
+            &state,
+            &VenueSnapshot::default(),
+            &VenueSnapshot::default(),
+            &[],
+            never,
+            1_789_812_742,
+            false,
+            0,
+        );
+        assert!(v0["hedge_holder"]["snapshot_at"].is_null());
+        assert_eq!(
+            v0["hedge_holder"]["feed_problem"],
+            "venue unreachable: long get_positions"
+        );
     }
 
     const POINTS: &str = concat!(
