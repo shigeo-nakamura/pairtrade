@@ -61,6 +61,24 @@ arm, never a 0: a zero denominator reads as "traded for nothing".
 An arm that fails is reported on stderr and skipped; the other arm's row
 is still written; the exit status is non-zero if any arm failed so the
 timer unit shows it.
+
+Instances (bot-strategy#1046)
+-----------------------------
+The cross-venue hedge holds its short leg on Lighter Core, whose own
+points (if any) change the hedge's cost per point. An arm may therefore
+name its instance: `NAME:ENV_PATH[:rh|core]`. The instance picks the
+REST host and the signing chain id, and the credential keys are read
+with the instance suffix first (`LIGHTER_ACCOUNT_INDEX_CORE`, the way
+`debot-xvenue-hedge-holder.env` spells them) and bare second (the arm
+env files). On Core, `livePoints/total` answers 403 (WAF) from both this
+workstation and the Tokyo host while `referral/points` answers the usual
+20001 unauthenticated, so that endpoint is optional there: a row is
+still written from `referral/points`, its live tally null and the
+reason under `errors`. `robinhood_points_daily.py` differences one
+instance at a time (`--instance rh`, the default, or `core`), and on
+Core wants the cumulative tally it does state (`--tally total_points`),
+never the null one (`last_week_points` is a per-drop figure, not a
+series to difference).
 """
 
 from __future__ import annotations
@@ -82,9 +100,13 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_BASE_URL = "https://api.rh.lighter.xyz"
-# `LIGHTER_ROBINHOOD_CHAIN_ID` in dex-connector (signing chain id for the
-# api.rh.lighter.xyz deployment). The token is signed for this chain.
+DEFAULT_CORE_BASE_URL = "https://mainnet.zklighter.elliot.ai"
+# `LIGHTER_ROBINHOOD_CHAIN_ID` / `LIGHTER_MAINNET_CHAIN_ID` in dex-connector
+# (signing chain ids for the api.rh.lighter.xyz and Lighter Core
+# deployments). The token is signed for the arm's chain.
 ROBINHOOD_SIGNING_CHAIN_ID = 466_324
+CORE_SIGNING_CHAIN_ID = 304
+ENDPOINTS = ("livePoints/total", "referral/points")
 DEFAULT_LIBSIGNER = "/opt/debot/lib/libsigner.so"
 DEFAULT_OUT = Path("/home/ec2-user/debot_status/robinhood-points/points_history.jsonl")
 TOKEN_TTL_SECS = 600
@@ -98,6 +120,23 @@ TALLY_FIELDS = (
     ("total_referral_reward_points", "referral/points", "user_total_referral_reward_points"),
     ("last_week_referral_reward_points", "referral/points", "user_last_week_referral_reward_points"),
 )
+
+
+@dataclass(frozen=True)
+class Instance:
+    name: str
+    chain_id: int
+    # Credential keys are looked up as KEY + suffix first, then KEY.
+    suffix: str
+    # Endpoints whose failure fails the arm; the others are attempted and
+    # their absence recorded in the row's `errors`.
+    required: tuple[str, ...]
+
+
+INSTANCES = {
+    "rh": Instance("rh", ROBINHOOD_SIGNING_CHAIN_ID, "_RH", ENDPOINTS),
+    "core": Instance("core", CORE_SIGNING_CHAIN_ID, "_CORE", ("referral/points",)),
+}
 
 
 class CollectorError(Exception):
@@ -127,10 +166,15 @@ def load_env(path: Path) -> dict[str, str]:
     return out
 
 
-def require(env: dict[str, str], key: str, path: Path) -> str:
-    value = env.get(key, "")
+def require(env: dict[str, str], key: str, path: Path, suffix: str = "") -> str:
+    """`key + suffix` when the file spells it that way (the hedge env
+    holds both legs, suffixed), else the bare `key` (the arm env files)."""
+    value = env.get(key + suffix, "") if suffix else ""
     if not value:
-        raise CollectorError(f"{path}: {key} is not set")
+        value = env.get(key, "")
+    if not value:
+        wanted = f"{key}{suffix} or {key}" if suffix else key
+        raise CollectorError(f"{path}: {wanted} is not set")
     return value
 
 
@@ -143,8 +187,15 @@ def resolve_region(env_files: list[Path], process_env: dict[str, str]) -> str:
     file is required to exist, and that is checked by its own reader."""
     region = process_env.get("AWS_REGION", "")
     for path in env_files:
-        if path.is_file():
+        if not path.is_file():
+            continue
+        try:
             region = load_env(path).get("AWS_REGION", region) or region
+        except PermissionError:
+            # An arm env this user may not read (the hedge holder's env
+            # before the installer relaxed it): that arm fails on its own
+            # later, with its reason; the region is not decided by it.
+            continue
     return region or "eu-central-1"
 
 
@@ -294,9 +345,17 @@ def check_envelope(endpoint: str, status: int, body: Any) -> dict:
 
 
 def tallies_from_bodies(bodies: dict[str, dict]) -> dict[str, Decimal | None]:
+    """Tallies of the endpoints that answered. An endpoint absent from
+    `bodies` (optional on this instance, and it failed) leaves its
+    tallies None; an endpoint that answered without its field is an
+    error as before."""
     out: dict[str, Decimal | None] = {}
     for key, endpoint, field in TALLY_FIELDS:
-        out[key] = parse_tally(bodies[endpoint].get(field), field)
+        body = bodies.get(endpoint)
+        out[key] = None if body is None else parse_tally(body.get(field), field)
+    if "referral/points" not in bodies:
+        out["reward_point_multiplier"] = None
+        return out
     multiplier = bodies["referral/points"].get("reward_point_multiplier")
     # Optional the way the venue means it: absent, null or an empty string
     # (the docs type it as a string) all say "no multiplier". A present,
@@ -308,16 +367,27 @@ def tallies_from_bodies(bodies: dict[str, dict]) -> dict[str, Decimal | None]:
     return out
 
 
-def fetch_points(base_url: str, token: str, api_key_public: str,
-                 account_index: int) -> dict[str, dict]:
+def fetch_points(base_url: str, token: str, api_key_public: str, account_index: int,
+                 required: tuple[str, ...] = ENDPOINTS) -> tuple[dict[str, dict], dict[str, str]]:
+    """Bodies of the endpoints that answered, and the failure of each one
+    that did not. A required endpoint's failure raises; an optional
+    one's is returned so the row records it."""
     headers = {"Authorization": token, "X-API-KEY": api_key_public,
                "User-Agent": "robinhood-points-collector (bot-strategy#938)"}
     bodies: dict[str, dict] = {}
-    for endpoint in ("livePoints/total", "referral/points"):
+    errors: dict[str, str] = {}
+    for endpoint in ENDPOINTS:
         url = f"{base_url}/api/v1/{endpoint}?account_index={account_index}"
-        status, body = http_get_json(url, headers)
-        bodies[endpoint] = check_envelope(endpoint, status, body)
-    return bodies
+        try:
+            status, body = http_get_json(url, headers)
+            bodies[endpoint] = check_envelope(endpoint, status, body)
+        except (CollectorError, OSError) as exc:
+            # OSError: urllib's URLError / socket timeout -- transport, not
+            # the venue's answer; still only this endpoint's failure.
+            if endpoint in required:
+                raise
+            errors[endpoint] = f"{endpoint}: {exc}" if isinstance(exc, OSError) else str(exc)
+    return bodies, errors
 
 
 # --- rows -----------------------------------------------------------------
@@ -340,18 +410,22 @@ def raw_for_row(bodies: dict[str, dict]) -> dict[str, dict]:
 
 
 def build_row(arm: str, account_index: int, bodies: dict[str, dict],
-              now_unix: int) -> dict[str, Any]:
+              now_unix: int, instance: str = "rh",
+              errors: dict[str, str] | None = None) -> dict[str, Any]:
     tallies = tallies_from_bodies(bodies)
     row: dict[str, Any] = {
         "ts": datetime.fromtimestamp(now_unix, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ts_unix": now_unix,
         "arm": arm,
+        "instance": instance,
         "account_index": account_index,
     }
     for key, _endpoint, _field in TALLY_FIELDS:
         row[key] = decimal_to_json(tallies[key])
     row["reward_point_multiplier"] = decimal_to_json(tallies["reward_point_multiplier"])
     row["raw"] = raw_for_row(bodies)
+    if errors:
+        row["errors"] = dict(errors)
     return row
 
 
@@ -369,44 +443,54 @@ def append_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 class Arm:
     name: str
     env_path: Path
+    instance: Instance = INSTANCES["rh"]
 
 
 def parse_arm(spec: str) -> Arm:
-    name, sep, path = spec.partition(":")
-    if not sep or not name or not path:
-        raise argparse.ArgumentTypeError(f"--arm wants NAME:ENV_PATH, got {spec!r}")
-    return Arm(name=name, env_path=Path(path))
+    parts = spec.split(":")
+    if len(parts) not in (2, 3) or not all(parts):
+        raise argparse.ArgumentTypeError(
+            f"--arm wants NAME:ENV_PATH[:rh|core], got {spec!r}")
+    instance = INSTANCES.get(parts[2] if len(parts) == 3 else "rh")
+    if instance is None:
+        raise argparse.ArgumentTypeError(
+            f"--arm instance must be one of {sorted(INSTANCES)}, got {parts[2]!r}")
+    return Arm(name=parts[0], env_path=Path(parts[1]), instance=instance)
 
 
-def collect_arm(arm: Arm, data_key: bytes, signer: Signer, base_url: str,
+def collect_arm(arm: Arm, data_key: bytes, signer: Signer, base_urls: dict[str, str],
                 now_unix: int) -> dict[str, Any]:
     env = load_env(arm.env_path)
-    api_key_index = int(require(env, "LIGHTER_API_KEY_INDEX", arm.env_path))
-    account_index = int(require(env, "LIGHTER_ACCOUNT_INDEX", arm.env_path))
+    inst = arm.instance
+    base_url = base_urls[inst.name]
+    api_key_index = int(require(env, "LIGHTER_API_KEY_INDEX", arm.env_path, inst.suffix))
+    account_index = int(require(env, "LIGHTER_ACCOUNT_INDEX", arm.env_path, inst.suffix))
     # Both keys the way the bot reads them: `decrypt_data_with_kms(..,
     # output_as_hex=true)` hex-encodes the decrypted bytes, and the
     # connector sends that hex as X-API-KEY and hands it to CreateClient.
     private_key_hex = aes_cbc_decrypt(
-        data_key, require(env, "LIGHTER_PRIVATE_API_KEY", arm.env_path)).hex()
+        data_key, require(env, "LIGHTER_PRIVATE_API_KEY", arm.env_path, inst.suffix)).hex()
     api_key_public = aes_cbc_decrypt(
-        data_key, require(env, "LIGHTER_PUBLIC_API_KEY", arm.env_path)).hex()
-    signer.create_client(base_url, private_key_hex, ROBINHOOD_SIGNING_CHAIN_ID,
-                         api_key_index, account_index)
+        data_key, require(env, "LIGHTER_PUBLIC_API_KEY", arm.env_path, inst.suffix)).hex()
+    signer.create_client(base_url, private_key_hex, inst.chain_id, api_key_index, account_index)
     token = signer.auth_token(now_unix + TOKEN_TTL_SECS, api_key_index, account_index)
-    bodies = fetch_points(base_url, token, api_key_public, account_index)
-    return build_row(arm.name, account_index, bodies, now_unix)
+    bodies, errors = fetch_points(base_url, token, api_key_public, account_index, inst.required)
+    return build_row(arm.name, account_index, bodies, now_unix, inst.name, errors)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--arm", action="append", type=parse_arm, required=True,
-                        help="NAME:ENV_PATH; repeatable (freq:/opt/debot/scripts/...env)")
+                        help="NAME:ENV_PATH[:rh|core]; repeatable "
+                             "(freq:/opt/debot/scripts/...env, core-canary:...hedge-holder.env:core)")
     parser.add_argument("--common", type=Path,
                         default=Path("/opt/debot/scripts/debot_secrets_common.env"),
                         help="env file holding ENCRYPTED_DATA_KEY (and optionally AWS_REGION)")
     parser.add_argument("--env", action="append", type=Path, default=[],
                         help="extra env file the launcher sources (debot.env); read for AWS_REGION")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="rh instance REST host")
+    parser.add_argument("--core-base-url", default=DEFAULT_CORE_BASE_URL,
+                        help="core instance REST host")
     parser.add_argument("--libsigner", default=DEFAULT_LIBSIGNER)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--s3-uri", default=os.environ.get("ROBINHOOD_POINTS_S3_URI", ""),
@@ -421,11 +505,12 @@ def main(argv: list[str] | None = None) -> int:
     signer = Signer(args.libsigner)
     now_unix = int(time.time())
 
+    base_urls = {"rh": args.base_url, "core": args.core_base_url}
     rows: list[dict[str, Any]] = []
     failures = 0
     for arm in args.arm:
         try:
-            rows.append(collect_arm(arm, data_key, signer, args.base_url, now_unix))
+            rows.append(collect_arm(arm, data_key, signer, base_urls, now_unix))
         except (CollectorError, OSError, ValueError) as exc:
             failures += 1
             print(f"arm {arm.name}: {exc}", file=sys.stderr)

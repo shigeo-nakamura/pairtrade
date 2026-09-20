@@ -42,7 +42,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+# Only the cumulative tallies: `last_week_points` is the size of the latest
+# drop (constant between drops, replaced on drop day), so differencing it
+# would count the first drop once, then skip or misstate every later one.
 TALLIES = ("live_points_total", "total_points")
+INSTANCES = ("rh", "core")
+# Rows written before the collector learned instances (bot-strategy#1046)
+# carry no `instance`; they are all Robinhood-chain rows.
+DEFAULT_INSTANCE = "rh"
+
+
+def rows_of_instance(rows: list[dict[str, Any]], instance: str) -> list[dict[str, Any]]:
+    """The snapshots of one venue. The Lighter Core rows (`instance:
+    "core"`) share the file and, by design, carry `live_points_total:
+    null` (that endpoint is WAF-blocked there), so differencing that
+    tally over the whole file would fail on them: a tally is always
+    differenced within one instance."""
+    return [row for row in rows if row.get("instance", DEFAULT_INSTANCE) == instance]
 
 
 class PointsDailyError(Exception):
@@ -133,12 +149,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("history", type=Path, help="points_history.jsonl from the collector")
     parser.add_argument("--tally", choices=TALLIES, required=True,
                         help="which venue tally to difference (see module doc)")
+    parser.add_argument("--instance", choices=INSTANCES, default=DEFAULT_INSTANCE,
+                        help="which venue's rows to difference: rh (default; rows without "
+                             "an instance count as rh) or core")
     parser.add_argument("--out", type=Path, default=None,
                         help="write the ledger's --points file here (default: stdout)")
     args = parser.parse_args(argv)
 
     try:
-        latest = last_snapshot_per_day(read_snapshots(args.history), args.tally)
+        latest = last_snapshot_per_day(
+            rows_of_instance(read_snapshots(args.history), args.instance), args.tally)
     except PointsDailyError as exc:
         print(str(exc), file=sys.stderr)
         return 2

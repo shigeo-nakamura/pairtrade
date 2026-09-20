@@ -99,6 +99,18 @@ account's live points since ARM (from the points collector's
 `cost_total_usd` = −(equity change since ARM), `as_of_ts` = the newest
 collector row. Absent until the book is armed with a points baseline.
 
+The points collector also reads the short leg's own tallies on Lighter
+Core (`--arm core-canary:<this env>:core`, rows with `instance: "core"`;
+`robinhood-points-snapshot.service`). Those rows are for the readout —
+whether the Core side earns anything for the hedge changes its cost per
+point — and are not part of `subsidy` (the dashboard reads the long
+account's rows by `account_index`). On Core `livePoints/total` answers
+403 (WAF), so those rows carry `live_points_total: null` and the reason
+under `errors`; the series to difference there is `total_points`
+(`robinhood_points_daily.py --instance core --tally total_points`;
+`last_week_points` is the latest drop's size, not a cumulative series). The hedge env must be group-readable by `ec2-user`
+(`install_robinhood_points_snapshot.sh` does this).
+
 Everything hedge-specific is under `hedge_holder`: `mode`,
 `halted`/`halt_reason`, `target_qty`, `net_qty`/`net_usd`, `basis_bps`
 (RH mark vs Core mark), `equity_total_usd`, `equity_at_arm_usd`,

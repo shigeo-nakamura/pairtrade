@@ -10,6 +10,9 @@
 # (`debot-pair-robinhood-lighter`) is not touched: the collector only reads
 # the same credential files as ec2-user and writes its own history file.
 #
+# Also makes the hedge holder's env group-readable by ec2-user for the
+# core-canary arm (bot-strategy#1046).
+#
 # Re-running is safe: units are re-copied, the timer stays enabled. To
 # verify: `systemctl list-timers robinhood-points-snapshot.timer` and, after
 # the first run, `journalctl -u robinhood-points-snapshot.service`.
@@ -21,6 +24,11 @@ COLLECTOR=${ROBINHOOD_POINTS_COLLECTOR:-/opt/debot/scripts/robinhood_points_coll
 OUT_DIR=${ROBINHOOD_POINTS_OUT_DIR:-/home/ec2-user/debot_status/robinhood-points}
 SYSTEMCTL=${ROBINHOOD_POINTS_SYSTEMCTL:-systemctl}
 RUN_AS=${ROBINHOOD_POINTS_USER:-ec2-user}
+# The hedge holder's env (root 0600, bot-strategy#1046) holds the Lighter
+# Core leg's keys the core-canary arm reads; group-read for the run-as
+# user is all the collector needs. Missing file: skipped (the arm then
+# fails per run, the rh arms are unaffected).
+HEDGE_ENV=${ROBINHOOD_POINTS_HEDGE_ENV:-/opt/debot/scripts/debot-xvenue-hedge-holder.env}
 
 for source in "$COLLECTOR" "$UNIT_SOURCE_DIR/robinhood-points-snapshot.service" \
               "$UNIT_SOURCE_DIR/robinhood-points-snapshot.timer"; do
@@ -35,6 +43,13 @@ if ! python3 -c 'import cryptography' 2>/dev/null; then
 fi
 
 install -d -o "$RUN_AS" -g "$RUN_AS" -m 0750 "$OUT_DIR"
+if [ -f "$HEDGE_ENV" ]; then
+  chgrp "$RUN_AS" "$HEDGE_ENV"
+  chmod 0640 "$HEDGE_ENV"
+  echo "$HEDGE_ENV: group-readable by $RUN_AS (core-canary arm)"
+else
+  echo "$HEDGE_ENV missing: the core-canary arm will fail until it exists" >&2
+fi
 install -m 0644 "$UNIT_SOURCE_DIR/robinhood-points-snapshot.service" \
   "$SYSTEMD_DIR/robinhood-points-snapshot.service"
 install -m 0644 "$UNIT_SOURCE_DIR/robinhood-points-snapshot.timer" \
