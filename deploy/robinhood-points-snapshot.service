@@ -12,9 +12,15 @@ User=ec2-user
 Group=ec2-user
 WorkingDirectory=/home/ec2-user
 Environment=ROBINHOOD_POINTS_S3_URI=s3://debot-dashboard/debot/status/robinhood-lighter/points_history.jsonl
+# core-canary (bot-strategy#1046): the hedge's Lighter Core short leg, read
+# from the hedge holder's env (its _CORE keys) so the Core side's own
+# points, if any, enter the cost-per-point. The installer makes that env
+# group-readable by ec2-user; the arm fails (rows for the others still
+# written) until it is.
 ExecStart=/usr/bin/python3 /opt/debot/scripts/robinhood_points_collector.py \
   --arm freq:/opt/debot/scripts/debot-pair-robinhood-lighter.env \
   --arm b:/opt/debot/scripts/debot-pair-robinhood-lighter-b.env \
+  --arm core-canary:/opt/debot/scripts/debot-xvenue-hedge-holder.env:core \
   --common /opt/debot/scripts/debot_secrets_common.env \
   --env /opt/debot/scripts/debot.env \
   --libsigner /opt/debot/lib/libsigner.so \

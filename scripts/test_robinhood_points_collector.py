@@ -202,10 +202,10 @@ class MainTests(unittest.TestCase):
 
             fetch_calls = []
 
-            def fake_fetch(base_url, token, api_key_public, account_index):
+            def fake_fetch(base_url, token, api_key_public, account_index, required):
                 fetch_calls.append((base_url, token, api_key_public, account_index))
                 if account_index == 3209:
-                    return bodies(live=10)
+                    return bodies(live=10), {}
                 raise collector.CollectorError("livePoints/total: HTTP 401, code 20013: bad")
 
             fake_signer = mock.Mock()
@@ -224,6 +224,8 @@ class MainTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual([row["arm"] for row in rows], ["freq"])
         self.assertEqual(rows[0]["live_points_total"], 10)
+        self.assertEqual(rows[0]["instance"], "rh")
+        self.assertNotIn("errors", rows[0])
         # The client was registered for freq's key pair with the Robinhood
         # signing chain id, and the token minted for that pair.
         fake_signer.create_client.assert_any_call(
@@ -248,6 +250,125 @@ class MainTests(unittest.TestCase):
             # A file's setting overrides the process env, as `set -a; source` does.
             self.assertEqual(collector.resolve_region([debot], {"AWS_REGION": "us-east-1"}),
                              "ap-northeast-1")
+
+
+class InstanceTests(unittest.TestCase):
+    """The Lighter Core arm (bot-strategy#1046): its own host, chain id,
+    suffixed credential keys, and an optional livePoints/total."""
+
+    def test_parse_arm_defaults_to_rh_and_knows_core(self):
+        rh = collector.parse_arm("freq:/x/freq.env")
+        self.assertEqual((rh.name, str(rh.env_path), rh.instance.name), ("freq", "/x/freq.env", "rh"))
+        core = collector.parse_arm("core-canary:/x/hedge.env:core")
+        self.assertEqual(core.instance.name, "core")
+        self.assertEqual(core.instance.chain_id, 304)
+        self.assertEqual(core.instance.required, ("referral/points",))
+        for bad in ("noenv", "a:b:extended", "a:b:c:d", "a::core"):
+            with self.assertRaises(Exception, msg=bad):
+                collector.parse_arm(bad)
+
+    def test_require_prefers_the_suffixed_key(self):
+        env = {"LIGHTER_ACCOUNT_INDEX": "3209", "LIGHTER_ACCOUNT_INDEX_CORE": "281474976624819",
+               "LIGHTER_API_KEY_INDEX_RH": "0"}
+        path = Path("/x/hedge.env")
+        self.assertEqual(collector.require(env, "LIGHTER_ACCOUNT_INDEX", path, "_CORE"),
+                         "281474976624819")
+        self.assertEqual(collector.require(env, "LIGHTER_ACCOUNT_INDEX", path, "_RH"), "3209")
+        self.assertEqual(collector.require(env, "LIGHTER_ACCOUNT_INDEX", path), "3209")
+        # Bare fallback, so the arm env files (unsuffixed) still read on rh.
+        self.assertEqual(collector.require(env, "LIGHTER_API_KEY_INDEX", path, "_RH"), "0")
+        with self.assertRaises(collector.CollectorError) as ctx:
+            collector.require(env, "LIGHTER_API_KEY_INDEX", path, "_CORE")
+        self.assertIn("LIGHTER_API_KEY_INDEX_CORE or LIGHTER_API_KEY_INDEX", str(ctx.exception))
+
+    def _fake_http(self, live_status, live_body):
+        def fake(url, headers):
+            if "livePoints/total" in url:
+                return live_status, live_body
+            return 200, referral_body()
+        return fake
+
+    def test_optional_endpoint_failure_is_recorded_not_fatal(self):
+        with mock.patch.object(collector, "http_get_json",
+                               side_effect=self._fake_http(403, {"message": "forbidden"})):
+            bodies_, errors = collector.fetch_points(
+                "https://core", "tok", "pub", 281474976624819, ("referral/points",))
+        self.assertEqual(set(bodies_), {"referral/points"})
+        self.assertIn("HTTP 403", errors["livePoints/total"])
+        row = collector.build_row("core-canary", 281474976624819, bodies_, 1_789_534_395,
+                                  "core", errors)
+        self.assertEqual(row["instance"], "core")
+        self.assertIsNone(row["live_points_total"])
+        self.assertEqual(row["last_week_points"], 150)
+        self.assertEqual(row["reward_point_multiplier"], 1.5)
+        self.assertIn("HTTP 403", row["errors"]["livePoints/total"])
+        self.assertNotIn("livePoints/total", row["raw"])
+        json.dumps(row)
+
+    def test_required_endpoint_failure_still_raises(self):
+        with mock.patch.object(collector, "http_get_json",
+                               side_effect=self._fake_http(403, {"message": "forbidden"})):
+            with self.assertRaises(collector.CollectorError):
+                collector.fetch_points("https://rh", "tok", "pub", 3209)
+            # And both answering: no errors, both bodies, as before.
+            with mock.patch.object(collector, "http_get_json",
+                                   side_effect=self._fake_http(
+                                       200, {"code": 200, "total_live_points": 1})):
+                bodies_, errors = collector.fetch_points("https://rh", "tok", "pub", 3209)
+        self.assertEqual(set(bodies_), set(collector.ENDPOINTS))
+        self.assertEqual(errors, {})
+
+    def test_main_core_arm_reads_the_hedge_env_and_signs_for_core(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            common = Path(tmp, "common.env")
+            common.write_text("ENCRYPTED_DATA_KEY=AAAA\n")
+            hedge = Path(tmp, "hedge.env")
+            hedge.write_text(
+                'export LIGHTER_ACCOUNT_INDEX_RH="3209"\nexport LIGHTER_API_KEY_INDEX_RH="0"\n'
+                'export LIGHTER_PUBLIC_API_KEY_RH="x"\nexport LIGHTER_PRIVATE_API_KEY_RH="y"\n'
+                'export LIGHTER_ACCOUNT_INDEX_CORE="281474976624819"\n'
+                'export LIGHTER_API_KEY_INDEX_CORE="2"\n'
+                'export LIGHTER_PUBLIC_API_KEY_CORE="x"\nexport LIGHTER_PRIVATE_API_KEY_CORE="y"\n')
+            out = Path(tmp, "points_history.jsonl")
+            fetch_calls = []
+
+            def fake_fetch(base_url, token, api_key_public, account_index, required):
+                fetch_calls.append((base_url, account_index, required))
+                if required == ("referral/points",):
+                    return {"referral/points": referral_body()}, {"livePoints/total": "HTTP 403"}
+                return bodies(live=10), {}
+
+            fake_signer = mock.Mock()
+            fake_signer.auth_token.return_value = "tok"
+            with mock.patch.object(collector, "kms_decrypt_data_key", return_value=b"k" * 32), \
+                    mock.patch.object(collector, "aes_cbc_decrypt",
+                                      side_effect=lambda key, ct: b"p" * 40), \
+                    mock.patch.object(collector, "Signer", return_value=fake_signer), \
+                    mock.patch.object(collector, "fetch_points", side_effect=fake_fetch), \
+                    mock.patch.object(collector.time, "time", return_value=1_789_534_395.0):
+                rc = collector.main([
+                    "--arm", f"freq:{hedge}", "--arm", f"core-canary:{hedge}:core",
+                    "--common", str(common), "--libsigner", "/nonexistent.so",
+                    "--out", str(out)])
+            rows = [json.loads(line) for line in out.read_text().splitlines()]
+
+        # An optional endpoint's failure is not an arm failure.
+        self.assertEqual(rc, 0)
+        self.assertEqual([(r["arm"], r["instance"], r["account_index"]) for r in rows],
+                         [("freq", "rh", 3209), ("core-canary", "core", 281474976624819)])
+        self.assertEqual(rows[1]["live_points_total"], None)
+        self.assertEqual(rows[1]["errors"], {"livePoints/total": "HTTP 403"})
+        self.assertEqual(fetch_calls, [
+            (collector.DEFAULT_BASE_URL, 3209, collector.ENDPOINTS),
+            (collector.DEFAULT_CORE_BASE_URL, 281474976624819, ("referral/points",))])
+        fake_signer.create_client.assert_any_call(
+            collector.DEFAULT_BASE_URL, ("p" * 40).encode().hex(),
+            collector.ROBINHOOD_SIGNING_CHAIN_ID, 0, 3209)
+        fake_signer.create_client.assert_any_call(
+            collector.DEFAULT_CORE_BASE_URL, ("p" * 40).encode().hex(),
+            collector.CORE_SIGNING_CHAIN_ID, 2, 281474976624819)
+        fake_signer.auth_token.assert_any_call(
+            1_789_534_395 + collector.TOKEN_TTL_SECS, 2, 281474976624819)
 
 
 class DailyTests(unittest.TestCase):
