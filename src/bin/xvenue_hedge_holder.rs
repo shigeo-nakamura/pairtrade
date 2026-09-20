@@ -827,7 +827,14 @@ impl Engine {
                 let reason = format!("venue unreachable: {e}");
                 log::error!("[FEED] {reason}");
                 self.feed_problem = Some(reason);
-                self.write_status(now, kill, &[]);
+                // Only from a real snapshot: before the first successful
+                // read the default (all-zero) legs would publish a flat
+                // book and a PnL of −equity as fresh figures, over the
+                // previous process's last honest status.json. Leaving that
+                // file alone (stale) is the truthful option there.
+                if self.last_snapshot_at.is_some() {
+                    self.write_status(now, kill, &[]);
+                }
                 return Ok(());
             }
         };
@@ -1059,17 +1066,27 @@ impl Engine {
             i += 1;
         }
 
-        // Settle Exited → Off once flat.
+        // Settle Exited → Off once flat. The re-read can fail like the
+        // first one; the orders already sent this tick are still reported
+        // and the settle simply waits for the next readable tick.
         if self.state.mode == Mode::Exited && self.state.target_qty == 0.0 {
-            let (b2, _, _) = self.book().await?;
-            if b2.long < self.min_qty && b2.short < self.min_qty {
-                log::info!("[EXIT] flat on both venues ({:?})", self.state.exit_reason);
-                self.event(
-                    "flat",
-                    serde_json::json!({ "reason": self.state.exit_reason }),
-                );
-                self.state.mode = Mode::Off;
-                self.persist();
+            match self.book().await {
+                Ok((b2, _, _)) => {
+                    if b2.long < self.min_qty && b2.short < self.min_qty {
+                        log::info!("[EXIT] flat on both venues ({:?})", self.state.exit_reason);
+                        self.event(
+                            "flat",
+                            serde_json::json!({ "reason": self.state.exit_reason }),
+                        );
+                        self.state.mode = Mode::Off;
+                        self.persist();
+                    }
+                }
+                Err(e) => {
+                    let reason = format!("venue unreachable: {e}");
+                    log::error!("[FEED] {reason}");
+                    self.feed_problem = Some(reason);
+                }
             }
         }
         self.write_status(now, kill, &orders);
@@ -1686,27 +1703,16 @@ mod tests {
         assert_eq!(h["legs"]["long"]["qty"], 0.247);
         assert_eq!(h["orders_this_tick"], 0);
 
-        // Before any successful read there is nothing to date.
-        let never = FeedStatus {
-            problem: Some("venue unreachable: long get_positions"),
-            snapshot_at: None,
+        // Before any successful read `tick()` does not publish at all (the
+        // default snapshot would show a flat book and −equity PnL as fresh
+        // figures); a healthy tick then dates itself.
+        let healthy = FeedStatus {
+            problem: None,
+            snapshot_at: Some(1_789_812_742),
         };
-        let v0 = status_value(
-            &cfg,
-            &state,
-            &VenueSnapshot::default(),
-            &VenueSnapshot::default(),
-            &[],
-            never,
-            1_789_812_742,
-            false,
-            0,
-        );
-        assert!(v0["hedge_holder"]["snapshot_at"].is_null());
-        assert_eq!(
-            v0["hedge_holder"]["feed_problem"],
-            "venue unreachable: long get_positions"
-        );
+        let v1 = status_value(&cfg, &state, &l, &s, &[], healthy, 1_789_812_742, false, 0);
+        assert!(v1["hedge_holder"]["feed_problem"].is_null());
+        assert_eq!(v1["hedge_holder"]["snapshot_at"], 1_789_812_742);
     }
 
     const POINTS: &str = concat!(

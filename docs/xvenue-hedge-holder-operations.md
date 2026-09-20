@@ -132,7 +132,12 @@ tick is skipped the same way: no order, no guard evaluation, and
 dates that snapshot (the top-level `ts` is the write time), so the card
 can show how old the marks and headroom figures are. `ARM`/`DISARM`
 files are left in place and register on the next readable tick.
-`feed_problem` is `null` on a healthy tick.
+`feed_problem` is `null` on a healthy tick. A process that starts *during*
+an outage has no snapshot yet and writes nothing until its first
+successful read (the previous process's `status.json` stays on disk and
+goes stale, which is the honest picture). The Exited → Off settle re-read
+fails the same way: orders already sent that tick are still reported and
+the settle waits for the next readable tick.
 
 ## Restart / stop
 
