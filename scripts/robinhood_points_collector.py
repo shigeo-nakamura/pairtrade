@@ -74,8 +74,10 @@ env files). On Core, `livePoints/total` answers 403 (WAF) from both this
 workstation and the Tokyo host while `referral/points` answers the usual
 20001 unauthenticated, so that endpoint is optional there: a row is
 still written from `referral/points`, its live tally null and the
-reason under `errors`. `robinhood_points_daily.py` then wants a tally
-Core does state (`--tally last_week_points`), never the null one.
+reason under `errors`. `robinhood_points_daily.py` differences one
+instance at a time (`--instance rh`, the default, or `core`), and on
+Core wants a tally it does state (`--tally last_week_points` or
+`total_points`), never the null one.
 """
 
 from __future__ import annotations
@@ -371,10 +373,12 @@ def fetch_points(base_url: str, token: str, api_key_public: str, account_index: 
         try:
             status, body = http_get_json(url, headers)
             bodies[endpoint] = check_envelope(endpoint, status, body)
-        except CollectorError as exc:
+        except (CollectorError, OSError) as exc:
+            # OSError: urllib's URLError / socket timeout -- transport, not
+            # the venue's answer; still only this endpoint's failure.
             if endpoint in required:
                 raise
-            errors[endpoint] = str(exc)
+            errors[endpoint] = f"{endpoint}: {exc}" if isinstance(exc, OSError) else str(exc)
     return bodies, errors
 
 

@@ -305,6 +305,22 @@ class InstanceTests(unittest.TestCase):
         self.assertNotIn("livePoints/total", row["raw"])
         json.dumps(row)
 
+    def test_optional_endpoint_transport_failure_is_recorded_too(self):
+        import urllib.error
+
+        def fake(url, headers):
+            if "livePoints/total" in url:
+                raise urllib.error.URLError("connection reset")
+            return 200, referral_body()
+
+        with mock.patch.object(collector, "http_get_json", side_effect=fake):
+            bodies_, errors = collector.fetch_points(
+                "https://core", "tok", "pub", 281474976624819, ("referral/points",))
+            with self.assertRaises(urllib.error.URLError):
+                collector.fetch_points("https://rh", "tok", "pub", 3209)
+        self.assertEqual(set(bodies_), {"referral/points"})
+        self.assertIn("connection reset", errors["livePoints/total"])
+
     def test_required_endpoint_failure_still_raises(self):
         with mock.patch.object(collector, "http_get_json",
                                side_effect=self._fake_http(403, {"message": "forbidden"})):
@@ -369,6 +385,51 @@ class InstanceTests(unittest.TestCase):
             collector.CORE_SIGNING_CHAIN_ID, 2, 281474976624819)
         fake_signer.auth_token.assert_any_call(
             1_789_534_395 + collector.TOKEN_TTL_SECS, 2, 281474976624819)
+
+
+class DailyInstanceTests(unittest.TestCase):
+    """A history holding both venues: each instance is differenced on its
+    own, so the Core rows' null live tally never breaks the rh readout."""
+
+    def _history(self, tmp):
+        def row(arm, instance, ts_unix, live, last_week):
+            r = {"arm": arm, "account_index": 1 if arm == "freq" else 2, "ts_unix": ts_unix,
+                 "live_points_total": live, "total_points": 0, "last_week_points": last_week}
+            if instance is not None:
+                r["instance"] = instance
+            return r
+        rows = [
+            row("freq", None, 1_789_500_000, 10.0, 0),        # pre-instance row = rh
+            row("core-canary", "core", 1_789_500_000, None, 5),
+            row("freq", "rh", 1_789_586_400, 12.5, 0),
+            row("core-canary", "core", 1_789_586_400, None, 7),
+        ]
+        path = Path(tmp, "points_history.jsonl")
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return path
+
+    def test_rh_default_ignores_core_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._history(tmp)
+            out = Path(tmp, "pts.jsonl")
+            rc = daily.main([str(path), "--tally", "live_points_total", "--out", str(out)])
+            rows = [json.loads(l) for l in out.read_text().splitlines()]
+        self.assertEqual(rc, 0)
+        self.assertEqual([(r["arm"], r["points"]) for r in rows], [("freq", 2.5)])
+
+    def test_core_instance_differences_its_own_tally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._history(tmp)
+            out = Path(tmp, "pts.jsonl")
+            rc = daily.main([str(path), "--tally", "last_week_points", "--instance", "core",
+                             "--out", str(out)])
+            rows = [json.loads(l) for l in out.read_text().splitlines()]
+            # The null live tally on core is still an error when asked for.
+            rc_null = daily.main([str(path), "--tally", "live_points_total", "--instance", "core",
+                                  "--out", str(Path(tmp, "x.jsonl"))])
+        self.assertEqual(rc, 0)
+        self.assertEqual([(r["arm"], r["points"]) for r in rows], [("core-canary", 2.0)])
+        self.assertEqual(rc_null, 2)
 
 
 class DailyTests(unittest.TestCase):
