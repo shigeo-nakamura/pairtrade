@@ -106,8 +106,9 @@ whether the Core side earns anything for the hedge changes its cost per
 point — and are not part of `subsidy` (the dashboard reads the long
 account's rows by `account_index`). On Core `livePoints/total` answers
 403 (WAF), so those rows carry `live_points_total: null` and the reason
-under `errors`; the weekly series there is `last_week_points` /
-`total_points`. The hedge env must be group-readable by `ec2-user`
+under `errors`; the series to difference there is `total_points`
+(`robinhood_points_daily.py --instance core --tally total_points`;
+`last_week_points` is the latest drop's size, not a cumulative series). The hedge env must be group-readable by `ec2-user`
 (`install_robinhood_points_snapshot.sh` does this).
 
 Everything hedge-specific is under `hedge_holder`: `mode`,

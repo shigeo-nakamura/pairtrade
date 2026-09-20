@@ -245,6 +245,17 @@ class MainTests(unittest.TestCase):
             self.assertEqual(collector.resolve_region([common, debot, arm], {}), "ap-northeast-1")
             self.assertEqual(collector.resolve_region([common], {}), "eu-central-1")
             self.assertEqual(collector.resolve_region([arm, missing], {}), "eu-central-1")
+            # An env this user may not read (the hedge env before the
+            # installer relaxed it) is skipped, not a crash: the other
+            # arms must still run.
+            locked = Path(tmp, "locked.env"); locked.write_text("AWS_REGION=us-west-2\n")
+            locked.chmod(0)
+            try:
+                if os.geteuid() != 0:  # root reads regardless of mode
+                    self.assertEqual(collector.resolve_region([debot, locked], {}),
+                                     "ap-northeast-1")
+            finally:
+                locked.chmod(0o600)
             self.assertEqual(collector.resolve_region([arm], {"AWS_REGION": "us-east-1"}),
                              "us-east-1")
             # A file's setting overrides the process env, as `set -a; source` does.
@@ -394,7 +405,7 @@ class DailyInstanceTests(unittest.TestCase):
     def _history(self, tmp):
         def row(arm, instance, ts_unix, live, last_week):
             r = {"arm": arm, "account_index": 1 if arm == "freq" else 2, "ts_unix": ts_unix,
-                 "live_points_total": live, "total_points": 0, "last_week_points": last_week}
+                 "live_points_total": live, "total_points": last_week, "last_week_points": 0}
             if instance is not None:
                 r["instance"] = instance
             return r
@@ -421,7 +432,7 @@ class DailyInstanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._history(tmp)
             out = Path(tmp, "pts.jsonl")
-            rc = daily.main([str(path), "--tally", "last_week_points", "--instance", "core",
+            rc = daily.main([str(path), "--tally", "total_points", "--instance", "core",
                              "--out", str(out)])
             rows = [json.loads(l) for l in out.read_text().splitlines()]
             # The null live tally on core is still an error when asked for.
@@ -430,6 +441,14 @@ class DailyInstanceTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual([(r["arm"], r["points"]) for r in rows], [("core-canary", 2.0)])
         self.assertEqual(rc_null, 2)
+
+    def test_instance_typo_and_per_drop_tally_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._history(tmp)
+            for argv in (["--tally", "total_points", "--instance", "Core"],
+                         ["--tally", "last_week_points", "--instance", "core"]):
+                with self.assertRaises(SystemExit, msg=argv):
+                    daily.main([str(path), *argv, "--out", str(Path(tmp, "x.jsonl"))])
 
 
 class DailyTests(unittest.TestCase):

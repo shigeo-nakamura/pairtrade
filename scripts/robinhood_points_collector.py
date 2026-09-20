@@ -76,8 +76,9 @@ workstation and the Tokyo host while `referral/points` answers the usual
 still written from `referral/points`, its live tally null and the
 reason under `errors`. `robinhood_points_daily.py` differences one
 instance at a time (`--instance rh`, the default, or `core`), and on
-Core wants a tally it does state (`--tally last_week_points` or
-`total_points`), never the null one.
+Core wants the cumulative tally it does state (`--tally total_points`),
+never the null one (`last_week_points` is a per-drop figure, not a
+series to difference).
 """
 
 from __future__ import annotations
@@ -186,8 +187,15 @@ def resolve_region(env_files: list[Path], process_env: dict[str, str]) -> str:
     file is required to exist, and that is checked by its own reader."""
     region = process_env.get("AWS_REGION", "")
     for path in env_files:
-        if path.is_file():
+        if not path.is_file():
+            continue
+        try:
             region = load_env(path).get("AWS_REGION", region) or region
+        except PermissionError:
+            # An arm env this user may not read (the hedge holder's env
+            # before the installer relaxed it): that arm fails on its own
+            # later, with its reason; the region is not decided by it.
+            continue
     return region or "eu-central-1"
 
 
