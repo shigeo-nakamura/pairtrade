@@ -456,6 +456,11 @@ fn remainder_is_dust(
 /// A holding the book does not carry counts as flat below this notional.
 const RECONCILE_DUST_USD: f64 = 5.0;
 
+/// Startup verification of the book against the venues: retries for
+/// transient read failures before halting.
+const STARTUP_RECONCILE_ATTEMPTS: u32 = 6;
+const STARTUP_RECONCILE_STEP_SECS: u64 = 10;
+
 /// An unsettled order's holding must sit exactly on its recorded baseline
 /// (f64 round-trips through state.json aside) to be declared "no fill".
 const PENDING_RESOLVE_EPS: f64 = 1e-9;
@@ -531,14 +536,18 @@ fn settle_fill(
 }
 
 /// What is left of a leg after a close that the venue confirmed as `closed`
-/// of `orig`. Residue inside the reconcile tolerance is dust (fees, size
-/// rounding), reported as 0 so the leg counts as closed.
-fn remaining_after_close(orig: f64, closed: f64, tol_pct: f64) -> f64 {
+/// of `orig`. Only residue worth less than `RECONCILE_DUST_USD` at `price`
+/// is dust (fees, size rounding) and reads as 0; without a price nothing
+/// is dust. A percentage would let a 98 % fill of a large leg "close" it
+/// with a stop-less remainder left at the venue.
+fn remaining_after_close(orig: f64, closed: f64, price: Option<f64>) -> f64 {
     let remaining = (orig - closed).max(0.0);
-    if orig <= 0.0 || remaining <= orig * tol_pct / 100.0 {
-        0.0
-    } else {
-        remaining
+    if orig <= 0.0 || remaining <= 0.0 {
+        return 0.0;
+    }
+    match price {
+        Some(p) if p > 0.0 && remaining * p < RECONCILE_DUST_USD => 0.0,
+        _ => remaining,
     }
 }
 
@@ -1238,7 +1247,7 @@ impl Engine {
         let before = self.hl_spot_holding(&base).await.with_context(|| {
             format!("{market}: pre-order holding unreadable, NOT ordering (fill could not be confirmed)")
         })?;
-        self.mark_pending("hyperliquid", market, side, size, before);
+        self.mark_pending("hyperliquid", market, side, size, before)?;
         let sent = self
             .hl
             .create_order_taker_ioc(market, size, side, self.cfg.hl_taker_slippage_bps, false)
@@ -1279,7 +1288,7 @@ impl Engine {
         let before = self.lt_perp_holding(symbol).await.with_context(|| {
             format!("{symbol}: pre-order position unreadable, NOT ordering (fill could not be confirmed)")
         })?;
-        self.mark_pending("lighter", symbol, side, size, before);
+        self.mark_pending("lighter", symbol, side, size, before)?;
         let sent = self
             .lt
             .create_order(symbol, size, side, None, None, reduce_only, None)
@@ -1316,7 +1325,7 @@ impl Engine {
         side: OrderSide,
         size: Decimal,
         before: f64,
-    ) {
+    ) -> Result<()> {
         self.state.pending_order = Some(PendingOrder {
             venue: venue.to_string(),
             symbol: symbol.to_string(),
@@ -1332,7 +1341,13 @@ impl Engine {
         if self.state.mode != Mode::On {
             self.state.book_dry_run = Some(self.cfg.dry_run);
         }
-        self.persist();
+        // Fail closed: the marker is the only thing that makes a crash
+        // between here and the confirmation recoverable. Unwritten → no
+        // order.
+        persist_json(&self.cfg.state_path, &self.state).with_context(|| {
+            format!("{symbol}: could not persist the pending-order marker, NOT ordering")
+        })?;
+        Ok(())
     }
 
     /// Clear the pending marker only when the outcome is KNOWN: the holding
@@ -1499,6 +1514,19 @@ impl Engine {
         let order_id = if self.cfg.dry_run {
             format!("dry-run-stop-{}", now_secs())
         } else {
+            // Sweep whatever else rests on this symbol before resting the
+            // new stop: a trigger submission whose response was lost (timed
+            // out after acceptance) never got an id recorded, and this is
+            // the only way it is ever removed. The account is dedicated and
+            // the bot rests nothing but this stop, so a sweep costs nothing.
+            // Whether Lighter's cancel-all covers trigger orders is part of
+            // the #950 live check; a failed sweep defers the placement.
+            self.lt
+                .cancel_all_orders(Some(symbol.to_string()))
+                .await
+                .map_err(|e| {
+                    anyhow!("Lighter cancel-all on {symbol} before resting a stop: {e:?}")
+                })?;
             // `side` is the POSITION side for Lighter's TP/SL helper (long
             // position → sell stop).
             let resp = self
@@ -2284,8 +2312,7 @@ impl Engine {
                     Ok(f) => {
                         let sold = f.to_f64().unwrap_or(0.0);
                         spot_closed = sold;
-                        let remaining =
-                            remaining_after_close(target, sold, self.cfg.reconcile_tolerance_pct);
+                        let remaining = remaining_after_close(target, sold, px);
                         log::info!("[EXIT] {market} spot sold {f} (remaining {remaining})");
                         leg.spot_size = remaining;
                         spot_px_source = src;
@@ -2351,8 +2378,7 @@ impl Engine {
                     Ok(f) => {
                         let closed = f.to_f64().unwrap_or(0.0);
                         perp_closed = closed;
-                        let remaining =
-                            remaining_after_close(target, closed, self.cfg.reconcile_tolerance_pct);
+                        let remaining = remaining_after_close(target, closed, px);
                         log::info!("[EXIT] {sym} perp closed {f} (remaining {remaining})");
                         leg.perp_size = remaining;
                         perp_px_source = src;
@@ -3147,7 +3173,23 @@ async fn main() -> Result<()> {
     // anything else — in every mode: a flat book must be flat at the venues
     // too, or an order the state never recorded is sitting there.
     if !engine.cfg.dry_run {
-        let _ = engine.reconcile().await;
+        let mut verified = false;
+        for attempt in 1..=STARTUP_RECONCILE_ATTEMPTS {
+            if engine.reconcile().await {
+                verified = true;
+                break;
+            }
+            if engine.state.halted {
+                break; // a divergence, not a read failure: the halt says it
+            }
+            log::warn!("[RECONCILE] startup check incomplete (attempt {attempt}), retrying");
+            tokio::time::sleep(Duration::from_secs(STARTUP_RECONCILE_STEP_SECS)).await;
+        }
+        if !verified && !engine.state.halted {
+            // Never let an ARM file or a due tranche run on an unverified
+            // book: the operator clears this once the venues are readable.
+            engine.halt("startup reconcile could not verify the book against the venues (venue reads failed); RISK_ACK once they are reachable".into());
+        }
     }
     let tick = Duration::from_secs(engine.cfg.tick_secs.max(5));
     loop {
@@ -4191,11 +4233,17 @@ mod tests {
 
     #[test]
     fn partial_close_leaves_the_remainder_open_and_dust_closed() {
-        assert_eq!(remaining_after_close(0.01, 0.01, 2.0), 0.0);
-        assert_eq!(remaining_after_close(0.01, 0.00985, 2.0), 0.0); // dust
-        let r = remaining_after_close(0.01, 0.006, 2.0);
+        let px = Some(80_000.0);
+        assert_eq!(remaining_after_close(0.01, 0.01, px), 0.0);
+        // $4 of residue is dust; $15 (1.5 % of a $1,000 leg) is NOT.
+        assert_eq!(remaining_after_close(0.01, 0.00995, px), 0.0);
+        let r = remaining_after_close(0.0125, 0.0123125, px);
+        assert!((r - 0.0001875).abs() < 1e-12);
+        let r = remaining_after_close(0.01, 0.006, px);
         assert!((r - 0.004).abs() < 1e-12);
-        assert_eq!(remaining_after_close(0.0, 0.0, 2.0), 0.0);
+        // No price → nothing is dust.
+        assert!(remaining_after_close(0.01, 0.00999, None) > 0.0);
+        assert_eq!(remaining_after_close(0.0, 0.0, px), 0.0);
     }
 
     #[test]
