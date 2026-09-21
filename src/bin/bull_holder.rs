@@ -466,13 +466,33 @@ const RECONCILE_DUST_USD: f64 = 5.0;
 ///   error (the caller halts; a RISK_ACK retry re-reads the holding first);
 /// - ack Err, no change → the error, no exposure taken;
 /// - holding unreadable → error regardless of the ack.
+/// Did the venue definitively NOT accept the order? Only an application-
+/// level rejection or a failure before submission counts. A transport
+/// timeout, a parse failure on the response, or a "reconcile required"
+/// error may all follow a venue-side acceptance, and a fill can then show
+/// up after the confirmation window — such an order stays pending.
+fn order_rejected_definitively(e: &dex_connector::DexError) -> bool {
+    use dex_connector::DexError::*;
+    matches!(
+        e,
+        ServerResponse(_)
+            | Permanent(_)
+            | InvalidInput { .. }
+            | UpcomingMaintenance
+            | ApiKeyRegistrationRequired
+            | RateLimited { .. }
+            | NoConnection
+    )
+}
+
 /// Is the outcome of a live order settled? Only when the holding could be
-/// read AND (it changed, or the order call itself failed with no change).
-fn order_outcome_known(acked: bool, observed: Option<f64>) -> bool {
+/// read AND (it changed, or the order was definitively rejected and the
+/// holding did not change).
+fn order_outcome_known(acked: bool, rejected_definitively: bool, observed: Option<f64>) -> bool {
     match observed {
         None => false,
         Some(o) if o > 0.0 => true,
-        Some(_) => !acked,
+        Some(_) => !acked && rejected_definitively,
     }
 }
 
@@ -1213,8 +1233,12 @@ impl Engine {
         let sent = self
             .hl
             .create_order_taker_ioc(market, size, side, self.cfg.hl_taker_slippage_bps, false)
-            .await
-            .map_err(|e| anyhow!("HL spot IOC {side} {market}: {e:?}"));
+            .await;
+        let rejected = sent
+            .as_ref()
+            .err()
+            .map_or(false, order_rejected_definitively);
+        let sent = sent.map_err(|e| anyhow!("HL spot IOC {side} {market}: {e:?}"));
         let observed = self
             .confirm_fill(
                 || self.hl_spot_holding(&base),
@@ -1223,7 +1247,7 @@ impl Engine {
                 size.to_f64().unwrap_or(0.0),
             )
             .await;
-        self.settle_pending(&sent, &observed);
+        self.settle_pending(&sent, rejected, &observed);
         settle_fill(&format!("HL spot {side} {market}"), size, sent, observed)
     }
 
@@ -1250,8 +1274,12 @@ impl Engine {
         let sent = self
             .lt
             .create_order(symbol, size, side, None, None, reduce_only, None)
-            .await
-            .map_err(|e| anyhow!("Lighter perp {side} {symbol}: {e:?}"));
+            .await;
+        let rejected = sent
+            .as_ref()
+            .err()
+            .map_or(false, order_rejected_definitively);
+        let sent = sent.map_err(|e| anyhow!("Lighter perp {side} {symbol}: {e:?}"));
         let observed = self
             .confirm_fill(
                 || self.lt_perp_holding(symbol),
@@ -1260,7 +1288,7 @@ impl Engine {
                 size.to_f64().unwrap_or(0.0),
             )
             .await;
-        self.settle_pending(&sent, &observed);
+        self.settle_pending(&sent, rejected, &observed);
         settle_fill(
             &format!("Lighter perp {side} {symbol}"),
             size,
@@ -1288,23 +1316,31 @@ impl Engine {
             holding_before: before,
             ts: now_secs(),
         });
-        // The book's provenance starts with its first order, filled or not.
-        if self.state.book_dry_run.is_none() {
+        // The book's provenance starts with its first order, filled or not
+        // — stamped on every new cycle, so a previous cycle's mode never
+        // survives into this one (the startup gate would otherwise refuse
+        // a live restart after a crash between this order and open_book).
+        if self.state.mode != Mode::On {
             self.state.book_dry_run = Some(self.cfg.dry_run);
         }
         self.persist();
     }
 
     /// Clear the pending marker only when the outcome is KNOWN: the holding
-    /// was readable and either changed, or the order call itself failed
-    /// with no change (no fill). An acknowledged order the venue never
-    /// showed, or an unreadable holding, keeps the marker.
+    /// was readable and either changed, or the venue definitively rejected
+    /// the order and nothing changed. An acknowledged order the venue never
+    /// showed, a timed-out submission, or an unreadable holding keeps it.
     fn settle_pending(
         &mut self,
         sent: &Result<dex_connector::CreateOrderResponse>,
+        rejected_definitively: bool,
         observed: &Result<f64>,
     ) {
-        if order_outcome_known(sent.is_ok(), observed.as_ref().ok().copied()) {
+        if order_outcome_known(
+            sent.is_ok(),
+            rejected_definitively,
+            observed.as_ref().ok().copied(),
+        ) {
             self.state.pending_order = None;
         } else {
             log::error!(
@@ -1407,6 +1443,23 @@ impl Engine {
                     );
                     prior_cancel_failed = true;
                 }
+            }
+            if !prior_cancel_failed {
+                // The cancel is confirmed: drop the old stop from state NOW,
+                // before the replacement is attempted. If creating it fails
+                // below, state must show the leg uncovered so `ensure_stops`
+                // retries — keeping the cancelled id would read as covered
+                // (same level, same size) and nothing would ever retry.
+                leg.stop_order_id = None;
+                leg.stop_level = None;
+                leg.stop_size = None;
+                if let Some(l) = self.state.legs.get_mut(symbol) {
+                    l.stop_order_id = None;
+                    l.stop_level = None;
+                    l.stop_size = None;
+                    l.lighter_peak = leg.lighter_peak;
+                }
+                self.persist();
             }
         }
         if prior_cancel_failed {
@@ -2204,11 +2257,12 @@ impl Engine {
                         log::info!("[EXIT] {market} spot sold {f} (remaining {remaining})");
                         leg.spot_size = remaining;
                         spot_px_source = src;
-                        // Part of the leg left the venue outside this bot
-                        // (stop, manual close): its price is unknown here,
-                        // so the leg's PnL is unknown rather than a number
-                        // that ignores it.
-                        spot_pnl = if target + 1e-12 < orig_spot_size {
+                        // The venue held something other than the book (a
+                        // stop or manual close took part of it, or an
+                        // unrecorded fill added to it): that part's price /
+                        // cost is unknown here, so the leg's PnL is unknown
+                        // rather than a number that ignores it.
+                        spot_pnl = if (target - orig_spot_size).abs() > 1e-12 {
                             None
                         } else {
                             px.map(|p| {
@@ -2260,7 +2314,7 @@ impl Engine {
                         log::info!("[EXIT] {sym} perp closed {f} (remaining {remaining})");
                         leg.perp_size = remaining;
                         perp_px_source = src;
-                        perp_pnl = if target + 1e-12 < orig_perp_size {
+                        perp_pnl = if (target - orig_perp_size).abs() > 1e-12 {
                             None
                         } else {
                             px.map(|p| {
@@ -4078,14 +4132,41 @@ mod tests {
     #[test]
     fn order_outcome_is_known_only_with_a_readable_holding() {
         // Readable + changed → known (ack or not).
-        assert!(order_outcome_known(true, Some(0.01)));
-        assert!(order_outcome_known(false, Some(0.01)));
-        // Readable + unchanged: known only if the order call itself failed.
-        assert!(order_outcome_known(false, Some(0.0)));
-        assert!(!order_outcome_known(true, Some(0.0)));
+        assert!(order_outcome_known(true, false, Some(0.01)));
+        assert!(order_outcome_known(false, false, Some(0.01)));
+        // Readable + unchanged: known only on a DEFINITIVE rejection. A
+        // timed-out submission may have been accepted and fill late.
+        assert!(order_outcome_known(false, true, Some(0.0)));
+        assert!(!order_outcome_known(false, false, Some(0.0)));
+        assert!(!order_outcome_known(true, false, Some(0.0)));
         // Unreadable → never known.
-        assert!(!order_outcome_known(true, None));
-        assert!(!order_outcome_known(false, None));
+        assert!(!order_outcome_known(true, false, None));
+        assert!(!order_outcome_known(false, true, None));
+    }
+
+    #[test]
+    fn only_venue_rejections_and_pre_submission_failures_are_definitive() {
+        use dex_connector::DexError;
+        assert!(order_rejected_definitively(&DexError::ServerResponse(
+            "reduce-only".into()
+        )));
+        assert!(order_rejected_definitively(&DexError::Permanent(
+            "no market".into()
+        )));
+        assert!(order_rejected_definitively(&DexError::NoConnection));
+        assert!(!order_rejected_definitively(&DexError::Transient(
+            "timeout".into()
+        )));
+        assert!(!order_rejected_definitively(
+            &DexError::ReconciliationRequired {
+                action: "order".into(),
+                nonce: 1,
+                detail: "ambiguous".into(),
+            }
+        ));
+        assert!(!order_rejected_definitively(&DexError::Serde(
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err()
+        )));
     }
 
     #[tokio::test(start_paused = true)]
