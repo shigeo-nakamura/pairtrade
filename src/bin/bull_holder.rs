@@ -430,6 +430,32 @@ fn fill_complete(observed: f64, requested: f64) -> bool {
 }
 const FILL_COMPLETE_TOL: f64 = 0.005;
 
+/// A partially filled leg whose remainder is below the venue minimum is
+/// marked done (it would otherwise block the ladder forever). Returns true
+/// when it did so.
+fn remainder_is_dust(
+    filled_usd: f64,
+    remainder: Decimal,
+    min_order: f64,
+    progress: &mut BTreeMap<String, LegProgress>,
+    sym: &str,
+    spot: bool,
+) -> bool {
+    if filled_usd <= 0.0 || remainder.to_f64().unwrap_or(0.0) >= min_order {
+        return false;
+    }
+    let pr = progress.entry(sym.to_string()).or_default();
+    if spot {
+        pr.spot_done = true;
+    } else {
+        pr.perp_done = true;
+    }
+    true
+}
+
+/// A holding the book does not carry counts as flat below this notional.
+const RECONCILE_DUST_USD: f64 = 5.0;
+
 /// Combine the order acknowledgement with the confirmed holding change into
 /// the fill to record. The venue's holding is authoritative:
 /// - ack Ok, change observed → that change (partial fills are recorded as
@@ -440,6 +466,16 @@ const FILL_COMPLETE_TOL: f64 = 0.005;
 ///   error (the caller halts; a RISK_ACK retry re-reads the holding first);
 /// - ack Err, no change → the error, no exposure taken;
 /// - holding unreadable → error regardless of the ack.
+/// Is the outcome of a live order settled? Only when the holding could be
+/// read AND (it changed, or the order call itself failed with no change).
+fn order_outcome_known(acked: bool, observed: Option<f64>) -> bool {
+    match observed {
+        None => false,
+        Some(o) if o > 0.0 => true,
+        Some(_) => !acked,
+    }
+}
+
 fn settle_fill(
     what: &str,
     requested: Decimal,
@@ -906,12 +942,16 @@ struct State {
     /// holdings that do not exist. `None` = flat, or a pre-#895 file.
     #[serde(default)]
     book_dry_run: Option<bool>,
+    /// See [`PendingOrder`].
+    #[serde(default)]
+    pending_order: Option<PendingOrder>,
 }
 
 /// Does the persisted book carry exposure that the process must not touch
 /// in the wrong execution mode?
 fn book_is_open(state: &State) -> bool {
     state.mode == Mode::On
+        || state.pending_order.is_some()
         || state
             .legs
             .values()
@@ -999,10 +1039,36 @@ fn apply_funding_payments(
     added
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq)]
 struct LegProgress {
     spot_done: bool,
     perp_done: bool,
+    /// Notional (USD at the fill quote) already filled for this tranche's
+    /// legs. A partial fill halts the ladder with these recorded; the
+    /// RISK_ACK retry orders only the remainder, never the full size again.
+    #[serde(default)]
+    spot_usd: f64,
+    #[serde(default)]
+    perp_usd: f64,
+}
+
+/// A live order whose outcome has not been settled against the venue yet.
+/// Written (and persisted) BEFORE the order is sent, cleared once the fill
+/// was confirmed or a no-fill was confirmed. Anything else — a crash, an
+/// unreadable holding, an acknowledged order the venue never showed — leaves
+/// it in place, and no further order is sent for the book until an
+/// account-wide reconcile has compared every configured symbol with the
+/// venues (`reconcile_before_orders`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct PendingOrder {
+    venue: String,
+    symbol: String,
+    side: String,
+    requested: f64,
+    /// Venue holding read just before the order (the baseline the
+    /// confirmation compares against).
+    holding_before: f64,
+    ts: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -1129,16 +1195,21 @@ impl Engine {
     /// Hyperliquid spot IOC (buy or sell). Returns the CONFIRMED fill (change
     /// in the base holding, net of any base-denominated fee); dry-run returns
     /// the requested size.
-    async fn hl_spot_ioc(&self, market: &str, size: Decimal, side: OrderSide) -> Result<Decimal> {
+    async fn hl_spot_ioc(
+        &mut self,
+        market: &str,
+        size: Decimal,
+        side: OrderSide,
+    ) -> Result<Decimal> {
         if self.cfg.dry_run {
             log::info!("[DRY_RUN] HL spot IOC {side} {market} size={size}");
             return Ok(size);
         }
         let base = spot_base(market);
-        let before = self
-            .hl_spot_holding(&base)
-            .await
-            .with_context(|| format!("{market}: pre-order holding unreadable, NOT ordering (fill could not be confirmed)"))?;
+        let before = self.hl_spot_holding(&base).await.with_context(|| {
+            format!("{market}: pre-order holding unreadable, NOT ordering (fill could not be confirmed)")
+        })?;
+        self.mark_pending("hyperliquid", market, side, size, before);
         let sent = self
             .hl
             .create_order_taker_ioc(market, size, side, self.cfg.hl_taker_slippage_bps, false)
@@ -1152,6 +1223,7 @@ impl Engine {
                 size.to_f64().unwrap_or(0.0),
             )
             .await;
+        self.settle_pending(&sent, &observed);
         settle_fill(&format!("HL spot {side} {market}"), size, sent, observed)
     }
 
@@ -1159,20 +1231,22 @@ impl Engine {
     /// path every pairtrade taker caller uses). Returns the CONFIRMED fill
     /// (change in the venue position); dry-run returns the requested size.
     async fn lt_perp_taker(
-        &self,
+        &mut self,
         symbol: &str,
         size: Decimal,
         side: OrderSide,
         reduce_only: bool,
     ) -> Result<Decimal> {
         if self.cfg.dry_run {
-            log::info!("[DRY_RUN] Lighter perp taker {side} {symbol} size={size} reduce_only={reduce_only}");
+            log::info!(
+                "[DRY_RUN] Lighter perp taker {side} {symbol} size={size} reduce_only={reduce_only}"
+            );
             return Ok(size);
         }
-        let before = self
-            .lt_perp_holding(symbol)
-            .await
-            .with_context(|| format!("{symbol}: pre-order position unreadable, NOT ordering (fill could not be confirmed)"))?;
+        let before = self.lt_perp_holding(symbol).await.with_context(|| {
+            format!("{symbol}: pre-order position unreadable, NOT ordering (fill could not be confirmed)")
+        })?;
+        self.mark_pending("lighter", symbol, side, size, before);
         let sent = self
             .lt
             .create_order(symbol, size, side, None, None, reduce_only, None)
@@ -1186,12 +1260,59 @@ impl Engine {
                 size.to_f64().unwrap_or(0.0),
             )
             .await;
+        self.settle_pending(&sent, &observed);
         settle_fill(
             &format!("Lighter perp {side} {symbol}"),
             size,
             sent,
             observed,
         )
+    }
+
+    /// Persist the order about to be sent, so a crash between send and
+    /// confirmation leaves a trace that blocks further orders until the
+    /// book has been reconciled against the venues.
+    fn mark_pending(
+        &mut self,
+        venue: &str,
+        symbol: &str,
+        side: OrderSide,
+        size: Decimal,
+        before: f64,
+    ) {
+        self.state.pending_order = Some(PendingOrder {
+            venue: venue.to_string(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            requested: size.to_f64().unwrap_or(0.0),
+            holding_before: before,
+            ts: now_secs(),
+        });
+        // The book's provenance starts with its first order, filled or not.
+        if self.state.book_dry_run.is_none() {
+            self.state.book_dry_run = Some(self.cfg.dry_run);
+        }
+        self.persist();
+    }
+
+    /// Clear the pending marker only when the outcome is KNOWN: the holding
+    /// was readable and either changed, or the order call itself failed
+    /// with no change (no fill). An acknowledged order the venue never
+    /// showed, or an unreadable holding, keeps the marker.
+    fn settle_pending(
+        &mut self,
+        sent: &Result<dex_connector::CreateOrderResponse>,
+        observed: &Result<f64>,
+    ) {
+        if order_outcome_known(sent.is_ok(), observed.as_ref().ok().copied()) {
+            self.state.pending_order = None;
+        } else {
+            log::error!(
+                "[FILL] outcome of {:?} is UNKNOWN — it stays recorded as pending; no further order until the book is reconciled",
+                self.state.pending_order
+            );
+        }
+        self.persist();
     }
 
     /// Re-read the holding until it reflects the whole requested change or
@@ -1211,18 +1332,22 @@ impl Engine {
     {
         let dir = if side == OrderSide::Short { -1.0 } else { 1.0 };
         let mut last_err = None;
-        let mut observed = 0.0;
+        // Best successful observation so far. A read failure AFTER a
+        // successful read must not discard what was already seen: the
+        // exposure is known to be at least that, and returning an error
+        // instead would route the caller to the unknown-fill path.
+        let mut observed: Option<f64> = None;
         for attempt in 0..FILL_CONFIRM_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(FILL_CONFIRM_STEP_MS)).await;
             match read().await {
                 Ok(after) => {
-                    observed = ((after - before) * dir).max(0.0);
-                    last_err = None;
-                    if fill_complete(observed, requested) {
-                        return Ok(observed);
+                    let seen = ((after - before) * dir).max(0.0);
+                    observed = Some(observed.map_or(seen, |o: f64| o.max(seen)));
+                    if fill_complete(seen, requested) {
+                        return Ok(seen);
                     }
                     log::debug!(
-                        "[FILL] attempt {}: observed {observed} of {requested}, waiting",
+                        "[FILL] attempt {}: observed {seen} of {requested}, waiting",
                         attempt + 1
                     );
                 }
@@ -1235,9 +1360,10 @@ impl Engine {
                 }
             }
         }
-        match last_err {
-            Some(e) => Err(e).context("holding unreadable after the order was sent"),
-            None => Ok(observed),
+        match (observed, last_err) {
+            (Some(o), _) => Ok(o),
+            (None, Some(e)) => Err(e).context("holding unreadable after the order was sent"),
+            (None, None) => Ok(0.0),
         }
     }
 
@@ -1733,7 +1859,9 @@ impl Engine {
     /// Buy one tranche (`state.tranche_*_usd` per symbol) of both legs for
     /// every symbol. The first call of a cycle creates the legs and flips the
     /// book to On; later calls add to them. Each fill is persisted as it
-    /// happens so a failure partway never leaves exposure unrecorded.
+    /// happens so a failure partway never leaves exposure unrecorded, and
+    /// `tranche_progress` carries the notional filled per leg so a retry
+    /// after a partial fill orders only the remainder.
     async fn buy_tranche(&mut self, why: &str) -> Result<()> {
         let spot_notional = self.state.tranche_spot_usd;
         let perp_notional = self.state.tranche_perp_usd;
@@ -1743,14 +1871,9 @@ impl Engine {
                 "[ENTRY] resuming tranche {n_th} after a partial failure; already filled: {:?}",
                 self.state.tranche_progress
             );
-            // The failure may have left exposure the state does not know
-            // about (an order whose fill could not be confirmed): compare
-            // the book with the venues before sending anything more.
-            self.reconcile().await;
-            if self.state.halted {
-                bail!("resume aborted: the book diverges from the venues (see [HALT]); fix state.json by hand, then RISK_ACK");
-            }
         }
+        self.reconcile_before_orders(&format!("{why} tranche {n_th}"))
+            .await?;
         for sym in self.cfg.symbols.clone() {
             let progress = self
                 .state
@@ -1767,8 +1890,37 @@ impl Engine {
             // Read-only: safe to bail before any order for this symbol is sent.
             let hq = self.quote(&self.hl, &market).await?;
             let lq = self.quote(&self.lt, &sym).await?;
-            let spot_size = size_from_notional(spot_notional, hq.price, hq.size_decimals);
-            let perp_size = size_from_notional(perp_notional, lq.price, lq.size_decimals);
+            // Remainders: what this tranche still owes each leg.
+            let spot_size = size_from_notional(
+                spot_notional - progress.spot_usd,
+                hq.price,
+                hq.size_decimals,
+            );
+            let perp_size = size_from_notional(
+                perp_notional - progress.perp_usd,
+                lq.price,
+                lq.size_decimals,
+            );
+            // A remainder too small to order (a partial fill that stopped
+            // just short) is settled as done rather than blocking forever.
+            let need_spot = need_spot
+                && !remainder_is_dust(
+                    progress.spot_usd,
+                    spot_size,
+                    hq.min_order,
+                    &mut self.state.tranche_progress,
+                    &sym,
+                    true,
+                );
+            let need_perp = need_perp
+                && !remainder_is_dust(
+                    progress.perp_usd,
+                    perp_size,
+                    lq.min_order,
+                    &mut self.state.tranche_progress,
+                    &sym,
+                    false,
+                );
             if need_spot && spot_size.to_f64().unwrap_or(0.0) < hq.min_order {
                 bail!(
                     "{market}: tranche spot size {spot_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
@@ -1780,6 +1932,13 @@ impl Engine {
                     "{sym}: tranche perp size {perp_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
                     lq.min_order
                 );
+            }
+            if !need_spot && !need_perp {
+                self.persist();
+                log::info!(
+                    "[ENTRY] {sym}: tranche {n_th} remainder below min_order, settled as filled"
+                );
+                continue;
             }
             // Record the leg BEFORE/AS EACH order fills so a failure partway
             // through this symbol (or the next one) never leaves a filled
@@ -1814,7 +1973,7 @@ impl Engine {
                     .await
                     .with_context(|| {
                         format!(
-                            "{sym}: spot {why} tranche {n_th} failed (this leg took no exposure; legs already filled in this attempt are recorded and will be skipped on retry)"
+                            "{sym}: spot {why} tranche {n_th} failed (legs already filled in this attempt are recorded and will be skipped on retry)"
                         )
                     })?;
                 fs = filled_spot.to_f64().unwrap_or(0.0);
@@ -1822,28 +1981,31 @@ impl Engine {
                 leg.spot_cost_usd += fs * hq.price;
             }
             self.state.legs.insert(sym.clone(), leg.clone());
-            self.state
-                .tranche_progress
-                .entry(sym.clone())
-                .or_default()
-                .spot_done = true;
+            let spot_done = {
+                let pr = self.state.tranche_progress.entry(sym.clone()).or_default();
+                pr.spot_usd += fs * hq.price;
+                pr.spot_done = !need_spot || fill_complete(pr.spot_usd, spot_notional);
+                pr.spot_done
+            };
             // Real exposure now exists: flip to On (only once) so a crash or
             // a later error in this loop never leaves a filled position
             // recorded under Off/Exited, where a stray re-ARM would double it.
-            if self.state.mode != Mode::On {
-                self.state.mode = Mode::On;
-                self.state.book_dry_run = Some(self.cfg.dry_run);
-                self.state.armed_at = Some(now_secs());
-                self.state.exited_at = None;
-                self.state.exit_reason = None;
-                self.state.cycles += 1;
-                // Funding is reported per holding period: a fresh ARM
-                // starts a fresh total, unknown until the first read.
-                self.state.cum_funding_usdc = None;
-                self.state.cum_funding_as_of = None;
-                self.state.funding_seen.clear();
+            if self.state.mode != Mode::On && (leg.spot_size > 0.0 || leg.perp_size > 0.0) {
+                self.open_book();
             }
             self.persist();
+            if !spot_done {
+                // Recorded, protected by the stop below on the next pass,
+                // but NOT completed: a thin-book partial must not pass as a
+                // full tranche (the perp leg would size against it and the
+                // book would end up leveraged asymmetrically). The retry
+                // after RISK_ACK orders the remainder only.
+                let _ = self.place_stop(&sym).await;
+                bail!(
+                    "{market}: spot {why} tranche {n_th} filled only {fs} (${:.0} of ${spot_notional:.0}); recorded, remainder retried on RISK_ACK",
+                    fs * hq.price
+                );
+            }
             let mut fp = 0.0;
             if need_perp {
                 let filled_perp = self
@@ -1860,11 +2022,12 @@ impl Engine {
                 leg.perp_cost_usd += fp * lq.price;
                 self.state.legs.insert(sym.clone(), leg.clone());
             }
-            self.state
-                .tranche_progress
-                .entry(sym.clone())
-                .or_default()
-                .perp_done = true;
+            let perp_done = {
+                let pr = self.state.tranche_progress.entry(sym.clone()).or_default();
+                pr.perp_usd += fp * lq.price;
+                pr.perp_done = !need_perp || fill_complete(pr.perp_usd, perp_notional);
+                pr.perp_done
+            };
             self.persist();
             log::info!(
                 "[ENTRY] {sym} {why} tranche {n_th}/{}: +spot {} @ {:.2} +perp {} @ {:.2}; book spot {} (${:.0}) perp {} (${:.0}); peak={:.2} exit_level={:.2}",
@@ -1874,6 +2037,12 @@ impl Engine {
             );
             if let Err(e) = self.place_stop(&sym).await {
                 log::error!("[STOP] stop (re)placement for {sym} failed: {e:?}");
+            }
+            if !perp_done {
+                bail!(
+                    "{sym}: perp {why} tranche {n_th} filled only {fp} (${:.0} of ${perp_notional:.0}); recorded and stop-covered, remainder retried on RISK_ACK",
+                    fp * lq.price
+                );
             }
         }
         self.state.tranche_progress.clear();
@@ -1888,6 +2057,49 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// First exposure of a cycle: the book is On from here.
+    fn open_book(&mut self) {
+        self.state.mode = Mode::On;
+        self.state.book_dry_run = Some(self.cfg.dry_run);
+        self.state.armed_at = Some(now_secs());
+        self.state.exited_at = None;
+        self.state.exit_reason = None;
+        self.state.cycles += 1;
+        // Funding is reported per holding period: a fresh ARM starts a
+        // fresh total, unknown until the first read.
+        self.state.cum_funding_usdc = None;
+        self.state.cum_funding_as_of = None;
+        self.state.funding_seen.clear();
+    }
+
+    /// Size to close on exit: the book's size, or the venue's holding when
+    /// that is larger beyond the reconcile tolerance (never smaller: a
+    /// venue read that is short is treated as unreadable for this purpose
+    /// and the book's size is sold). DRY_RUN: the book's size.
+    async fn exit_target(&self, book: f64, spot_market: Option<&str>, symbol: &str) -> f64 {
+        if self.cfg.dry_run {
+            return book;
+        }
+        let holding = match spot_market {
+            Some(m) => self.hl_spot_holding(&spot_base(m)).await,
+            None => self.lt_perp_holding(symbol).await,
+        };
+        let what = spot_market.unwrap_or(symbol);
+        match holding {
+            Ok(h) if h > book && !within_tolerance(book, h, self.cfg.reconcile_tolerance_pct) => {
+                log::error!(
+                    "[EXIT] {what}: venue holds {h} but the book says {book} — selling the venue amount"
+                );
+                h
+            }
+            Ok(_) => book,
+            Err(e) => {
+                log::warn!("[EXIT] {what}: holding unreadable, selling the book's size: {e:?}");
+                book
+            }
+        }
     }
 
     /// Best-effort reference price for PnL accounting: a live quote, falling
@@ -1938,23 +2150,29 @@ impl Engine {
             let mut perp_pnl: Option<f64> = None;
             let mut perp_px_source = "n/a";
 
+            let mut spot_closed = 0.0;
+            let mut perp_closed = 0.0;
             if orig_spot_size > 0.0 {
                 let (px, src) = self
                     .exit_reference_price(&self.hl, &market, leg.last_close)
                     .await;
-                let size = Decimal::from_f64(orig_spot_size).unwrap_or(Decimal::ZERO);
+                // Sell what the venue actually holds when that is more than
+                // the book (an order the state never recorded): an exit
+                // must not leave exposure behind because the ledger is short.
+                let target = self.exit_target(orig_spot_size, Some(&market), &sym).await;
+                let size = Decimal::from_f64(target).unwrap_or(Decimal::ZERO);
                 match self.hl_spot_ioc(&market, size, OrderSide::Short).await {
                     Ok(f) => {
                         let sold = f.to_f64().unwrap_or(0.0);
-                        let remaining = remaining_after_close(
-                            orig_spot_size,
-                            sold,
-                            self.cfg.reconcile_tolerance_pct,
-                        );
+                        spot_closed = sold;
+                        let remaining =
+                            remaining_after_close(target, sold, self.cfg.reconcile_tolerance_pct);
                         log::info!("[EXIT] {market} spot sold {f} (remaining {remaining})");
                         leg.spot_size = remaining;
                         spot_px_source = src;
-                        spot_pnl = px.map(|p| p * sold - leg.spot_cost_usd * sold / orig_spot_size);
+                        spot_pnl = px.map(|p| {
+                            p * sold - leg.spot_cost_usd * (sold / orig_spot_size).min(1.0)
+                        });
                         if px.is_none() {
                             log::warn!(
                                 "[EXIT] {market} closed but no trustworthy price available — PnL for this leg is unknown, not zero"
@@ -1962,7 +2180,7 @@ impl Engine {
                         }
                         if remaining > 0.0 {
                             log::error!(
-                                "[EXIT] {market} spot only PARTIALLY closed ({sold} of {orig_spot_size}), leg remains OPEN in state"
+                                "[EXIT] {market} spot only PARTIALLY closed ({sold} of {target}), leg remains OPEN in state"
                             );
                             self.halt(format!(
                                 "spot exit partial for {market}: {remaining} still held"
@@ -1983,20 +2201,20 @@ impl Engine {
                 let (px, src) = self
                     .exit_reference_price(&self.lt, &sym, leg.last_close)
                     .await;
-                let size = Decimal::from_f64(orig_perp_size).unwrap_or(Decimal::ZERO);
+                let target = self.exit_target(orig_perp_size, None, &sym).await;
+                let size = Decimal::from_f64(target).unwrap_or(Decimal::ZERO);
                 match self.lt_perp_taker(&sym, size, OrderSide::Short, true).await {
                     Ok(f) => {
                         let closed = f.to_f64().unwrap_or(0.0);
-                        let remaining = remaining_after_close(
-                            orig_perp_size,
-                            closed,
-                            self.cfg.reconcile_tolerance_pct,
-                        );
+                        perp_closed = closed;
+                        let remaining =
+                            remaining_after_close(target, closed, self.cfg.reconcile_tolerance_pct);
                         log::info!("[EXIT] {sym} perp closed {f} (remaining {remaining})");
                         leg.perp_size = remaining;
                         perp_px_source = src;
-                        perp_pnl =
-                            px.map(|p| p * closed - leg.perp_cost_usd * closed / orig_perp_size);
+                        perp_pnl = px.map(|p| {
+                            p * closed - leg.perp_cost_usd * (closed / orig_perp_size).min(1.0)
+                        });
                         if px.is_none() {
                             log::warn!(
                                 "[EXIT] {sym} perp closed but no trustworthy price available — PnL for this leg is unknown, not zero"
@@ -2004,7 +2222,7 @@ impl Engine {
                         }
                         if remaining > 0.0 {
                             log::error!(
-                                "[EXIT] {sym} perp only PARTIALLY closed ({closed} of {orig_perp_size}), leg remains OPEN in state"
+                                "[EXIT] {sym} perp only PARTIALLY closed ({closed} of {target}), leg remains OPEN in state"
                             );
                             self.halt(format!(
                                 "perp exit partial for {sym}: {remaining} still held"
@@ -2028,11 +2246,25 @@ impl Engine {
             if pnl_known {
                 total += leg_total;
             }
+            // The record carries what was CONFIRMED closed and the cost
+            // basis of that part; a partial close is then visible as such.
+            let spot_cost_closed = if orig_spot_size > 0.0 {
+                leg.spot_cost_usd * (spot_closed / orig_spot_size).min(1.0)
+            } else {
+                0.0
+            };
+            let perp_cost_closed = if orig_perp_size > 0.0 {
+                leg.perp_cost_usd * (perp_closed / orig_perp_size).min(1.0)
+            } else {
+                0.0
+            };
             let rec = serde_json::json!({
                 "ts": now_secs(), "symbol": sym, "reason": reason,
-                "spot_size_closed": orig_spot_size, "spot_cost_usd": leg.spot_cost_usd,
+                "spot_size_closed": spot_closed, "spot_size_before": orig_spot_size,
+                "spot_cost_usd": spot_cost_closed,
                 "spot_pnl_usd": spot_pnl, "spot_px_source": spot_px_source,
-                "perp_size_closed": orig_perp_size, "perp_cost_usd": leg.perp_cost_usd,
+                "perp_size_closed": perp_closed, "perp_size_before": orig_perp_size,
+                "perp_cost_usd": perp_cost_closed,
                 "perp_pnl_usd": perp_pnl, "perp_px_source": perp_px_source,
                 "peak_close": leg.peak_close, "exit_level": leg.exit_level,
                 "pnl_usd_ex_funding": if pnl_known { Some(leg_total) } else { None },
@@ -2186,10 +2418,17 @@ impl Engine {
 
     // ----------------------------------------------------------- reconcile
 
-    async fn reconcile(&mut self) {
+    /// Compare the book with the venues for EVERY configured symbol — a
+    /// symbol without a leg must be flat at both venues (dust below
+    /// `RECONCILE_DUST_USD` aside), or an order the state never recorded is
+    /// sitting there. Halts on the first divergence. Returns whether the
+    /// comparison could be made and passed: `false` on a halt AND on a read
+    /// failure, so callers that gate an order on it never proceed on "could
+    /// not check".
+    async fn reconcile(&mut self) -> bool {
         self.margin_monitor().await;
         if self.cfg.dry_run {
-            return; // nothing real to compare against
+            return true; // nothing real to compare against
         }
         // Both reads are account-wide (all symbols in one call); fetch each
         // once instead of once per symbol.
@@ -2207,10 +2446,9 @@ impl Engine {
                 None
             }
         };
+        let mut complete = positions.is_some() && balance.is_some();
         for sym in self.cfg.symbols.clone() {
-            let Some(leg) = self.state.legs.get(&sym).cloned() else {
-                continue;
-            };
+            let leg = self.state.legs.get(&sym).cloned().unwrap_or_default();
             // Perp leg: Lighter positions.
             if let Some(pos) = &positions {
                 let actual = pos
@@ -2218,12 +2456,19 @@ impl Engine {
                     .filter(|p| p.symbol.eq_ignore_ascii_case(&sym))
                     .map(|p| p.size.to_f64().unwrap_or(0.0) * if p.sign < 0 { -1.0 } else { 1.0 })
                     .sum::<f64>();
-                if !within_tolerance(leg.perp_size, actual, self.cfg.reconcile_tolerance_pct) {
-                    self.halt(format!(
-                        "{sym} perp mismatch: expected {:.6} actual {actual:.6}",
-                        leg.perp_size
-                    ));
-                    return;
+                match self
+                    .leg_matches(&self.lt.clone(), &sym, leg.perp_size, actual)
+                    .await
+                {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.halt(format!(
+                            "{sym} perp mismatch: expected {:.6} actual {actual:.6}",
+                            leg.perp_size
+                        ));
+                        return false;
+                    }
+                    None => complete = false,
                 }
             }
             // Spot leg: Hyperliquid spot balances (base token of the market).
@@ -2236,16 +2481,81 @@ impl Engine {
                     .filter(|a| a.symbol.eq_ignore_ascii_case(&base))
                     .map(|a| a.balance.to_f64().unwrap_or(0.0))
                     .sum::<f64>();
-                if !within_tolerance(leg.spot_size, actual, self.cfg.reconcile_tolerance_pct) {
-                    self.halt(format!(
-                        "{market} spot mismatch: expected {:.6} actual {actual:.6}",
-                        leg.spot_size
-                    ));
-                    return;
+                match self
+                    .leg_matches(&self.hl.clone(), &market, leg.spot_size, actual)
+                    .await
+                {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.halt(format!(
+                            "{market} spot mismatch: expected {:.6} actual {actual:.6}",
+                            leg.spot_size
+                        ));
+                        return false;
+                    }
+                    None => complete = false,
                 }
             }
         }
-        log::debug!("[RECONCILE] ok");
+        if complete {
+            log::debug!("[RECONCILE] ok");
+        } else {
+            log::warn!("[RECONCILE] incomplete: a venue read failed, the book is unverified");
+        }
+        complete
+    }
+
+    /// Does the venue holding match the book for one leg? A leg the book
+    /// does not hold must be flat at the venue, where "flat" tolerates dust
+    /// worth less than `RECONCILE_DUST_USD` (size rounding, base fees) —
+    /// which needs a price; `None` if that price could not be read.
+    async fn leg_matches(
+        &self,
+        venue: &Arc<dyn DexConnector + Send + Sync>,
+        symbol: &str,
+        expected: f64,
+        actual: f64,
+    ) -> Option<bool> {
+        if expected > 0.0 {
+            return Some(within_tolerance(
+                expected,
+                actual,
+                self.cfg.reconcile_tolerance_pct,
+            ));
+        }
+        if actual.abs() < 1e-12 {
+            return Some(true);
+        }
+        match self.quote(venue, symbol).await {
+            Ok(q) => Some(actual.abs() * q.price < RECONCILE_DUST_USD),
+            Err(e) => {
+                log::warn!("[RECONCILE] {symbol}: unexpected holding {actual} and no price to size it: {e:?}");
+                None
+            }
+        }
+    }
+
+    /// Gate before any order that changes the book: an unsettled order in
+    /// state means exposure may exist that the book does not show, so the
+    /// venues are compared first and the marker is cleared only if they
+    /// agree with the book. `Err` = do not order.
+    async fn reconcile_before_orders(&mut self, what: &str) -> Result<()> {
+        let Some(pending) = self.state.pending_order.clone() else {
+            return Ok(());
+        };
+        log::warn!(
+            "[FILL] {what}: an earlier order is unsettled ({pending:?}); reconciling the book against the venues before any new order"
+        );
+        if !self.reconcile().await {
+            bail!(
+                "{what} refused: an earlier order is unsettled ({pending:?}) and the book could not be verified against the venues; \
+                 fix state.json by hand if it diverges, then RISK_ACK"
+            );
+        }
+        log::warn!("[FILL] unsettled order resolved by reconcile: the venues agree with the book");
+        self.state.pending_order = None;
+        self.persist();
+        Ok(())
     }
 
     // ---------------------------------------------------------------- tick
@@ -2411,7 +2721,7 @@ impl Engine {
                 && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
             {
                 self.last_reconcile = now;
-                self.reconcile().await;
+                let _ = self.reconcile().await;
             }
         }
         // Read-only, so it runs while halted and for a day after EXIT (the
@@ -2594,9 +2904,11 @@ async fn main() -> Result<()> {
         last_funding_poll: 0,
         cfg,
     };
-    // A restart while On must re-verify the book before doing anything else.
-    if engine.state.mode == Mode::On {
-        engine.reconcile().await;
+    // A live restart re-verifies the book against the venues before doing
+    // anything else — in every mode: a flat book must be flat at the venues
+    // too, or an order the state never recorded is sitting there.
+    if !engine.cfg.dry_run {
+        let _ = engine.reconcile().await;
     }
     let tick = Duration::from_secs(engine.cfg.tick_secs.max(5));
     loop {
@@ -2906,12 +3218,13 @@ mod tests {
         assert_eq!(legs_pending(&fresh, false), (true, false));
         let spot_only = LegProgress {
             spot_done: true,
-            perp_done: false,
+            ..Default::default()
         };
         assert_eq!(legs_pending(&spot_only, true), (false, true));
         let both = LegProgress {
             spot_done: true,
             perp_done: true,
+            ..Default::default()
         };
         assert_eq!(legs_pending(&both, true), (false, false));
         // A resumed tranche keeps the counters untouched until it completes:
@@ -3674,6 +3987,151 @@ mod tests {
         // A pre-#895 file (no field) loads as None.
         let old: State = serde_json::from_str(r#"{"mode":"On"}"#).unwrap();
         assert_eq!(old.book_dry_run, None);
+    }
+
+    #[test]
+    fn order_outcome_is_known_only_with_a_readable_holding() {
+        // Readable + changed → known (ack or not).
+        assert!(order_outcome_known(true, Some(0.01)));
+        assert!(order_outcome_known(false, Some(0.01)));
+        // Readable + unchanged: known only if the order call itself failed.
+        assert!(order_outcome_known(false, Some(0.0)));
+        assert!(!order_outcome_known(true, Some(0.0)));
+        // Unreadable → never known.
+        assert!(!order_outcome_known(true, None));
+        assert!(!order_outcome_known(false, None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_keeps_a_partial_observation_across_a_later_read_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_confirm_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = engine_with_stops(&dir);
+        // First read sees 40% of the request, every later read fails.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c = calls.clone();
+        let read = move || {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Ok(1.004)
+                } else {
+                    Err(anyhow!("503"))
+                }
+            }
+        };
+        let got = e
+            .confirm_fill(read, 1.0, OrderSide::Long, 0.01)
+            .await
+            .unwrap();
+        assert!(
+            (got - 0.004).abs() < 1e-12,
+            "the 0.004 seen must survive, got {got}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            FILL_CONFIRM_ATTEMPTS
+        );
+        // All reads failing is the only unreadable outcome.
+        let all_fail = || async { Err::<f64, _>(anyhow!("503")) };
+        assert!(e
+            .confirm_fill(all_fail, 1.0, OrderSide::Long, 0.01)
+            .await
+            .is_err());
+        // A sell is measured as a decrease.
+        let sold = || async { Ok(0.99) };
+        let got = e
+            .confirm_fill(sold, 1.0, OrderSide::Short, 0.01)
+            .await
+            .unwrap();
+        assert!((got - 0.01).abs() < 1e-12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sub_minimum_remainder_settles_the_leg_as_done() {
+        let mut progress = BTreeMap::new();
+        // Nothing filled yet: a small computed size is a real problem, not dust.
+        assert!(!remainder_is_dust(
+            0.0,
+            Decimal::from_str("0.00001").unwrap(),
+            0.0001,
+            &mut progress,
+            "BTC",
+            true
+        ));
+        assert!(progress.is_empty());
+        // Partially filled and the remainder is below min_order: done.
+        assert!(remainder_is_dust(
+            390.0,
+            Decimal::from_str("0.00001").unwrap(),
+            0.0001,
+            &mut progress,
+            "BTC",
+            true
+        ));
+        assert!(progress["BTC"].spot_done);
+        assert!(!progress["BTC"].perp_done);
+        // Remainder still orderable: not dust.
+        assert!(!remainder_is_dust(
+            200.0,
+            Decimal::from_str("0.002").unwrap(),
+            0.0001,
+            &mut progress,
+            "BTC",
+            false
+        ));
+        assert!(!progress["BTC"].perp_done);
+    }
+
+    #[test]
+    fn unsettled_order_counts_as_an_open_book_and_survives_persist() {
+        let mut st = State::default();
+        assert!(!book_is_open(&st));
+        st.pending_order = Some(PendingOrder {
+            venue: "hyperliquid".into(),
+            symbol: "UBTC/USDC".into(),
+            side: "long".into(),
+            requested: 0.005,
+            holding_before: 0.0,
+            ts: 1,
+        });
+        st.book_dry_run = Some(false);
+        assert!(
+            book_is_open(&st),
+            "an unsettled order is exposure of unknown size"
+        );
+        assert!(
+            check_book_mode(&st, true).is_err(),
+            "must not be simulated away under DRY_RUN"
+        );
+        assert!(check_book_mode(&st, false).is_ok());
+        let js = serde_json::to_string(&st).unwrap();
+        let back: State = serde_json::from_str(&js).unwrap();
+        assert_eq!(back.pending_order, st.pending_order);
+        // Progress notional round-trips too (a partial fill's remainder
+        // depends on it after a restart).
+        let mut st2 = State::default();
+        st2.tranche_progress.insert(
+            "ETH".into(),
+            LegProgress {
+                spot_done: false,
+                perp_done: false,
+                spot_usd: 123.4,
+                perp_usd: 0.0,
+            },
+        );
+        let back: State = serde_json::from_str(&serde_json::to_string(&st2).unwrap()).unwrap();
+        assert_eq!(back.tranche_progress["ETH"].spot_usd, 123.4);
+        let old: State = serde_json::from_str(
+            r#"{"tranche_progress":{"ETH":{"spot_done":true,"perp_done":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.tranche_progress["ETH"].spot_usd, 0.0);
     }
 
     fn test_config() -> Config {
