@@ -1583,6 +1583,10 @@ impl Engine {
             l.stop_level = None;
             l.stop_size = None;
         }
+        // Persist now, before the (slow) exit orders that follow: a crash
+        // in between would otherwise restart with the cancelled id still
+        // trusted as cover.
+        self.persist();
     }
 
     // ------------------------------------------------- collateral guard
@@ -2696,6 +2700,29 @@ impl Engine {
         for (sym, leg) in self.state.legs.clone() {
             if leg.perp_size <= 0.0 {
                 continue;
+            }
+            // Only against a position the venue confirms right now: state
+            // may be stale after a restart, and a stop sized from it would
+            // be oversized or orphaned. A read failure or a divergence
+            // skips (reconcile halts on the divergence).
+            match self.lt_perp_holding(&sym).await {
+                Ok(actual)
+                    if within_tolerance(
+                        leg.perp_size,
+                        actual,
+                        self.cfg.reconcile_tolerance_pct,
+                    ) => {}
+                Ok(actual) => {
+                    log::error!(
+                        "[STOP] {sym}: venue perp {actual} differs from the book {} — not placing a stop from stale state",
+                        leg.perp_size
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("[STOP] {sym}: position unreadable, stop check deferred: {e:?}");
+                    continue;
+                }
             }
             // Covered in size AND resting at the level the refreshed peak
             // calls for: a move whose cancel failed leaves the old, lower
