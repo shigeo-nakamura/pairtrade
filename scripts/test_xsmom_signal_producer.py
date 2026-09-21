@@ -54,8 +54,14 @@ class ProducerTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             xp.build(bad, 1000.0, datetime.now(timezone.utc))
         bad = dict(ROW, book={"LIT": {"side": 1, "notional": 100.0}, "APT": {"side": 1, "notional": 100.0}})
-        with self.assertRaises(SystemExit):  # net 0.2 > 0.05
+        with self.assertRaises(SystemExit):  # net 0.2 > 0.15
             xp.build(bad, 1000.0, datetime.now(timezone.utc))
+        # the caps are parameters: a tighter tolerance refuses what the default passes
+        with self.assertRaises(SystemExit):
+            xp.build(ROW, 1000.0, datetime.now(timezone.utc), net_tolerance=0.01)  # |net| 0.0148
+        xp.build(ROW, 1000.0, datetime.now(timezone.utc), net_tolerance=0.02)
+        with self.assertRaises(SystemExit):
+            xp.build(ROW, 1000.0, datetime.now(timezone.utc), max_symbol_weight=0.04)  # GRAM 0.0458
         bad = dict(ROW, book={"LIT": {"side": 2, "notional": 10.0}})
         with self.assertRaises(SystemExit):
             xp.build(bad, 1000.0, datetime.now(timezone.utc))
@@ -89,7 +95,8 @@ class ProducerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             cfg = os.path.join(d, "cfg.yaml")
             with open(cfg, "w") as f:
-                f.write("universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\nschedule:\n  kind: daily\n")
+                f.write("universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\nschedule:\n  kind: daily\n"
+                        "signal:\n  net_tolerance: 0.15\nsizing:\n  max_symbol_weight: 0.15\n")
             self.assertEqual(xp.universe_from_config(cfg), {"LIT", "GRAM", "APT"})
             ledger = os.path.join(d, "ledger.jsonl")
             write_ledger(ledger, [ROW])
@@ -104,7 +111,8 @@ class ProducerTests(unittest.TestCase):
             with open(cfg, "a") as f:
                 f.write("")
             with open(cfg, "w") as f:
-                f.write("universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\n    - ENA\nschedule:\n  kind: daily\n")
+                f.write("universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\n    - ENA\nschedule:\n  kind: daily\n"
+                        "signal:\n  net_tolerance: 0.15\nsizing:\n  max_symbol_weight: 0.15\n")
             r = subprocess.run(cmd, capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertTrue(os.path.exists(out))
@@ -114,6 +122,61 @@ class ProducerTests(unittest.TestCase):
                 f.write("schedule:\n  kind: daily\n")
             with self.assertRaises(SystemExit):
                 xp.universe_from_config(bad)
+
+    def test_caps_come_from_the_deployed_config(self):
+        """bot-strategy#937: the shadow carries surviving legs at drifted
+        notional, so its rows are not dollar-neutral by construction. The
+        2026-09-21 row (|net| 0.0636) was refused by a 0.05 constant here
+        while the host runtime's rail is max_net_usd 150 / gross 1000."""
+        row_0921 = dict(ROW, date="2026-09-21", book={
+            "GRAM": {"side": -1, "notional": 72.3}, "ZEC": {"side": 1, "notional": 41.31},
+            "XMR": {"side": 1, "notional": 63.76}, "ARB": {"side": 1, "notional": 46.06},
+            "PAXG": {"side": -1, "notional": 71.04}, "JUP": {"side": 1, "notional": 71.43},
+            "VVV": {"side": 1, "notional": 71.43}, "NEAR": {"side": 1, "notional": 71.43},
+            "UNI": {"side": 1, "notional": 71.43}, "TRUMP": {"side": -1, "notional": 71.43},
+            "PUMP": {"side": -1, "notional": 71.43}, "XPL": {"side": -1, "notional": 71.43},
+            "BCH": {"side": -1, "notional": 71.43}, "XRP": {"side": -1, "notional": 71.43}})
+        deployed = os.path.join(HERE, "..", "configs", "book", "xsmom-695.yaml")
+        max_w, net_tol = xp.caps_from_config(deployed)
+        self.assertEqual((max_w, net_tol), (0.15, 0.15))
+        with self.assertRaises(SystemExit):  # the pre-fix constant
+            xp.build(row_0921, 1000.0, datetime.now(timezone.utc), net_tolerance=0.05)
+        sig = xp.build(row_0921, 1000.0, datetime.now(timezone.utc), max_symbol_weight=max_w, net_tolerance=net_tol)
+        self.assertAlmostEqual(sig["meta"]["net_usd"], -63.64, places=2)
+        with tempfile.TemporaryDirectory() as d:
+            ledger = os.path.join(d, "ledger.jsonl")
+            write_ledger(ledger, [ROW])
+            out = os.path.join(d, "signal.json")
+            cfg = os.path.join(d, "cfg.yaml")
+            head = "universe:\n  symbols:\n    - LIT\n    - GRAM\n    - APT\n    - ENA\nschedule:\n  kind: daily\n"
+            cmd = [sys.executable, os.path.join(HERE, "xsmom_signal_producer.py"),
+                   "--ledger", ledger, "--out", out, "--date", "2026-09-06", "--config", cfg]
+            # ROW: |net| 0.0148, max |w| 0.0458 — the config decides, not this script
+            with open(cfg, "w") as f:
+                f.write(head + "signal:\n  net_tolerance: 0.01\nsizing:\n  max_symbol_weight: 0.15  # cap\n")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("net_tolerance 0.01", r.stderr)
+            self.assertFalse(os.path.exists(out))
+            with open(cfg, "w") as f:
+                f.write(head + "signal:\n  net_tolerance: 0.02\nsizing:\n  max_symbol_weight: 0.04\n")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn("max_symbol_weight 0.04", r.stderr)
+            with open(cfg, "w") as f:
+                f.write(head + "signal:\n  net_tolerance: 0.02\nsizing:\n  max_symbol_weight: 0.15\n")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(os.path.exists(out))
+            # a config that does not state a cap is an error, never a default
+            for body in ("signal:\n  max_age_secs: 7200\nsizing:\n  max_symbol_weight: 0.15\n",
+                         "signal:\n  net_tolerance: 0.02\nsizing:\n  gross_notional_usd: 1000\n",
+                         "signal:\n  net_tolerance: nan\nsizing:\n  max_symbol_weight: 0.15\n",
+                         "signal:\n  net_tolerance: 0.02\n"):
+                with open(cfg, "w") as f:
+                    f.write(head + body)
+                with self.assertRaises(SystemExit, msg=body):
+                    xp.caps_from_config(cfg)
 
     def test_cli_writes_only_on_a_rebalance_date(self):
         with tempfile.TemporaryDirectory() as d:

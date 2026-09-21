@@ -53,7 +53,7 @@ signal:
   producer_id: xsmom_695_L28_H5_q20_riskadj
   max_age_secs: 7200              # now - generated_at must be below this
   require_dollar_neutral: true    # |sum(w)| <= net_tolerance
-  net_tolerance: 0.05
+  net_tolerance: 0.15             # = sizing.max_net_usd / gross_notional_usd: one net rail, not two
 
 sizing:
   gross_notional_usd: 1000        # sum |w| == 1 maps to this
