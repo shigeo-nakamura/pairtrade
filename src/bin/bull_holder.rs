@@ -456,6 +456,10 @@ fn remainder_is_dust(
 /// A holding the book does not carry counts as flat below this notional.
 const RECONCILE_DUST_USD: f64 = 5.0;
 
+/// An unsettled order's holding must sit exactly on its recorded baseline
+/// (f64 round-trips through state.json aside) to be declared "no fill".
+const PENDING_RESOLVE_EPS: f64 = 1e-9;
+
 /// Combine the order acknowledgement with the confirmed holding change into
 /// the fill to record. The venue's holding is authoritative:
 /// - ack Ok, change observed → that change (partial fills are recorded as
@@ -899,6 +903,11 @@ struct LegState {
     last_close_date: Option<String>,
     last_close: Option<f64>,
     close_fetch_failures: u32,
+    /// The leg's cost basis no longer describes what is held: an exit found
+    /// the venue holding something other than the book and closed only part
+    /// of it. PnL for this leg is unknown from here until it is flat.
+    #[serde(default)]
+    cost_basis_unknown: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -2016,6 +2025,7 @@ impl Engine {
                         last_close_date: None,
                         last_close: None,
                         close_fetch_failures: 0,
+                        cost_basis_unknown: false,
                     }
                 }
             };
@@ -2269,7 +2279,11 @@ impl Engine {
                         // unrecorded fill added to it): that part's price /
                         // cost is unknown here, so the leg's PnL is unknown
                         // rather than a number that ignores it.
-                        spot_pnl = if (target - orig_spot_size).abs() > 1e-12 {
+                        let venue_differs = (target - orig_spot_size).abs() > 1e-12;
+                        if venue_differs && remaining > 0.0 {
+                            leg.cost_basis_unknown = true;
+                        }
+                        spot_pnl = if venue_differs || leg.cost_basis_unknown {
                             None
                         } else {
                             px.map(|p| {
@@ -2327,7 +2341,11 @@ impl Engine {
                         log::info!("[EXIT] {sym} perp closed {f} (remaining {remaining})");
                         leg.perp_size = remaining;
                         perp_px_source = src;
-                        perp_pnl = if (target - orig_perp_size).abs() > 1e-12 {
+                        let venue_differs = (target - orig_perp_size).abs() > 1e-12;
+                        if venue_differs && remaining > 0.0 {
+                            leg.cost_basis_unknown = true;
+                        }
+                        perp_pnl = if venue_differs || leg.cost_basis_unknown {
                             None
                         } else {
                             px.map(|p| {
@@ -2690,15 +2708,39 @@ impl Engine {
             return Ok(());
         };
         log::warn!(
-            "[FILL] {what}: an earlier order is unsettled ({pending:?}); reconciling the book against the venues before any new order"
+            "[FILL] {what}: an earlier order is unsettled ({pending:?}); checking its own baseline and the whole book before any new order"
         );
+        // The order's OWN baseline first: the general reconcile tolerates
+        // 2 % / dust, which is exactly the size of a late partial fill —
+        // that would clear the marker and let the remainder be re-sent.
+        let now_holding = match pending.venue.as_str() {
+            "hyperliquid" => self.hl_spot_holding(&spot_base(&pending.symbol)).await,
+            _ => self.lt_perp_holding(&pending.symbol).await,
+        }
+        .with_context(|| format!("{what} refused: the unsettled order's holding is unreadable"))?;
+        let dir = if pending.side == OrderSide::Short.to_string() {
+            -1.0
+        } else {
+            1.0
+        };
+        let moved = (now_holding - pending.holding_before) * dir;
+        if moved.abs() > PENDING_RESOLVE_EPS {
+            self.halt(format!(
+                "unsettled {} {} {} on {} DID move the holding by {moved:+} since it was sent (baseline {}, now {now_holding}); \
+                 record it in state.json by hand, then RISK_ACK",
+                pending.side, pending.requested, pending.symbol, pending.venue, pending.holding_before
+            ));
+            bail!("{what} refused: the unsettled order filled (see [HALT])");
+        }
         if !self.reconcile().await {
             bail!(
                 "{what} refused: an earlier order is unsettled ({pending:?}) and the book could not be verified against the venues; \
                  fix state.json by hand if it diverges, then RISK_ACK"
             );
         }
-        log::warn!("[FILL] unsettled order resolved by reconcile: the venues agree with the book");
+        log::warn!(
+            "[FILL] unsettled order resolved: its holding is unchanged since it was sent and the venues agree with the book"
+        );
         self.state.pending_order = None;
         self.persist();
         Ok(())
@@ -2874,15 +2916,21 @@ impl Engine {
                     }
                 }
             }
-            if (self.state.mode == Mode::On || self.state.pending_order.is_some())
-                && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
-            {
-                // Also while Off/Exited with an unsettled order: the first
-                // entry of a cycle may have filled without a leg recorded,
-                // and only a venue comparison can surface that.
+            if now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs {
                 self.last_reconcile = now;
                 let _ = self.reconcile().await;
             }
+        }
+        // An unsettled order while Off/Exited (the first entry of a cycle
+        // may have filled without a leg recorded): only a venue comparison
+        // can surface that, so it runs outside the On-gated lifecycle above,
+        // halted or not.
+        if self.state.mode != Mode::On
+            && self.state.pending_order.is_some()
+            && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
+        {
+            self.last_reconcile = now;
+            let _ = self.reconcile().await;
         }
         // Read-only, so it runs while halted and for a day after EXIT (the
         // last settlements land after the perp leg is closed); gated on ARM
@@ -3997,6 +4045,7 @@ mod tests {
                     last_close_date: None,
                     last_close: Some(px),
                     close_fetch_failures: 0,
+                    cost_basis_unknown: false,
                 },
             );
         }
@@ -4414,6 +4463,46 @@ mod tests {
         assert!(
             e.state.legs.values().all(|l| l.perp_size == 0.005),
             "the recorded leg is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unsettled order is resolved against ITS baseline, not the 2 %
+    /// reconcile tolerance: a late fill smaller than the tolerance must
+    /// still halt (the remainder would otherwise be re-sent on top of it).
+    #[tokio::test]
+    async fn unsettled_order_is_resolved_against_its_own_baseline() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_pending_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        // Venue shows 0.00505 long on both symbols; the book holds 0.005
+        // (within the 2 % tolerance), but the pending order's baseline
+        // was 0.005 → it moved by 0.00005 → a late fill.
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: false,
+            perp_position: Some(0.00505),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        e.state.pending_order = Some(PendingOrder {
+            venue: "lighter".into(),
+            symbol: "BTC".into(),
+            side: OrderSide::Long.to_string(),
+            requested: 0.0005,
+            holding_before: 0.005,
+            ts: 1,
+        });
+        assert!(e.reconcile_before_orders("test").await.is_err());
+        assert!(e.state.halted, "a late fill inside the tolerance must halt");
+        assert!(
+            e.state.pending_order.is_some(),
+            "marker kept for the operator"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
