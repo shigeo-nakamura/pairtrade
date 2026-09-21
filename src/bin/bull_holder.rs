@@ -1345,12 +1345,16 @@ impl Engine {
         rejected_definitively: bool,
         observed: &Result<f64>,
     ) {
-        if order_outcome_known(
-            sent.is_ok(),
-            rejected_definitively,
-            observed.as_ref().ok().copied(),
-        ) {
-            self.state.pending_order = None;
+        let observed_fill = observed.as_ref().ok().copied();
+        if order_outcome_known(sent.is_ok(), rejected_definitively, observed_fill) {
+            // A confirmed NO-fill has nothing to record: clear now. A
+            // confirmed fill stays marked until the caller has persisted
+            // the leg (`clear_pending_after_record`): a crash in between
+            // would otherwise leave real exposure with no leg and no
+            // marker, i.e. a "flat" book.
+            if observed_fill.unwrap_or(0.0) <= 0.0 {
+                self.state.pending_order = None;
+            }
         } else {
             log::error!(
                 "[FILL] outcome of {:?} is UNKNOWN — it stays recorded as pending; no further order until the book is reconciled",
@@ -1358,6 +1362,15 @@ impl Engine {
             );
         }
         self.persist();
+    }
+
+    /// The fill an order produced is now in state: the marker can go. Called
+    /// right after the leg is persisted, so the two writes are adjacent and
+    /// a crash between them leaves the (safe) marker, not a flat book.
+    fn clear_pending_after_record(&mut self) {
+        if self.state.pending_order.take().is_some() {
+            self.persist();
+        }
     }
 
     /// Re-read the holding until it reflects the whole requested change or
@@ -2057,6 +2070,7 @@ impl Engine {
                 self.open_book();
             }
             self.persist();
+            self.clear_pending_after_record();
             if !spot_done {
                 // Recorded, protected by the stop below on the next pass,
                 // but NOT completed: a thin-book partial must not pass as a
@@ -2094,6 +2108,7 @@ impl Engine {
                 pr.perp_done
             };
             self.persist();
+            self.clear_pending_after_record();
             log::info!(
                 "[ENTRY] {sym} {why} tranche {n_th}/{}: +spot {} @ {:.2} +perp {} @ {:.2}; book spot {} (${:.0}) perp {} (${:.0}); peak={:.2} exit_level={:.2}",
                 self.state.tranches_done + self.state.tranches_remaining,
@@ -2426,6 +2441,7 @@ impl Engine {
             }
             self.state.legs.insert(sym.clone(), leg.clone());
             self.persist();
+            self.clear_pending_after_record();
             log::info!(
                 "[EXIT] {sym} pnl(ex-funding)={} peak={:.2} exit_level={:.2}",
                 if pnl_known {
@@ -2652,16 +2668,31 @@ impl Engine {
             return;
         }
         for (sym, leg) in self.state.legs.clone() {
-            if leg.perp_size <= 0.0
-                || stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
+            if leg.perp_size <= 0.0 {
+                continue;
+            }
+            // Covered in size AND resting at the level the refreshed peak
+            // calls for: a move whose cancel failed leaves the old, lower
+            // trigger tracked, and only a retry here (place_stop cancels
+            // it again first) brings it up.
+            let want = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
+            if stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
+                && stop_is_current(
+                    leg.stop_level,
+                    leg.stop_size,
+                    leg.stop_order_id.is_some(),
+                    want,
+                    leg.perp_size,
+                )
             {
                 continue;
             }
             log::warn!(
-                "[STOP] {sym}: perp {} is not stop-covered (order {:?} size {:?}) — re-placing",
+                "[STOP] {sym}: perp {} is not stop-covered at the current level (order {:?} size {:?} level {:?}, want {want:.2}) — re-placing",
                 leg.perp_size,
                 leg.stop_order_id,
-                leg.stop_size
+                leg.stop_size,
+                leg.stop_level
             );
             if let Err(e) = self.place_stop(&sym).await {
                 log::error!("[STOP] {sym}: re-placement failed, will retry next reconcile: {e:?}");
