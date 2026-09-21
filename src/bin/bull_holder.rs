@@ -1,4 +1,4 @@
-//! Bull-mode holder (bot-strategy#893 / #894) — PROTOTYPE, DRY_RUN only.
+//! Bull-mode holder (bot-strategy#893 / #894 / #895).
 //!
 //! Operator-declared regime, β with discipline. The bot never decides whether
 //! a bull market is on: the operator ARMs it. While armed it holds, per symbol,
@@ -66,15 +66,17 @@
 //! DRY_RUN evaluates both checks but never blocks on them (the DRY_RUN
 //! account holds no real collateral).
 //!
-//! KNOWN GAPS before any live use (bot-strategy#895 rollout gates):
-//! - `BULL_HOLDER_DRY_RUN=false` is refused at startup (code change to lift).
-//! - Lighter trigger orders have not been exercised live by pairtrade.
+//! Live flip (bot-strategy#895, 2026-09-21): `BULL_HOLDER_DRY_RUN=false` is
+//! accepted after the DRY_RUN observation (14 d, daily evals matched the
+//! replay) and the operator drills (KILL_SWITCH, DISARM, injected HALT →
+//! RISK_ACK → ARM) passed with the owner's explicit small-live approval.
+//! Still unverified until the first live ARM (bot-strategy#950): whether
+//! Lighter reports resting trigger orders on the open-orders channel, so
+//! `stop_covers` trusts the tracked `stop_order_id` instead of cross-checking.
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-use debot::directional::{
-    append_jsonl, config_fingerprint, load_json, persist_json, refuse_live, Sentinels,
-};
+use debot::directional::{append_jsonl, config_fingerprint, load_json, persist_json, Sentinels};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{DexConnector, FundingPayment, OrderSide, TpSl, TriggerOrderStyle};
 use env_logger::Builder;
@@ -1673,10 +1675,17 @@ impl Engine {
         let mut total = 0.0;
         let mut any_leg_still_open = false;
         for sym in self.cfg.symbols.clone() {
+            if !self.state.legs.contains_key(&sym) {
+                continue;
+            }
+            // Cancel first, then snapshot: `cancel_stop` clears the stop
+            // fields in state, and the clone below is written back at the
+            // end of this iteration — cloning before the cancel would
+            // resurrect the cancelled stop's id/level/size in state.
+            self.cancel_stop(&sym).await;
             let Some(mut leg) = self.state.legs.get(&sym).cloned() else {
                 continue;
             };
-            self.cancel_stop(&sym).await;
             let market = self.cfg.hl_spot_market[&sym].clone();
             let orig_spot_size = leg.spot_size;
             let orig_perp_size = leg.perp_size;
@@ -2251,11 +2260,11 @@ async fn main() -> Result<()> {
         cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.lighter_mmr_pct, cfg.perp_margin_min_pct,
         cfg.hl_taker_slippage_bps, cfg.fingerprint()
     );
-    refuse_live(
-        cfg.dry_run,
-        BOT,
-        "prototype not yet cleared by the bot-strategy#895 rollout gates (see KNOWN GAPS in this file's module doc)",
-    )?;
+    if !cfg.dry_run {
+        log::warn!(
+            "[CONFIG] LIVE: orders will be signed and sent (bot-strategy#895 small-live approval)"
+        );
+    }
 
     let hl_markets: Vec<String> = cfg.hl_spot_market.values().cloned().collect();
     let hl = DexConnectorBox::create(
@@ -2917,6 +2926,356 @@ mod tests {
         b.exit_dd_pct = 25.0;
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint(), test_config().fingerprint());
+    }
+
+    /// Connector stub for the DRY_RUN exit path: only `get_ticker` answers
+    /// (the pre-exit reference price); every order/cancel call is skipped
+    /// by `dry_run` before reaching the venue, so anything else is a bug.
+    struct QuoteOnly {
+        price: Decimal,
+    }
+
+    #[async_trait::async_trait]
+    impl DexConnector for QuoteOnly {
+        async fn start(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: start must not be called on the DRY_RUN exit path")
+        }
+        async fn get_funding_payments(
+            &self,
+            _since_secs: i64,
+        ) -> Result<Vec<dex_connector::FundingPayment>, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_funding_payments must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn stop(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: stop must not be called on the DRY_RUN exit path")
+        }
+        async fn restart(&self, _max_retries: i32) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: restart must not be called on the DRY_RUN exit path")
+        }
+        async fn set_leverage(
+            &self,
+            _symbol: &str,
+            _leverage: u32,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: set_leverage must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_ticker(
+            &self,
+            _symbol: &str,
+            _test_price: Option<Decimal>,
+        ) -> Result<dex_connector::TickerResponse, dex_connector::DexError> {
+            Ok(dex_connector::TickerResponse {
+                symbol: _symbol.to_string(),
+                price: self.price,
+                size_decimals: Some(4),
+                ..Default::default()
+            })
+        }
+        async fn get_filled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::FilledOrdersResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_filled_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_canceled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::CanceledOrdersResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_canceled_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_open_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::OpenOrdersResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_balance(
+            &self,
+            _symbol: Option<&str>,
+        ) -> Result<dex_connector::BalanceResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_balance must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_combined_balance(
+            &self,
+        ) -> Result<dex_connector::CombinedBalanceResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_combined_balance must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_positions(
+            &self,
+        ) -> Result<Vec<dex_connector::PositionSnapshot>, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_positions must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_last_trades(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::LastTradesResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_last_trades must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_order_book(
+            &self,
+            _symbol: &str,
+            _depth: usize,
+        ) -> Result<dex_connector::OrderBookSnapshot, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_order_book must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_filled_order(
+            &self,
+            _symbol: &str,
+            _trade_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: clear_filled_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_all_filled_orders(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: clear_all_filled_orders must not be called on the DRY_RUN exit path")
+        }
+        async fn clear_canceled_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: clear_canceled_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_all_canceled_orders(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: clear_all_canceled_orders must not be called on the DRY_RUN exit path")
+        }
+        async fn create_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: create_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn create_advanced_trigger_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _trigger_px: Decimal,
+            _limit_px: Option<Decimal>,
+            _order_style: dex_connector::TriggerOrderStyle,
+            _slippage_bps: Option<u32>,
+            _tpsl: dex_connector::TpSl,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: create_advanced_trigger_order must not be called on the DRY_RUN exit path")
+        }
+        async fn create_order_taker_ioc(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _slippage_bps: u32,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: create_order_taker_ioc must not be called on the DRY_RUN exit path")
+        }
+        async fn create_order_taker_ioc_at(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _limit_price: Decimal,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: create_order_taker_ioc_at must not be called on the DRY_RUN exit path")
+        }
+        async fn modify_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+            _side: OrderSide,
+            _target_total_size: Decimal,
+            _open_remaining_size: Decimal,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: modify_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn cancel_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: cancel_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn cancel_all_orders(
+            &self,
+            _symbol: Option<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: cancel_all_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn cancel_orders(
+            &self,
+            _symbol: Option<String>,
+            _order_ids: Vec<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: cancel_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn close_all_positions(
+            &self,
+            _symbol: Option<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: close_all_positions must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_last_trades(&self, _symbol: &str) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: clear_last_trades must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+            unimplemented!("QuoteOnly stub: is_upcoming_maintenance must not be called on the DRY_RUN exit path")
+        }
+        async fn sign_evm_65b(&self, _message: &str) -> Result<String, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: sign_evm_65b must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn sign_evm_65b_with_eip191(
+            &self,
+            _message: &str,
+        ) -> Result<String, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: sign_evm_65b_with_eip191 must not be called on the DRY_RUN exit path")
+        }
+        fn subscribe_price_updates(
+            &self,
+        ) -> Result<
+            tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>,
+            dex_connector::DexError,
+        > {
+            unimplemented!("QuoteOnly stub: subscribe_price_updates must not be called on the DRY_RUN exit path")
+        }
+    }
+
+    fn engine_with_stops(dir: &std::path::Path) -> Engine {
+        let mut cfg = test_config();
+        cfg.state_path = dir.join("state.json");
+        cfg.status_path = dir.join("status.json");
+        cfg.pnl_log_path = dir.join("pnl.jsonl");
+        let mut state = State::default();
+        state.mode = Mode::On;
+        for (sym, px) in [("BTC", 80_000.0), ("ETH", 2_600.0)] {
+            state.legs.insert(
+                sym.to_string(),
+                LegState {
+                    spot_size: 0.01,
+                    spot_cost_usd: px * 0.01,
+                    perp_size: 0.005,
+                    perp_cost_usd: px * 0.005,
+                    peak_close: px,
+                    exit_level: level_below_peak(px, 30.0),
+                    lighter_peak: px,
+                    stop_level: Some(level_below_peak(px, 35.0)),
+                    stop_order_id: Some(format!("stop-{sym}")),
+                    stop_size: Some(0.005),
+                    last_close_date: None,
+                    last_close: Some(px),
+                    close_fetch_failures: 0,
+                },
+            );
+        }
+        let quote: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+        });
+        Engine {
+            cfg: cfg.clone(),
+            hl: quote.clone(),
+            lt: quote,
+            http: reqwest::Client::new(),
+            sentinels: Sentinels::new(cfg.kill_switch_path.clone(), cfg.risk_ack_path.clone()),
+            state,
+            last_status_write: 0,
+            last_reconcile: 0,
+            last_margin_check: 0,
+            last_margin: None,
+            last_funding_poll: 0,
+        }
+    }
+
+    /// Regression (found in the 2026-09-21 DISARM drill): `exit_all` used
+    /// to clone the leg BEFORE `cancel_stop` cleared its stop fields, then
+    /// wrote the stale clone back — state kept reporting a stop that had
+    /// been cancelled at the venue. Harmless once Exited, but on the
+    /// partial-exit failure path (mode stays On) `stop_covers` would have
+    /// read the open leg as protected by an order that no longer rests.
+    #[tokio::test]
+    async fn exit_clears_the_cancelled_stop_from_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_stop_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.exit_all("test").await;
+        assert_eq!(e.state.mode, Mode::Exited);
+        for sym in ["BTC", "ETH"] {
+            let leg = &e.state.legs[sym];
+            assert_eq!(leg.spot_size, 0.0, "{sym} spot closed");
+            assert_eq!(leg.perp_size, 0.0, "{sym} perp closed");
+            assert_eq!(
+                leg.stop_order_id, None,
+                "{sym} stop id must not survive the exit"
+            );
+            assert_eq!(
+                leg.stop_level, None,
+                "{sym} stop level must not survive the exit"
+            );
+            assert_eq!(
+                leg.stop_size, None,
+                "{sym} stop size must not survive the exit"
+            );
+            assert!(
+                !stop_covers(leg.stop_order_id.is_some(), leg.stop_size, 0.005),
+                "{sym}: a cancelled stop must not read as covering anything"
+            );
+        }
+        // The persisted copy is what a restart reads back.
+        let back: State = load_json(&e.cfg.state_path).unwrap().unwrap();
+        assert!(back.legs.values().all(|l| l.stop_order_id.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_config() -> Config {
