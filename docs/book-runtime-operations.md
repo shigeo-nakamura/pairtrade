@@ -23,10 +23,12 @@ this workstation (cron)                     S3                          Tokyo ho
   universe screen, ranking, and quantile membership, so the DRY_RUN book
   tracks the pre-registered shadow track 1:1 (`weight = side × notional /
   1000`). It refuses to emit off-grid dates or books that violate the
-  runtime caps (exit 2), and writes nothing on non-rebalance days.
+  runtime caps, and writes nothing on non-rebalance days. With `--config`
+  the caps are the deployed config's own (`sizing.max_symbol_weight`,
+  `signal.net_tolerance`), never a copy kept in the script.
 - Decision grid: anchor 2026-07-03, every 5 days, decision 00:30, grace
-  90 min (`signal_grace_secs: 5400`). Next decisions: 2026-09-11,
-  2026-09-16, 2026-09-21. The watcher's first successful run
+  90 min (`signal_grace_secs: 5400`). Next decisions: 2026-09-26,
+  2026-10-01, 2026-10-06. The watcher's first successful run
   of a rebalance day is normally 00:20; if it only succeeds later the
   producer still emits within the hour, and the runtime accepts anything
   inside the window. A rebalance day with no valid file by 02:00 is
@@ -51,6 +53,22 @@ profile already on this machine.
 (Point the script path at the checkout that tracks `master` once
 pairtrade#285/#286 are merged. The local `aws` CLI uses the admin profile
 that already exists on this machine.)
+
+## Net drift (every rebalance, by construction)
+
+The shadow keeps a leg that survives the quantile screen at its drifted
+notional — a hold is a hold, nothing is resized — so a rebalance row is
+never dollar-neutral: over 2026-07-03 .. 2026-09-21 the 16 rows ran
+`|net|` 0.000 .. 0.064 of gross, always short-heavy, twice above 0.05.
+The runtime has one net rail, `sizing.max_net_usd` (150 = 0.15 of gross),
+and `signal.net_tolerance` is set equal to it so a book the runtime would
+size is never refused upstream. It was 0.05 (in the config and again as
+a constant in the producer): the 2026-09-21 row (`|net| 0.0636`) was
+refused at 00:25 UTC, the fetcher kept the stale 09-16 file, and the
+decision ended `skipped:window_closed_after_reject` — the paper book held
+the 09-16 legs while the shadow rotated 13 of 18 (bot-strategy#937).
+Widening the tolerance is not a strategy change: the track is the
+shadow's, the runtime only mirrors it.
 
 ## Universe drift (a Lighter listing, not every rebalance)
 

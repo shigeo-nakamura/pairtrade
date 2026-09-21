@@ -151,7 +151,12 @@ signal:
   producer_id: xsmom_695_L28_H5_q20_riskadj
   max_age_secs: 7200
   require_dollar_neutral: true
-  net_tolerance: 0.05
+  # Equal to sizing.max_net_usd / gross_notional_usd so the post-rounding
+  # cap is the only net rail. The shadow carries surviving legs at their
+  # drifted notional (no resizing on hold), so its rebalance rows are not
+  # dollar-neutral by construction: 16 rows 07-03..09-21 ran |net| up to
+  # 0.064, and 0.05 refused the 09-21 book for five days (bot-strategy#937).
+  net_tolerance: 0.15
 
 sizing:
   gross_notional_usd: 1000         # same $1000 gross as the shadow book

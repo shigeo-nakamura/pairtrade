@@ -43,8 +43,14 @@ PRODUCER_ID = "xsmom_695_L28_H5_q20_riskadj"
 ANCHOR = date(2026, 7, 3)
 EVERY_DAYS = 5
 GROSS_USD = 1000.0
+# Fallbacks for a run without --config. With --config the caps are read
+# from the deployed runtime YAML (`sizing.max_symbol_weight`,
+# `signal.net_tolerance`) so this script cannot refuse a book the runtime
+# would accept, or pass one it would reject (bot-strategy#937: a 0.05 copy
+# here refused the 2026-09-21 row at |net| 0.064 and the host held the
+# 09-16 book for five days).
 MAX_SYMBOL_WEIGHT = 0.15
-NET_TOLERANCE = 0.05
+NET_TOLERANCE = 0.15
 
 
 def on_grid(d: date, anchor: date = ANCHOR, every: int = EVERY_DAYS) -> bool:
@@ -109,12 +115,13 @@ def check_caps(weights: dict, max_symbol_weight: float, net_tolerance: float) ->
         raise SystemExit(f"|net| = {abs(net):.6f} > net_tolerance {net_tolerance}")
 
 
-def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PRODUCER_ID) -> dict:
+def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PRODUCER_ID, *,
+          max_symbol_weight: float = MAX_SYMBOL_WEIGHT, net_tolerance: float = NET_TOLERANCE) -> dict:
     d = date.fromisoformat(row["date"])
     if "book" not in row:
         raise SystemExit(f"rebalance row for {row.get('date')} has no 'book' key; refusing (a flat book is an explicit {{}})")
     weights = weights_from_book(row["book"], gross)
-    check_caps(weights, MAX_SYMBOL_WEIGHT, NET_TOLERANCE)
+    check_caps(weights, max_symbol_weight, net_tolerance)
     as_of = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     def _finite_or_none(v):
         if v is None:
@@ -153,6 +160,36 @@ def universe_from_config(path: str) -> set:
     return syms
 
 
+def _scalar_from_config(text: str, section: str, key: str, path: str) -> float:
+    block = re.search(rf"^{section}:\s*$(.*?)(?:^[a-z_]+:|\Z)", text, re.M | re.S)
+    if not block:
+        raise SystemExit(f"{path}: no {section}: block")
+    m = re.search(rf"^\s+{key}:\s*([0-9.eE+-]+)\s*(?:#.*)?$", block.group(1), re.M)
+    if not m:
+        raise SystemExit(f"{path}: {section}.{key} is not set")
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        raise SystemExit(f"{path}: {section}.{key} is not a number: {m.group(1)!r}")
+    if not math.isfinite(v) or v < 0:
+        raise SystemExit(f"{path}: {section}.{key} must be a finite non-negative number, got {v}")
+    return v
+
+
+def caps_from_config(path: str) -> tuple:
+    """(max_symbol_weight, net_tolerance) the deployed runtime enforces.
+
+    Same regex reading as `universe_from_config`, same reason. A missing
+    key is an error: the runtime has defaults, but this script must not
+    guess which build of the runtime is on the host.
+    """
+    text = open(path).read()
+    return (
+        _scalar_from_config(text, "sizing", "max_symbol_weight", path),
+        _scalar_from_config(text, "signal", "net_tolerance", path),
+    )
+
+
 def upload(path: str, s3_uri: str) -> None:
     subprocess.run(
         ["aws", "s3", "cp", "--only-show-errors", "--content-type", "application/json",
@@ -167,8 +204,9 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="local signal.json path (written atomically)")
     ap.add_argument("--s3-uri", default=None, help="optional s3://bucket/key to upload the file to")
     ap.add_argument("--config", default=None,
-                    help="deployed runtime config; refuse to publish a signal naming a symbol "
-                         "outside its universe (the runtime would reject the whole file)")
+                    help="deployed runtime config; caps (sizing.max_symbol_weight, signal.net_tolerance) "
+                         "are taken from it, and a signal naming a symbol outside its universe is "
+                         "refused (the runtime would reject the whole file)")
     ap.add_argument("--date", default=None, help="decision date YYYY-MM-DD (default: today UTC)")
     ap.add_argument("--gross", type=float, default=GROSS_USD)
     ap.add_argument("--producer-id", default=PRODUCER_ID)
@@ -189,7 +227,9 @@ def main() -> int:
     if not on_grid(today) and not a.allow_off_grid:
         print(f"refusing: {today} is not on the {ANCHOR}+{EVERY_DAYS}d grid", file=sys.stderr)
         return 2
-    sig = build(row, a.gross, datetime.now(timezone.utc), a.producer_id)
+    max_w, net_tol = caps_from_config(a.config) if a.config else (MAX_SYMBOL_WEIGHT, NET_TOLERANCE)
+    sig = build(row, a.gross, datetime.now(timezone.utc), a.producer_id,
+                max_symbol_weight=max_w, net_tolerance=net_tol)
     if a.config:
         # A symbol the deployed config does not list makes the runtime
         # reject the entire signal and hold the previous book. Surface it
