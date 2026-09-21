@@ -2000,7 +2000,9 @@ impl Engine {
                 // full tranche (the perp leg would size against it and the
                 // book would end up leveraged asymmetrically). The retry
                 // after RISK_ACK orders the remainder only.
-                let _ = self.place_stop(&sym).await;
+                if let Err(e) = self.place_stop(&sym).await {
+                    log::error!("[STOP] stop for the partial {market} entry failed, reconcile will retry: {e:?}");
+                }
                 bail!(
                     "{market}: spot {why} tranche {n_th} filled only {fs} (${:.0} of ${spot_notional:.0}); recorded, remainder retried on RISK_ACK",
                     fs * hq.price
@@ -2036,7 +2038,12 @@ impl Engine {
                 leg.spot_size, leg.spot_cost_usd, leg.perp_size, leg.perp_cost_usd, leg.peak_close, leg.exit_level
             );
             if let Err(e) = self.place_stop(&sym).await {
-                log::error!("[STOP] stop (re)placement for {sym} failed: {e:?}");
+                // Exposure is recorded, but the documented exchange-side
+                // protection is missing: never complete the tranche
+                // silently. `reconcile` re-places uncovered stops on its
+                // cadence; the halt makes the gap visible meanwhile.
+                self.halt(format!("{sym}: stop placement failed after entry: {e}"));
+                bail!("{sym}: entry filled but the stop could not be placed: {e:?}");
             }
             if !perp_done {
                 bail!(
@@ -2088,13 +2095,17 @@ impl Engine {
         };
         let what = spot_market.unwrap_or(symbol);
         match holding {
-            Ok(h) if h > book && !within_tolerance(book, h, self.cfg.reconcile_tolerance_pct) => {
+            Ok(h) if within_tolerance(book, h, self.cfg.reconcile_tolerance_pct) => book,
+            Ok(h) => {
+                // Larger: an order the state never recorded — sell it all.
+                // Smaller: the exchange stop (or a manual close) already
+                // took part of it — selling the stale book size would be
+                // rejected/partial and halt forever instead of converging.
                 log::error!(
-                    "[EXIT] {what}: venue holds {h} but the book says {book} — selling the venue amount"
+                    "[EXIT] {what}: venue holds {h} but the book says {book} — closing the venue amount"
                 );
-                h
+                h.max(0.0)
             }
-            Ok(_) => book,
             Err(e) => {
                 log::warn!("[EXIT] {what}: holding unreadable, selling the book's size: {e:?}");
                 book
@@ -2142,6 +2153,23 @@ impl Engine {
             let Some(mut leg) = self.state.legs.get(&sym).cloned() else {
                 continue;
             };
+            if leg.stop_order_id.is_some() {
+                // The cancel did not go through (see `cancel_stop`): the
+                // trigger may still rest at the venue. Close the legs
+                // anyway (that is the exit's job), but the book must not
+                // reach Exited with it: a later ARM clears the legs and the
+                // orphaned reduce-only trigger would act on the new
+                // position. It stays tracked and halted until a retried
+                // DISARM (after RISK_ACK) confirms the cancel.
+                log::error!(
+                    "[EXIT] {sym}: stop {:?} could not be cancelled — legs are closed below but the book stays On/halted until the cancel is confirmed",
+                    leg.stop_order_id
+                );
+                any_leg_still_open = true;
+                self.halt(format!(
+                    "{sym}: stop cancel unconfirmed on exit; retry DISARM after RISK_ACK"
+                ));
+            }
             let market = self.cfg.hl_spot_market[&sym].clone();
             let orig_spot_size = leg.spot_size;
             let orig_perp_size = leg.perp_size;
@@ -2161,7 +2189,13 @@ impl Engine {
                 // must not leave exposure behind because the ledger is short.
                 let target = self.exit_target(orig_spot_size, Some(&market), &sym).await;
                 let size = Decimal::from_f64(target).unwrap_or(Decimal::ZERO);
-                match self.hl_spot_ioc(&market, size, OrderSide::Short).await {
+                let sell = if target <= 0.0 {
+                    log::warn!("[EXIT] {market}: nothing left at the venue, no sell sent");
+                    Ok(Decimal::ZERO)
+                } else {
+                    self.hl_spot_ioc(&market, size, OrderSide::Short).await
+                };
+                match sell {
                     Ok(f) => {
                         let sold = f.to_f64().unwrap_or(0.0);
                         spot_closed = sold;
@@ -2170,9 +2204,17 @@ impl Engine {
                         log::info!("[EXIT] {market} spot sold {f} (remaining {remaining})");
                         leg.spot_size = remaining;
                         spot_px_source = src;
-                        spot_pnl = px.map(|p| {
-                            p * sold - leg.spot_cost_usd * (sold / orig_spot_size).min(1.0)
-                        });
+                        // Part of the leg left the venue outside this bot
+                        // (stop, manual close): its price is unknown here,
+                        // so the leg's PnL is unknown rather than a number
+                        // that ignores it.
+                        spot_pnl = if target + 1e-12 < orig_spot_size {
+                            None
+                        } else {
+                            px.map(|p| {
+                                p * sold - leg.spot_cost_usd * (sold / orig_spot_size).min(1.0)
+                            })
+                        };
                         if px.is_none() {
                             log::warn!(
                                 "[EXIT] {market} closed but no trustworthy price available — PnL for this leg is unknown, not zero"
@@ -2203,7 +2245,13 @@ impl Engine {
                     .await;
                 let target = self.exit_target(orig_perp_size, None, &sym).await;
                 let size = Decimal::from_f64(target).unwrap_or(Decimal::ZERO);
-                match self.lt_perp_taker(&sym, size, OrderSide::Short, true).await {
+                let close = if target <= 0.0 {
+                    log::warn!("[EXIT] {sym}: no perp position left at the venue (stop already closed it?), no order sent");
+                    Ok(Decimal::ZERO)
+                } else {
+                    self.lt_perp_taker(&sym, size, OrderSide::Short, true).await
+                };
+                match close {
                     Ok(f) => {
                         let closed = f.to_f64().unwrap_or(0.0);
                         perp_closed = closed;
@@ -2212,9 +2260,13 @@ impl Engine {
                         log::info!("[EXIT] {sym} perp closed {f} (remaining {remaining})");
                         leg.perp_size = remaining;
                         perp_px_source = src;
-                        perp_pnl = px.map(|p| {
-                            p * closed - leg.perp_cost_usd * (closed / orig_perp_size).min(1.0)
-                        });
+                        perp_pnl = if target + 1e-12 < orig_perp_size {
+                            None
+                        } else {
+                            px.map(|p| {
+                                p * closed - leg.perp_cost_usd * (closed / orig_perp_size).min(1.0)
+                            })
+                        };
                         if px.is_none() {
                             log::warn!(
                                 "[EXIT] {sym} perp closed but no trustworthy price available — PnL for this leg is unknown, not zero"
@@ -2502,7 +2554,34 @@ impl Engine {
         } else {
             log::warn!("[RECONCILE] incomplete: a venue read failed, the book is unverified");
         }
+        self.ensure_stops().await;
         complete
+    }
+
+    /// Every perp leg with size must have a resting stop covering it; a
+    /// placement that failed at entry (or a size the stop no longer covers)
+    /// is retried here on the reconcile cadence, in every mode but under
+    /// KILL_SWITCH (which blocks stop re-placement by design).
+    async fn ensure_stops(&mut self) {
+        if self.sentinels.kill_switch_engaged() {
+            return;
+        }
+        for (sym, leg) in self.state.legs.clone() {
+            if leg.perp_size <= 0.0
+                || stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
+            {
+                continue;
+            }
+            log::warn!(
+                "[STOP] {sym}: perp {} is not stop-covered (order {:?} size {:?}) — re-placing",
+                leg.perp_size,
+                leg.stop_order_id,
+                leg.stop_size
+            );
+            if let Err(e) = self.place_stop(&sym).await {
+                log::error!("[STOP] {sym}: re-placement failed, will retry next reconcile: {e:?}");
+            }
+        }
     }
 
     /// Does the venue holding match the book for one leg? A leg the book
@@ -3537,6 +3616,8 @@ mod tests {
     /// by `dry_run` before reaching the venue, so anything else is a bug.
     struct QuoteOnly {
         price: Decimal,
+        /// Live-path knob: `cancel_order` fails (the venue kept the stop).
+        cancel_fails: bool,
     }
 
     #[async_trait::async_trait]
@@ -3735,9 +3816,13 @@ mod tests {
             _symbol: &str,
             _order_id: &str,
         ) -> Result<(), dex_connector::DexError> {
-            unimplemented!(
-                "QuoteOnly stub: cancel_order must not be called on the DRY_RUN exit path"
-            )
+            if self.cancel_fails {
+                Err(dex_connector::DexError::Transient(
+                    "cancel timed out".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn cancel_all_orders(
             &self,
@@ -3822,6 +3907,7 @@ mod tests {
         }
         let quote: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
+            cancel_fails: false,
         });
         Engine {
             cfg: cfg.clone(),
@@ -4132,6 +4218,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.tranche_progress["ETH"].spot_usd, 0.0);
+    }
+
+    /// Live exit where the venue already flattened the legs (the exchange
+    /// stop fired) but the stop cancel fails: the book must NOT reach
+    /// Exited — a later ARM would clear the leg and forget a trigger that
+    /// may still rest at the venue.
+    #[tokio::test]
+    async fn exit_with_an_unconfirmed_stop_cancel_stays_on_and_halts() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_cancel_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: true,
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+        }
+        e.exit_all("test").await;
+        assert_eq!(
+            e.state.mode,
+            Mode::On,
+            "must not be Exited with a stop unconfirmed"
+        );
+        assert!(e.state.halted);
+        assert!(
+            e.state.legs.values().all(|l| l.stop_order_id.is_some()),
+            "stop stays tracked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_config() -> Config {
