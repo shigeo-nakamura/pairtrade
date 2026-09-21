@@ -917,6 +917,9 @@ struct LegState {
     /// of it. PnL for this leg is unknown from here until it is flat.
     #[serde(default)]
     cost_basis_unknown: bool,
+    /// Same, for the perp leg (the two holdings are independent).
+    #[serde(default)]
+    perp_cost_basis_unknown: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -2071,6 +2074,7 @@ impl Engine {
                         last_close: None,
                         close_fetch_failures: 0,
                         cost_basis_unknown: false,
+                        perp_cost_basis_unknown: false,
                     }
                 }
             };
@@ -2388,9 +2392,9 @@ impl Engine {
                         perp_px_source = src;
                         let venue_differs = (target - orig_perp_size).abs() > 1e-12;
                         if venue_differs && remaining > 0.0 {
-                            leg.cost_basis_unknown = true;
+                            leg.perp_cost_basis_unknown = true;
                         }
-                        perp_pnl = if venue_differs || leg.cost_basis_unknown {
+                        perp_pnl = if venue_differs || leg.perp_cost_basis_unknown {
                             None
                         } else {
                             px.map(|p| {
@@ -4151,6 +4155,7 @@ mod tests {
                     last_close: Some(px),
                     close_fetch_failures: 0,
                     cost_basis_unknown: false,
+                    perp_cost_basis_unknown: false,
                 },
             );
         }
