@@ -2705,7 +2705,12 @@ impl Engine {
             // may be stale after a restart, and a stop sized from it would
             // be oversized or orphaned. A read failure or a divergence
             // skips (reconcile halts on the divergence).
-            match self.lt_perp_holding(&sym).await {
+            let venue_size = if self.cfg.dry_run {
+                Ok(leg.perp_size) // no venue book to compare against
+            } else {
+                self.lt_perp_holding(&sym).await
+            };
+            match venue_size {
                 Ok(actual)
                     if within_tolerance(
                         leg.perp_size,
