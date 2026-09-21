@@ -2138,9 +2138,9 @@ impl Engine {
     /// that is larger beyond the reconcile tolerance (never smaller: a
     /// venue read that is short is treated as unreadable for this purpose
     /// and the book's size is sold). DRY_RUN: the book's size.
-    async fn exit_target(&self, book: f64, spot_market: Option<&str>, symbol: &str) -> f64 {
+    async fn exit_target(&self, book: f64, spot_market: Option<&str>, symbol: &str) -> Result<f64> {
         if self.cfg.dry_run {
-            return book;
+            return Ok(book);
         }
         let holding = match spot_market {
             Some(m) => self.hl_spot_holding(&spot_base(m)).await,
@@ -2148,7 +2148,10 @@ impl Engine {
         };
         let what = spot_market.unwrap_or(symbol);
         match holding {
-            Ok(h) if within_tolerance(book, h, self.cfg.reconcile_tolerance_pct) => book,
+            Ok(h) if h < 0.0 => bail!(
+                "{what}: venue holds a SHORT ({h}) where the book has a long of {book} — not flat, not ours to sell; close it by hand"
+            ),
+            Ok(h) if within_tolerance(book, h, self.cfg.reconcile_tolerance_pct) => Ok(book),
             Ok(h) => {
                 // Larger: an order the state never recorded — sell it all.
                 // Smaller: the exchange stop (or a manual close) already
@@ -2157,11 +2160,11 @@ impl Engine {
                 log::error!(
                     "[EXIT] {what}: venue holds {h} but the book says {book} — closing the venue amount"
                 );
-                h.max(0.0)
+                Ok(h)
             }
             Err(e) => {
                 log::warn!("[EXIT] {what}: holding unreadable, selling the book's size: {e:?}");
-                book
+                Ok(book)
             }
         }
     }
@@ -2240,14 +2243,18 @@ impl Engine {
                 // Sell what the venue actually holds when that is more than
                 // the book (an order the state never recorded): an exit
                 // must not leave exposure behind because the ledger is short.
-                let target = self.exit_target(orig_spot_size, Some(&market), &sym).await;
-                let size = Decimal::from_f64(target).unwrap_or(Decimal::ZERO);
-                let sell = if target <= 0.0 {
-                    log::warn!("[EXIT] {market}: nothing left at the venue, no sell sent");
-                    Ok(Decimal::ZERO)
-                } else {
-                    self.hl_spot_ioc(&market, size, OrderSide::Short).await
-                };
+                let (target, sell) =
+                    match self.exit_target(orig_spot_size, Some(&market), &sym).await {
+                        Err(e) => (orig_spot_size, Err(e)),
+                        Ok(t) if t <= 0.0 => {
+                            log::warn!("[EXIT] {market}: nothing left at the venue, no sell sent");
+                            (t, Ok(Decimal::ZERO))
+                        }
+                        Ok(t) => {
+                            let size = Decimal::from_f64(t).unwrap_or(Decimal::ZERO);
+                            (t, self.hl_spot_ioc(&market, size, OrderSide::Short).await)
+                        }
+                    };
                 match sell {
                     Ok(f) => {
                         let sold = f.to_f64().unwrap_or(0.0);
@@ -2297,13 +2304,19 @@ impl Engine {
                 let (px, src) = self
                     .exit_reference_price(&self.lt, &sym, leg.last_close)
                     .await;
-                let target = self.exit_target(orig_perp_size, None, &sym).await;
-                let size = Decimal::from_f64(target).unwrap_or(Decimal::ZERO);
-                let close = if target <= 0.0 {
-                    log::warn!("[EXIT] {sym}: no perp position left at the venue (stop already closed it?), no order sent");
-                    Ok(Decimal::ZERO)
-                } else {
-                    self.lt_perp_taker(&sym, size, OrderSide::Short, true).await
+                let (target, close) = match self.exit_target(orig_perp_size, None, &sym).await {
+                    Err(e) => (orig_perp_size, Err(e)),
+                    Ok(t) if t <= 0.0 => {
+                        log::warn!("[EXIT] {sym}: no perp position left at the venue (stop already closed it?), no order sent");
+                        (t, Ok(Decimal::ZERO))
+                    }
+                    Ok(t) => {
+                        let size = Decimal::from_f64(t).unwrap_or(Decimal::ZERO);
+                        (
+                            t,
+                            self.lt_perp_taker(&sym, size, OrderSide::Short, true).await,
+                        )
+                    }
                 };
                 match close {
                     Ok(f) => {
@@ -2740,6 +2753,12 @@ impl Engine {
                         self.state.mode
                     );
                 } else {
+                    if let Some(p) = &self.state.pending_order {
+                        log::error!(
+                            "[DISARM] the book records nothing held, but an order is unsettled ({p:?}); \
+                             the venues are compared on the reconcile cadence — check them by hand before assuming flat"
+                        );
+                    }
                     log::info!(
                         "[DISARM] nothing held (mode={:?}); ignored",
                         self.state.mode
@@ -2807,6 +2826,11 @@ impl Engine {
                 && now.saturating_sub(self.last_margin_check) >= self.cfg.reconcile_every_secs
             {
                 self.margin_monitor().await;
+                // Protection is not an "action" a halt should block: a
+                // partial exit (stop already cancelled) or a failed stop
+                // placement halts with live perp size uncovered — re-cover
+                // it while the operator investigates.
+                self.ensure_stops().await;
             }
         } else if self.state.mode == Mode::On && intent != OperatorIntent::DisarmNow {
             self.daily_eval().await;
@@ -2850,9 +2874,12 @@ impl Engine {
                     }
                 }
             }
-            if self.state.mode == Mode::On
+            if (self.state.mode == Mode::On || self.state.pending_order.is_some())
                 && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
             {
+                // Also while Off/Exited with an unsettled order: the first
+                // entry of a cycle may have filled without a leg recorded,
+                // and only a venue comparison can surface that.
                 self.last_reconcile = now;
                 let _ = self.reconcile().await;
             }
@@ -3672,6 +3699,9 @@ mod tests {
         price: Decimal,
         /// Live-path knob: `cancel_order` fails (the venue kept the stop).
         cancel_fails: bool,
+        /// Live-path knob: signed perp position `get_positions` reports for
+        /// every symbol (`None` = the call is unexpected).
+        perp_position: Option<f64>,
     }
 
     #[async_trait::async_trait]
@@ -3756,9 +3786,20 @@ mod tests {
         async fn get_positions(
             &self,
         ) -> Result<Vec<dex_connector::PositionSnapshot>, dex_connector::DexError> {
-            unimplemented!(
-                "QuoteOnly stub: get_positions must not be called on the DRY_RUN exit path"
-            )
+            let Some(p) = self.perp_position else {
+                unimplemented!(
+                    "QuoteOnly stub: get_positions must not be called on the DRY_RUN exit path"
+                )
+            };
+            Ok(["BTC", "ETH"]
+                .iter()
+                .map(|sym| dex_connector::PositionSnapshot {
+                    symbol: sym.to_string(),
+                    size: Decimal::from_f64(p.abs()).unwrap(),
+                    sign: if p < 0.0 { -1 } else { 1 },
+                    entry_price: None,
+                })
+                .collect())
         }
         async fn get_last_trades(
             &self,
@@ -3962,6 +4003,7 @@ mod tests {
         let quote: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: false,
+            perp_position: None,
         });
         Engine {
             cfg: cfg.clone(),
@@ -4318,6 +4360,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: true,
+            perp_position: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4335,6 +4378,42 @@ mod tests {
         assert!(
             e.state.legs.values().all(|l| l.stop_order_id.is_some()),
             "stop stays tracked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live exit where the venue shows a SHORT where the book has a long
+    /// (manual action / unrecorded order): never "closed", no order sent
+    /// for it, the book halts with the leg as recorded.
+    #[tokio::test]
+    async fn exit_refuses_a_reversed_venue_position() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_rev_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: false,
+            perp_position: Some(-0.005),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0; // perp-only book for this test
+        }
+        e.exit_all("test").await;
+        assert_eq!(e.state.mode, Mode::On);
+        assert!(
+            e.state.halted,
+            "a reversed position must halt, not read as flat"
+        );
+        assert!(
+            e.state.legs.values().all(|l| l.perp_size == 0.005),
+            "the recorded leg is untouched"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
