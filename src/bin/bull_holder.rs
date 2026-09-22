@@ -1881,24 +1881,13 @@ impl Engine {
                 return None;
             }
         };
-        let account = v.get("accounts")?.as_array()?.first()?;
-        let n = |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-        let mut total = n(account, "pending_order_count");
-        let mut seen = false;
-        for p in account.get("positions")?.as_array()? {
-            if p.get("symbol").and_then(|x| x.as_str()) != Some(symbol) {
-                continue;
+        match resting_orders_for(&v, symbol) {
+            Some(n) => Some(n),
+            None => {
+                log::warn!("[STOP] {symbol}: account endpoint response not understood");
+                None
             }
-            seen = true;
-            total += n(p, "open_order_count")
-                + n(p, "position_tied_order_count")
-                + n(p, "pending_order_count");
         }
-        if !seen {
-            log::warn!("[STOP] {symbol}: not present in the account endpoint's positions");
-            return None;
-        }
-        Some(total)
     }
 
     async fn stop_absent_confirmed(&self, symbol: &str, order_id: &str) -> bool {
