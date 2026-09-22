@@ -1819,16 +1819,25 @@ impl Engine {
             .unwrap_or_else(|| "0".to_string());
         let base = self.cfg.lighter_account_url.trim_end_matches('/');
         let mut matched: Vec<u64> = Vec::new();
+        // A probe that could not be read leaves the set incomplete: the
+        // account it would have matched may be the real one, so "only one
+        // match" among the rest is not a conclusion.
+        let mut incomplete = false;
         for &idx in candidates {
             let url =
                 format!("{base}/api/v1/apikeys?account_index={idx}&api_key_index={key_index}");
             let v: serde_json::Value = match self.http.get(&url).send().await {
                 Ok(r) => match r.json().await {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        log::warn!("[STOP] api-key probe for account {idx} unreadable: {e:?}");
+                        incomplete = true;
+                        continue;
+                    }
                 },
                 Err(e) => {
                     log::warn!("[STOP] api-key probe for account {idx} failed: {e:?}");
+                    incomplete = true;
                     continue;
                 }
             };
@@ -1841,16 +1850,17 @@ impl Engine {
             }
         }
         match matched.as_slice() {
-            [only] => Some(*only),
+            [only] if !incomplete => Some(*only),
             // Zero matches, or several accounts with a key in the same
             // slot: this probe cannot tell them apart (the bot's own
             // public key is KMS ciphertext here, not comparable material),
             // and guessing could point the checks at another account.
             _ => {
                 log::warn!(
-                    "[STOP] {} of the wallet's {} accounts carry API key index {key_index}; set LIGHTER_ACCOUNT_INDEX to name the one this bot trades — venue order checks are inconclusive until then",
+                    "[STOP] {} of the wallet's {} accounts carry API key index {key_index}{}; set LIGHTER_ACCOUNT_INDEX to name the one this bot trades — venue order checks are inconclusive until then",
                     matched.len(),
-                    candidates.len()
+                    candidates.len(),
+                    if incomplete { " (and some could not be read)" } else { "" }
                 );
                 None
             }
