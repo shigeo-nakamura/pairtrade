@@ -223,7 +223,11 @@ struct Config {
     /// Read-only REST: the authority on whether an order rests, used where
     /// the connector's WebSocket-fed views cannot prove absence.
     lighter_account_url: String,
+    /// Empty when the deployment leaves it to the connector's
+    /// auto-discovery (index unset or `0`); resolved from the wallet
+    /// address on first use.
     lighter_account_index: String,
+    lighter_wallet_address: String,
     arm_path: PathBuf,
     add_path: PathBuf,
     disarm_path: PathBuf,
@@ -289,6 +293,9 @@ impl Config {
             lighter_account_url: lighter_env("REST_ENDPOINT", &instance_id)
                 .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai".to_string()),
             lighter_account_index: lighter_env("LIGHTER_ACCOUNT_INDEX", &instance_id)
+                .filter(|v| v.trim() != "0")
+                .unwrap_or_default(),
+            lighter_wallet_address: lighter_env("LIGHTER_WALLET_ADDRESS", &instance_id)
                 .unwrap_or_default(),
             hl_info_url: env_string(
                 "BULL_HOLDER_HL_INFO_URL",
@@ -371,9 +378,6 @@ impl Config {
                 "BULL_HOLDER_STOP_SLIPPAGE_BPS={} out of range (1..=2000)",
                 self.stop_slippage_bps
             );
-        }
-        if !self.dry_run && self.lighter_account_index.trim().is_empty() {
-            bail!("LIGHTER_ACCOUNT_INDEX must be set: the stop checks read the venue's account endpoint directly");
         }
         if self.hl_taker_slippage_bps == 0 || self.hl_taker_slippage_bps > 1_000 {
             bail!("BULL_HOLDER_HL_TAKER_SLIPPAGE_BPS must be in 1..=1000");
@@ -1214,6 +1218,9 @@ struct Engine {
     last_margin: Option<MarginSnapshot>,
     /// When the Lighter funding history was last polled (bot-strategy#963).
     last_funding_poll: u64,
+    /// Account index the venue reads use, resolved once from the wallet
+    /// address when the config leaves it to auto-discovery.
+    resolved_account_index: tokio::sync::Mutex<Option<String>>,
 }
 
 /// Result of one runtime collateral-guard evaluation (bot-strategy#909).
@@ -1747,16 +1754,66 @@ impl Engine {
     /// zero resting orders for the market settles it. This is the only
     /// path that can clear a stop Lighter dropped during validation, which
     /// never existed and so can never appear in the cancelled feed.
+    /// The account these venue reads target. Configured index when the
+    /// deployment pins one; otherwise discovered from the wallet address
+    /// (the connector's own auto-discovery case) and cached. A wallet with
+    /// several accounts cannot be disambiguated here without the API-key
+    /// probe the connector does, so it resolves to `None` — which makes
+    /// every absence check inconclusive rather than wrong.
+    async fn lighter_account_index(&self) -> Option<String> {
+        if !self.cfg.lighter_account_index.is_empty() {
+            return Some(self.cfg.lighter_account_index.clone());
+        }
+        let mut cached = self.resolved_account_index.lock().await;
+        if let Some(idx) = cached.as_ref() {
+            return Some(idx.clone());
+        }
+        if self.cfg.lighter_wallet_address.is_empty() {
+            log::warn!(
+                "[STOP] no Lighter account index and no wallet address to discover one; venue order checks are inconclusive"
+            );
+            return None;
+        }
+        let url = format!(
+            "{}/api/v1/account?by=l1_address&value={}",
+            self.cfg.lighter_account_url.trim_end_matches('/'),
+            self.cfg.lighter_wallet_address
+        );
+        let v: serde_json::Value = match self.http.get(&url).send().await {
+            Ok(r) => r.json().await.ok()?,
+            Err(e) => {
+                log::warn!("[STOP] account discovery read failed: {e:?}");
+                return None;
+            }
+        };
+        let accounts = v.get("accounts")?.as_array()?;
+        if accounts.len() != 1 {
+            log::warn!(
+                "[STOP] wallet {} has {} accounts; set LIGHTER_ACCOUNT_INDEX so the venue order checks can name one",
+                self.cfg.lighter_wallet_address,
+                accounts.len()
+            );
+            return None;
+        }
+        let idx = accounts[0]
+            .get("account_index")
+            .and_then(|x| x.as_u64())?
+            .to_string();
+        log::info!("[STOP] resolved Lighter account index {idx} from the wallet address");
+        *cached = Some(idx.clone());
+        Some(idx)
+    }
+
     /// Orders resting for `symbol` according to Lighter's own account
     /// endpoint (REST, not the WebSocket cache): `None` when the read or
     /// the parse failed. Counts the market's resting and position-tied
     /// orders, plus the account-wide pending count — the account is
     /// dedicated to this bot, which rests nothing but its stops.
     async fn lighter_resting_orders(&self, symbol: &str) -> Option<u64> {
+        let index = self.lighter_account_index().await?;
         let url = format!(
-            "{}/api/v1/account?by=index&value={}",
+            "{}/api/v1/account?by=index&value={index}",
             self.cfg.lighter_account_url.trim_end_matches('/'),
-            self.cfg.lighter_account_index
         );
         let v: serde_json::Value = match self.http.get(&url).send().await {
             Ok(r) => match r.json().await {
@@ -3570,6 +3627,7 @@ async fn main() -> Result<()> {
         last_margin_check: 0,
         last_margin: None,
         last_funding_poll: 0,
+        resolved_account_index: tokio::sync::Mutex::new(None),
         cfg,
     };
     // A live restart re-verifies the book against the venues before doing
@@ -4611,6 +4669,7 @@ mod tests {
             last_margin_check: 0,
             last_margin: None,
             last_funding_poll: 0,
+            resolved_account_index: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -5371,6 +5430,7 @@ mod tests {
             reconcile_every_secs: 600,
             lighter_account_url: "http://127.0.0.1:1".into(),
             lighter_account_index: "1".into(),
+            lighter_wallet_address: String::new(),
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
             add_path: dir.join("ADD"),
