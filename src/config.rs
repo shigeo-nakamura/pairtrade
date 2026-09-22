@@ -259,23 +259,6 @@ fn suffixed_env(name: &str, instance_id: Option<&str>) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// Hyperliquid *account* connector config (bot-strategy#894). Read-side only
-/// when no signer key is provided (balances / fills for the configured
-/// account); execution-capable when `HYPERLIQUID_SIGNER_PRIVATE_KEY` (KMS,
-/// decrypted with `ENCRYPTED_DATA_KEY` like the Lighter keys) or
-/// `HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY` (testing only) is set.
-///
-/// Env (all accept the `_<INSTANCE>` suffix):
-/// - `HYPERLIQUID_ACCOUNT_ADDRESS` (required) — the account that owns funds
-///   (master or sub-account), NOT the API wallet address
-/// - `HYPERLIQUID_SIGNER_PRIVATE_KEY` / `HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY`
-/// - `HYPERLIQUID_VAULT_ADDRESS` (optional)
-/// - `HYPERLIQUID_IS_MAINNET` (default true)
-/// - `HYPERLIQUID_NONCE_STATE_PATH` (required with a signer)
-/// - `HYPERLIQUID_MAX_TAKER_NOTIONAL_USD` (required with a signer; IOC cap)
-/// - `HYPERLIQUID_MAX_TAKER_SLIPPAGE_BPS` (default 50)
-/// - `HYPERLIQUID_MAX_TAKER_BOOK_AGE_MS` (default 5000)
-#[cfg(feature = "hyperliquid-sdk")]
 /// The decrypted signer key is accepted in either form `scripts/encrypt.py`
 /// produces: the 64-hex string (encrypted as text) or the raw 32-byte key
 /// (encrypted from a `0x…` argument, which the script hex-decodes). Both
@@ -293,6 +276,23 @@ fn signer_key_from_decrypted(bytes: Vec<u8>) -> Result<String, ConfigError> {
     Ok(text.trim().to_owned())
 }
 
+/// Hyperliquid *account* connector config (bot-strategy#894). Read-side only
+/// when no signer key is provided (balances / fills for the configured
+/// account); execution-capable when `HYPERLIQUID_SIGNER_PRIVATE_KEY` (KMS,
+/// decrypted with `ENCRYPTED_DATA_KEY` like the Lighter keys) or
+/// `HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY` (testing only) is set.
+///
+/// Env (all accept the `_<INSTANCE>` suffix):
+/// - `HYPERLIQUID_ACCOUNT_ADDRESS` (required) — the account that owns funds
+///   (master or sub-account), NOT the API wallet address
+/// - `HYPERLIQUID_SIGNER_PRIVATE_KEY` / `HYPERLIQUID_PLAIN_SIGNER_PRIVATE_KEY`
+/// - `HYPERLIQUID_VAULT_ADDRESS` (optional)
+/// - `HYPERLIQUID_IS_MAINNET` (default true)
+/// - `HYPERLIQUID_NONCE_STATE_PATH` (required with a signer)
+/// - `HYPERLIQUID_MAX_TAKER_NOTIONAL_USD` (required with a signer; IOC cap)
+/// - `HYPERLIQUID_MAX_TAKER_SLIPPAGE_BPS` (default 50)
+/// - `HYPERLIQUID_MAX_TAKER_BOOK_AGE_MS` (default 5000)
+#[cfg(feature = "hyperliquid-sdk")]
 pub async fn get_hyperliquid_account_config_from_env(
     instance_id: Option<&str>,
 ) -> Result<dex_connector::HyperliquidAccountConfig, ConfigError> {
