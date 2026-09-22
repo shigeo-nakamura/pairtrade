@@ -219,6 +219,15 @@ struct Config {
     reconcile_tolerance_pct: f64,
     reconcile_every_secs: u64,
     hl_info_url: String,
+    /// Lighter's public account endpoint and the account index behind it.
+    /// Read-only REST: the authority on whether an order rests, used where
+    /// the connector's WebSocket-fed views cannot prove absence.
+    lighter_account_url: String,
+    /// Empty when the deployment leaves it to the connector's
+    /// auto-discovery (index unset or `0`); resolved from the wallet
+    /// address on first use.
+    lighter_account_index: String,
+    lighter_wallet_address: String,
     arm_path: PathBuf,
     add_path: PathBuf,
     disarm_path: PathBuf,
@@ -258,7 +267,7 @@ impl Config {
             hl_spot_market.insert(s.clone(), m);
         }
         let cfg = Self {
-            instance_id,
+            instance_id: instance_id.clone(),
             dry_run: parse_dry_run(std::env::var("BULL_HOLDER_DRY_RUN").ok().as_deref())?,
             symbols,
             hl_spot_market,
@@ -277,6 +286,17 @@ impl Config {
             stop_slippage_bps: env_u32("BULL_HOLDER_STOP_SLIPPAGE_BPS", 500),
             reconcile_tolerance_pct: env_f64("BULL_HOLDER_RECONCILE_TOLERANCE_PCT", 2.0),
             reconcile_every_secs: env_u64("BULL_HOLDER_RECONCILE_EVERY_SECS", 600),
+            // Same resolution the connector uses (`lighter_env` in
+            // config.rs): the instance-suffixed value wins, so this check
+            // can never read a different account or network than the one
+            // `DexConnectorBox` trades on.
+            lighter_account_url: lighter_env("REST_ENDPOINT", &instance_id)
+                .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai".to_string()),
+            lighter_account_index: lighter_env("LIGHTER_ACCOUNT_INDEX", &instance_id)
+                .filter(|v| v.trim() != "0")
+                .unwrap_or_default(),
+            lighter_wallet_address: lighter_env("LIGHTER_WALLET_ADDRESS", &instance_id)
+                .unwrap_or_default(),
             hl_info_url: env_string(
                 "BULL_HOLDER_HL_INFO_URL",
                 "https://api.hyperliquid.xyz/info",
@@ -465,8 +485,53 @@ fn remainder_is_dust(
     true
 }
 
+/// Resting orders for `symbol` in a Lighter `/api/v1/account` response:
+/// the market's own resting / position-tied / pending orders plus the
+/// account-wide pending count (the account is dedicated to this bot).
+/// `None` when the response does not carry the market — never 0, which
+/// would read as "nothing rests".
+/// Instance-suffixed env lookup, mirroring `config::lighter_env` so the
+/// venue reads here resolve to the same account as the connector's.
+fn lighter_env(name: &str, instance_id: &str) -> Option<String> {
+    let suffix = instance_id.to_uppercase().replace('-', "_");
+    std::env::var(format!("{name}_{suffix}"))
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var(name).ok().filter(|v| !v.is_empty()))
+}
+
+fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
+    let account = v.get("accounts")?.as_array()?.first()?;
+    // Strict: a count that is absent or not a number makes the response
+    // unreadable, never zero. Reading a malformed reply as "no orders"
+    // would clear a stop that is still live.
+    let n = |o: &serde_json::Value, k: &str| -> Option<u64> { o.get(k)?.as_u64() };
+    let mut total = n(account, "pending_order_count")?;
+    for p in account.get("positions")?.as_array()? {
+        if p.get("symbol").and_then(|x| x.as_str()) != Some(symbol) {
+            continue;
+        }
+        return Some(
+            total
+                + n(p, "open_order_count")?
+                + n(p, "position_tied_order_count")?
+                + n(p, "pending_order_count")?,
+        );
+    }
+    // The market row can be omitted when it carries neither a position nor
+    // an order. That is only evidence of absence if the account as a whole
+    // reports no orders — and those counts must be present too.
+    total += n(account, "total_order_count")? + n(account, "total_isolated_order_count")?;
+    Some(total)
+}
+
 /// A holding the book does not carry counts as flat below this notional.
 const RECONCILE_DUST_USD: f64 = 5.0;
+
+/// How long a freshly placed stop is given to appear in the venue's own
+/// order list before it is treated as never placed.
+const STOP_CONFIRM_ATTEMPTS: u32 = 6;
+const STOP_CONFIRM_STEP_MS: u64 = 2_000;
 
 /// Startup verification of the book against the venues: retries for
 /// transient read failures before halting.
@@ -932,6 +997,14 @@ struct LegState {
     /// Same, for the perp leg (the two holdings are independent).
     #[serde(default)]
     perp_cost_basis_unknown: bool,
+    /// A stop the venue acknowledged but never confirmed as resting. It is
+    /// NOT cover (it may not exist), and it must NOT be forgotten either
+    /// (it may): `get_open_orders` is served from the Lighter WebSocket
+    /// cache, so an empty read during a reconnect is not proof of absence.
+    /// Cancelled by id — which does not depend on that cache — before the
+    /// next stop is placed, and cleared only when that cancel succeeds.
+    #[serde(default)]
+    stop_unconfirmed_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1143,6 +1216,9 @@ struct Engine {
     last_margin: Option<MarginSnapshot>,
     /// When the Lighter funding history was last polled (bot-strategy#963).
     last_funding_poll: u64,
+    /// Account index the venue reads use, resolved once from the wallet
+    /// address when the config leaves it to auto-discovery.
+    resolved_account_index: tokio::sync::Mutex<Option<String>>,
 }
 
 /// Result of one runtime collateral-guard evaluation (bot-strategy#909).
@@ -1468,13 +1544,15 @@ impl Engine {
         let lighter_price = self.quote(&self.lt, symbol).await?.price;
         leg.lighter_peak = leg.lighter_peak.max(lighter_price);
         let level = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
-        if stop_is_current(
-            leg.stop_level,
-            leg.stop_size,
-            leg.stop_order_id.is_some(),
-            level,
-            leg.perp_size,
-        ) {
+        if leg.stop_unconfirmed_id.is_none()
+            && stop_is_current(
+                leg.stop_level,
+                leg.stop_size,
+                leg.stop_order_id.is_some(),
+                level,
+                leg.perp_size,
+            )
+        {
             if let Some(l) = self.state.legs.get_mut(symbol) {
                 l.lighter_peak = leg.lighter_peak;
             }
@@ -1529,6 +1607,15 @@ impl Engine {
         let order_id = if self.cfg.dry_run {
             format!("dry-run-stop-{}", now_secs())
         } else {
+            // An earlier stop whose existence is unknown must be cancelled
+            // by id first — the sweep below cannot see what the WS cache
+            // does not carry, so placing a replacement while it is still
+            // tracked risks TWO live stops on the position.
+            if !self.drop_unconfirmed_stop(symbol).await {
+                bail!(
+                    "Lighter stop {symbol}: an earlier stop with unknown state is still tracked and could not be cancelled; not placing another one"
+                );
+            }
             // Sweep whatever else rests on this symbol before resting the
             // new stop: a trigger submission whose response was lost (timed
             // out after acceptance) never got an id recorded, and this is
@@ -1569,6 +1656,24 @@ impl Engine {
                 )
                 .await
                 .with_context(|| format!("Lighter stop {symbol} @ {level:.2}"))?;
+            // `sendTx` returning 200 means the transaction was ACCEPTED for
+            // processing, not that the order rests: Lighter validates it
+            // asynchronously and can drop it silently (first live stops,
+            // 2026-09-22 — 2 of 3 acknowledged stops never appeared at the
+            // venue while the bot recorded their ids and stopped retrying).
+            // The order only exists once the venue reports it.
+            // Persist the id as unconfirmed BEFORE the confirmation poll: a
+            // crash inside that window would otherwise leave an accepted
+            // order with no record anywhere. It is promoted to real cover
+            // below, only if the venue shows it.
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.stop_unconfirmed_id = Some(resp.order_id.clone());
+            }
+            self.persist();
+            self.confirm_stop_rests(symbol, &resp.order_id).await?;
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.stop_unconfirmed_id = None;
+            }
             resp.order_id
         };
         log::info!(
@@ -1585,6 +1690,290 @@ impl Engine {
         }
         self.persist();
         Ok(())
+    }
+
+    /// Cancel a previously unconfirmed stop by id (no WS cache involved)
+    /// and forget it once the venue confirms the cancel. A failed cancel
+    /// keeps it recorded for the next attempt — the id is the only handle
+    /// on an order that may or may not exist.
+    /// `true` = nothing uncertain is left for this symbol (there was none,
+    /// or the cancel was confirmed). `false` = an order that may be resting
+    /// is still tracked, and no new stop may be placed on top of it.
+    async fn drop_unconfirmed_stop(&mut self, symbol: &str) -> bool {
+        let Some(id) = self
+            .state
+            .legs
+            .get(symbol)
+            .and_then(|l| l.stop_unconfirmed_id.clone())
+        else {
+            return true;
+        };
+        if self.cfg.dry_run {
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.stop_unconfirmed_id = None;
+            }
+            self.persist();
+            return true;
+        }
+        // HTTP 200 on the cancel is the same weak signal as on the
+        // placement: accepted for processing, not "the order is gone". And
+        // the motivating failure — a stop dropped during Lighter's
+        // asynchronous validation — never existed, so it can never appear
+        // in the cancelled feed either. Two independent settlements:
+        // the venue reports it cancelled, or a READY account snapshot
+        // shows it is not resting.
+        if let Err(e) = self.lt.cancel_order(symbol, &id).await {
+            // A timed-out cancel may still have been processed, and a
+            // repeat cancel of an already-cancelled id returns not-found —
+            // so the request's outcome never gates the evidence below.
+            log::warn!("[STOP] {symbol}: cancel of unconfirmed stop {id} failed: {e:?}");
+        }
+        let settled = self.cancel_confirmed(symbol, &id).await
+            || self.stop_absent_confirmed(symbol, &id).await;
+        if !settled {
+            log::warn!(
+                "[STOP] {symbol}: {id} is still unsettled (neither reported cancelled nor shown absent by a ready snapshot); keeping it tracked"
+            );
+            return false;
+        }
+        log::warn!("[STOP] {symbol}: unconfirmed stop {id} settled — it is not resting");
+        if let Some(l) = self.state.legs.get_mut(symbol) {
+            l.stop_unconfirmed_id = None;
+        }
+        self.persist();
+        true
+    }
+
+    /// Is `order_id` provably NOT resting? The connector's order list is
+    /// served from the Lighter WebSocket cache, which can be empty or
+    /// stale (a reconnect, or a stalled connection whose first snapshot
+    /// still satisfies the positions-ready flag), so its silence is never
+    /// proof. Lighter's account endpoint is REST and fetched per call:
+    /// zero resting orders for the market settles it. This is the only
+    /// path that can clear a stop Lighter dropped during validation, which
+    /// never existed and so can never appear in the cancelled feed.
+    /// The account these venue reads target. Configured index when the
+    /// deployment pins one; otherwise discovered from the wallet address
+    /// (the connector's own auto-discovery case) and cached. A wallet with
+    /// several accounts cannot be disambiguated here without the API-key
+    /// probe the connector does, so it resolves to `None` — which makes
+    /// every absence check inconclusive rather than wrong.
+    async fn lighter_account_index(&self) -> Option<String> {
+        if !self.cfg.lighter_account_index.is_empty() {
+            return Some(self.cfg.lighter_account_index.clone());
+        }
+        let mut cached = self.resolved_account_index.lock().await;
+        if let Some(idx) = cached.as_ref() {
+            return Some(idx.clone());
+        }
+        if self.cfg.lighter_wallet_address.is_empty() {
+            log::warn!(
+                "[STOP] no Lighter account index and no wallet address to discover one; venue order checks are inconclusive"
+            );
+            return None;
+        }
+        let url = format!(
+            "{}/api/v1/account?by=l1_address&value={}",
+            self.cfg.lighter_account_url.trim_end_matches('/'),
+            self.cfg.lighter_wallet_address
+        );
+        let v: serde_json::Value = match self.http.get(&url).send().await {
+            Ok(r) => r.json().await.ok()?,
+            Err(e) => {
+                log::warn!("[STOP] account discovery read failed: {e:?}");
+                return None;
+            }
+        };
+        let accounts = v.get("accounts")?.as_array()?;
+        let indices: Vec<u64> = accounts
+            .iter()
+            .filter_map(|a| a.get("account_index").and_then(|x| x.as_u64()))
+            .collect();
+        let idx = match indices.as_slice() {
+            [] => {
+                log::warn!(
+                    "[STOP] wallet {} has no accounts",
+                    self.cfg.lighter_wallet_address
+                );
+                return None;
+            }
+            [only] => only.to_string(),
+            // Several accounts behind one wallet: the API key picks the
+            // one the connector trades on, the same probe it does.
+            many => self.account_for_api_key(many).await?.to_string(),
+        };
+        log::info!("[STOP] resolved Lighter account index {idx} from the wallet address");
+        *cached = Some(idx.clone());
+        Some(idx)
+    }
+
+    /// Which of `candidates` carries this bot's API key — the account the
+    /// connector resolved. Mirrors its discovery probe (an `apikeys` read
+    /// per candidate). `None` when no key index is configured or none
+    /// matches, which leaves the venue checks inconclusive.
+    async fn account_for_api_key(&self, candidates: &[u64]) -> Option<u64> {
+        // Same default as the connector's config loader: slot 0.
+        let key_index = lighter_env("LIGHTER_API_KEY_INDEX", &self.cfg.instance_id)
+            .unwrap_or_else(|| "0".to_string());
+        let base = self.cfg.lighter_account_url.trim_end_matches('/');
+        let mut matched: Vec<u64> = Vec::new();
+        // A probe that could not be read leaves the set incomplete: the
+        // account it would have matched may be the real one, so "only one
+        // match" among the rest is not a conclusion.
+        let mut incomplete = false;
+        for &idx in candidates {
+            let url =
+                format!("{base}/api/v1/apikeys?account_index={idx}&api_key_index={key_index}");
+            let v: serde_json::Value = match self.http.get(&url).send().await {
+                Ok(r) => match r.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("[STOP] api-key probe for account {idx} unreadable: {e:?}");
+                        incomplete = true;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    log::warn!("[STOP] api-key probe for account {idx} failed: {e:?}");
+                    incomplete = true;
+                    continue;
+                }
+            };
+            let has_key = v
+                .get("api_keys")
+                .and_then(|k| k.as_array())
+                .is_some_and(|k| !k.is_empty());
+            if v.get("code").and_then(|c| c.as_u64()) == Some(200) && has_key {
+                matched.push(idx);
+            }
+        }
+        match matched.as_slice() {
+            [only] if !incomplete => Some(*only),
+            // Zero matches, or several accounts with a key in the same
+            // slot: this probe cannot tell them apart (the bot's own
+            // public key is KMS ciphertext here, not comparable material),
+            // and guessing could point the checks at another account.
+            _ => {
+                log::warn!(
+                    "[STOP] {} of the wallet's {} accounts carry API key index {key_index}{}; set LIGHTER_ACCOUNT_INDEX to name the one this bot trades — venue order checks are inconclusive until then",
+                    matched.len(),
+                    candidates.len(),
+                    if incomplete { " (and some could not be read)" } else { "" }
+                );
+                None
+            }
+        }
+    }
+
+    /// Orders resting for `symbol` according to Lighter's own account
+    /// endpoint (REST, not the WebSocket cache): `None` when the read or
+    /// the parse failed. Counts the market's resting and position-tied
+    /// orders, plus the account-wide pending count — the account is
+    /// dedicated to this bot, which rests nothing but its stops.
+    async fn lighter_resting_orders(&self, symbol: &str) -> Option<u64> {
+        let index = self.lighter_account_index().await?;
+        let url = format!(
+            "{}/api/v1/account?by=index&value={index}",
+            self.cfg.lighter_account_url.trim_end_matches('/'),
+        );
+        let v: serde_json::Value = match self.http.get(&url).send().await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("[STOP] {symbol}: account endpoint parse failed: {e:?}");
+                    return None;
+                }
+            },
+            Err(e) => {
+                log::warn!("[STOP] {symbol}: account endpoint read failed: {e:?}");
+                return None;
+            }
+        };
+        match resting_orders_for(&v, symbol) {
+            Some(n) => Some(n),
+            None => {
+                log::warn!("[STOP] {symbol}: account endpoint response not understood");
+                None
+            }
+        }
+    }
+
+    async fn stop_absent_confirmed(&self, symbol: &str, order_id: &str) -> bool {
+        for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
+            // The REST account endpoint is fetched fresh on every call, so
+            // it cannot be a stale cache from before this placement or
+            // cancel — which is what the WebSocket-fed views cannot rule
+            // out. Zero orders for the market is proof nothing rests.
+            match self.lighter_resting_orders(symbol).await {
+                Some(0) => return true,
+                Some(n) => log::warn!(
+                    "[STOP] {symbol}: the venue reports {n} resting order(s) for this market, {order_id} may be one of them (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS})"
+                ),
+                None => log::warn!(
+                    "[STOP] {symbol}: venue account read unavailable (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}); absence proves nothing"
+                ),
+            }
+        }
+        false
+    }
+
+    /// Did the venue itself report `order_id` as cancelled? Positive
+    /// evidence only: the cancelled-order feed naming it. An order list
+    /// that merely no longer shows it is not proof (the same WS cache can
+    /// be empty during a reconnect), so "not seen" keeps it tracked.
+    async fn cancel_confirmed(&self, symbol: &str, order_id: &str) -> bool {
+        for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
+            match self.lt.get_canceled_orders(symbol).await {
+                Ok(resp) if resp.orders.iter().any(|o| o.order_id == order_id) => return true,
+                Ok(_) => log::debug!(
+                    "[STOP] {symbol}: {order_id} not in the cancelled feed yet (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS})"
+                ),
+                Err(e) => log::warn!(
+                    "[STOP] {symbol}: cancelled-order read failed (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}): {e:?}"
+                ),
+            }
+        }
+        false
+    }
+
+    /// Poll the venue's own order list until it reports `order_id`. The
+    /// Lighter connector serves this from its WebSocket order tracking,
+    /// which was confirmed live to carry trigger orders (a stop placed at
+    /// 16:48 UTC on 2026-09-22 was found and cancelled through it).
+    /// `Err` = the venue never showed it; the caller must not record it.
+    async fn confirm_stop_rests(&self, symbol: &str, order_id: &str) -> Result<()> {
+        let mut last: Option<String> = None;
+        for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
+            match self.lt.get_open_orders(symbol).await {
+                Ok(resp) => {
+                    if resp.orders.iter().any(|o| o.order_id == order_id) {
+                        return Ok(());
+                    }
+                    let ids: Vec<&str> = resp.orders.iter().map(|o| o.order_id.as_str()).collect();
+                    log::warn!(
+                        "[STOP] {symbol}: stop {order_id} not visible yet (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}); venue shows {ids:?}"
+                    );
+                    last = None;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[STOP] {symbol}: open-order read failed (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}): {e:?}"
+                    );
+                    last = Some(format!("{e:?}"));
+                }
+            }
+        }
+        match last {
+            Some(e) => bail!(
+                "stop {order_id} for {symbol} could not be confirmed: the venue's order list was unreadable ({e})"
+            ),
+            None => bail!(
+                "stop {order_id} for {symbol} was acknowledged but never appeared at the venue (sendTx 200 is not an order); it is NOT recorded, so the next reconcile re-places it"
+            ),
+        }
     }
 
     async fn cancel_stop(&mut self, symbol: &str) {
@@ -2096,6 +2485,7 @@ impl Engine {
                         close_fetch_failures: 0,
                         cost_basis_unknown: false,
                         perp_cost_basis_unknown: false,
+                        stop_unconfirmed_id: None,
                     }
                 }
             };
@@ -2508,6 +2898,36 @@ impl Engine {
                 leg.exit_level
             );
         }
+        // Every leg is closed before any of this: settling an
+        // acknowledged-but-unconfirmed stop polls the venue for up to ~2
+        // minutes per symbol, and nothing may hold a drawdown exit open
+        // for that long — least of all the symbols not yet reached.
+        // Unsettled ones still keep the book On/halted, which is what
+        // stops a later ARM inheriting an orphaned reduce-only trigger.
+        for sym in self.cfg.symbols.clone() {
+            if self
+                .state
+                .legs
+                .get(&sym)
+                .and_then(|l| l.stop_unconfirmed_id.as_ref())
+                .is_none()
+            {
+                continue;
+            }
+            if !self.drop_unconfirmed_stop(&sym).await {
+                log::error!(
+                    "[EXIT] {sym}: a stop with unknown state ({:?}) could not be settled — the legs are closed, but the book stays On/halted until it is",
+                    self.state
+                        .legs
+                        .get(&sym)
+                        .and_then(|l| l.stop_unconfirmed_id.clone())
+                );
+                any_leg_still_open = true;
+                self.halt(format!(
+                    "{sym}: unconfirmed stop still tracked after the exit; retry DISARM after RISK_ACK"
+                ));
+            }
+        }
         self.state.realized_pnl_total_usd += total;
         if self.state.tranches_remaining > 0 {
             log::warn!(
@@ -2754,12 +3174,45 @@ impl Engine {
                     continue;
                 }
             }
+            // The recorded stop must still be RESTING at the venue — a
+            // stop can be dropped after its `sendTx` was acknowledged, or
+            // cancelled outside the bot; in both cases state's id is a
+            // ghost and nothing else would ever re-place it.
+            let rests = match (&leg.stop_order_id, self.cfg.dry_run) {
+                (None, _) => Some(false),
+                (Some(_), true) => Some(true), // no venue book in DRY_RUN
+                (Some(id), false) => match self.lt.get_open_orders(&sym).await {
+                    Ok(resp) => Some(resp.orders.iter().any(|o| &o.order_id == id)),
+                    Err(e) => {
+                        log::warn!(
+                            "[STOP] {sym}: open-order read failed, stop check deferred: {e:?}"
+                        );
+                        None
+                    }
+                },
+            };
+            let Some(rests) = rests else { continue };
+            if !rests && leg.stop_order_id.is_some() {
+                log::error!(
+                    "[STOP] {sym}: recorded stop {:?} is NOT in the venue's order list — it stops counting as cover and is cancelled by id before the replacement",
+                    leg.stop_order_id
+                );
+                if let Some(l) = self.state.legs.get_mut(&sym) {
+                    // Demote, never delete: the read may be an empty WS
+                    // cache rather than proof the order is gone.
+                    l.stop_unconfirmed_id = l.stop_order_id.take();
+                    l.stop_level = None;
+                    l.stop_size = None;
+                }
+                self.persist();
+            }
             // Covered in size AND resting at the level the refreshed peak
             // calls for: a move whose cancel failed leaves the old, lower
             // trigger tracked, and only a retry here (place_stop cancels
             // it again first) brings it up.
             let want = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
-            if stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
+            if rests
+                && stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
                 && stop_is_current(
                     leg.stop_level,
                     leg.stop_size,
@@ -3224,6 +3677,7 @@ async fn main() -> Result<()> {
         last_margin_check: 0,
         last_margin: None,
         last_funding_poll: 0,
+        resolved_account_index: tokio::sync::Mutex::new(None),
         cfg,
     };
     // A live restart re-verifies the book against the venues before doing
@@ -3883,6 +4337,13 @@ mod tests {
         /// Live-path knob: record `create_advanced_trigger_order` arguments
         /// (style, slippage_bps, tpsl, reduce_only) instead of panicking.
         trigger_calls: Option<std::sync::Mutex<Vec<(String, Option<u32>, String, bool)>>>,
+        /// Live-path knob: the order id `get_open_orders` reports as
+        /// resting. `None` = the venue shows nothing (the 2026-09-22
+        /// failure: `sendTx` 200 but no order).
+        stop_rests: Option<String>,
+        /// Live-path knob: ids the venue reports as cancelled. A cancel is
+        /// only settled when its id shows up here.
+        canceled: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -3937,17 +4398,45 @@ mod tests {
             &self,
             _symbol: &str,
         ) -> Result<dex_connector::CanceledOrdersResponse, dex_connector::DexError> {
-            unimplemented!(
-                "QuoteOnly stub: get_canceled_orders must not be called on the DRY_RUN exit path"
-            )
+            if self.trigger_calls.is_none() {
+                unimplemented!(
+                    "QuoteOnly stub: get_canceled_orders must not be called on the DRY_RUN exit path"
+                )
+            }
+            Ok(dex_connector::CanceledOrdersResponse {
+                orders: self
+                    .canceled
+                    .iter()
+                    .map(|id| dex_connector::CanceledOrder {
+                        order_id: id.clone(),
+                        canceled_timestamp: 1,
+                    })
+                    .collect(),
+            })
         }
         async fn get_open_orders(
             &self,
-            _symbol: &str,
+            symbol: &str,
         ) -> Result<dex_connector::OpenOrdersResponse, dex_connector::DexError> {
-            unimplemented!(
-                "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
-            )
+            let Some(calls) = &self.trigger_calls else {
+                unimplemented!(
+                    "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
+                )
+            };
+            let _ = calls;
+            let orders = if let Some(id) = &self.stop_rests {
+                vec![dex_connector::OpenOrder {
+                    order_id: id.clone(),
+                    symbol: symbol.to_string(),
+                    side: OrderSide::Short,
+                    size: Decimal::ONE,
+                    price: Decimal::ONE,
+                    status: "open".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(dex_connector::OpenOrdersResponse { orders })
         }
         async fn get_balance(
             &self,
@@ -3968,6 +4457,14 @@ mod tests {
             &self,
         ) -> Result<Vec<dex_connector::PositionSnapshot>, dex_connector::DexError> {
             let Some(p) = self.perp_position else {
+                if self.trigger_calls.is_some() {
+                    // Live-path stub without a position knob: the account
+                    // snapshot is NOT ready (what dex-connector returns
+                    // until the first `account_all` of a connection).
+                    return Err(dex_connector::DexError::Transient(
+                        "positions not ready from websocket".into(),
+                    ));
+                }
                 unimplemented!(
                     "QuoteOnly stub: get_positions must not be called on the DRY_RUN exit path"
                 )
@@ -4198,6 +4695,7 @@ mod tests {
                     close_fetch_failures: 0,
                     cost_basis_unknown: false,
                     perp_cost_basis_unknown: false,
+                    stop_unconfirmed_id: None,
                 },
             );
         }
@@ -4206,6 +4704,8 @@ mod tests {
             cancel_fails: false,
             perp_position: None,
             trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
         });
         Engine {
             cfg: cfg.clone(),
@@ -4219,6 +4719,7 @@ mod tests {
             last_margin_check: 0,
             last_margin: None,
             last_funding_poll: 0,
+            resolved_account_index: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -4555,7 +5056,7 @@ mod tests {
     /// stop fired) but the stop cancel fails: the book must NOT reach
     /// Exited — a later ARM would clear the leg and forget a trigger that
     /// may still rest at the venue.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exit_with_an_unconfirmed_stop_cancel_stays_on_and_halts() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_exit_cancel_{}_{}",
@@ -4570,6 +5071,8 @@ mod tests {
             cancel_fails: true,
             perp_position: None,
             trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4594,7 +5097,7 @@ mod tests {
     /// Live exit where the venue shows a SHORT where the book has a long
     /// (manual action / unrecorded order): never "closed", no order sent
     /// for it, the book halts with the leg as recorded.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exit_refuses_a_reversed_venue_position() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_exit_rev_{}_{}",
@@ -4609,6 +5112,8 @@ mod tests {
             cancel_fails: false,
             perp_position: Some(-0.005),
             trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4649,6 +5154,8 @@ mod tests {
             cancel_fails: false,
             perp_position: Some(0.00505),
             trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4673,7 +5180,7 @@ mod tests {
     /// (type 3) with the configured protective slippage, reduce-only, SL:
     /// the connector's `Market` style sends execution price 0 and the
     /// Lighter signer rejects it (first live ARM, bot-strategy#895/#950).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_stop_is_a_slippage_controlled_stop_limit() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_stop_style_{}_{}",
@@ -4689,6 +5196,8 @@ mod tests {
             cancel_fails: false,
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: Some("stop-1".into()),
+            canceled: Vec::new(),
         });
         let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
         e.lt = dyn_venue;
@@ -4714,6 +5223,244 @@ mod tests {
         assert!(*reduce_only);
         assert_eq!(e.state.legs["BTC"].stop_order_id.as_deref(), Some("stop-1"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sendTx` returning 200 is not an order: when the venue never shows
+    /// the stop, `place_stop` must fail and record NOTHING, so the next
+    /// reconcile re-places it. (2026-09-22: two acknowledged stops never
+    /// rested while the bot kept their ids and stopped retrying.)
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledged_stop_the_venue_never_shows_is_not_recorded() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_ghost_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: Some(0.005), // a ready account snapshot
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None, // acknowledged, never rests
+            canceled: Vec::new(),
+        });
+        e.lt = venue;
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_order_id = None;
+            l.stop_level = None;
+            l.stop_size = None;
+        }
+        let err = e.place_stop("BTC").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("never appeared at the venue"),
+            "unexpected error: {err:#}"
+        );
+        let leg = &e.state.legs["BTC"];
+        assert_eq!(
+            leg.stop_order_id, None,
+            "a ghost stop must not count as cover"
+        );
+        assert_eq!(leg.stop_level, None);
+        assert_eq!(leg.stop_size, None);
+        assert!(
+            !stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size),
+            "the leg must read as uncovered so ensure_stops retries"
+        );
+        // ...but the id is kept: an empty WS-cache read is not proof the
+        // order is absent, so it must be cancellable by id later.
+        assert_eq!(
+            leg.stop_unconfirmed_id.as_deref(),
+            Some("stop-1"),
+            "an unconfirmed stop id must never be forgotten"
+        );
+        // It survives a restart, and the next placement cancels it first.
+        let back: State = load_json(&e.cfg.state_path).unwrap().unwrap();
+        assert_eq!(
+            back.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("stop-1")
+        );
+        // It is not settled while the venue cannot be read (this test's
+        // account endpoint is unreachable): absence is never assumed.
+        assert!(!e.drop_unconfirmed_stop("BTC").await);
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("stop-1"),
+            "an unreadable venue keeps the id"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancel that fails leaves the unconfirmed stop tracked: forgetting
+    /// an order that may be resting is the failure mode this guards.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_cancel_keeps_the_unconfirmed_stop_tracked() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_keep_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,
+            perp_position: None,
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        e.lt = venue;
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_unconfirmed_id = Some("ghost-7".into());
+        }
+        e.drop_unconfirmed_stop("BTC").await;
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("ghost-7")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While a stop with unknown state is still tracked, no replacement may
+    /// be sent (two live stops on one position) and an exit may not reach
+    /// Exited (a later ARM would inherit an orphaned reduce-only trigger).
+    #[tokio::test(start_paused = true)]
+    async fn an_unsettled_stop_blocks_replacement_and_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_block_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,         // the uncertain stop cannot be settled
+            perp_position: Some(0.005), // ready snapshot...
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: Some("ghost-9".into()), // ...and it shows the stop IS resting
+            canceled: Vec::new(),
+        });
+        e.lt = venue.clone();
+        e.hl = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.stop_order_id = None;
+            leg.stop_level = None;
+            leg.stop_size = None;
+            leg.stop_unconfirmed_id = Some("ghost-9".into());
+        }
+        // No replacement while it is unsettled.
+        let err = e.place_stop("BTC").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("could not be cancelled"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("ghost-9")
+        );
+        // And an exit must not reach Exited.
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+        }
+        e.exit_all("test").await;
+        assert_eq!(
+            e.state.mode,
+            Mode::On,
+            "must not be Exited with a live-maybe stop"
+        );
+        assert!(e.state.halted);
+        // The exposure is closed first: settling the stop polls the venue
+        // for up to ~2 min per symbol and must never delay the exit.
+        for (sym, leg) in &e.state.legs {
+            assert_eq!(leg.spot_size, 0.0, "{sym} spot must be closed");
+            assert_eq!(leg.perp_size, 0.0, "{sym} perp must be closed");
+            assert!(
+                leg.stop_unconfirmed_id.is_some(),
+                "{sym} keeps the unsettled stop id"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn venue_reads_resolve_the_instance_suffixed_account() {
+        // Same rule as config::lighter_env — the suffixed value wins, so
+        // this check can never read a different account than the one the
+        // connector trades on.
+        std::env::set_var("BULL_HOLDER_TEST_IDX", "shared");
+        std::env::set_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER", "dedicated");
+        assert_eq!(
+            lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder").as_deref(),
+            Some("dedicated")
+        );
+        assert_eq!(
+            lighter_env("BULL_HOLDER_TEST_IDX", "other").as_deref(),
+            Some("shared")
+        );
+        std::env::set_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER", "");
+        assert_eq!(
+            lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder").as_deref(),
+            Some("shared"),
+            "an empty suffixed value falls back, it is not a value"
+        );
+        std::env::remove_var("BULL_HOLDER_TEST_IDX");
+        std::env::remove_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER");
+        assert_eq!(lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder"), None);
+    }
+
+    #[test]
+    fn resting_orders_are_read_from_the_account_endpoint() {
+        let flat = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0},
+            {"symbol":"ETH","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&flat, "BTC"), Some(0));
+        let resting = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":1,"position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&resting, "BTC"), Some(1));
+        let tied = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":1,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&tied, "BTC"), Some(1));
+        // An account-wide pending order counts: it may be this stop.
+        let pending = serde_json::json!({"accounts":[{"pending_order_count":1,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&pending, "BTC"), Some(1));
+        // A count that is missing, or not a number, makes the response
+        // unreadable — it must never settle as "zero orders".
+        let missing = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&missing, "BTC"), None);
+        let wrong_type = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":"0","position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&wrong_type, "BTC"), None);
+        let no_account_count = serde_json::json!({"accounts":[{"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&no_account_count, "BTC"), None);
+        // An omitted market row settles only against account-wide counts:
+        // all zero means nothing rests anywhere, so nothing rests here.
+        let omitted_flat = serde_json::json!({"accounts":[{"total_order_count":0,
+            "total_isolated_order_count":0,"pending_order_count":0,
+            "positions":[{"symbol":"ETH","open_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&omitted_flat, "BTC"), Some(0));
+        // ...but not while the account carries orders somewhere.
+        let omitted_busy = serde_json::json!({"accounts":[{"total_order_count":1,
+            "total_isolated_order_count":0,"pending_order_count":0,
+            "positions":[{"symbol":"ETH","open_order_count":1}]}]});
+        assert_eq!(resting_orders_for(&omitted_busy, "BTC"), Some(1));
+        // Neither the market row nor a count: unknown, NOT zero.
+        let other =
+            serde_json::json!({"accounts":[{"positions":[{"symbol":"ETH","open_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&other, "BTC"), None);
+        assert_eq!(
+            resting_orders_for(&serde_json::json!({"code":500}), "BTC"),
+            None
+        );
     }
 
     fn test_config() -> Config {
@@ -4743,6 +5490,9 @@ mod tests {
             stop_slippage_bps: 500,
             reconcile_tolerance_pct: 2.0,
             reconcile_every_secs: 600,
+            lighter_account_url: "http://127.0.0.1:1".into(),
+            lighter_account_index: "1".into(),
+            lighter_wallet_address: String::new(),
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
             add_path: dir.join("ADD"),
