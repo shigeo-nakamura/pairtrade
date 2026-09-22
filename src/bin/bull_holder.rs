@@ -3880,6 +3880,9 @@ mod tests {
         /// Live-path knob: signed perp position `get_positions` reports for
         /// every symbol (`None` = the call is unexpected).
         perp_position: Option<f64>,
+        /// Live-path knob: record `create_advanced_trigger_order` arguments
+        /// (style, slippage_bps, tpsl, reduce_only) instead of panicking.
+        trigger_calls: Option<std::sync::Mutex<Vec<(String, Option<u32>, String, bool)>>>,
     }
 
     #[async_trait::async_trait]
@@ -4041,13 +4044,28 @@ mod tests {
             _side: OrderSide,
             _trigger_px: Decimal,
             _limit_px: Option<Decimal>,
-            _order_style: dex_connector::TriggerOrderStyle,
-            _slippage_bps: Option<u32>,
-            _tpsl: dex_connector::TpSl,
-            _reduce_only: bool,
+            order_style: dex_connector::TriggerOrderStyle,
+            slippage_bps: Option<u32>,
+            tpsl: dex_connector::TpSl,
+            reduce_only: bool,
             _expiry_secs: Option<u64>,
         ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
-            unimplemented!("QuoteOnly stub: create_advanced_trigger_order must not be called on the DRY_RUN exit path")
+            let Some(calls) = &self.trigger_calls else {
+                unimplemented!("QuoteOnly stub: create_advanced_trigger_order must not be called on the DRY_RUN exit path")
+            };
+            calls.lock().unwrap().push((
+                format!("{order_style:?}"),
+                slippage_bps,
+                format!("{tpsl:?}"),
+                reduce_only,
+            ));
+            Ok(dex_connector::CreateOrderResponse {
+                order_id: "stop-1".into(),
+                exchange_order_id: None,
+                ordered_price: Decimal::ONE,
+                ordered_size: _size,
+                client_order_id: None,
+            })
         }
         async fn create_order_taker_ioc(
             &self,
@@ -4101,6 +4119,9 @@ mod tests {
             &self,
             _symbol: Option<String>,
         ) -> Result<(), dex_connector::DexError> {
+            if self.trigger_calls.is_some() {
+                return Ok(());
+            }
             unimplemented!(
                 "QuoteOnly stub: cancel_all_orders must not be called on the DRY_RUN exit path"
             )
@@ -4184,6 +4205,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: false,
             perp_position: None,
+            trigger_calls: None,
         });
         Engine {
             cfg: cfg.clone(),
@@ -4547,6 +4569,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: true,
             perp_position: None,
+            trigger_calls: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4585,6 +4608,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: false,
             perp_position: Some(-0.005),
+            trigger_calls: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4624,6 +4648,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: false,
             perp_position: Some(0.00505),
+            trigger_calls: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4641,6 +4666,53 @@ mod tests {
             e.state.pending_order.is_some(),
             "marker kept for the operator"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live Lighter stop must be the slippage-controlled stop-LIMIT
+    /// (type 3) with the configured protective slippage, reduce-only, SL:
+    /// the connector's `Market` style sends execution price 0 and the
+    /// Lighter signer rejects it (first live ARM, bot-strategy#895/#950).
+    #[tokio::test]
+    async fn live_stop_is_a_slippage_controlled_stop_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_style_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        e.cfg.stop_slippage_bps = 700;
+        let venue = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: None,
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+        });
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue;
+        // No stop tracked yet → place_stop must create one.
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_order_id = None;
+            l.stop_level = None;
+            l.stop_size = None;
+        }
+        e.place_stop("BTC").await.unwrap();
+        let calls = venue
+            .trigger_calls
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(calls.len(), 1);
+        let (style, slip, tpsl, reduce_only) = &calls[0];
+        assert_eq!(style, "MarketWithSlippageControl");
+        assert_eq!(*slip, Some(700));
+        assert_eq!(tpsl, "Sl");
+        assert!(*reduce_only);
+        assert_eq!(e.state.legs["BTC"].stop_order_id.as_deref(), Some("stop-1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
