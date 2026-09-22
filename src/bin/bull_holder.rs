@@ -1814,8 +1814,11 @@ impl Engine {
     /// per candidate). `None` when no key index is configured or none
     /// matches, which leaves the venue checks inconclusive.
     async fn account_for_api_key(&self, candidates: &[u64]) -> Option<u64> {
-        let key_index = lighter_env("LIGHTER_API_KEY_INDEX", &self.cfg.instance_id)?;
+        // Same default as the connector's config loader: slot 0.
+        let key_index = lighter_env("LIGHTER_API_KEY_INDEX", &self.cfg.instance_id)
+            .unwrap_or_else(|| "0".to_string());
         let base = self.cfg.lighter_account_url.trim_end_matches('/');
+        let mut matched: Vec<u64> = Vec::new();
         for &idx in candidates {
             let url =
                 format!("{base}/api/v1/apikeys?account_index={idx}&api_key_index={key_index}");
@@ -1834,14 +1837,24 @@ impl Engine {
                 .and_then(|k| k.as_array())
                 .is_some_and(|k| !k.is_empty());
             if v.get("code").and_then(|c| c.as_u64()) == Some(200) && has_key {
-                return Some(idx);
+                matched.push(idx);
             }
         }
-        log::warn!(
-            "[STOP] none of the wallet's {} accounts carries API key index {key_index}; venue order checks are inconclusive",
-            candidates.len()
-        );
-        None
+        match matched.as_slice() {
+            [only] => Some(*only),
+            // Zero matches, or several accounts with a key in the same
+            // slot: this probe cannot tell them apart (the bot's own
+            // public key is KMS ciphertext here, not comparable material),
+            // and guessing could point the checks at another account.
+            _ => {
+                log::warn!(
+                    "[STOP] {} of the wallet's {} accounts carry API key index {key_index}; set LIGHTER_ACCOUNT_INDEX to name the one this bot trades — venue order checks are inconclusive until then",
+                    matched.len(),
+                    candidates.len()
+                );
+                None
+            }
+        }
     }
 
     /// Orders resting for `symbol` according to Lighter's own account
