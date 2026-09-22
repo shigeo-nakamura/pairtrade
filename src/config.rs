@@ -276,6 +276,23 @@ fn suffixed_env(name: &str, instance_id: Option<&str>) -> Option<String> {
 /// - `HYPERLIQUID_MAX_TAKER_SLIPPAGE_BPS` (default 50)
 /// - `HYPERLIQUID_MAX_TAKER_BOOK_AGE_MS` (default 5000)
 #[cfg(feature = "hyperliquid-sdk")]
+/// The decrypted signer key is accepted in either form `scripts/encrypt.py`
+/// produces: the 64-hex string (encrypted as text) or the raw 32-byte key
+/// (encrypted from a `0x…` argument, which the script hex-decodes). Both
+/// become the hex string `LocalWallet::from_str` parses.
+#[cfg(feature = "hyperliquid-sdk")]
+fn signer_key_from_decrypted(bytes: Vec<u8>) -> Result<String, ConfigError> {
+    if bytes.len() == 32 {
+        return Ok(bytes.iter().map(|b| format!("{b:02x}")).collect());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        ConfigError::OtherError(
+            "HYPERLIQUID_SIGNER_PRIVATE_KEY is neither a 32-byte key nor utf-8 text".to_owned(),
+        )
+    })?;
+    Ok(text.trim().to_owned())
+}
+
 pub async fn get_hyperliquid_account_config_from_env(
     instance_id: Option<&str>,
 ) -> Result<dex_connector::HyperliquidAccountConfig, ConfigError> {
@@ -304,9 +321,7 @@ pub async fn get_hyperliquid_account_config_from_env(
                 .map_err(|_| {
                     ConfigError::OtherError("decrypt HYPERLIQUID_SIGNER_PRIVATE_KEY".to_owned())
                 })?;
-            Some(String::from_utf8(bytes).map_err(|_| {
-                ConfigError::OtherError("HYPERLIQUID_SIGNER_PRIVATE_KEY is not utf-8".to_owned())
-            })?)
+            Some(signer_key_from_decrypted(bytes)?)
         }
         (None, None) => None,
     };
@@ -353,4 +368,21 @@ pub async fn get_hyperliquid_account_config_from_env(
         max_taker_slippage_bps,
         max_taker_book_age_ms,
     })
+}
+
+#[cfg(all(test, feature = "hyperliquid-sdk"))]
+mod hl_signer_key_tests {
+    use super::signer_key_from_decrypted;
+
+    #[test]
+    fn raw_32_bytes_and_hex_text_both_yield_the_hex_key() {
+        let raw: Vec<u8> = (0u8..32).collect();
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert_eq!(signer_key_from_decrypted(raw).unwrap(), hex);
+        assert_eq!(
+            signer_key_from_decrypted(format!(" {hex}\n").into_bytes()).unwrap(),
+            hex
+        );
+        assert!(signer_key_from_decrypted(vec![0xff, 0xfe, 0x00]).is_err());
+    }
 }
