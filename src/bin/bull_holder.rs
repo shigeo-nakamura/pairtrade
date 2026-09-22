@@ -1,4 +1,4 @@
-//! Bull-mode holder (bot-strategy#893 / #894) — PROTOTYPE, DRY_RUN only.
+//! Bull-mode holder (bot-strategy#893 / #894 / #895).
 //!
 //! Operator-declared regime, β with discipline. The bot never decides whether
 //! a bull market is on: the operator ARMs it. While armed it holds, per symbol,
@@ -66,15 +66,17 @@
 //! DRY_RUN evaluates both checks but never blocks on them (the DRY_RUN
 //! account holds no real collateral).
 //!
-//! KNOWN GAPS before any live use (bot-strategy#895 rollout gates):
-//! - `BULL_HOLDER_DRY_RUN=false` is refused at startup (code change to lift).
-//! - Lighter trigger orders have not been exercised live by pairtrade.
+//! Live flip (bot-strategy#895, 2026-09-21): `BULL_HOLDER_DRY_RUN=false` is
+//! accepted after the DRY_RUN observation (14 d, daily evals matched the
+//! replay) and the operator drills (KILL_SWITCH, DISARM, injected HALT →
+//! RISK_ACK → ARM) passed with the owner's explicit small-live approval.
+//! Still unverified until the first live ARM (bot-strategy#950): whether
+//! Lighter reports resting trigger orders on the open-orders channel, so
+//! `stop_covers` trusts the tracked `stop_order_id` instead of cross-checking.
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{FixedOffset, TimeZone, Timelike, Utc};
-use debot::directional::{
-    append_jsonl, config_fingerprint, load_json, persist_json, refuse_live, Sentinels,
-};
+use debot::directional::{append_jsonl, config_fingerprint, load_json, persist_json, Sentinels};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{DexConnector, FundingPayment, OrderSide, TpSl, TriggerOrderStyle};
 use env_logger::Builder;
@@ -146,11 +148,21 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(default)
+/// `BULL_HOLDER_DRY_RUN`, parsed strictly: only an explicit `false`/`0`/`no`
+/// goes live. `env_bool` reads every unrecognised value as `false`, which
+/// here would mean a typo (`ture`, an empty export) silently builds
+/// execution-capable connectors — the one switch that must never fail open.
+fn parse_dry_run(raw: Option<&str>) -> Result<bool> {
+    let Some(raw) = raw else {
+        return Ok(true);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        other => bail!(
+            "BULL_HOLDER_DRY_RUN={other:?} is not a recognised value (true/false only); refusing to guess"
+        ),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +255,7 @@ impl Config {
         }
         let cfg = Self {
             instance_id,
-            dry_run: env_bool("BULL_HOLDER_DRY_RUN", true),
+            dry_run: parse_dry_run(std::env::var("BULL_HOLDER_DRY_RUN").ok().as_deref())?,
             symbols,
             hl_spot_market,
             equity_usd: env_f64("BULL_HOLDER_EQUITY_USD", 1_000.0),
@@ -399,6 +411,144 @@ fn leg_notionals(
         equity_usd * spot_fraction / n,
         equity_usd * perp_fraction / n,
     )
+}
+
+/// Base token of a Hyperliquid spot market string (`UBTC/USDC` → `UBTC`).
+fn spot_base(market: &str) -> String {
+    market.split('/').next().unwrap_or("").to_ascii_uppercase()
+}
+
+/// How long a live fill is given to show up in the venue's holding before
+/// the observed (possibly partial) change is taken as final.
+const FILL_CONFIRM_ATTEMPTS: u32 = 8;
+const FILL_CONFIRM_STEP_MS: u64 = 1_500;
+
+/// The observed change covers the request (f64 round-trips and a
+/// base-denominated fee are absorbed by the tolerance).
+fn fill_complete(observed: f64, requested: f64) -> bool {
+    requested <= 0.0 || observed >= requested * (1.0 - FILL_COMPLETE_TOL)
+}
+const FILL_COMPLETE_TOL: f64 = 0.005;
+
+/// A partially filled leg whose remainder is below the venue minimum is
+/// marked done (it would otherwise block the ladder forever). Returns true
+/// when it did so.
+fn remainder_is_dust(
+    filled_usd: f64,
+    remainder: Decimal,
+    min_order: f64,
+    progress: &mut BTreeMap<String, LegProgress>,
+    sym: &str,
+    spot: bool,
+) -> bool {
+    if filled_usd <= 0.0 || remainder.to_f64().unwrap_or(0.0) >= min_order {
+        return false;
+    }
+    let pr = progress.entry(sym.to_string()).or_default();
+    if spot {
+        pr.spot_done = true;
+    } else {
+        pr.perp_done = true;
+    }
+    true
+}
+
+/// A holding the book does not carry counts as flat below this notional.
+const RECONCILE_DUST_USD: f64 = 5.0;
+
+/// Startup verification of the book against the venues: retries for
+/// transient read failures before halting.
+const STARTUP_RECONCILE_ATTEMPTS: u32 = 6;
+const STARTUP_RECONCILE_STEP_SECS: u64 = 10;
+
+/// An unsettled order's holding must sit exactly on its recorded baseline
+/// (f64 round-trips through state.json aside) to be declared "no fill".
+const PENDING_RESOLVE_EPS: f64 = 1e-9;
+
+/// Combine the order acknowledgement with the confirmed holding change into
+/// the fill to record. The venue's holding is authoritative:
+/// - ack Ok, change observed → that change (partial fills are recorded as
+///   what they are; the caller logs the shortfall);
+/// - ack Err, change observed → the order DID (at least partly) fill before
+///   the error: record it, never retry the full size;
+/// - ack Ok, no change → the venue never showed the fill: unknown, so an
+///   error (the caller halts; a RISK_ACK retry re-reads the holding first);
+/// - ack Err, no change → the error, no exposure taken;
+/// - holding unreadable → error regardless of the ack.
+/// Did the venue definitively NOT accept the order? Only an application-
+/// level rejection or a failure before submission counts. A transport
+/// timeout, a parse failure on the response, or a "reconcile required"
+/// error may all follow a venue-side acceptance, and a fill can then show
+/// up after the confirmation window — such an order stays pending.
+fn order_rejected_definitively(e: &dex_connector::DexError) -> bool {
+    use dex_connector::DexError::*;
+    matches!(
+        e,
+        ServerResponse(_)
+            | Permanent(_)
+            | InvalidInput { .. }
+            | UpcomingMaintenance
+            | ApiKeyRegistrationRequired
+            | RateLimited { .. }
+            | NoConnection
+    )
+}
+
+/// Is the outcome of a live order settled? Only when the holding could be
+/// read AND (it changed, or the order was definitively rejected and the
+/// holding did not change).
+fn order_outcome_known(acked: bool, rejected_definitively: bool, observed: Option<f64>) -> bool {
+    match observed {
+        None => false,
+        Some(o) if o > 0.0 => true,
+        Some(_) => !acked && rejected_definitively,
+    }
+}
+
+fn settle_fill(
+    what: &str,
+    requested: Decimal,
+    sent: Result<dex_connector::CreateOrderResponse>,
+    observed: Result<f64>,
+) -> Result<Decimal> {
+    let observed = observed.with_context(|| {
+        format!("{what}: exposure after the order is UNKNOWN (reconcile before any retry)")
+    })?;
+    let filled = Decimal::from_f64(observed).unwrap_or(Decimal::ZERO);
+    match sent {
+        Ok(_) if observed > 0.0 => {
+            if !fill_complete(observed, requested.to_f64().unwrap_or(0.0)) {
+                log::warn!("[FILL] {what}: PARTIAL — requested {requested}, confirmed {filled}");
+            }
+            Ok(filled)
+        }
+        Ok(_) => bail!(
+            "{what}: order acknowledged but the venue holding did not change within the confirmation window; treating the fill as UNKNOWN (reconcile before any retry)"
+        ),
+        Err(e) if observed > 0.0 => {
+            log::error!(
+                "[FILL] {what}: order call failed but the venue shows {filled} filled — recording it, NOT retrying: {e:?}"
+            );
+            Ok(filled)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What is left of a leg after a close that the venue confirmed as `closed`
+/// of `orig`. Only residue worth less than `RECONCILE_DUST_USD` at `price`
+/// is dust (fees, size rounding) and reads as 0; without a price nothing
+/// is dust. A percentage would let a 98 % fill of a large leg "close" it
+/// with a stop-less remainder left at the venue.
+fn remaining_after_close(orig: f64, closed: f64, price: Option<f64>) -> f64 {
+    let remaining = (orig - closed).max(0.0);
+    if orig <= 0.0 || remaining <= 0.0 {
+        return 0.0;
+    }
+    match price {
+        Some(p) if p > 0.0 && remaining * p < RECONCILE_DUST_USD => 0.0,
+        _ => remaining,
+    }
 }
 
 /// Round a notional/price size DOWN to the venue's size decimals.
@@ -762,6 +912,14 @@ struct LegState {
     last_close_date: Option<String>,
     last_close: Option<f64>,
     close_fetch_failures: u32,
+    /// The leg's cost basis no longer describes what is held: an exit found
+    /// the venue holding something other than the book and closed only part
+    /// of it. PnL for this leg is unknown from here until it is flat.
+    #[serde(default)]
+    cost_basis_unknown: bool,
+    /// Same, for the perp leg (the two holdings are independent).
+    #[serde(default)]
+    perp_cost_basis_unknown: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -816,6 +974,50 @@ struct State {
     /// re-read window (`FUNDING_REREAD_SECS`).
     #[serde(default)]
     funding_seen: BTreeMap<i64, i64>,
+    /// Execution mode that created the current book (`Some(true)` = DRY_RUN
+    /// simulated fills, `Some(false)` = live venue fills). Set when the book
+    /// opens, checked at startup: a book must only ever be operated in the
+    /// mode that created it — a live book loaded under DRY_RUN would be
+    /// "closed" by simulated sells while the venue positions and the stop
+    /// stay open; a simulated book loaded live would send real sells for
+    /// holdings that do not exist. `None` = flat, or a pre-#895 file.
+    #[serde(default)]
+    book_dry_run: Option<bool>,
+    /// See [`PendingOrder`].
+    #[serde(default)]
+    pending_order: Option<PendingOrder>,
+}
+
+/// Does the persisted book carry exposure that the process must not touch
+/// in the wrong execution mode?
+fn book_is_open(state: &State) -> bool {
+    state.mode == Mode::On
+        || state.pending_order.is_some()
+        || state
+            .legs
+            .values()
+            .any(|l| l.spot_size > 0.0 || l.perp_size > 0.0)
+}
+
+/// Startup gate for the persisted state vs the configured execution mode.
+/// `Ok(())` = safe to operate; `Err` = refuse to start (never "fix" it here:
+/// the operator must DISARM under the mode that created the book, or clear
+/// the state file by hand after confirming the venues are flat).
+fn check_book_mode(state: &State, dry_run: bool) -> Result<()> {
+    if !book_is_open(state) {
+        return Ok(());
+    }
+    match state.book_dry_run {
+        Some(created_dry_run) if created_dry_run == dry_run => Ok(()),
+        Some(created_dry_run) => bail!(
+            "state.json holds an open book created with dry_run={created_dry_run} but this process runs dry_run={dry_run}; \
+             DISARM it under the original mode (or clear the state file after confirming the venues are flat) before switching"
+        ),
+        None => bail!(
+            "state.json holds an open book with no recorded execution mode (pre-#895 file); \
+             DISARM it under the mode that created it before running this build"
+        ),
+    }
 }
 
 /// How far behind the last successful read the next funding-history read
@@ -878,10 +1080,36 @@ fn apply_funding_payments(
     added
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq)]
 struct LegProgress {
     spot_done: bool,
     perp_done: bool,
+    /// Notional (USD at the fill quote) already filled for this tranche's
+    /// legs. A partial fill halts the ladder with these recorded; the
+    /// RISK_ACK retry orders only the remainder, never the full size again.
+    #[serde(default)]
+    spot_usd: f64,
+    #[serde(default)]
+    perp_usd: f64,
+}
+
+/// A live order whose outcome has not been settled against the venue yet.
+/// Written (and persisted) BEFORE the order is sent, cleared once the fill
+/// was confirmed or a no-fill was confirmed. Anything else — a crash, an
+/// unreadable holding, an acknowledged order the venue never showed — leaves
+/// it in place, and no further order is sent for the book until an
+/// account-wide reconcile has compared every configured symbol with the
+/// venues (`reconcile_before_orders`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct PendingOrder {
+    venue: String,
+    symbol: String,
+    side: String,
+    requested: f64,
+    /// Venue holding read just before the order (the baseline the
+    /// confirmation compares against).
+    holding_before: f64,
+    ts: u64,
 }
 
 // ---------------------------------------------------------------------
@@ -967,40 +1195,252 @@ impl Engine {
     }
 
     // --------------------------------------------------------------- orders
+    //
+    // Live fills are CONFIRMED from the venue's own holding, never inferred
+    // from the order acknowledgement: `CreateOrderResponse.ordered_size` is
+    // what was requested, an IOC can fill partially, and a timeout can land
+    // after the venue accepted the order. Each live order is bracketed by a
+    // read of the holding it changes (HL spot base balance / Lighter perp
+    // position) and the recorded fill is the observed change. An order
+    // whose effect cannot be read is reported as an error so the caller
+    // halts — it must never be retried on the assumption that nothing filled.
 
-    /// Hyperliquid spot IOC (buy or sell) — dry-run returns the requested size.
-    async fn hl_spot_ioc(&self, market: &str, size: Decimal, side: OrderSide) -> Result<Decimal> {
+    /// Hyperliquid spot holding of the market's base token.
+    async fn hl_spot_holding(&self, base: &str) -> Result<f64> {
+        let b = self
+            .hl
+            .get_combined_balance()
+            .await
+            .map_err(|e| anyhow!("HL get_combined_balance: {e:?}"))?;
+        Ok(b.spot_assets
+            .iter()
+            .filter(|a| a.symbol.eq_ignore_ascii_case(base))
+            .map(|a| a.balance.to_f64().unwrap_or(0.0))
+            .sum())
+    }
+
+    /// Lighter signed perp position for the symbol (long > 0).
+    async fn lt_perp_holding(&self, symbol: &str) -> Result<f64> {
+        let pos = self
+            .lt
+            .get_positions()
+            .await
+            .map_err(|e| anyhow!("Lighter get_positions: {e:?}"))?;
+        Ok(pos
+            .iter()
+            .filter(|p| p.symbol.eq_ignore_ascii_case(symbol))
+            .map(|p| p.size.to_f64().unwrap_or(0.0) * if p.sign < 0 { -1.0 } else { 1.0 })
+            .sum())
+    }
+
+    /// Hyperliquid spot IOC (buy or sell). Returns the CONFIRMED fill (change
+    /// in the base holding, net of any base-denominated fee); dry-run returns
+    /// the requested size.
+    async fn hl_spot_ioc(
+        &mut self,
+        market: &str,
+        size: Decimal,
+        side: OrderSide,
+    ) -> Result<Decimal> {
         if self.cfg.dry_run {
             log::info!("[DRY_RUN] HL spot IOC {side} {market} size={size}");
             return Ok(size);
         }
-        let resp = self
+        let base = spot_base(market);
+        let before = self.hl_spot_holding(&base).await.with_context(|| {
+            format!("{market}: pre-order holding unreadable, NOT ordering (fill could not be confirmed)")
+        })?;
+        self.mark_pending("hyperliquid", market, side, size, before)?;
+        let sent = self
             .hl
             .create_order_taker_ioc(market, size, side, self.cfg.hl_taker_slippage_bps, false)
-            .await
-            .with_context(|| format!("HL spot IOC {side} {market}"))?;
-        Ok(resp.ordered_size)
+            .await;
+        let rejected = sent
+            .as_ref()
+            .err()
+            .map_or(false, order_rejected_definitively);
+        let sent = sent.map_err(|e| anyhow!("HL spot IOC {side} {market}: {e:?}"));
+        let observed = self
+            .confirm_fill(
+                || self.hl_spot_holding(&base),
+                before,
+                side,
+                size.to_f64().unwrap_or(0.0),
+            )
+            .await;
+        self.settle_pending(&sent, rejected, &observed);
+        settle_fill(&format!("HL spot {side} {market}"), size, sent, observed)
     }
 
     /// Lighter perp taker (price=None → IOC with protection price; the same
-    /// path every pairtrade taker caller uses).
+    /// path every pairtrade taker caller uses). Returns the CONFIRMED fill
+    /// (change in the venue position); dry-run returns the requested size.
     async fn lt_perp_taker(
-        &self,
+        &mut self,
         symbol: &str,
         size: Decimal,
         side: OrderSide,
         reduce_only: bool,
     ) -> Result<Decimal> {
         if self.cfg.dry_run {
-            log::info!("[DRY_RUN] Lighter perp taker {side} {symbol} size={size} reduce_only={reduce_only}");
+            log::info!(
+                "[DRY_RUN] Lighter perp taker {side} {symbol} size={size} reduce_only={reduce_only}"
+            );
             return Ok(size);
         }
-        let resp = self
+        let before = self.lt_perp_holding(symbol).await.with_context(|| {
+            format!("{symbol}: pre-order position unreadable, NOT ordering (fill could not be confirmed)")
+        })?;
+        self.mark_pending("lighter", symbol, side, size, before)?;
+        let sent = self
             .lt
             .create_order(symbol, size, side, None, None, reduce_only, None)
-            .await
-            .with_context(|| format!("Lighter perp {side} {symbol}"))?;
-        Ok(resp.ordered_size)
+            .await;
+        let rejected = sent
+            .as_ref()
+            .err()
+            .map_or(false, order_rejected_definitively);
+        let sent = sent.map_err(|e| anyhow!("Lighter perp {side} {symbol}: {e:?}"));
+        let observed = self
+            .confirm_fill(
+                || self.lt_perp_holding(symbol),
+                before,
+                side,
+                size.to_f64().unwrap_or(0.0),
+            )
+            .await;
+        self.settle_pending(&sent, rejected, &observed);
+        settle_fill(
+            &format!("Lighter perp {side} {symbol}"),
+            size,
+            sent,
+            observed,
+        )
+    }
+
+    /// Persist the order about to be sent, so a crash between send and
+    /// confirmation leaves a trace that blocks further orders until the
+    /// book has been reconciled against the venues.
+    fn mark_pending(
+        &mut self,
+        venue: &str,
+        symbol: &str,
+        side: OrderSide,
+        size: Decimal,
+        before: f64,
+    ) -> Result<()> {
+        self.state.pending_order = Some(PendingOrder {
+            venue: venue.to_string(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            requested: size.to_f64().unwrap_or(0.0),
+            holding_before: before,
+            ts: now_secs(),
+        });
+        // The book's provenance starts with its first order, filled or not
+        // — stamped on every new cycle, so a previous cycle's mode never
+        // survives into this one (the startup gate would otherwise refuse
+        // a live restart after a crash between this order and open_book).
+        if self.state.mode != Mode::On {
+            self.state.book_dry_run = Some(self.cfg.dry_run);
+        }
+        // Fail closed: the marker is the only thing that makes a crash
+        // between here and the confirmation recoverable. Unwritten → no
+        // order.
+        persist_json(&self.cfg.state_path, &self.state).with_context(|| {
+            format!("{symbol}: could not persist the pending-order marker, NOT ordering")
+        })?;
+        Ok(())
+    }
+
+    /// Clear the pending marker only when the outcome is KNOWN: the holding
+    /// was readable and either changed, or the venue definitively rejected
+    /// the order and nothing changed. An acknowledged order the venue never
+    /// showed, a timed-out submission, or an unreadable holding keeps it.
+    fn settle_pending(
+        &mut self,
+        sent: &Result<dex_connector::CreateOrderResponse>,
+        rejected_definitively: bool,
+        observed: &Result<f64>,
+    ) {
+        let observed_fill = observed.as_ref().ok().copied();
+        if order_outcome_known(sent.is_ok(), rejected_definitively, observed_fill) {
+            // A confirmed NO-fill has nothing to record: clear now. A
+            // confirmed fill stays marked until the caller has persisted
+            // the leg (`clear_pending_after_record`): a crash in between
+            // would otherwise leave real exposure with no leg and no
+            // marker, i.e. a "flat" book.
+            if observed_fill.unwrap_or(0.0) <= 0.0 {
+                self.state.pending_order = None;
+            }
+        } else {
+            log::error!(
+                "[FILL] outcome of {:?} is UNKNOWN — it stays recorded as pending; no further order until the book is reconciled",
+                self.state.pending_order
+            );
+        }
+        self.persist();
+    }
+
+    /// The fill an order produced is now in state: the marker can go. Called
+    /// right after the leg is persisted, so the two writes are adjacent and
+    /// a crash between them leaves the (safe) marker, not a flat book.
+    fn clear_pending_after_record(&mut self) {
+        if self.state.pending_order.take().is_some() {
+            self.persist();
+        }
+    }
+
+    /// Re-read the holding until it reflects the whole requested change or
+    /// the wait budget runs out; returns the change observed in the order's
+    /// direction (never negative). `Err` only if the holding could not be
+    /// read at all — the exposure is then unknown, not zero.
+    async fn confirm_fill<F, Fut>(
+        &self,
+        read: F,
+        before: f64,
+        side: OrderSide,
+        requested: f64,
+    ) -> Result<f64>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<f64>>,
+    {
+        let dir = if side == OrderSide::Short { -1.0 } else { 1.0 };
+        let mut last_err = None;
+        // Best successful observation so far. A read failure AFTER a
+        // successful read must not discard what was already seen: the
+        // exposure is known to be at least that, and returning an error
+        // instead would route the caller to the unknown-fill path.
+        let mut observed: Option<f64> = None;
+        for attempt in 0..FILL_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(FILL_CONFIRM_STEP_MS)).await;
+            match read().await {
+                Ok(after) => {
+                    let seen = ((after - before) * dir).max(0.0);
+                    observed = Some(observed.map_or(seen, |o: f64| o.max(seen)));
+                    if fill_complete(seen, requested) {
+                        return Ok(seen);
+                    }
+                    log::debug!(
+                        "[FILL] attempt {}: observed {seen} of {requested}, waiting",
+                        attempt + 1
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[FILL] holding re-read failed (attempt {}): {e:?}",
+                        attempt + 1
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        match (observed, last_err) {
+            (Some(o), _) => Ok(o),
+            (None, Some(e)) => Err(e).context("holding unreadable after the order was sent"),
+            (None, None) => Ok(0.0),
+        }
     }
 
     /// Rest (or move) the Lighter exchange-side stop for the perp leg.
@@ -1044,6 +1484,23 @@ impl Engine {
                     prior_cancel_failed = true;
                 }
             }
+            if !prior_cancel_failed {
+                // The cancel is confirmed: drop the old stop from state NOW,
+                // before the replacement is attempted. If creating it fails
+                // below, state must show the leg uncovered so `ensure_stops`
+                // retries — keeping the cancelled id would read as covered
+                // (same level, same size) and nothing would ever retry.
+                leg.stop_order_id = None;
+                leg.stop_level = None;
+                leg.stop_size = None;
+                if let Some(l) = self.state.legs.get_mut(symbol) {
+                    l.stop_order_id = None;
+                    l.stop_level = None;
+                    l.stop_size = None;
+                    l.lighter_peak = leg.lighter_peak;
+                }
+                self.persist();
+            }
         }
         if prior_cancel_failed {
             // Persist the refreshed peak but leave the old stop_order_id/
@@ -1060,6 +1517,19 @@ impl Engine {
         let order_id = if self.cfg.dry_run {
             format!("dry-run-stop-{}", now_secs())
         } else {
+            // Sweep whatever else rests on this symbol before resting the
+            // new stop: a trigger submission whose response was lost (timed
+            // out after acceptance) never got an id recorded, and this is
+            // the only way it is ever removed. The account is dedicated and
+            // the bot rests nothing but this stop, so a sweep costs nothing.
+            // Whether Lighter's cancel-all covers trigger orders is part of
+            // the #950 live check; a failed sweep defers the placement.
+            self.lt
+                .cancel_all_orders(Some(symbol.to_string()))
+                .await
+                .map_err(|e| {
+                    anyhow!("Lighter cancel-all on {symbol} before resting a stop: {e:?}")
+                })?;
             // `side` is the POSITION side for Lighter's TP/SL helper (long
             // position → sell stop).
             let resp = self
@@ -1116,6 +1586,10 @@ impl Engine {
             l.stop_level = None;
             l.stop_size = None;
         }
+        // Persist now, before the (slow) exit orders that follow: a crash
+        // in between would otherwise restart with the cancelled id still
+        // trusted as cover.
+        self.persist();
     }
 
     // ------------------------------------------------- collateral guard
@@ -1495,7 +1969,9 @@ impl Engine {
     /// Buy one tranche (`state.tranche_*_usd` per symbol) of both legs for
     /// every symbol. The first call of a cycle creates the legs and flips the
     /// book to On; later calls add to them. Each fill is persisted as it
-    /// happens so a failure partway never leaves exposure unrecorded.
+    /// happens so a failure partway never leaves exposure unrecorded, and
+    /// `tranche_progress` carries the notional filled per leg so a retry
+    /// after a partial fill orders only the remainder.
     async fn buy_tranche(&mut self, why: &str) -> Result<()> {
         let spot_notional = self.state.tranche_spot_usd;
         let perp_notional = self.state.tranche_perp_usd;
@@ -1506,6 +1982,8 @@ impl Engine {
                 self.state.tranche_progress
             );
         }
+        self.reconcile_before_orders(&format!("{why} tranche {n_th}"))
+            .await?;
         for sym in self.cfg.symbols.clone() {
             let progress = self
                 .state
@@ -1522,8 +2000,37 @@ impl Engine {
             // Read-only: safe to bail before any order for this symbol is sent.
             let hq = self.quote(&self.hl, &market).await?;
             let lq = self.quote(&self.lt, &sym).await?;
-            let spot_size = size_from_notional(spot_notional, hq.price, hq.size_decimals);
-            let perp_size = size_from_notional(perp_notional, lq.price, lq.size_decimals);
+            // Remainders: what this tranche still owes each leg.
+            let spot_size = size_from_notional(
+                spot_notional - progress.spot_usd,
+                hq.price,
+                hq.size_decimals,
+            );
+            let perp_size = size_from_notional(
+                perp_notional - progress.perp_usd,
+                lq.price,
+                lq.size_decimals,
+            );
+            // A remainder too small to order (a partial fill that stopped
+            // just short) is settled as done rather than blocking forever.
+            let need_spot = need_spot
+                && !remainder_is_dust(
+                    progress.spot_usd,
+                    spot_size,
+                    hq.min_order,
+                    &mut self.state.tranche_progress,
+                    &sym,
+                    true,
+                );
+            let need_perp = need_perp
+                && !remainder_is_dust(
+                    progress.perp_usd,
+                    perp_size,
+                    lq.min_order,
+                    &mut self.state.tranche_progress,
+                    &sym,
+                    false,
+                );
             if need_spot && spot_size.to_f64().unwrap_or(0.0) < hq.min_order {
                 bail!(
                     "{market}: tranche spot size {spot_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
@@ -1535,6 +2042,13 @@ impl Engine {
                     "{sym}: tranche perp size {perp_size} below min_order {} (raise EQUITY_USD or lower ENTRY_TRANCHES)",
                     lq.min_order
                 );
+            }
+            if !need_spot && !need_perp {
+                self.persist();
+                log::info!(
+                    "[ENTRY] {sym}: tranche {n_th} remainder below min_order, settled as filled"
+                );
+                continue;
             }
             // Record the leg BEFORE/AS EACH order fills so a failure partway
             // through this symbol (or the next one) never leaves a filled
@@ -1559,6 +2073,8 @@ impl Engine {
                         last_close_date: None,
                         last_close: None,
                         close_fetch_failures: 0,
+                        cost_basis_unknown: false,
+                        perp_cost_basis_unknown: false,
                     }
                 }
             };
@@ -1569,7 +2085,7 @@ impl Engine {
                     .await
                     .with_context(|| {
                         format!(
-                            "{sym}: spot {why} tranche {n_th} failed (this leg took no exposure; legs already filled in this attempt are recorded and will be skipped on retry)"
+                            "{sym}: spot {why} tranche {n_th} failed (legs already filled in this attempt are recorded and will be skipped on retry)"
                         )
                     })?;
                 fs = filled_spot.to_f64().unwrap_or(0.0);
@@ -1577,27 +2093,34 @@ impl Engine {
                 leg.spot_cost_usd += fs * hq.price;
             }
             self.state.legs.insert(sym.clone(), leg.clone());
-            self.state
-                .tranche_progress
-                .entry(sym.clone())
-                .or_default()
-                .spot_done = true;
+            let spot_done = {
+                let pr = self.state.tranche_progress.entry(sym.clone()).or_default();
+                pr.spot_usd += fs * hq.price;
+                pr.spot_done = !need_spot || fill_complete(pr.spot_usd, spot_notional);
+                pr.spot_done
+            };
             // Real exposure now exists: flip to On (only once) so a crash or
             // a later error in this loop never leaves a filled position
             // recorded under Off/Exited, where a stray re-ARM would double it.
-            if self.state.mode != Mode::On {
-                self.state.mode = Mode::On;
-                self.state.armed_at = Some(now_secs());
-                self.state.exited_at = None;
-                self.state.exit_reason = None;
-                self.state.cycles += 1;
-                // Funding is reported per holding period: a fresh ARM
-                // starts a fresh total, unknown until the first read.
-                self.state.cum_funding_usdc = None;
-                self.state.cum_funding_as_of = None;
-                self.state.funding_seen.clear();
+            if self.state.mode != Mode::On && (leg.spot_size > 0.0 || leg.perp_size > 0.0) {
+                self.open_book();
             }
             self.persist();
+            self.clear_pending_after_record();
+            if !spot_done {
+                // Recorded, protected by the stop below on the next pass,
+                // but NOT completed: a thin-book partial must not pass as a
+                // full tranche (the perp leg would size against it and the
+                // book would end up leveraged asymmetrically). The retry
+                // after RISK_ACK orders the remainder only.
+                if let Err(e) = self.place_stop(&sym).await {
+                    log::error!("[STOP] stop for the partial {market} entry failed, reconcile will retry: {e:?}");
+                }
+                bail!(
+                    "{market}: spot {why} tranche {n_th} filled only {fs} (${:.0} of ${spot_notional:.0}); recorded, remainder retried on RISK_ACK",
+                    fs * hq.price
+                );
+            }
             let mut fp = 0.0;
             if need_perp {
                 let filled_perp = self
@@ -1614,12 +2137,14 @@ impl Engine {
                 leg.perp_cost_usd += fp * lq.price;
                 self.state.legs.insert(sym.clone(), leg.clone());
             }
-            self.state
-                .tranche_progress
-                .entry(sym.clone())
-                .or_default()
-                .perp_done = true;
+            let perp_done = {
+                let pr = self.state.tranche_progress.entry(sym.clone()).or_default();
+                pr.perp_usd += fp * lq.price;
+                pr.perp_done = !need_perp || fill_complete(pr.perp_usd, perp_notional);
+                pr.perp_done
+            };
             self.persist();
+            self.clear_pending_after_record();
             log::info!(
                 "[ENTRY] {sym} {why} tranche {n_th}/{}: +spot {} @ {:.2} +perp {} @ {:.2}; book spot {} (${:.0}) perp {} (${:.0}); peak={:.2} exit_level={:.2}",
                 self.state.tranches_done + self.state.tranches_remaining,
@@ -1627,7 +2152,18 @@ impl Engine {
                 leg.spot_size, leg.spot_cost_usd, leg.perp_size, leg.perp_cost_usd, leg.peak_close, leg.exit_level
             );
             if let Err(e) = self.place_stop(&sym).await {
-                log::error!("[STOP] stop (re)placement for {sym} failed: {e:?}");
+                // Exposure is recorded, but the documented exchange-side
+                // protection is missing: never complete the tranche
+                // silently. `reconcile` re-places uncovered stops on its
+                // cadence; the halt makes the gap visible meanwhile.
+                self.halt(format!("{sym}: stop placement failed after entry: {e}"));
+                bail!("{sym}: entry filled but the stop could not be placed: {e:?}");
+            }
+            if !perp_done {
+                bail!(
+                    "{sym}: perp {why} tranche {n_th} filled only {fp} (${:.0} of ${perp_notional:.0}); recorded and stop-covered, remainder retried on RISK_ACK",
+                    fp * lq.price
+                );
             }
         }
         self.state.tranche_progress.clear();
@@ -1642,6 +2178,56 @@ impl Engine {
             );
         }
         Ok(())
+    }
+
+    /// First exposure of a cycle: the book is On from here.
+    fn open_book(&mut self) {
+        self.state.mode = Mode::On;
+        self.state.book_dry_run = Some(self.cfg.dry_run);
+        self.state.armed_at = Some(now_secs());
+        self.state.exited_at = None;
+        self.state.exit_reason = None;
+        self.state.cycles += 1;
+        // Funding is reported per holding period: a fresh ARM starts a
+        // fresh total, unknown until the first read.
+        self.state.cum_funding_usdc = None;
+        self.state.cum_funding_as_of = None;
+        self.state.funding_seen.clear();
+    }
+
+    /// Size to close on exit: the book's size, or the venue's holding when
+    /// that is larger beyond the reconcile tolerance (never smaller: a
+    /// venue read that is short is treated as unreadable for this purpose
+    /// and the book's size is sold). DRY_RUN: the book's size.
+    async fn exit_target(&self, book: f64, spot_market: Option<&str>, symbol: &str) -> Result<f64> {
+        if self.cfg.dry_run {
+            return Ok(book);
+        }
+        let holding = match spot_market {
+            Some(m) => self.hl_spot_holding(&spot_base(m)).await,
+            None => self.lt_perp_holding(symbol).await,
+        };
+        let what = spot_market.unwrap_or(symbol);
+        match holding {
+            Ok(h) if h < 0.0 => bail!(
+                "{what}: venue holds a SHORT ({h}) where the book has a long of {book} — not flat, not ours to sell; close it by hand"
+            ),
+            Ok(h) if within_tolerance(book, h, self.cfg.reconcile_tolerance_pct) => Ok(book),
+            Ok(h) => {
+                // Larger: an order the state never recorded — sell it all.
+                // Smaller: the exchange stop (or a manual close) already
+                // took part of it — selling the stale book size would be
+                // rejected/partial and halt forever instead of converging.
+                log::error!(
+                    "[EXIT] {what}: venue holds {h} but the book says {book} — closing the venue amount"
+                );
+                Ok(h)
+            }
+            Err(e) => {
+                log::warn!("[EXIT] {what}: holding unreadable, selling the book's size: {e:?}");
+                Ok(book)
+            }
+        }
     }
 
     /// Best-effort reference price for PnL accounting: a live quote, falling
@@ -1673,10 +2259,34 @@ impl Engine {
         let mut total = 0.0;
         let mut any_leg_still_open = false;
         for sym in self.cfg.symbols.clone() {
+            if !self.state.legs.contains_key(&sym) {
+                continue;
+            }
+            // Cancel first, then snapshot: `cancel_stop` clears the stop
+            // fields in state, and the clone below is written back at the
+            // end of this iteration — cloning before the cancel would
+            // resurrect the cancelled stop's id/level/size in state.
+            self.cancel_stop(&sym).await;
             let Some(mut leg) = self.state.legs.get(&sym).cloned() else {
                 continue;
             };
-            self.cancel_stop(&sym).await;
+            if leg.stop_order_id.is_some() {
+                // The cancel did not go through (see `cancel_stop`): the
+                // trigger may still rest at the venue. Close the legs
+                // anyway (that is the exit's job), but the book must not
+                // reach Exited with it: a later ARM clears the legs and the
+                // orphaned reduce-only trigger would act on the new
+                // position. It stays tracked and halted until a retried
+                // DISARM (after RISK_ACK) confirms the cancel.
+                log::error!(
+                    "[EXIT] {sym}: stop {:?} could not be cancelled — legs are closed below but the book stays On/halted until the cancel is confirmed",
+                    leg.stop_order_id
+                );
+                any_leg_still_open = true;
+                self.halt(format!(
+                    "{sym}: stop cancel unconfirmed on exit; retry DISARM after RISK_ACK"
+                ));
+            }
             let market = self.cfg.hl_spot_market[&sym].clone();
             let orig_spot_size = leg.spot_size;
             let orig_perp_size = leg.perp_size;
@@ -1685,21 +2295,64 @@ impl Engine {
             let mut perp_pnl: Option<f64> = None;
             let mut perp_px_source = "n/a";
 
+            let mut spot_closed = 0.0;
+            let mut perp_closed = 0.0;
             if orig_spot_size > 0.0 {
                 let (px, src) = self
                     .exit_reference_price(&self.hl, &market, leg.last_close)
                     .await;
-                let size = Decimal::from_f64(orig_spot_size).unwrap_or(Decimal::ZERO);
-                match self.hl_spot_ioc(&market, size, OrderSide::Short).await {
+                // Sell what the venue actually holds when that is more than
+                // the book (an order the state never recorded): an exit
+                // must not leave exposure behind because the ledger is short.
+                let (target, sell) =
+                    match self.exit_target(orig_spot_size, Some(&market), &sym).await {
+                        Err(e) => (orig_spot_size, Err(e)),
+                        Ok(t) if t <= 0.0 => {
+                            log::warn!("[EXIT] {market}: nothing left at the venue, no sell sent");
+                            (t, Ok(Decimal::ZERO))
+                        }
+                        Ok(t) => {
+                            let size = Decimal::from_f64(t).unwrap_or(Decimal::ZERO);
+                            (t, self.hl_spot_ioc(&market, size, OrderSide::Short).await)
+                        }
+                    };
+                match sell {
                     Ok(f) => {
-                        log::info!("[EXIT] {market} spot sold {f}");
-                        leg.spot_size = 0.0; // closed regardless of whether we could price it
+                        let sold = f.to_f64().unwrap_or(0.0);
+                        spot_closed = sold;
+                        let remaining = remaining_after_close(target, sold, px);
+                        log::info!("[EXIT] {market} spot sold {f} (remaining {remaining})");
+                        leg.spot_size = remaining;
                         spot_px_source = src;
-                        spot_pnl = px.map(|p| p * orig_spot_size - leg.spot_cost_usd);
+                        // The venue held something other than the book (a
+                        // stop or manual close took part of it, or an
+                        // unrecorded fill added to it): that part's price /
+                        // cost is unknown here, so the leg's PnL is unknown
+                        // rather than a number that ignores it.
+                        let venue_differs = (target - orig_spot_size).abs() > 1e-12;
+                        if venue_differs && remaining > 0.0 {
+                            leg.cost_basis_unknown = true;
+                        }
+                        spot_pnl = if venue_differs || leg.cost_basis_unknown {
+                            None
+                        } else {
+                            px.map(|p| {
+                                p * sold - leg.spot_cost_usd * (sold / orig_spot_size).min(1.0)
+                            })
+                        };
                         if px.is_none() {
                             log::warn!(
                                 "[EXIT] {market} closed but no trustworthy price available — PnL for this leg is unknown, not zero"
                             );
+                        }
+                        if remaining > 0.0 {
+                            log::error!(
+                                "[EXIT] {market} spot only PARTIALLY closed ({sold} of {target}), leg remains OPEN in state"
+                            );
+                            self.halt(format!(
+                                "spot exit partial for {market}: {remaining} still held"
+                            ));
+                            any_leg_still_open = true;
                         }
                     }
                     Err(e) => {
@@ -1715,17 +2368,52 @@ impl Engine {
                 let (px, src) = self
                     .exit_reference_price(&self.lt, &sym, leg.last_close)
                     .await;
-                let size = Decimal::from_f64(orig_perp_size).unwrap_or(Decimal::ZERO);
-                match self.lt_perp_taker(&sym, size, OrderSide::Short, true).await {
+                let (target, close) = match self.exit_target(orig_perp_size, None, &sym).await {
+                    Err(e) => (orig_perp_size, Err(e)),
+                    Ok(t) if t <= 0.0 => {
+                        log::warn!("[EXIT] {sym}: no perp position left at the venue (stop already closed it?), no order sent");
+                        (t, Ok(Decimal::ZERO))
+                    }
+                    Ok(t) => {
+                        let size = Decimal::from_f64(t).unwrap_or(Decimal::ZERO);
+                        (
+                            t,
+                            self.lt_perp_taker(&sym, size, OrderSide::Short, true).await,
+                        )
+                    }
+                };
+                match close {
                     Ok(f) => {
-                        log::info!("[EXIT] {sym} perp closed {f}");
-                        leg.perp_size = 0.0;
+                        let closed = f.to_f64().unwrap_or(0.0);
+                        perp_closed = closed;
+                        let remaining = remaining_after_close(target, closed, px);
+                        log::info!("[EXIT] {sym} perp closed {f} (remaining {remaining})");
+                        leg.perp_size = remaining;
                         perp_px_source = src;
-                        perp_pnl = px.map(|p| p * orig_perp_size - leg.perp_cost_usd);
+                        let venue_differs = (target - orig_perp_size).abs() > 1e-12;
+                        if venue_differs && remaining > 0.0 {
+                            leg.perp_cost_basis_unknown = true;
+                        }
+                        perp_pnl = if venue_differs || leg.perp_cost_basis_unknown {
+                            None
+                        } else {
+                            px.map(|p| {
+                                p * closed - leg.perp_cost_usd * (closed / orig_perp_size).min(1.0)
+                            })
+                        };
                         if px.is_none() {
                             log::warn!(
                                 "[EXIT] {sym} perp closed but no trustworthy price available — PnL for this leg is unknown, not zero"
                             );
+                        }
+                        if remaining > 0.0 {
+                            log::error!(
+                                "[EXIT] {sym} perp only PARTIALLY closed ({closed} of {target}), leg remains OPEN in state"
+                            );
+                            self.halt(format!(
+                                "perp exit partial for {sym}: {remaining} still held"
+                            ));
+                            any_leg_still_open = true;
                         }
                     }
                     Err(e) => {
@@ -1744,11 +2432,25 @@ impl Engine {
             if pnl_known {
                 total += leg_total;
             }
+            // The record carries what was CONFIRMED closed and the cost
+            // basis of that part; a partial close is then visible as such.
+            let spot_cost_closed = if orig_spot_size > 0.0 {
+                leg.spot_cost_usd * (spot_closed / orig_spot_size).min(1.0)
+            } else {
+                0.0
+            };
+            let perp_cost_closed = if orig_perp_size > 0.0 {
+                leg.perp_cost_usd * (perp_closed / orig_perp_size).min(1.0)
+            } else {
+                0.0
+            };
             let rec = serde_json::json!({
                 "ts": now_secs(), "symbol": sym, "reason": reason,
-                "spot_size_closed": orig_spot_size, "spot_cost_usd": leg.spot_cost_usd,
+                "spot_size_closed": spot_closed, "spot_size_before": orig_spot_size,
+                "spot_cost_usd": spot_cost_closed,
                 "spot_pnl_usd": spot_pnl, "spot_px_source": spot_px_source,
-                "perp_size_closed": orig_perp_size, "perp_cost_usd": leg.perp_cost_usd,
+                "perp_size_closed": perp_closed, "perp_size_before": orig_perp_size,
+                "perp_cost_usd": perp_cost_closed,
                 "perp_pnl_usd": perp_pnl, "perp_px_source": perp_px_source,
                 "peak_close": leg.peak_close, "exit_level": leg.exit_level,
                 "pnl_usd_ex_funding": if pnl_known { Some(leg_total) } else { None },
@@ -1763,12 +2465,17 @@ impl Engine {
             // still reflects its real, un-exited exposure.
             if leg.spot_size <= 0.0 {
                 leg.spot_cost_usd = 0.0;
+            } else if orig_spot_size > 0.0 {
+                leg.spot_cost_usd *= leg.spot_size / orig_spot_size;
             }
             if leg.perp_size <= 0.0 {
                 leg.perp_cost_usd = 0.0;
+            } else if orig_perp_size > 0.0 {
+                leg.perp_cost_usd *= leg.perp_size / orig_perp_size;
             }
             self.state.legs.insert(sym.clone(), leg.clone());
             self.persist();
+            self.clear_pending_after_record();
             log::info!(
                 "[EXIT] {sym} pnl(ex-funding)={} peak={:.2} exit_level={:.2}",
                 if pnl_known {
@@ -1898,10 +2605,17 @@ impl Engine {
 
     // ----------------------------------------------------------- reconcile
 
-    async fn reconcile(&mut self) {
+    /// Compare the book with the venues for EVERY configured symbol — a
+    /// symbol without a leg must be flat at both venues (dust below
+    /// `RECONCILE_DUST_USD` aside), or an order the state never recorded is
+    /// sitting there. Halts on the first divergence. Returns whether the
+    /// comparison could be made and passed: `false` on a halt AND on a read
+    /// failure, so callers that gate an order on it never proceed on "could
+    /// not check".
+    async fn reconcile(&mut self) -> bool {
         self.margin_monitor().await;
         if self.cfg.dry_run {
-            return; // nothing real to compare against
+            return true; // nothing real to compare against
         }
         // Both reads are account-wide (all symbols in one call); fetch each
         // once instead of once per symbol.
@@ -1919,10 +2633,9 @@ impl Engine {
                 None
             }
         };
+        let mut complete = positions.is_some() && balance.is_some();
         for sym in self.cfg.symbols.clone() {
-            let Some(leg) = self.state.legs.get(&sym).cloned() else {
-                continue;
-            };
+            let leg = self.state.legs.get(&sym).cloned().unwrap_or_default();
             // Perp leg: Lighter positions.
             if let Some(pos) = &positions {
                 let actual = pos
@@ -1930,17 +2643,24 @@ impl Engine {
                     .filter(|p| p.symbol.eq_ignore_ascii_case(&sym))
                     .map(|p| p.size.to_f64().unwrap_or(0.0) * if p.sign < 0 { -1.0 } else { 1.0 })
                     .sum::<f64>();
-                if !within_tolerance(leg.perp_size, actual, self.cfg.reconcile_tolerance_pct) {
-                    self.halt(format!(
-                        "{sym} perp mismatch: expected {:.6} actual {actual:.6}",
-                        leg.perp_size
-                    ));
-                    return;
+                match self
+                    .leg_matches(&self.lt.clone(), &sym, leg.perp_size, actual)
+                    .await
+                {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.halt(format!(
+                            "{sym} perp mismatch: expected {:.6} actual {actual:.6}",
+                            leg.perp_size
+                        ));
+                        return false;
+                    }
+                    None => complete = false,
                 }
             }
             // Spot leg: Hyperliquid spot balances (base token of the market).
             let market = self.cfg.hl_spot_market[&sym].clone();
-            let base = market.split('/').next().unwrap_or("").to_ascii_uppercase();
+            let base = spot_base(&market);
             if let Some(b) = &balance {
                 let actual = b
                     .spot_assets
@@ -1948,16 +2668,175 @@ impl Engine {
                     .filter(|a| a.symbol.eq_ignore_ascii_case(&base))
                     .map(|a| a.balance.to_f64().unwrap_or(0.0))
                     .sum::<f64>();
-                if !within_tolerance(leg.spot_size, actual, self.cfg.reconcile_tolerance_pct) {
-                    self.halt(format!(
-                        "{market} spot mismatch: expected {:.6} actual {actual:.6}",
-                        leg.spot_size
-                    ));
-                    return;
+                match self
+                    .leg_matches(&self.hl.clone(), &market, leg.spot_size, actual)
+                    .await
+                {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.halt(format!(
+                            "{market} spot mismatch: expected {:.6} actual {actual:.6}",
+                            leg.spot_size
+                        ));
+                        return false;
+                    }
+                    None => complete = false,
                 }
             }
         }
-        log::debug!("[RECONCILE] ok");
+        if complete {
+            log::debug!("[RECONCILE] ok");
+        } else {
+            log::warn!("[RECONCILE] incomplete: a venue read failed, the book is unverified");
+        }
+        self.ensure_stops().await;
+        complete
+    }
+
+    /// Every perp leg with size must have a resting stop covering it; a
+    /// placement that failed at entry (or a size the stop no longer covers)
+    /// is retried here on the reconcile cadence, in every mode but under
+    /// KILL_SWITCH (which blocks stop re-placement by design).
+    async fn ensure_stops(&mut self) {
+        if self.sentinels.kill_switch_engaged() {
+            return;
+        }
+        for (sym, leg) in self.state.legs.clone() {
+            if leg.perp_size <= 0.0 {
+                continue;
+            }
+            // Only against a position the venue confirms right now: state
+            // may be stale after a restart, and a stop sized from it would
+            // be oversized or orphaned. A read failure or a divergence
+            // skips (reconcile halts on the divergence).
+            let venue_size = if self.cfg.dry_run {
+                Ok(leg.perp_size) // no venue book to compare against
+            } else {
+                self.lt_perp_holding(&sym).await
+            };
+            match venue_size {
+                Ok(actual)
+                    if within_tolerance(
+                        leg.perp_size,
+                        actual,
+                        self.cfg.reconcile_tolerance_pct,
+                    ) => {}
+                Ok(actual) => {
+                    log::error!(
+                        "[STOP] {sym}: venue perp {actual} differs from the book {} — not placing a stop from stale state",
+                        leg.perp_size
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("[STOP] {sym}: position unreadable, stop check deferred: {e:?}");
+                    continue;
+                }
+            }
+            // Covered in size AND resting at the level the refreshed peak
+            // calls for: a move whose cancel failed leaves the old, lower
+            // trigger tracked, and only a retry here (place_stop cancels
+            // it again first) brings it up.
+            let want = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
+            if stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
+                && stop_is_current(
+                    leg.stop_level,
+                    leg.stop_size,
+                    leg.stop_order_id.is_some(),
+                    want,
+                    leg.perp_size,
+                )
+            {
+                continue;
+            }
+            log::warn!(
+                "[STOP] {sym}: perp {} is not stop-covered at the current level (order {:?} size {:?} level {:?}, want {want:.2}) — re-placing",
+                leg.perp_size,
+                leg.stop_order_id,
+                leg.stop_size,
+                leg.stop_level
+            );
+            if let Err(e) = self.place_stop(&sym).await {
+                log::error!("[STOP] {sym}: re-placement failed, will retry next reconcile: {e:?}");
+            }
+        }
+    }
+
+    /// Does the venue holding match the book for one leg? A leg the book
+    /// does not hold must be flat at the venue, where "flat" tolerates dust
+    /// worth less than `RECONCILE_DUST_USD` (size rounding, base fees) —
+    /// which needs a price; `None` if that price could not be read.
+    async fn leg_matches(
+        &self,
+        venue: &Arc<dyn DexConnector + Send + Sync>,
+        symbol: &str,
+        expected: f64,
+        actual: f64,
+    ) -> Option<bool> {
+        if expected > 0.0 {
+            return Some(within_tolerance(
+                expected,
+                actual,
+                self.cfg.reconcile_tolerance_pct,
+            ));
+        }
+        if actual.abs() < 1e-12 {
+            return Some(true);
+        }
+        match self.quote(venue, symbol).await {
+            Ok(q) => Some(actual.abs() * q.price < RECONCILE_DUST_USD),
+            Err(e) => {
+                log::warn!("[RECONCILE] {symbol}: unexpected holding {actual} and no price to size it: {e:?}");
+                None
+            }
+        }
+    }
+
+    /// Gate before any order that changes the book: an unsettled order in
+    /// state means exposure may exist that the book does not show, so the
+    /// venues are compared first and the marker is cleared only if they
+    /// agree with the book. `Err` = do not order.
+    async fn reconcile_before_orders(&mut self, what: &str) -> Result<()> {
+        let Some(pending) = self.state.pending_order.clone() else {
+            return Ok(());
+        };
+        log::warn!(
+            "[FILL] {what}: an earlier order is unsettled ({pending:?}); checking its own baseline and the whole book before any new order"
+        );
+        // The order's OWN baseline first: the general reconcile tolerates
+        // 2 % / dust, which is exactly the size of a late partial fill —
+        // that would clear the marker and let the remainder be re-sent.
+        let now_holding = match pending.venue.as_str() {
+            "hyperliquid" => self.hl_spot_holding(&spot_base(&pending.symbol)).await,
+            _ => self.lt_perp_holding(&pending.symbol).await,
+        }
+        .with_context(|| format!("{what} refused: the unsettled order's holding is unreadable"))?;
+        let dir = if pending.side == OrderSide::Short.to_string() {
+            -1.0
+        } else {
+            1.0
+        };
+        let moved = (now_holding - pending.holding_before) * dir;
+        if moved.abs() > PENDING_RESOLVE_EPS {
+            self.halt(format!(
+                "unsettled {} {} {} on {} DID move the holding by {moved:+} since it was sent (baseline {}, now {now_holding}); \
+                 record it in state.json by hand, then RISK_ACK",
+                pending.side, pending.requested, pending.symbol, pending.venue, pending.holding_before
+            ));
+            bail!("{what} refused: the unsettled order filled (see [HALT])");
+        }
+        if !self.reconcile().await {
+            bail!(
+                "{what} refused: an earlier order is unsettled ({pending:?}) and the book could not be verified against the venues; \
+                 fix state.json by hand if it diverges, then RISK_ACK"
+            );
+        }
+        log::warn!(
+            "[FILL] unsettled order resolved: its holding is unchanged since it was sent and the venues agree with the book"
+        );
+        self.state.pending_order = None;
+        self.persist();
+        Ok(())
     }
 
     // ---------------------------------------------------------------- tick
@@ -2009,6 +2888,12 @@ impl Engine {
                         self.state.mode
                     );
                 } else {
+                    if let Some(p) = &self.state.pending_order {
+                        log::error!(
+                            "[DISARM] the book records nothing held, but an order is unsettled ({p:?}); \
+                             the venues are compared on the reconcile cadence — check them by hand before assuming flat"
+                        );
+                    }
                     log::info!(
                         "[DISARM] nothing held (mode={:?}); ignored",
                         self.state.mode
@@ -2076,6 +2961,11 @@ impl Engine {
                 && now.saturating_sub(self.last_margin_check) >= self.cfg.reconcile_every_secs
             {
                 self.margin_monitor().await;
+                // Protection is not an "action" a halt should block: a
+                // partial exit (stop already cancelled) or a failed stop
+                // placement halts with live perp size uncovered — re-cover
+                // it while the operator investigates.
+                self.ensure_stops().await;
             }
         } else if self.state.mode == Mode::On && intent != OperatorIntent::DisarmNow {
             self.daily_eval().await;
@@ -2119,12 +3009,21 @@ impl Engine {
                     }
                 }
             }
-            if self.state.mode == Mode::On
-                && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
-            {
+            if now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs {
                 self.last_reconcile = now;
-                self.reconcile().await;
+                let _ = self.reconcile().await;
             }
+        }
+        // An unsettled order while Off/Exited (the first entry of a cycle
+        // may have filled without a leg recorded): only a venue comparison
+        // can surface that, so it runs outside the On-gated lifecycle above,
+        // halted or not.
+        if self.state.mode != Mode::On
+            && self.state.pending_order.is_some()
+            && now.saturating_sub(self.last_reconcile) >= self.cfg.reconcile_every_secs
+        {
+            self.last_reconcile = now;
+            let _ = self.reconcile().await;
         }
         // Read-only, so it runs while halted and for a day after EXIT (the
         // last settlements land after the perp leg is closed); gated on ARM
@@ -2251,11 +3150,24 @@ async fn main() -> Result<()> {
         cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.lighter_mmr_pct, cfg.perp_margin_min_pct,
         cfg.hl_taker_slippage_bps, cfg.fingerprint()
     );
-    refuse_live(
-        cfg.dry_run,
-        BOT,
-        "prototype not yet cleared by the bot-strategy#895 rollout gates (see KNOWN GAPS in this file's module doc)",
-    )?;
+    if !cfg.dry_run {
+        log::warn!(
+            "[CONFIG] LIVE: orders will be signed and sent (bot-strategy#895 small-live approval)"
+        );
+    }
+
+    // Before any connector (and any signer) is built: an open book is only
+    // operated in the mode that created it.
+    let state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    log::info!(
+        "[STARTUP] mode={:?} legs={} halted={} book_dry_run={:?} realized_total=${:.2}",
+        state.mode,
+        state.legs.len(),
+        state.halted,
+        state.book_dry_run,
+        state.realized_pnl_total_usd
+    );
+    check_book_mode(&state, cfg.dry_run)?;
 
     let hl_markets: Vec<String> = cfg.hl_spot_market.values().cloned().collect();
     let hl = DexConnectorBox::create(
@@ -2277,15 +3189,6 @@ async fn main() -> Result<()> {
     hl.start().await.context("start Hyperliquid connector")?;
     lt.start().await.context("start Lighter connector")?;
 
-    let state: State = load_json(&cfg.state_path)?.unwrap_or_default();
-    log::info!(
-        "[STARTUP] mode={:?} legs={} halted={} realized_total=${:.2}",
-        state.mode,
-        state.legs.len(),
-        state.halted,
-        state.realized_pnl_total_usd
-    );
-
     let mut engine = Engine {
         sentinels: Sentinels::new(cfg.kill_switch_path.clone(), cfg.risk_ack_path.clone()),
         http: reqwest::Client::builder()
@@ -2302,9 +3205,27 @@ async fn main() -> Result<()> {
         last_funding_poll: 0,
         cfg,
     };
-    // A restart while On must re-verify the book before doing anything else.
-    if engine.state.mode == Mode::On {
-        engine.reconcile().await;
+    // A live restart re-verifies the book against the venues before doing
+    // anything else — in every mode: a flat book must be flat at the venues
+    // too, or an order the state never recorded is sitting there.
+    if !engine.cfg.dry_run {
+        let mut verified = false;
+        for attempt in 1..=STARTUP_RECONCILE_ATTEMPTS {
+            if engine.reconcile().await {
+                verified = true;
+                break;
+            }
+            if engine.state.halted {
+                break; // a divergence, not a read failure: the halt says it
+            }
+            log::warn!("[RECONCILE] startup check incomplete (attempt {attempt}), retrying");
+            tokio::time::sleep(Duration::from_secs(STARTUP_RECONCILE_STEP_SECS)).await;
+        }
+        if !verified && !engine.state.halted {
+            // Never let an ARM file or a due tranche run on an unverified
+            // book: the operator clears this once the venues are readable.
+            engine.halt("startup reconcile could not verify the book against the venues (venue reads failed); RISK_ACK once they are reachable".into());
+        }
     }
     let tick = Duration::from_secs(engine.cfg.tick_secs.max(5));
     loop {
@@ -2614,12 +3535,13 @@ mod tests {
         assert_eq!(legs_pending(&fresh, false), (true, false));
         let spot_only = LegProgress {
             spot_done: true,
-            perp_done: false,
+            ..Default::default()
         };
         assert_eq!(legs_pending(&spot_only, true), (false, true));
         let both = LegProgress {
             spot_done: true,
             perp_done: true,
+            ..Default::default()
         };
         assert_eq!(legs_pending(&both, true), (false, false));
         // A resumed tranche keeps the counters untouched until it completes:
@@ -2742,10 +3664,18 @@ mod tests {
     }
 
     #[test]
-    fn env_bool_trims_whitespace() {
-        std::env::set_var("BULL_HOLDER_TEST_ENV_BOOL", " true \n");
-        assert!(env_bool("BULL_HOLDER_TEST_ENV_BOOL", false));
-        std::env::remove_var("BULL_HOLDER_TEST_ENV_BOOL");
+    fn dry_run_switch_only_goes_live_on_an_explicit_false() {
+        assert_eq!(parse_dry_run(None).unwrap(), true);
+        assert_eq!(parse_dry_run(Some(" true \n")).unwrap(), true);
+        assert_eq!(parse_dry_run(Some("FALSE")).unwrap(), false);
+        assert_eq!(parse_dry_run(Some("0")).unwrap(), false);
+        // A typo or an empty export must not fail open into live.
+        for bad in ["ture", "", "  ", "off", "flase", "2"] {
+            assert!(
+                parse_dry_run(Some(bad)).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2917,6 +3847,780 @@ mod tests {
         b.exit_dd_pct = 25.0;
         assert_ne!(a.fingerprint(), b.fingerprint());
         assert_eq!(a.fingerprint(), test_config().fingerprint());
+    }
+
+    /// Connector stub for the DRY_RUN exit path: only `get_ticker` answers
+    /// (the pre-exit reference price); every order/cancel call is skipped
+    /// by `dry_run` before reaching the venue, so anything else is a bug.
+    struct QuoteOnly {
+        price: Decimal,
+        /// Live-path knob: `cancel_order` fails (the venue kept the stop).
+        cancel_fails: bool,
+        /// Live-path knob: signed perp position `get_positions` reports for
+        /// every symbol (`None` = the call is unexpected).
+        perp_position: Option<f64>,
+    }
+
+    #[async_trait::async_trait]
+    impl DexConnector for QuoteOnly {
+        async fn start(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: start must not be called on the DRY_RUN exit path")
+        }
+        async fn get_funding_payments(
+            &self,
+            _since_secs: i64,
+        ) -> Result<Vec<dex_connector::FundingPayment>, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_funding_payments must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn stop(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: stop must not be called on the DRY_RUN exit path")
+        }
+        async fn restart(&self, _max_retries: i32) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: restart must not be called on the DRY_RUN exit path")
+        }
+        async fn set_leverage(
+            &self,
+            _symbol: &str,
+            _leverage: u32,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: set_leverage must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_ticker(
+            &self,
+            _symbol: &str,
+            _test_price: Option<Decimal>,
+        ) -> Result<dex_connector::TickerResponse, dex_connector::DexError> {
+            Ok(dex_connector::TickerResponse {
+                symbol: _symbol.to_string(),
+                price: self.price,
+                size_decimals: Some(4),
+                ..Default::default()
+            })
+        }
+        async fn get_filled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::FilledOrdersResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_filled_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_canceled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::CanceledOrdersResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_canceled_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_open_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::OpenOrdersResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_balance(
+            &self,
+            _symbol: Option<&str>,
+        ) -> Result<dex_connector::BalanceResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_balance must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_combined_balance(
+            &self,
+        ) -> Result<dex_connector::CombinedBalanceResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_combined_balance must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_positions(
+            &self,
+        ) -> Result<Vec<dex_connector::PositionSnapshot>, dex_connector::DexError> {
+            let Some(p) = self.perp_position else {
+                unimplemented!(
+                    "QuoteOnly stub: get_positions must not be called on the DRY_RUN exit path"
+                )
+            };
+            Ok(["BTC", "ETH"]
+                .iter()
+                .map(|sym| dex_connector::PositionSnapshot {
+                    symbol: sym.to_string(),
+                    size: Decimal::from_f64(p.abs()).unwrap(),
+                    sign: if p < 0.0 { -1 } else { 1 },
+                    entry_price: None,
+                })
+                .collect())
+        }
+        async fn get_last_trades(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::LastTradesResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_last_trades must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn get_order_book(
+            &self,
+            _symbol: &str,
+            _depth: usize,
+        ) -> Result<dex_connector::OrderBookSnapshot, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: get_order_book must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_filled_order(
+            &self,
+            _symbol: &str,
+            _trade_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: clear_filled_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_all_filled_orders(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: clear_all_filled_orders must not be called on the DRY_RUN exit path")
+        }
+        async fn clear_canceled_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: clear_canceled_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_all_canceled_orders(&self) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: clear_all_canceled_orders must not be called on the DRY_RUN exit path")
+        }
+        async fn create_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: create_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn create_advanced_trigger_order(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _trigger_px: Decimal,
+            _limit_px: Option<Decimal>,
+            _order_style: dex_connector::TriggerOrderStyle,
+            _slippage_bps: Option<u32>,
+            _tpsl: dex_connector::TpSl,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: create_advanced_trigger_order must not be called on the DRY_RUN exit path")
+        }
+        async fn create_order_taker_ioc(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _slippage_bps: u32,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: create_order_taker_ioc must not be called on the DRY_RUN exit path")
+        }
+        async fn create_order_taker_ioc_at(
+            &self,
+            _symbol: &str,
+            _size: Decimal,
+            _side: OrderSide,
+            _limit_price: Decimal,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: create_order_taker_ioc_at must not be called on the DRY_RUN exit path")
+        }
+        async fn modify_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+            _side: OrderSide,
+            _target_total_size: Decimal,
+            _open_remaining_size: Decimal,
+            _price: Option<Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: modify_order must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn cancel_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), dex_connector::DexError> {
+            if self.cancel_fails {
+                Err(dex_connector::DexError::Transient(
+                    "cancel timed out".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        async fn cancel_all_orders(
+            &self,
+            _symbol: Option<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: cancel_all_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn cancel_orders(
+            &self,
+            _symbol: Option<String>,
+            _order_ids: Vec<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: cancel_orders must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn close_all_positions(
+            &self,
+            _symbol: Option<String>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: close_all_positions must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn clear_last_trades(&self, _symbol: &str) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: clear_last_trades must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+            unimplemented!("QuoteOnly stub: is_upcoming_maintenance must not be called on the DRY_RUN exit path")
+        }
+        async fn sign_evm_65b(&self, _message: &str) -> Result<String, dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: sign_evm_65b must not be called on the DRY_RUN exit path"
+            )
+        }
+        async fn sign_evm_65b_with_eip191(
+            &self,
+            _message: &str,
+        ) -> Result<String, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: sign_evm_65b_with_eip191 must not be called on the DRY_RUN exit path")
+        }
+        fn subscribe_price_updates(
+            &self,
+        ) -> Result<
+            tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>,
+            dex_connector::DexError,
+        > {
+            unimplemented!("QuoteOnly stub: subscribe_price_updates must not be called on the DRY_RUN exit path")
+        }
+    }
+
+    fn engine_with_stops(dir: &std::path::Path) -> Engine {
+        let mut cfg = test_config();
+        cfg.state_path = dir.join("state.json");
+        cfg.status_path = dir.join("status.json");
+        cfg.pnl_log_path = dir.join("pnl.jsonl");
+        let mut state = State::default();
+        state.mode = Mode::On;
+        for (sym, px) in [("BTC", 80_000.0), ("ETH", 2_600.0)] {
+            state.legs.insert(
+                sym.to_string(),
+                LegState {
+                    spot_size: 0.01,
+                    spot_cost_usd: px * 0.01,
+                    perp_size: 0.005,
+                    perp_cost_usd: px * 0.005,
+                    peak_close: px,
+                    exit_level: level_below_peak(px, 30.0),
+                    lighter_peak: px,
+                    stop_level: Some(level_below_peak(px, 35.0)),
+                    stop_order_id: Some(format!("stop-{sym}")),
+                    stop_size: Some(0.005),
+                    last_close_date: None,
+                    last_close: Some(px),
+                    close_fetch_failures: 0,
+                    cost_basis_unknown: false,
+                    perp_cost_basis_unknown: false,
+                },
+            );
+        }
+        let quote: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: false,
+            perp_position: None,
+        });
+        Engine {
+            cfg: cfg.clone(),
+            hl: quote.clone(),
+            lt: quote,
+            http: reqwest::Client::new(),
+            sentinels: Sentinels::new(cfg.kill_switch_path.clone(), cfg.risk_ack_path.clone()),
+            state,
+            last_status_write: 0,
+            last_reconcile: 0,
+            last_margin_check: 0,
+            last_margin: None,
+            last_funding_poll: 0,
+        }
+    }
+
+    /// Regression (found in the 2026-09-21 DISARM drill): `exit_all` used
+    /// to clone the leg BEFORE `cancel_stop` cleared its stop fields, then
+    /// wrote the stale clone back — state kept reporting a stop that had
+    /// been cancelled at the venue. Harmless once Exited, but on the
+    /// partial-exit failure path (mode stays On) `stop_covers` would have
+    /// read the open leg as protected by an order that no longer rests.
+    #[tokio::test]
+    async fn exit_clears_the_cancelled_stop_from_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_stop_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.exit_all("test").await;
+        assert_eq!(e.state.mode, Mode::Exited);
+        for sym in ["BTC", "ETH"] {
+            let leg = &e.state.legs[sym];
+            assert_eq!(leg.spot_size, 0.0, "{sym} spot closed");
+            assert_eq!(leg.perp_size, 0.0, "{sym} perp closed");
+            assert_eq!(
+                leg.stop_order_id, None,
+                "{sym} stop id must not survive the exit"
+            );
+            assert_eq!(
+                leg.stop_level, None,
+                "{sym} stop level must not survive the exit"
+            );
+            assert_eq!(
+                leg.stop_size, None,
+                "{sym} stop size must not survive the exit"
+            );
+            assert!(
+                !stop_covers(leg.stop_order_id.is_some(), leg.stop_size, 0.005),
+                "{sym}: a cancelled stop must not read as covering anything"
+            );
+        }
+        // The persisted copy is what a restart reads back.
+        let back: State = load_json(&e.cfg.state_path).unwrap().unwrap();
+        assert!(back.legs.values().all(|l| l.stop_order_id.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ack() -> Result<dex_connector::CreateOrderResponse> {
+        Ok(dex_connector::CreateOrderResponse {
+            order_id: "1".into(),
+            exchange_order_id: None,
+            ordered_price: Decimal::ONE,
+            ordered_size: Decimal::ONE,
+            client_order_id: None,
+        })
+    }
+
+    #[test]
+    fn live_fill_is_the_venue_holding_change_not_the_ack() {
+        let req = Decimal::from_str("0.01").unwrap();
+        // Ack + full change → the change.
+        assert_eq!(
+            settle_fill("t", req, ack(), Ok(0.01)).unwrap(),
+            Decimal::from_str("0.01").unwrap()
+        );
+        // Ack + partial change → the partial, never the requested size.
+        assert_eq!(
+            settle_fill("t", req, ack(), Ok(0.004)).unwrap(),
+            Decimal::from_str("0.004").unwrap()
+        );
+        // Ack but nothing observed → unknown, an error (caller halts).
+        assert!(settle_fill("t", req, ack(), Ok(0.0)).is_err());
+        // Error after the venue filled → record the fill, do not surface the
+        // error as "no exposure" (a retry would double the position).
+        assert_eq!(
+            settle_fill("t", req, Err(anyhow!("timeout")), Ok(0.01)).unwrap(),
+            Decimal::from_str("0.01").unwrap()
+        );
+        // Error and nothing filled → the error.
+        assert!(settle_fill("t", req, Err(anyhow!("rejected")), Ok(0.0)).is_err());
+        // Holding unreadable → error even with a clean ack.
+        assert!(settle_fill("t", req, ack(), Err(anyhow!("503"))).is_err());
+    }
+
+    #[test]
+    fn fill_completion_tolerates_a_base_fee_but_not_a_short_fill() {
+        assert!(fill_complete(0.01, 0.01));
+        assert!(fill_complete(0.00996, 0.01)); // 0.04% base fee
+        assert!(!fill_complete(0.009, 0.01));
+        assert!(fill_complete(0.0, 0.0));
+    }
+
+    #[test]
+    fn partial_close_leaves_the_remainder_open_and_dust_closed() {
+        let px = Some(80_000.0);
+        assert_eq!(remaining_after_close(0.01, 0.01, px), 0.0);
+        // $4 of residue is dust; $15 (1.5 % of a $1,000 leg) is NOT.
+        assert_eq!(remaining_after_close(0.01, 0.00995, px), 0.0);
+        let r = remaining_after_close(0.0125, 0.0123125, px);
+        assert!((r - 0.0001875).abs() < 1e-12);
+        let r = remaining_after_close(0.01, 0.006, px);
+        assert!((r - 0.004).abs() < 1e-12);
+        // No price → nothing is dust.
+        assert!(remaining_after_close(0.01, 0.00999, None) > 0.0);
+        assert_eq!(remaining_after_close(0.0, 0.0, px), 0.0);
+    }
+
+    #[test]
+    fn open_book_is_only_operated_in_the_mode_that_created_it() {
+        let mut st = State::default();
+        // Flat: any mode is fine, including a pre-#895 file.
+        assert!(check_book_mode(&st, true).is_ok());
+        assert!(check_book_mode(&st, false).is_ok());
+        st.mode = Mode::On;
+        st.book_dry_run = Some(true);
+        assert!(check_book_mode(&st, true).is_ok());
+        assert!(
+            check_book_mode(&st, false).is_err(),
+            "simulated book must not go live"
+        );
+        st.book_dry_run = Some(false);
+        assert!(check_book_mode(&st, false).is_ok());
+        assert!(
+            check_book_mode(&st, true).is_err(),
+            "live book must not be simulated away"
+        );
+        st.book_dry_run = None;
+        assert!(
+            check_book_mode(&st, true).is_err(),
+            "unknown provenance with exposure is refused"
+        );
+        // Exited but a leg still open (partial exit) counts as open.
+        st.mode = Mode::Exited;
+        st.book_dry_run = Some(false);
+        st.legs.insert(
+            "BTC".into(),
+            LegState {
+                spot_size: 0.001,
+                ..Default::default()
+            },
+        );
+        assert!(check_book_mode(&st, true).is_err());
+        assert!(check_book_mode(&st, false).is_ok());
+    }
+
+    #[test]
+    fn opening_the_book_records_the_execution_mode() {
+        // Round-trip: the field must survive persist/load (it is what the
+        // startup gate reads).
+        let mut st = State::default();
+        st.mode = Mode::On;
+        st.book_dry_run = Some(false);
+        let js = serde_json::to_string(&st).unwrap();
+        let back: State = serde_json::from_str(&js).unwrap();
+        assert_eq!(back.book_dry_run, Some(false));
+        // A pre-#895 file (no field) loads as None.
+        let old: State = serde_json::from_str(r#"{"mode":"On"}"#).unwrap();
+        assert_eq!(old.book_dry_run, None);
+    }
+
+    #[test]
+    fn order_outcome_is_known_only_with_a_readable_holding() {
+        // Readable + changed → known (ack or not).
+        assert!(order_outcome_known(true, false, Some(0.01)));
+        assert!(order_outcome_known(false, false, Some(0.01)));
+        // Readable + unchanged: known only on a DEFINITIVE rejection. A
+        // timed-out submission may have been accepted and fill late.
+        assert!(order_outcome_known(false, true, Some(0.0)));
+        assert!(!order_outcome_known(false, false, Some(0.0)));
+        assert!(!order_outcome_known(true, false, Some(0.0)));
+        // Unreadable → never known.
+        assert!(!order_outcome_known(true, false, None));
+        assert!(!order_outcome_known(false, true, None));
+    }
+
+    #[test]
+    fn only_venue_rejections_and_pre_submission_failures_are_definitive() {
+        use dex_connector::DexError;
+        assert!(order_rejected_definitively(&DexError::ServerResponse(
+            "reduce-only".into()
+        )));
+        assert!(order_rejected_definitively(&DexError::Permanent(
+            "no market".into()
+        )));
+        assert!(order_rejected_definitively(&DexError::NoConnection));
+        assert!(!order_rejected_definitively(&DexError::Transient(
+            "timeout".into()
+        )));
+        assert!(!order_rejected_definitively(
+            &DexError::ReconciliationRequired {
+                action: "order".into(),
+                nonce: 1,
+                detail: "ambiguous".into(),
+            }
+        ));
+        assert!(!order_rejected_definitively(&DexError::Serde(
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err()
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_keeps_a_partial_observation_across_a_later_read_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_confirm_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = engine_with_stops(&dir);
+        // First read sees 40% of the request, every later read fails.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c = calls.clone();
+        let read = move || {
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Ok(1.004)
+                } else {
+                    Err(anyhow!("503"))
+                }
+            }
+        };
+        let got = e
+            .confirm_fill(read, 1.0, OrderSide::Long, 0.01)
+            .await
+            .unwrap();
+        assert!(
+            (got - 0.004).abs() < 1e-12,
+            "the 0.004 seen must survive, got {got}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            FILL_CONFIRM_ATTEMPTS
+        );
+        // All reads failing is the only unreadable outcome.
+        let all_fail = || async { Err::<f64, _>(anyhow!("503")) };
+        assert!(e
+            .confirm_fill(all_fail, 1.0, OrderSide::Long, 0.01)
+            .await
+            .is_err());
+        // A sell is measured as a decrease.
+        let sold = || async { Ok(0.99) };
+        let got = e
+            .confirm_fill(sold, 1.0, OrderSide::Short, 0.01)
+            .await
+            .unwrap();
+        assert!((got - 0.01).abs() < 1e-12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sub_minimum_remainder_settles_the_leg_as_done() {
+        let mut progress = BTreeMap::new();
+        // Nothing filled yet: a small computed size is a real problem, not dust.
+        assert!(!remainder_is_dust(
+            0.0,
+            Decimal::from_str("0.00001").unwrap(),
+            0.0001,
+            &mut progress,
+            "BTC",
+            true
+        ));
+        assert!(progress.is_empty());
+        // Partially filled and the remainder is below min_order: done.
+        assert!(remainder_is_dust(
+            390.0,
+            Decimal::from_str("0.00001").unwrap(),
+            0.0001,
+            &mut progress,
+            "BTC",
+            true
+        ));
+        assert!(progress["BTC"].spot_done);
+        assert!(!progress["BTC"].perp_done);
+        // Remainder still orderable: not dust.
+        assert!(!remainder_is_dust(
+            200.0,
+            Decimal::from_str("0.002").unwrap(),
+            0.0001,
+            &mut progress,
+            "BTC",
+            false
+        ));
+        assert!(!progress["BTC"].perp_done);
+    }
+
+    #[test]
+    fn unsettled_order_counts_as_an_open_book_and_survives_persist() {
+        let mut st = State::default();
+        assert!(!book_is_open(&st));
+        st.pending_order = Some(PendingOrder {
+            venue: "hyperliquid".into(),
+            symbol: "UBTC/USDC".into(),
+            side: "long".into(),
+            requested: 0.005,
+            holding_before: 0.0,
+            ts: 1,
+        });
+        st.book_dry_run = Some(false);
+        assert!(
+            book_is_open(&st),
+            "an unsettled order is exposure of unknown size"
+        );
+        assert!(
+            check_book_mode(&st, true).is_err(),
+            "must not be simulated away under DRY_RUN"
+        );
+        assert!(check_book_mode(&st, false).is_ok());
+        let js = serde_json::to_string(&st).unwrap();
+        let back: State = serde_json::from_str(&js).unwrap();
+        assert_eq!(back.pending_order, st.pending_order);
+        // Progress notional round-trips too (a partial fill's remainder
+        // depends on it after a restart).
+        let mut st2 = State::default();
+        st2.tranche_progress.insert(
+            "ETH".into(),
+            LegProgress {
+                spot_done: false,
+                perp_done: false,
+                spot_usd: 123.4,
+                perp_usd: 0.0,
+            },
+        );
+        let back: State = serde_json::from_str(&serde_json::to_string(&st2).unwrap()).unwrap();
+        assert_eq!(back.tranche_progress["ETH"].spot_usd, 123.4);
+        let old: State = serde_json::from_str(
+            r#"{"tranche_progress":{"ETH":{"spot_done":true,"perp_done":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.tranche_progress["ETH"].spot_usd, 0.0);
+    }
+
+    /// Live exit where the venue already flattened the legs (the exchange
+    /// stop fired) but the stop cancel fails: the book must NOT reach
+    /// Exited — a later ARM would clear the leg and forget a trigger that
+    /// may still rest at the venue.
+    #[tokio::test]
+    async fn exit_with_an_unconfirmed_stop_cancel_stays_on_and_halts() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_cancel_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: true,
+            perp_position: None,
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+        }
+        e.exit_all("test").await;
+        assert_eq!(
+            e.state.mode,
+            Mode::On,
+            "must not be Exited with a stop unconfirmed"
+        );
+        assert!(e.state.halted);
+        assert!(
+            e.state.legs.values().all(|l| l.stop_order_id.is_some()),
+            "stop stays tracked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live exit where the venue shows a SHORT where the book has a long
+    /// (manual action / unrecorded order): never "closed", no order sent
+    /// for it, the book halts with the leg as recorded.
+    #[tokio::test]
+    async fn exit_refuses_a_reversed_venue_position() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_rev_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: false,
+            perp_position: Some(-0.005),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0; // perp-only book for this test
+        }
+        e.exit_all("test").await;
+        assert_eq!(e.state.mode, Mode::On);
+        assert!(
+            e.state.halted,
+            "a reversed position must halt, not read as flat"
+        );
+        assert!(
+            e.state.legs.values().all(|l| l.perp_size == 0.005),
+            "the recorded leg is untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unsettled order is resolved against ITS baseline, not the 2 %
+    /// reconcile tolerance: a late fill smaller than the tolerance must
+    /// still halt (the remainder would otherwise be re-sent on top of it).
+    #[tokio::test]
+    async fn unsettled_order_is_resolved_against_its_own_baseline() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_pending_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        // Venue shows 0.00505 long on both symbols; the book holds 0.005
+        // (within the 2 % tolerance), but the pending order's baseline
+        // was 0.005 → it moved by 0.00005 → a late fill.
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: false,
+            perp_position: Some(0.00505),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        e.state.pending_order = Some(PendingOrder {
+            venue: "lighter".into(),
+            symbol: "BTC".into(),
+            side: OrderSide::Long.to_string(),
+            requested: 0.0005,
+            holding_before: 0.005,
+            ts: 1,
+        });
+        assert!(e.reconcile_before_orders("test").await.is_err());
+        assert!(e.state.halted, "a late fill inside the tolerance must halt");
+        assert!(
+            e.state.pending_order.is_some(),
+            "marker kept for the operator"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_config() -> Config {
