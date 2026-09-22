@@ -263,7 +263,7 @@ impl Config {
             hl_spot_market.insert(s.clone(), m);
         }
         let cfg = Self {
-            instance_id,
+            instance_id: instance_id.clone(),
             dry_run: parse_dry_run(std::env::var("BULL_HOLDER_DRY_RUN").ok().as_deref())?,
             symbols,
             hl_spot_market,
@@ -282,11 +282,14 @@ impl Config {
             stop_slippage_bps: env_u32("BULL_HOLDER_STOP_SLIPPAGE_BPS", 500),
             reconcile_tolerance_pct: env_f64("BULL_HOLDER_RECONCILE_TOLERANCE_PCT", 2.0),
             reconcile_every_secs: env_u64("BULL_HOLDER_RECONCILE_EVERY_SECS", 600),
-            lighter_account_url: env_string(
-                "BULL_HOLDER_LIGHTER_API_URL",
-                "https://mainnet.zklighter.elliot.ai",
-            ),
-            lighter_account_index: env_string("LIGHTER_ACCOUNT_INDEX", ""),
+            // Same resolution the connector uses (`lighter_env` in
+            // config.rs): the instance-suffixed value wins, so this check
+            // can never read a different account or network than the one
+            // `DexConnectorBox` trades on.
+            lighter_account_url: lighter_env("REST_ENDPOINT", &instance_id)
+                .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai".to_string()),
+            lighter_account_index: lighter_env("LIGHTER_ACCOUNT_INDEX", &instance_id)
+                .unwrap_or_default(),
             hl_info_url: env_string(
                 "BULL_HOLDER_HL_INFO_URL",
                 "https://api.hyperliquid.xyz/info",
@@ -483,6 +486,16 @@ fn remainder_is_dust(
 /// account-wide pending count (the account is dedicated to this bot).
 /// `None` when the response does not carry the market — never 0, which
 /// would read as "nothing rests".
+/// Instance-suffixed env lookup, mirroring `config::lighter_env` so the
+/// venue reads here resolve to the same account as the connector's.
+fn lighter_env(name: &str, instance_id: &str) -> Option<String> {
+    let suffix = instance_id.to_uppercase().replace('-', "_");
+    std::env::var(format!("{name}_{suffix}"))
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var(name).ok().filter(|v| !v.is_empty()))
+}
+
 fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
     let account = v.get("accounts")?.as_array()?.first()?;
     let n = |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1704,11 +1717,13 @@ impl Engine {
         // in the cancelled feed either. Two independent settlements:
         // the venue reports it cancelled, or a READY account snapshot
         // shows it is not resting.
-        let cancel_sent = self.lt.cancel_order(symbol, &id).await;
-        if let Err(e) = &cancel_sent {
+        if let Err(e) = self.lt.cancel_order(symbol, &id).await {
+            // A timed-out cancel may still have been processed, and a
+            // repeat cancel of an already-cancelled id returns not-found —
+            // so the request's outcome never gates the evidence below.
             log::warn!("[STOP] {symbol}: cancel of unconfirmed stop {id} failed: {e:?}");
         }
-        let settled = (cancel_sent.is_ok() && self.cancel_confirmed(symbol, &id).await)
+        let settled = self.cancel_confirmed(symbol, &id).await
             || self.stop_absent_confirmed(symbol, &id).await;
         if !settled {
             log::warn!(
@@ -2765,11 +2780,33 @@ impl Engine {
             self.state.legs.insert(sym.clone(), leg.clone());
             self.persist();
             self.clear_pending_after_record();
-            // Only now — the exposure is closed. An acknowledged-but-
-            // unconfirmed stop still has to be settled (a later ARM would
-            // otherwise inherit an orphaned reduce-only trigger), but its
-            // settlement polls the venue for up to ~2 minutes per symbol,
-            // and nothing may delay a drawdown exit by that much.
+            log::info!(
+                "[EXIT] {sym} pnl(ex-funding)={} peak={:.2} exit_level={:.2}",
+                if pnl_known {
+                    format!("${leg_total:+.2}")
+                } else {
+                    "unknown".to_string()
+                },
+                leg.peak_close,
+                leg.exit_level
+            );
+        }
+        // Every leg is closed before any of this: settling an
+        // acknowledged-but-unconfirmed stop polls the venue for up to ~2
+        // minutes per symbol, and nothing may hold a drawdown exit open
+        // for that long — least of all the symbols not yet reached.
+        // Unsettled ones still keep the book On/halted, which is what
+        // stops a later ARM inheriting an orphaned reduce-only trigger.
+        for sym in self.cfg.symbols.clone() {
+            if self
+                .state
+                .legs
+                .get(&sym)
+                .and_then(|l| l.stop_unconfirmed_id.as_ref())
+                .is_none()
+            {
+                continue;
+            }
             if !self.drop_unconfirmed_stop(&sym).await {
                 log::error!(
                     "[EXIT] {sym}: a stop with unknown state ({:?}) could not be settled — the legs are closed, but the book stays On/halted until it is",
@@ -2783,16 +2820,6 @@ impl Engine {
                     "{sym}: unconfirmed stop still tracked after the exit; retry DISARM after RISK_ACK"
                 ));
             }
-            log::info!(
-                "[EXIT] {sym} pnl(ex-funding)={} peak={:.2} exit_level={:.2}",
-                if pnl_known {
-                    format!("${leg_total:+.2}")
-                } else {
-                    "unknown".to_string()
-                },
-                leg.peak_close,
-                leg.exit_level
-            );
         }
         self.state.realized_pnl_total_usd += total;
         if self.state.tranches_remaining > 0 {
@@ -5251,6 +5278,32 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn venue_reads_resolve_the_instance_suffixed_account() {
+        // Same rule as config::lighter_env — the suffixed value wins, so
+        // this check can never read a different account than the one the
+        // connector trades on.
+        std::env::set_var("BULL_HOLDER_TEST_IDX", "shared");
+        std::env::set_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER", "dedicated");
+        assert_eq!(
+            lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder").as_deref(),
+            Some("dedicated")
+        );
+        assert_eq!(
+            lighter_env("BULL_HOLDER_TEST_IDX", "other").as_deref(),
+            Some("shared")
+        );
+        std::env::set_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER", "");
+        assert_eq!(
+            lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder").as_deref(),
+            Some("shared"),
+            "an empty suffixed value falls back, it is not a value"
+        );
+        std::env::remove_var("BULL_HOLDER_TEST_IDX");
+        std::env::remove_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER");
+        assert_eq!(lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder"), None);
     }
 
     #[test]
