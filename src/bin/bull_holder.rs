@@ -1787,21 +1787,61 @@ impl Engine {
             }
         };
         let accounts = v.get("accounts")?.as_array()?;
-        if accounts.len() != 1 {
-            log::warn!(
-                "[STOP] wallet {} has {} accounts; set LIGHTER_ACCOUNT_INDEX so the venue order checks can name one",
-                self.cfg.lighter_wallet_address,
-                accounts.len()
-            );
-            return None;
-        }
-        let idx = accounts[0]
-            .get("account_index")
-            .and_then(|x| x.as_u64())?
-            .to_string();
+        let indices: Vec<u64> = accounts
+            .iter()
+            .filter_map(|a| a.get("account_index").and_then(|x| x.as_u64()))
+            .collect();
+        let idx = match indices.as_slice() {
+            [] => {
+                log::warn!(
+                    "[STOP] wallet {} has no accounts",
+                    self.cfg.lighter_wallet_address
+                );
+                return None;
+            }
+            [only] => only.to_string(),
+            // Several accounts behind one wallet: the API key picks the
+            // one the connector trades on, the same probe it does.
+            many => self.account_for_api_key(many).await?.to_string(),
+        };
         log::info!("[STOP] resolved Lighter account index {idx} from the wallet address");
         *cached = Some(idx.clone());
         Some(idx)
+    }
+
+    /// Which of `candidates` carries this bot's API key — the account the
+    /// connector resolved. Mirrors its discovery probe (an `apikeys` read
+    /// per candidate). `None` when no key index is configured or none
+    /// matches, which leaves the venue checks inconclusive.
+    async fn account_for_api_key(&self, candidates: &[u64]) -> Option<u64> {
+        let key_index = lighter_env("LIGHTER_API_KEY_INDEX", &self.cfg.instance_id)?;
+        let base = self.cfg.lighter_account_url.trim_end_matches('/');
+        for &idx in candidates {
+            let url =
+                format!("{base}/api/v1/apikeys?account_index={idx}&api_key_index={key_index}");
+            let v: serde_json::Value = match self.http.get(&url).send().await {
+                Ok(r) => match r.json().await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+                Err(e) => {
+                    log::warn!("[STOP] api-key probe for account {idx} failed: {e:?}");
+                    continue;
+                }
+            };
+            let has_key = v
+                .get("api_keys")
+                .and_then(|k| k.as_array())
+                .is_some_and(|k| !k.is_empty());
+            if v.get("code").and_then(|c| c.as_u64()) == Some(200) && has_key {
+                return Some(idx);
+            }
+        }
+        log::warn!(
+            "[STOP] none of the wallet's {} accounts carries API key index {key_index}; venue order checks are inconclusive",
+            candidates.len()
+        );
+        None
     }
 
     /// Orders resting for `symbol` according to Lighter's own account
