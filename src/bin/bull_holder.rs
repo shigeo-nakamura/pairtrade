@@ -1654,6 +1654,15 @@ impl Engine {
         }
         match self.lt.cancel_order(symbol, &id).await {
             Ok(()) => {
+                // HTTP 200 on the cancel is the same weak signal as on the
+                // placement: accepted for processing, not "the order is
+                // gone". Only the venue's own terminal update settles it.
+                if !self.cancel_confirmed(symbol, &id).await {
+                    log::warn!(
+                        "[STOP] {symbol}: cancel of {id} was acknowledged but the venue has not reported it cancelled yet; keeping it tracked"
+                    );
+                    return false;
+                }
                 log::warn!("[STOP] {symbol}: unconfirmed stop {id} cancelled; it did exist");
                 if let Some(l) = self.state.legs.get_mut(symbol) {
                     l.stop_unconfirmed_id = None;
@@ -1671,6 +1680,26 @@ impl Engine {
                 false
             }
         }
+    }
+
+    /// Did the venue itself report `order_id` as cancelled? Positive
+    /// evidence only: the cancelled-order feed naming it. An order list
+    /// that merely no longer shows it is not proof (the same WS cache can
+    /// be empty during a reconnect), so "not seen" keeps it tracked.
+    async fn cancel_confirmed(&self, symbol: &str, order_id: &str) -> bool {
+        for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
+            match self.lt.get_canceled_orders(symbol).await {
+                Ok(resp) if resp.orders.iter().any(|o| o.order_id == order_id) => return true,
+                Ok(_) => log::debug!(
+                    "[STOP] {symbol}: {order_id} not in the cancelled feed yet (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS})"
+                ),
+                Err(e) => log::warn!(
+                    "[STOP] {symbol}: cancelled-order read failed (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}): {e:?}"
+                ),
+            }
+        }
+        false
     }
 
     /// Poll the venue's own order list until it reports `order_id`. The
@@ -4059,6 +4088,9 @@ mod tests {
         /// stop this stub created rests; `false` = the venue dropped it
         /// (the 2026-09-22 failure: `sendTx` 200 but no order).
         stop_rests: bool,
+        /// Live-path knob: ids the venue reports as cancelled. A cancel is
+        /// only settled when its id shows up here.
+        canceled: Vec<String>,
     }
 
     #[async_trait::async_trait]
@@ -4113,9 +4145,21 @@ mod tests {
             &self,
             _symbol: &str,
         ) -> Result<dex_connector::CanceledOrdersResponse, dex_connector::DexError> {
-            unimplemented!(
-                "QuoteOnly stub: get_canceled_orders must not be called on the DRY_RUN exit path"
-            )
+            if self.trigger_calls.is_none() {
+                unimplemented!(
+                    "QuoteOnly stub: get_canceled_orders must not be called on the DRY_RUN exit path"
+                )
+            }
+            Ok(dex_connector::CanceledOrdersResponse {
+                orders: self
+                    .canceled
+                    .iter()
+                    .map(|id| dex_connector::CanceledOrder {
+                        order_id: id.clone(),
+                        canceled_timestamp: 1,
+                    })
+                    .collect(),
+            })
         }
         async fn get_open_orders(
             &self,
@@ -4400,6 +4444,7 @@ mod tests {
             perp_position: None,
             trigger_calls: None,
             stop_rests: false,
+            canceled: Vec::new(),
         });
         Engine {
             cfg: cfg.clone(),
@@ -4765,6 +4810,7 @@ mod tests {
             perp_position: None,
             trigger_calls: None,
             stop_rests: false,
+            canceled: Vec::new(),
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4805,6 +4851,7 @@ mod tests {
             perp_position: Some(-0.005),
             trigger_calls: None,
             stop_rests: false,
+            canceled: Vec::new(),
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4846,6 +4893,7 @@ mod tests {
             perp_position: Some(0.00505),
             trigger_calls: None,
             stop_rests: false,
+            canceled: Vec::new(),
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4887,6 +4935,7 @@ mod tests {
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: true,
+            canceled: Vec::new(),
         });
         let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
         e.lt = dyn_venue;
@@ -4934,6 +4983,7 @@ mod tests {
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: false, // acknowledged, never rests
+            canceled: Vec::new(),
         });
         e.lt = venue;
         if let Some(l) = e.state.legs.get_mut("BTC") {
@@ -4970,10 +5020,27 @@ mod tests {
             back.legs["BTC"].stop_unconfirmed_id.as_deref(),
             Some("stop-1")
         );
-        e.drop_unconfirmed_stop("BTC").await;
+        // An acknowledged cancel alone does not clear it — the venue must
+        // report the cancellation.
+        assert!(!e.drop_unconfirmed_stop("BTC").await);
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("stop-1"),
+            "an unreported cancel keeps the id"
+        );
+        let settling: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: None,
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: false,
+            canceled: vec!["stop-1".into()],
+        });
+        e.lt = settling;
+        assert!(e.drop_unconfirmed_stop("BTC").await);
         assert_eq!(
             e.state.legs["BTC"].stop_unconfirmed_id, None,
-            "a confirmed cancel clears it"
+            "a cancellation the venue reports clears it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4996,6 +5063,7 @@ mod tests {
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: false,
+            canceled: Vec::new(),
         });
         e.lt = venue;
         if let Some(l) = e.state.legs.get_mut("BTC") {
@@ -5028,6 +5096,7 @@ mod tests {
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: false,
+            canceled: Vec::new(),
         });
         e.lt = venue.clone();
         e.hl = venue;
