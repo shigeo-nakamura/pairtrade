@@ -468,6 +468,11 @@ fn remainder_is_dust(
 /// A holding the book does not carry counts as flat below this notional.
 const RECONCILE_DUST_USD: f64 = 5.0;
 
+/// How long a freshly placed stop is given to appear in the venue's own
+/// order list before it is treated as never placed.
+const STOP_CONFIRM_ATTEMPTS: u32 = 6;
+const STOP_CONFIRM_STEP_MS: u64 = 2_000;
+
 /// Startup verification of the book against the venues: retries for
 /// transient read failures before halting.
 const STARTUP_RECONCILE_ATTEMPTS: u32 = 6;
@@ -1569,6 +1574,13 @@ impl Engine {
                 )
                 .await
                 .with_context(|| format!("Lighter stop {symbol} @ {level:.2}"))?;
+            // `sendTx` returning 200 means the transaction was ACCEPTED for
+            // processing, not that the order rests: Lighter validates it
+            // asynchronously and can drop it silently (first live stops,
+            // 2026-09-22 — 2 of 3 acknowledged stops never appeared at the
+            // venue while the bot recorded their ids and stopped retrying).
+            // The order only exists once the venue reports it.
+            self.confirm_stop_rests(symbol, &resp.order_id).await?;
             resp.order_id
         };
         log::info!(
@@ -1585,6 +1597,44 @@ impl Engine {
         }
         self.persist();
         Ok(())
+    }
+
+    /// Poll the venue's own order list until it reports `order_id`. The
+    /// Lighter connector serves this from its WebSocket order tracking,
+    /// which was confirmed live to carry trigger orders (a stop placed at
+    /// 16:48 UTC on 2026-09-22 was found and cancelled through it).
+    /// `Err` = the venue never showed it; the caller must not record it.
+    async fn confirm_stop_rests(&self, symbol: &str, order_id: &str) -> Result<()> {
+        let mut last: Option<String> = None;
+        for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
+            match self.lt.get_open_orders(symbol).await {
+                Ok(resp) => {
+                    if resp.orders.iter().any(|o| o.order_id == order_id) {
+                        return Ok(());
+                    }
+                    let ids: Vec<&str> = resp.orders.iter().map(|o| o.order_id.as_str()).collect();
+                    log::warn!(
+                        "[STOP] {symbol}: stop {order_id} not visible yet (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}); venue shows {ids:?}"
+                    );
+                    last = None;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[STOP] {symbol}: open-order read failed (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}): {e:?}"
+                    );
+                    last = Some(format!("{e:?}"));
+                }
+            }
+        }
+        match last {
+            Some(e) => bail!(
+                "stop {order_id} for {symbol} could not be confirmed: the venue's order list was unreadable ({e})"
+            ),
+            None => bail!(
+                "stop {order_id} for {symbol} was acknowledged but never appeared at the venue (sendTx 200 is not an order); it is NOT recorded, so the next reconcile re-places it"
+            ),
+        }
     }
 
     async fn cancel_stop(&mut self, symbol: &str) {
@@ -2754,12 +2804,43 @@ impl Engine {
                     continue;
                 }
             }
+            // The recorded stop must still be RESTING at the venue — a
+            // stop can be dropped after its `sendTx` was acknowledged, or
+            // cancelled outside the bot; in both cases state's id is a
+            // ghost and nothing else would ever re-place it.
+            let rests = match (&leg.stop_order_id, self.cfg.dry_run) {
+                (None, _) => Some(false),
+                (Some(_), true) => Some(true), // no venue book in DRY_RUN
+                (Some(id), false) => match self.lt.get_open_orders(&sym).await {
+                    Ok(resp) => Some(resp.orders.iter().any(|o| &o.order_id == id)),
+                    Err(e) => {
+                        log::warn!(
+                            "[STOP] {sym}: open-order read failed, stop check deferred: {e:?}"
+                        );
+                        None
+                    }
+                },
+            };
+            let Some(rests) = rests else { continue };
+            if !rests && leg.stop_order_id.is_some() {
+                log::error!(
+                    "[STOP] {sym}: recorded stop {:?} is NOT resting at the venue — clearing it and re-placing",
+                    leg.stop_order_id
+                );
+                if let Some(l) = self.state.legs.get_mut(&sym) {
+                    l.stop_order_id = None;
+                    l.stop_level = None;
+                    l.stop_size = None;
+                }
+                self.persist();
+            }
             // Covered in size AND resting at the level the refreshed peak
             // calls for: a move whose cancel failed leaves the old, lower
             // trigger tracked, and only a retry here (place_stop cancels
             // it again first) brings it up.
             let want = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
-            if stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
+            if rests
+                && stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size)
                 && stop_is_current(
                     leg.stop_level,
                     leg.stop_size,
@@ -3883,6 +3964,10 @@ mod tests {
         /// Live-path knob: record `create_advanced_trigger_order` arguments
         /// (style, slippage_bps, tpsl, reduce_only) instead of panicking.
         trigger_calls: Option<std::sync::Mutex<Vec<(String, Option<u32>, String, bool)>>>,
+        /// Live-path knob: what `get_open_orders` reports. `true` = the
+        /// stop this stub created rests; `false` = the venue dropped it
+        /// (the 2026-09-22 failure: `sendTx` 200 but no order).
+        stop_rests: bool,
     }
 
     #[async_trait::async_trait]
@@ -3943,11 +4028,27 @@ mod tests {
         }
         async fn get_open_orders(
             &self,
-            _symbol: &str,
+            symbol: &str,
         ) -> Result<dex_connector::OpenOrdersResponse, dex_connector::DexError> {
-            unimplemented!(
-                "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
-            )
+            let Some(calls) = &self.trigger_calls else {
+                unimplemented!(
+                    "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
+                )
+            };
+            let placed = calls.lock().unwrap().len();
+            let orders = if self.stop_rests && placed > 0 {
+                vec![dex_connector::OpenOrder {
+                    order_id: "stop-1".into(),
+                    symbol: symbol.to_string(),
+                    side: OrderSide::Short,
+                    size: Decimal::ONE,
+                    price: Decimal::ONE,
+                    status: "open".into(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(dex_connector::OpenOrdersResponse { orders })
         }
         async fn get_balance(
             &self,
@@ -4206,6 +4307,7 @@ mod tests {
             cancel_fails: false,
             perp_position: None,
             trigger_calls: None,
+            stop_rests: false,
         });
         Engine {
             cfg: cfg.clone(),
@@ -4570,6 +4672,7 @@ mod tests {
             cancel_fails: true,
             perp_position: None,
             trigger_calls: None,
+            stop_rests: false,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4609,6 +4712,7 @@ mod tests {
             cancel_fails: false,
             perp_position: Some(-0.005),
             trigger_calls: None,
+            stop_rests: false,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4649,6 +4753,7 @@ mod tests {
             cancel_fails: false,
             perp_position: Some(0.00505),
             trigger_calls: None,
+            stop_rests: false,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4689,6 +4794,7 @@ mod tests {
             cancel_fails: false,
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: true,
         });
         let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
         e.lt = dyn_venue;
@@ -4713,6 +4819,49 @@ mod tests {
         assert_eq!(tpsl, "Sl");
         assert!(*reduce_only);
         assert_eq!(e.state.legs["BTC"].stop_order_id.as_deref(), Some("stop-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sendTx` returning 200 is not an order: when the venue never shows
+    /// the stop, `place_stop` must fail and record NOTHING, so the next
+    /// reconcile re-places it. (2026-09-22: two acknowledged stops never
+    /// rested while the bot kept their ids and stopped retrying.)
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledged_stop_the_venue_never_shows_is_not_recorded() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_ghost_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: None,
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: false, // acknowledged, never rests
+        });
+        e.lt = venue;
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_order_id = None;
+            l.stop_level = None;
+            l.stop_size = None;
+        }
+        let err = e.place_stop("BTC").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("never appeared at the venue"),
+            "unexpected error: {err:#}"
+        );
+        let leg = &e.state.legs["BTC"];
+        assert_eq!(leg.stop_order_id, None, "a ghost stop must not be recorded");
+        assert_eq!(leg.stop_level, None);
+        assert_eq!(leg.stop_size, None);
+        assert!(
+            !stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size),
+            "the leg must read as uncovered so ensure_stops retries"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
