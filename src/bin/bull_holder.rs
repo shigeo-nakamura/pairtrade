@@ -1652,34 +1652,61 @@ impl Engine {
             self.persist();
             return true;
         }
-        match self.lt.cancel_order(symbol, &id).await {
-            Ok(()) => {
-                // HTTP 200 on the cancel is the same weak signal as on the
-                // placement: accepted for processing, not "the order is
-                // gone". Only the venue's own terminal update settles it.
-                if !self.cancel_confirmed(symbol, &id).await {
-                    log::warn!(
-                        "[STOP] {symbol}: cancel of {id} was acknowledged but the venue has not reported it cancelled yet; keeping it tracked"
-                    );
-                    return false;
-                }
-                log::warn!("[STOP] {symbol}: unconfirmed stop {id} cancelled; it did exist");
-                if let Some(l) = self.state.legs.get_mut(symbol) {
-                    l.stop_unconfirmed_id = None;
-                }
-                self.persist();
-                true
-            }
-            Err(e) => {
-                // Either it never existed, or the cancel failed. Both keep
-                // the id: a cancel of a non-existent order is harmless to
-                // retry, forgetting a live one is not.
+        // HTTP 200 on the cancel is the same weak signal as on the
+        // placement: accepted for processing, not "the order is gone". And
+        // the motivating failure — a stop dropped during Lighter's
+        // asynchronous validation — never existed, so it can never appear
+        // in the cancelled feed either. Two independent settlements:
+        // the venue reports it cancelled, or a READY account snapshot
+        // shows it is not resting.
+        let cancel_sent = self.lt.cancel_order(symbol, &id).await;
+        if let Err(e) = &cancel_sent {
+            log::warn!("[STOP] {symbol}: cancel of unconfirmed stop {id} failed: {e:?}");
+        }
+        let settled = (cancel_sent.is_ok() && self.cancel_confirmed(symbol, &id).await)
+            || self.stop_absent_confirmed(symbol, &id).await;
+        if !settled {
+            log::warn!(
+                "[STOP] {symbol}: {id} is still unsettled (neither reported cancelled nor shown absent by a ready snapshot); keeping it tracked"
+            );
+            return false;
+        }
+        log::warn!("[STOP] {symbol}: unconfirmed stop {id} settled — it is not resting");
+        if let Some(l) = self.state.legs.get_mut(symbol) {
+            l.stop_unconfirmed_id = None;
+        }
+        self.persist();
+        true
+    }
+
+    /// Is `order_id` provably NOT resting? A missing entry in the order
+    /// list only means that when the account snapshot behind it is fresh:
+    /// `get_positions` fails with "positions not ready" until the first
+    /// `account_all` snapshot of the CURRENT connection (dex-connector,
+    /// bot-strategy#911), so a successful positions read is the readiness
+    /// proof that turns absence into evidence. This is what clears a stop
+    /// that Lighter dropped during validation and that therefore can never
+    /// appear in the cancelled feed.
+    async fn stop_absent_confirmed(&self, symbol: &str, order_id: &str) -> bool {
+        for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
+            if let Err(e) = self.lt.get_positions().await {
                 log::warn!(
-                    "[STOP] {symbol}: cancel of unconfirmed stop {id} failed, keeping it tracked: {e:?}"
+                    "[STOP] {symbol}: account snapshot not ready (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}), absence proves nothing yet: {e:?}"
                 );
-                false
+                continue;
+            }
+            match self.lt.get_open_orders(symbol).await {
+                Ok(resp) if !resp.orders.iter().any(|o| o.order_id == order_id) => return true,
+                Ok(_) => log::warn!(
+                    "[STOP] {symbol}: {order_id} IS resting at the venue (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS})"
+                ),
+                Err(e) => log::warn!(
+                    "[STOP] {symbol}: order-list read failed (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}): {e:?}"
+                ),
             }
         }
+        false
     }
 
     /// Did the venue itself report `order_id` as cancelled? Positive
@@ -4084,10 +4111,10 @@ mod tests {
         /// Live-path knob: record `create_advanced_trigger_order` arguments
         /// (style, slippage_bps, tpsl, reduce_only) instead of panicking.
         trigger_calls: Option<std::sync::Mutex<Vec<(String, Option<u32>, String, bool)>>>,
-        /// Live-path knob: what `get_open_orders` reports. `true` = the
-        /// stop this stub created rests; `false` = the venue dropped it
-        /// (the 2026-09-22 failure: `sendTx` 200 but no order).
-        stop_rests: bool,
+        /// Live-path knob: the order id `get_open_orders` reports as
+        /// resting. `None` = the venue shows nothing (the 2026-09-22
+        /// failure: `sendTx` 200 but no order).
+        stop_rests: Option<String>,
         /// Live-path knob: ids the venue reports as cancelled. A cancel is
         /// only settled when its id shows up here.
         canceled: Vec<String>,
@@ -4170,10 +4197,10 @@ mod tests {
                     "QuoteOnly stub: get_open_orders must not be called on the DRY_RUN exit path"
                 )
             };
-            let placed = calls.lock().unwrap().len();
-            let orders = if self.stop_rests && placed > 0 {
+            let _ = calls;
+            let orders = if let Some(id) = &self.stop_rests {
                 vec![dex_connector::OpenOrder {
-                    order_id: "stop-1".into(),
+                    order_id: id.clone(),
                     symbol: symbol.to_string(),
                     side: OrderSide::Short,
                     size: Decimal::ONE,
@@ -4204,6 +4231,14 @@ mod tests {
             &self,
         ) -> Result<Vec<dex_connector::PositionSnapshot>, dex_connector::DexError> {
             let Some(p) = self.perp_position else {
+                if self.trigger_calls.is_some() {
+                    // Live-path stub without a position knob: the account
+                    // snapshot is NOT ready (what dex-connector returns
+                    // until the first `account_all` of a connection).
+                    return Err(dex_connector::DexError::Transient(
+                        "positions not ready from websocket".into(),
+                    ));
+                }
                 unimplemented!(
                     "QuoteOnly stub: get_positions must not be called on the DRY_RUN exit path"
                 )
@@ -4443,7 +4478,7 @@ mod tests {
             cancel_fails: false,
             perp_position: None,
             trigger_calls: None,
-            stop_rests: false,
+            stop_rests: None,
             canceled: Vec::new(),
         });
         Engine {
@@ -4794,7 +4829,7 @@ mod tests {
     /// stop fired) but the stop cancel fails: the book must NOT reach
     /// Exited — a later ARM would clear the leg and forget a trigger that
     /// may still rest at the venue.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exit_with_an_unconfirmed_stop_cancel_stays_on_and_halts() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_exit_cancel_{}_{}",
@@ -4809,7 +4844,7 @@ mod tests {
             cancel_fails: true,
             perp_position: None,
             trigger_calls: None,
-            stop_rests: false,
+            stop_rests: None,
             canceled: Vec::new(),
         });
         e.hl = venue.clone();
@@ -4835,7 +4870,7 @@ mod tests {
     /// Live exit where the venue shows a SHORT where the book has a long
     /// (manual action / unrecorded order): never "closed", no order sent
     /// for it, the book halts with the leg as recorded.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exit_refuses_a_reversed_venue_position() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_exit_rev_{}_{}",
@@ -4850,7 +4885,7 @@ mod tests {
             cancel_fails: false,
             perp_position: Some(-0.005),
             trigger_calls: None,
-            stop_rests: false,
+            stop_rests: None,
             canceled: Vec::new(),
         });
         e.hl = venue.clone();
@@ -4892,7 +4927,7 @@ mod tests {
             cancel_fails: false,
             perp_position: Some(0.00505),
             trigger_calls: None,
-            stop_rests: false,
+            stop_rests: None,
             canceled: Vec::new(),
         });
         e.hl = venue.clone();
@@ -4918,7 +4953,7 @@ mod tests {
     /// (type 3) with the configured protective slippage, reduce-only, SL:
     /// the connector's `Market` style sends execution price 0 and the
     /// Lighter signer rejects it (first live ARM, bot-strategy#895/#950).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn live_stop_is_a_slippage_controlled_stop_limit() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_stop_style_{}_{}",
@@ -4934,7 +4969,7 @@ mod tests {
             cancel_fails: false,
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
-            stop_rests: true,
+            stop_rests: Some("stop-1".into()),
             canceled: Vec::new(),
         });
         let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
@@ -4980,9 +5015,9 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: false,
-            perp_position: None,
+            perp_position: Some(0.005), // a ready account snapshot
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
-            stop_rests: false, // acknowledged, never rests
+            stop_rests: None, // acknowledged, never rests
             canceled: Vec::new(),
         });
         e.lt = venue;
@@ -5020,34 +5055,39 @@ mod tests {
             back.legs["BTC"].stop_unconfirmed_id.as_deref(),
             Some("stop-1")
         );
-        // An acknowledged cancel alone does not clear it — the venue must
-        // report the cancellation.
+        // A ghost can never appear in the cancelled feed, so a READY
+        // account snapshot showing it absent is what settles it — without
+        // this the leg would stay blocked and uncovered forever.
+        assert!(e.drop_unconfirmed_stop("BTC").await);
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id, None,
+            "a ghost proven absent by a ready snapshot clears"
+        );
+        // With no ready snapshot, absence proves nothing and the id stays.
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_unconfirmed_id = Some("stop-1".into());
+        }
+        let not_ready: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,
+            perp_position: None, // positions not ready
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        e.lt = not_ready;
         assert!(!e.drop_unconfirmed_stop("BTC").await);
         assert_eq!(
             e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
             Some("stop-1"),
-            "an unreported cancel keeps the id"
-        );
-        let settling: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
-            price: Decimal::from(80_000),
-            cancel_fails: false,
-            perp_position: None,
-            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
-            stop_rests: false,
-            canceled: vec!["stop-1".into()],
-        });
-        e.lt = settling;
-        assert!(e.drop_unconfirmed_stop("BTC").await);
-        assert_eq!(
-            e.state.legs["BTC"].stop_unconfirmed_id, None,
-            "a cancellation the venue reports clears it"
+            "absence without a ready snapshot is not evidence"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A cancel that fails leaves the unconfirmed stop tracked: forgetting
     /// an order that may be resting is the failure mode this guards.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_cancel_keeps_the_unconfirmed_stop_tracked() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_stop_keep_{}_{}",
@@ -5062,7 +5102,7 @@ mod tests {
             cancel_fails: true,
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
-            stop_rests: false,
+            stop_rests: None,
             canceled: Vec::new(),
         });
         e.lt = venue;
@@ -5080,7 +5120,7 @@ mod tests {
     /// While a stop with unknown state is still tracked, no replacement may
     /// be sent (two live stops on one position) and an exit may not reach
     /// Exited (a later ARM would inherit an orphaned reduce-only trigger).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_unsettled_stop_blocks_replacement_and_exit() {
         let dir = std::env::temp_dir().join(format!(
             "bull_holder_stop_block_{}_{}",
@@ -5092,10 +5132,10 @@ mod tests {
         e.cfg.dry_run = false;
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
-            cancel_fails: true, // the uncertain stop cannot be settled
-            perp_position: None,
+            cancel_fails: true,         // the uncertain stop cannot be settled
+            perp_position: Some(0.005), // ready snapshot...
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
-            stop_rests: false,
+            stop_rests: Some("ghost-9".into()), // ...and it shows the stop IS resting
             canceled: Vec::new(),
         });
         e.lt = venue.clone();
