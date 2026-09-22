@@ -211,6 +211,10 @@ struct Config {
     max_close_fetch_failures: u32,
     /// IOC slippage tolerance for the Hyperliquid spot legs (bps).
     hl_taker_slippage_bps: u32,
+    /// Protective limit of the Lighter exchange stop, below its trigger
+    /// (bps). Wide on purpose: the stop is the 35 % insurance under the 30 %
+    /// daily rule, execution matters more than price.
+    stop_slippage_bps: u32,
     /// Reconcile: |expected − actual| / expected above this (%) halts.
     reconcile_tolerance_pct: f64,
     reconcile_every_secs: u64,
@@ -270,6 +274,7 @@ impl Config {
             daily_eval_after_utc_secs: env_u32("BULL_HOLDER_DAILY_EVAL_AFTER_UTC_SECS", 300),
             max_close_fetch_failures: env_u32("BULL_HOLDER_MAX_CLOSE_FETCH_FAILURES", 3),
             hl_taker_slippage_bps: env_u32("BULL_HOLDER_HL_TAKER_SLIPPAGE_BPS", 30),
+            stop_slippage_bps: env_u32("BULL_HOLDER_STOP_SLIPPAGE_BPS", 500),
             reconcile_tolerance_pct: env_f64("BULL_HOLDER_RECONCILE_TOLERANCE_PCT", 2.0),
             reconcile_every_secs: env_u64("BULL_HOLDER_RECONCILE_EVERY_SECS", 600),
             hl_info_url: env_string(
@@ -348,6 +353,12 @@ impl Config {
         if !(0.0 <= self.perp_fraction && self.perp_fraction <= 1.0) {
             bail!("BULL_HOLDER_PERP_FRACTION must be in [0,1]");
         }
+        if self.stop_slippage_bps == 0 || self.stop_slippage_bps > 2_000 {
+            bail!(
+                "BULL_HOLDER_STOP_SLIPPAGE_BPS={} out of range (1..=2000)",
+                self.stop_slippage_bps
+            );
+        }
         if self.hl_taker_slippage_bps == 0 || self.hl_taker_slippage_bps > 1_000 {
             bail!("BULL_HOLDER_HL_TAKER_SLIPPAGE_BPS must be in 1..=1000");
         }
@@ -381,6 +392,7 @@ impl Config {
                 "hl_taker_slippage_bps",
                 self.hl_taker_slippage_bps.to_string(),
             ),
+            ("stop_slippage_bps", self.stop_slippage_bps.to_string()),
         ])
     }
 }
@@ -1532,6 +1544,15 @@ impl Engine {
                 })?;
             // `side` is the POSITION side for Lighter's TP/SL helper (long
             // position → sell stop).
+            //
+            // Style: stop-LIMIT with a wide protective limit (trigger minus
+            // `stop_slippage_bps`), Lighter type 3. The connector's `Market`
+            // style (type 2) sends execution price 0, which the Lighter
+            // signer rejects ("OrderPrice should not be less than 1") — found
+            // on the first live ARM (bot-strategy#895 / #950). Once
+            // triggered, the limit sits far below the trigger, so it fills
+            // as a taker unless the market gapped through it, in which case
+            // it rests there instead of being lost.
             let resp = self
                 .lt
                 .create_advanced_trigger_order(
@@ -1540,8 +1561,8 @@ impl Engine {
                     OrderSide::Long,
                     trigger,
                     None,
-                    TriggerOrderStyle::Market,
-                    None,
+                    TriggerOrderStyle::MarketWithSlippageControl,
+                    Some(self.cfg.stop_slippage_bps),
                     TpSl::Sl,
                     true,
                     None,
@@ -3145,9 +3166,9 @@ async fn main() -> Result<()> {
     init_logger();
     let cfg = Config::from_env()?;
     log::info!(
-        "[CONFIG] bot={BOT} instance={} dry_run={} symbols={} equity=${:.0} spot_frac={} perp_frac={} tranches={} exit_dd={}% stop_dd={}% mmr={}% margin_min={}% hl_slip={}bps fp={}",
+        "[CONFIG] bot={BOT} instance={} dry_run={} symbols={} equity=${:.0} spot_frac={} perp_frac={} tranches={} exit_dd={}% stop_dd={}% stop_slip={}bps mmr={}% margin_min={}% hl_slip={}bps fp={}",
         cfg.instance_id, cfg.dry_run, cfg.symbols.join(","), cfg.equity_usd, cfg.spot_fraction, cfg.perp_fraction,
-        cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.lighter_mmr_pct, cfg.perp_margin_min_pct,
+        cfg.entry_tranches, cfg.exit_dd_pct, cfg.stop_dd_pct, cfg.stop_slippage_bps, cfg.lighter_mmr_pct, cfg.perp_margin_min_pct,
         cfg.hl_taker_slippage_bps, cfg.fingerprint()
     );
     if !cfg.dry_run {
@@ -3859,6 +3880,9 @@ mod tests {
         /// Live-path knob: signed perp position `get_positions` reports for
         /// every symbol (`None` = the call is unexpected).
         perp_position: Option<f64>,
+        /// Live-path knob: record `create_advanced_trigger_order` arguments
+        /// (style, slippage_bps, tpsl, reduce_only) instead of panicking.
+        trigger_calls: Option<std::sync::Mutex<Vec<(String, Option<u32>, String, bool)>>>,
     }
 
     #[async_trait::async_trait]
@@ -4020,13 +4044,28 @@ mod tests {
             _side: OrderSide,
             _trigger_px: Decimal,
             _limit_px: Option<Decimal>,
-            _order_style: dex_connector::TriggerOrderStyle,
-            _slippage_bps: Option<u32>,
-            _tpsl: dex_connector::TpSl,
-            _reduce_only: bool,
+            order_style: dex_connector::TriggerOrderStyle,
+            slippage_bps: Option<u32>,
+            tpsl: dex_connector::TpSl,
+            reduce_only: bool,
             _expiry_secs: Option<u64>,
         ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
-            unimplemented!("QuoteOnly stub: create_advanced_trigger_order must not be called on the DRY_RUN exit path")
+            let Some(calls) = &self.trigger_calls else {
+                unimplemented!("QuoteOnly stub: create_advanced_trigger_order must not be called on the DRY_RUN exit path")
+            };
+            calls.lock().unwrap().push((
+                format!("{order_style:?}"),
+                slippage_bps,
+                format!("{tpsl:?}"),
+                reduce_only,
+            ));
+            Ok(dex_connector::CreateOrderResponse {
+                order_id: "stop-1".into(),
+                exchange_order_id: None,
+                ordered_price: Decimal::ONE,
+                ordered_size: _size,
+                client_order_id: None,
+            })
         }
         async fn create_order_taker_ioc(
             &self,
@@ -4080,6 +4119,9 @@ mod tests {
             &self,
             _symbol: Option<String>,
         ) -> Result<(), dex_connector::DexError> {
+            if self.trigger_calls.is_some() {
+                return Ok(());
+            }
             unimplemented!(
                 "QuoteOnly stub: cancel_all_orders must not be called on the DRY_RUN exit path"
             )
@@ -4163,6 +4205,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: false,
             perp_position: None,
+            trigger_calls: None,
         });
         Engine {
             cfg: cfg.clone(),
@@ -4526,6 +4569,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: true,
             perp_position: None,
+            trigger_calls: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4564,6 +4608,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: false,
             perp_position: Some(-0.005),
+            trigger_calls: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4603,6 +4648,7 @@ mod tests {
             price: Decimal::from(1),
             cancel_fails: false,
             perp_position: Some(0.00505),
+            trigger_calls: None,
         });
         e.hl = venue.clone();
         e.lt = venue;
@@ -4620,6 +4666,53 @@ mod tests {
             e.state.pending_order.is_some(),
             "marker kept for the operator"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live Lighter stop must be the slippage-controlled stop-LIMIT
+    /// (type 3) with the configured protective slippage, reduce-only, SL:
+    /// the connector's `Market` style sends execution price 0 and the
+    /// Lighter signer rejects it (first live ARM, bot-strategy#895/#950).
+    #[tokio::test]
+    async fn live_stop_is_a_slippage_controlled_stop_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_style_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        e.cfg.stop_slippage_bps = 700;
+        let venue = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: None,
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+        });
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue;
+        // No stop tracked yet → place_stop must create one.
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_order_id = None;
+            l.stop_level = None;
+            l.stop_size = None;
+        }
+        e.place_stop("BTC").await.unwrap();
+        let calls = venue
+            .trigger_calls
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(calls.len(), 1);
+        let (style, slip, tpsl, reduce_only) = &calls[0];
+        assert_eq!(style, "MarketWithSlippageControl");
+        assert_eq!(*slip, Some(700));
+        assert_eq!(tpsl, "Sl");
+        assert!(*reduce_only);
+        assert_eq!(e.state.legs["BTC"].stop_order_id.as_deref(), Some("stop-1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4647,6 +4740,7 @@ mod tests {
             daily_eval_after_utc_secs: 300,
             max_close_fetch_failures: 3,
             hl_taker_slippage_bps: 30,
+            stop_slippage_bps: 500,
             reconcile_tolerance_pct: 2.0,
             reconcile_every_secs: 600,
             hl_info_url: "http://127.0.0.1:1/info".into(),
