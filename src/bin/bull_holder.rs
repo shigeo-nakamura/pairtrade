@@ -2546,23 +2546,9 @@ impl Engine {
             // end of this iteration — cloning before the cancel would
             // resurrect the cancelled stop's id/level/size in state.
             self.cancel_stop(&sym).await;
-            // An acknowledged-but-unconfirmed stop is just as dangerous to
-            // leave behind: a later ARM clears the leg, and an orphaned
-            // reduce-only trigger would act on the new position.
-            let uncertain_settled = self.drop_unconfirmed_stop(&sym).await;
             let Some(mut leg) = self.state.legs.get(&sym).cloned() else {
                 continue;
             };
-            if !uncertain_settled {
-                log::error!(
-                    "[EXIT] {sym}: a stop with unknown state ({:?}) could not be cancelled — legs are closed below but the book stays On/halted until it is settled",
-                    leg.stop_unconfirmed_id
-                );
-                any_leg_still_open = true;
-                self.halt(format!(
-                    "{sym}: unconfirmed stop still tracked on exit; retry DISARM after RISK_ACK"
-                ));
-            }
             if leg.stop_order_id.is_some() {
                 // The cancel did not go through (see `cancel_stop`): the
                 // trigger may still rest at the venue. Close the legs
@@ -2769,6 +2755,24 @@ impl Engine {
             self.state.legs.insert(sym.clone(), leg.clone());
             self.persist();
             self.clear_pending_after_record();
+            // Only now — the exposure is closed. An acknowledged-but-
+            // unconfirmed stop still has to be settled (a later ARM would
+            // otherwise inherit an orphaned reduce-only trigger), but its
+            // settlement polls the venue for up to ~2 minutes per symbol,
+            // and nothing may delay a drawdown exit by that much.
+            if !self.drop_unconfirmed_stop(&sym).await {
+                log::error!(
+                    "[EXIT] {sym}: a stop with unknown state ({:?}) could not be settled — the legs are closed, but the book stays On/halted until it is",
+                    self.state
+                        .legs
+                        .get(&sym)
+                        .and_then(|l| l.stop_unconfirmed_id.clone())
+                );
+                any_leg_still_open = true;
+                self.halt(format!(
+                    "{sym}: unconfirmed stop still tracked after the exit; retry DISARM after RISK_ACK"
+                ));
+            }
             log::info!(
                 "[EXIT] {sym} pnl(ex-funding)={} peak={:.2} exit_level={:.2}",
                 if pnl_known {
@@ -5226,6 +5230,16 @@ mod tests {
             "must not be Exited with a live-maybe stop"
         );
         assert!(e.state.halted);
+        // The exposure is closed first: settling the stop polls the venue
+        // for up to ~2 min per symbol and must never delay the exit.
+        for (sym, leg) in &e.state.legs {
+            assert_eq!(leg.spot_size, 0.0, "{sym} spot must be closed");
+            assert_eq!(leg.perp_size, 0.0, "{sym} perp must be closed");
+            assert!(
+                leg.stop_unconfirmed_id.is_some(),
+                "{sym} keeps the unsettled stop id"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
