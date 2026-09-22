@@ -497,7 +497,17 @@ fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
             + n(p, "position_tied_order_count")
             + n(p, "pending_order_count");
     }
-    seen.then_some(total)
+    if seen {
+        return Some(total);
+    }
+    // The market row can be omitted when it carries neither a position nor
+    // an order. That is only evidence of absence if the account as a whole
+    // reports no orders — and the count must be PRESENT, or the response is
+    // simply not understood.
+    let account_total = account.get("total_order_count").and_then(|x| x.as_u64())?
+        + n(account, "total_isolated_order_count")
+        + n(account, "pending_order_count");
+    Some(account_total)
 }
 
 /// A holding the book does not carry counts as flat below this notional.
@@ -5259,7 +5269,17 @@ mod tests {
         let pending = serde_json::json!({"accounts":[{"pending_order_count":1,"positions":[
             {"symbol":"BTC","open_order_count":0}]}]});
         assert_eq!(resting_orders_for(&pending, "BTC"), Some(1));
-        // A response that does not carry the market is unknown, NOT zero.
+        // An omitted market row settles only against account-wide counts:
+        // all zero means nothing rests anywhere, so nothing rests here.
+        let omitted_flat = serde_json::json!({"accounts":[{"total_order_count":0,
+            "total_isolated_order_count":0,"pending_order_count":0,
+            "positions":[{"symbol":"ETH","open_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&omitted_flat, "BTC"), Some(0));
+        // ...but not while the account carries orders somewhere.
+        let omitted_busy = serde_json::json!({"accounts":[{"total_order_count":1,
+            "positions":[{"symbol":"ETH","open_order_count":1}]}]});
+        assert_eq!(resting_orders_for(&omitted_busy, "BTC"), Some(1));
+        // Neither the market row nor a count: unknown, NOT zero.
         let other =
             serde_json::json!({"accounts":[{"positions":[{"symbol":"ETH","open_order_count":0}]}]});
         assert_eq!(resting_orders_for(&other, "BTC"), None);
