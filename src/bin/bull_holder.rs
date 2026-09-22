@@ -937,6 +937,14 @@ struct LegState {
     /// Same, for the perp leg (the two holdings are independent).
     #[serde(default)]
     perp_cost_basis_unknown: bool,
+    /// A stop the venue acknowledged but never confirmed as resting. It is
+    /// NOT cover (it may not exist), and it must NOT be forgotten either
+    /// (it may): `get_open_orders` is served from the Lighter WebSocket
+    /// cache, so an empty read during a reconnect is not proof of absence.
+    /// Cancelled by id — which does not depend on that cache — before the
+    /// next stop is placed, and cleared only when that cancel succeeds.
+    #[serde(default)]
+    stop_unconfirmed_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1473,13 +1481,15 @@ impl Engine {
         let lighter_price = self.quote(&self.lt, symbol).await?.price;
         leg.lighter_peak = leg.lighter_peak.max(lighter_price);
         let level = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
-        if stop_is_current(
-            leg.stop_level,
-            leg.stop_size,
-            leg.stop_order_id.is_some(),
-            level,
-            leg.perp_size,
-        ) {
+        if leg.stop_unconfirmed_id.is_none()
+            && stop_is_current(
+                leg.stop_level,
+                leg.stop_size,
+                leg.stop_order_id.is_some(),
+                level,
+                leg.perp_size,
+            )
+        {
             if let Some(l) = self.state.legs.get_mut(symbol) {
                 l.lighter_peak = leg.lighter_peak;
             }
@@ -1534,6 +1544,10 @@ impl Engine {
         let order_id = if self.cfg.dry_run {
             format!("dry-run-stop-{}", now_secs())
         } else {
+            // An earlier stop whose existence is unknown must be cancelled
+            // by id first — the sweep below cannot see what the WS cache
+            // does not carry.
+            self.drop_unconfirmed_stop(symbol).await;
             // Sweep whatever else rests on this symbol before resting the
             // new stop: a trigger submission whose response was lost (timed
             // out after acceptance) never got an id recorded, and this is
@@ -1580,7 +1594,17 @@ impl Engine {
             // 2026-09-22 — 2 of 3 acknowledged stops never appeared at the
             // venue while the bot recorded their ids and stopped retrying).
             // The order only exists once the venue reports it.
-            self.confirm_stop_rests(symbol, &resp.order_id).await?;
+            if let Err(e) = self.confirm_stop_rests(symbol, &resp.order_id).await {
+                // Keep the id: it may be resting even though this read did
+                // not show it (WS cache). It is not cover, so the leg stays
+                // uncovered and gets a new stop — after this one is
+                // cancelled by id, which needs no WS cache.
+                if let Some(l) = self.state.legs.get_mut(symbol) {
+                    l.stop_unconfirmed_id = Some(resp.order_id.clone());
+                }
+                self.persist();
+                return Err(e);
+            }
             resp.order_id
         };
         log::info!(
@@ -1597,6 +1621,45 @@ impl Engine {
         }
         self.persist();
         Ok(())
+    }
+
+    /// Cancel a previously unconfirmed stop by id (no WS cache involved)
+    /// and forget it once the venue confirms the cancel. A failed cancel
+    /// keeps it recorded for the next attempt — the id is the only handle
+    /// on an order that may or may not exist.
+    async fn drop_unconfirmed_stop(&mut self, symbol: &str) {
+        let Some(id) = self
+            .state
+            .legs
+            .get(symbol)
+            .and_then(|l| l.stop_unconfirmed_id.clone())
+        else {
+            return;
+        };
+        if self.cfg.dry_run {
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.stop_unconfirmed_id = None;
+            }
+            self.persist();
+            return;
+        }
+        match self.lt.cancel_order(symbol, &id).await {
+            Ok(()) => {
+                log::warn!("[STOP] {symbol}: unconfirmed stop {id} cancelled; it did exist");
+                if let Some(l) = self.state.legs.get_mut(symbol) {
+                    l.stop_unconfirmed_id = None;
+                }
+                self.persist();
+            }
+            Err(e) => {
+                // Either it never existed, or the cancel failed. Both keep
+                // the id: a cancel of a non-existent order is harmless to
+                // retry, forgetting a live one is not.
+                log::warn!(
+                    "[STOP] {symbol}: cancel of unconfirmed stop {id} failed, keeping it tracked: {e:?}"
+                );
+            }
+        }
     }
 
     /// Poll the venue's own order list until it reports `order_id`. The
@@ -2146,6 +2209,7 @@ impl Engine {
                         close_fetch_failures: 0,
                         cost_basis_unknown: false,
                         perp_cost_basis_unknown: false,
+                        stop_unconfirmed_id: None,
                     }
                 }
             };
@@ -2824,11 +2888,13 @@ impl Engine {
             let Some(rests) = rests else { continue };
             if !rests && leg.stop_order_id.is_some() {
                 log::error!(
-                    "[STOP] {sym}: recorded stop {:?} is NOT resting at the venue — clearing it and re-placing",
+                    "[STOP] {sym}: recorded stop {:?} is NOT in the venue's order list — it stops counting as cover and is cancelled by id before the replacement",
                     leg.stop_order_id
                 );
                 if let Some(l) = self.state.legs.get_mut(&sym) {
-                    l.stop_order_id = None;
+                    // Demote, never delete: the read may be an empty WS
+                    // cache rather than proof the order is gone.
+                    l.stop_unconfirmed_id = l.stop_order_id.take();
                     l.stop_level = None;
                     l.stop_size = None;
                 }
@@ -4299,6 +4365,7 @@ mod tests {
                     close_fetch_failures: 0,
                     cost_basis_unknown: false,
                     perp_cost_basis_unknown: false,
+                    stop_unconfirmed_id: None,
                 },
             );
         }
@@ -4855,12 +4922,64 @@ mod tests {
             "unexpected error: {err:#}"
         );
         let leg = &e.state.legs["BTC"];
-        assert_eq!(leg.stop_order_id, None, "a ghost stop must not be recorded");
+        assert_eq!(
+            leg.stop_order_id, None,
+            "a ghost stop must not count as cover"
+        );
         assert_eq!(leg.stop_level, None);
         assert_eq!(leg.stop_size, None);
         assert!(
             !stop_covers(leg.stop_order_id.is_some(), leg.stop_size, leg.perp_size),
             "the leg must read as uncovered so ensure_stops retries"
+        );
+        // ...but the id is kept: an empty WS-cache read is not proof the
+        // order is absent, so it must be cancellable by id later.
+        assert_eq!(
+            leg.stop_unconfirmed_id.as_deref(),
+            Some("stop-1"),
+            "an unconfirmed stop id must never be forgotten"
+        );
+        // It survives a restart, and the next placement cancels it first.
+        let back: State = load_json(&e.cfg.state_path).unwrap().unwrap();
+        assert_eq!(
+            back.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("stop-1")
+        );
+        e.drop_unconfirmed_stop("BTC").await;
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id, None,
+            "a confirmed cancel clears it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancel that fails leaves the unconfirmed stop tracked: forgetting
+    /// an order that may be resting is the failure mode this guards.
+    #[tokio::test]
+    async fn a_failed_cancel_keeps_the_unconfirmed_stop_tracked() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_stop_keep_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,
+            perp_position: None,
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: false,
+        });
+        e.lt = venue;
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_unconfirmed_id = Some("ghost-7".into());
+        }
+        e.drop_unconfirmed_stop("BTC").await;
+        assert_eq!(
+            e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
+            Some("ghost-7")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
