@@ -219,6 +219,11 @@ struct Config {
     reconcile_tolerance_pct: f64,
     reconcile_every_secs: u64,
     hl_info_url: String,
+    /// Lighter's public account endpoint and the account index behind it.
+    /// Read-only REST: the authority on whether an order rests, used where
+    /// the connector's WebSocket-fed views cannot prove absence.
+    lighter_account_url: String,
+    lighter_account_index: String,
     arm_path: PathBuf,
     add_path: PathBuf,
     disarm_path: PathBuf,
@@ -277,6 +282,11 @@ impl Config {
             stop_slippage_bps: env_u32("BULL_HOLDER_STOP_SLIPPAGE_BPS", 500),
             reconcile_tolerance_pct: env_f64("BULL_HOLDER_RECONCILE_TOLERANCE_PCT", 2.0),
             reconcile_every_secs: env_u64("BULL_HOLDER_RECONCILE_EVERY_SECS", 600),
+            lighter_account_url: env_string(
+                "BULL_HOLDER_LIGHTER_API_URL",
+                "https://mainnet.zklighter.elliot.ai",
+            ),
+            lighter_account_index: env_string("LIGHTER_ACCOUNT_INDEX", ""),
             hl_info_url: env_string(
                 "BULL_HOLDER_HL_INFO_URL",
                 "https://api.hyperliquid.xyz/info",
@@ -358,6 +368,9 @@ impl Config {
                 "BULL_HOLDER_STOP_SLIPPAGE_BPS={} out of range (1..=2000)",
                 self.stop_slippage_bps
             );
+        }
+        if !self.dry_run && self.lighter_account_index.trim().is_empty() {
+            bail!("LIGHTER_ACCOUNT_INDEX must be set: the stop checks read the venue's account endpoint directly");
         }
         if self.hl_taker_slippage_bps == 0 || self.hl_taker_slippage_bps > 1_000 {
             bail!("BULL_HOLDER_HL_TAKER_SLIPPAGE_BPS must be in 1..=1000");
@@ -463,6 +476,28 @@ fn remainder_is_dust(
         pr.perp_done = true;
     }
     true
+}
+
+/// Resting orders for `symbol` in a Lighter `/api/v1/account` response:
+/// the market's own resting / position-tied / pending orders plus the
+/// account-wide pending count (the account is dedicated to this bot).
+/// `None` when the response does not carry the market — never 0, which
+/// would read as "nothing rests".
+fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
+    let account = v.get("accounts")?.as_array()?.first()?;
+    let n = |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let mut total = n(account, "pending_order_count");
+    let mut seen = false;
+    for p in account.get("positions")?.as_array()? {
+        if p.get("symbol").and_then(|x| x.as_str()) != Some(symbol) {
+            continue;
+        }
+        seen = true;
+        total += n(p, "open_order_count")
+            + n(p, "position_tied_order_count")
+            + n(p, "pending_order_count");
+    }
+    seen.then_some(total)
 }
 
 /// A holding the book does not carry counts as flat below this notional.
@@ -1679,30 +1714,72 @@ impl Engine {
         true
     }
 
-    /// Is `order_id` provably NOT resting? A missing entry in the order
-    /// list only means that when the account snapshot behind it is fresh:
-    /// `get_positions` fails with "positions not ready" until the first
-    /// `account_all` snapshot of the CURRENT connection (dex-connector,
-    /// bot-strategy#911), so a successful positions read is the readiness
-    /// proof that turns absence into evidence. This is what clears a stop
-    /// that Lighter dropped during validation and that therefore can never
-    /// appear in the cancelled feed.
+    /// Is `order_id` provably NOT resting? The connector's order list is
+    /// served from the Lighter WebSocket cache, which can be empty or
+    /// stale (a reconnect, or a stalled connection whose first snapshot
+    /// still satisfies the positions-ready flag), so its silence is never
+    /// proof. Lighter's account endpoint is REST and fetched per call:
+    /// zero resting orders for the market settles it. This is the only
+    /// path that can clear a stop Lighter dropped during validation, which
+    /// never existed and so can never appear in the cancelled feed.
+    /// Orders resting for `symbol` according to Lighter's own account
+    /// endpoint (REST, not the WebSocket cache): `None` when the read or
+    /// the parse failed. Counts the market's resting and position-tied
+    /// orders, plus the account-wide pending count — the account is
+    /// dedicated to this bot, which rests nothing but its stops.
+    async fn lighter_resting_orders(&self, symbol: &str) -> Option<u64> {
+        let url = format!(
+            "{}/api/v1/account?by=index&value={}",
+            self.cfg.lighter_account_url.trim_end_matches('/'),
+            self.cfg.lighter_account_index
+        );
+        let v: serde_json::Value = match self.http.get(&url).send().await {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("[STOP] {symbol}: account endpoint parse failed: {e:?}");
+                    return None;
+                }
+            },
+            Err(e) => {
+                log::warn!("[STOP] {symbol}: account endpoint read failed: {e:?}");
+                return None;
+            }
+        };
+        let account = v.get("accounts")?.as_array()?.first()?;
+        let n = |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let mut total = n(account, "pending_order_count");
+        let mut seen = false;
+        for p in account.get("positions")?.as_array()? {
+            if p.get("symbol").and_then(|x| x.as_str()) != Some(symbol) {
+                continue;
+            }
+            seen = true;
+            total += n(p, "open_order_count")
+                + n(p, "position_tied_order_count")
+                + n(p, "pending_order_count");
+        }
+        if !seen {
+            log::warn!("[STOP] {symbol}: not present in the account endpoint's positions");
+            return None;
+        }
+        Some(total)
+    }
+
     async fn stop_absent_confirmed(&self, symbol: &str, order_id: &str) -> bool {
         for attempt in 1..=STOP_CONFIRM_ATTEMPTS {
             tokio::time::sleep(Duration::from_millis(STOP_CONFIRM_STEP_MS)).await;
-            if let Err(e) = self.lt.get_positions().await {
-                log::warn!(
-                    "[STOP] {symbol}: account snapshot not ready (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}), absence proves nothing yet: {e:?}"
-                );
-                continue;
-            }
-            match self.lt.get_open_orders(symbol).await {
-                Ok(resp) if !resp.orders.iter().any(|o| o.order_id == order_id) => return true,
-                Ok(_) => log::warn!(
-                    "[STOP] {symbol}: {order_id} IS resting at the venue (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS})"
+            // The REST account endpoint is fetched fresh on every call, so
+            // it cannot be a stale cache from before this placement or
+            // cancel — which is what the WebSocket-fed views cannot rule
+            // out. Zero orders for the market is proof nothing rests.
+            match self.lighter_resting_orders(symbol).await {
+                Some(0) => return true,
+                Some(n) => log::warn!(
+                    "[STOP] {symbol}: the venue reports {n} resting order(s) for this market, {order_id} may be one of them (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS})"
                 ),
-                Err(e) => log::warn!(
-                    "[STOP] {symbol}: order-list read failed (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}): {e:?}"
+                None => log::warn!(
+                    "[STOP] {symbol}: venue account read unavailable (attempt {attempt}/{STOP_CONFIRM_ATTEMPTS}); absence proves nothing"
                 ),
             }
         }
@@ -5055,32 +5132,13 @@ mod tests {
             back.legs["BTC"].stop_unconfirmed_id.as_deref(),
             Some("stop-1")
         );
-        // A ghost can never appear in the cancelled feed, so a READY
-        // account snapshot showing it absent is what settles it — without
-        // this the leg would stay blocked and uncovered forever.
-        assert!(e.drop_unconfirmed_stop("BTC").await);
-        assert_eq!(
-            e.state.legs["BTC"].stop_unconfirmed_id, None,
-            "a ghost proven absent by a ready snapshot clears"
-        );
-        // With no ready snapshot, absence proves nothing and the id stays.
-        if let Some(l) = e.state.legs.get_mut("BTC") {
-            l.stop_unconfirmed_id = Some("stop-1".into());
-        }
-        let not_ready: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
-            price: Decimal::from(80_000),
-            cancel_fails: true,
-            perp_position: None, // positions not ready
-            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
-            stop_rests: None,
-            canceled: Vec::new(),
-        });
-        e.lt = not_ready;
+        // It is not settled while the venue cannot be read (this test's
+        // account endpoint is unreachable): absence is never assumed.
         assert!(!e.drop_unconfirmed_stop("BTC").await);
         assert_eq!(
             e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
             Some("stop-1"),
-            "absence without a ready snapshot is not evidence"
+            "an unreadable venue keeps the id"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5171,6 +5229,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn resting_orders_are_read_from_the_account_endpoint() {
+        let flat = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0},
+            {"symbol":"ETH","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&flat, "BTC"), Some(0));
+        let resting = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":1,"position_tied_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&resting, "BTC"), Some(1));
+        let tied = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":1}]}]});
+        assert_eq!(resting_orders_for(&tied, "BTC"), Some(1));
+        // An account-wide pending order counts: it may be this stop.
+        let pending = serde_json::json!({"accounts":[{"pending_order_count":1,"positions":[
+            {"symbol":"BTC","open_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&pending, "BTC"), Some(1));
+        // A response that does not carry the market is unknown, NOT zero.
+        let other =
+            serde_json::json!({"accounts":[{"positions":[{"symbol":"ETH","open_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&other, "BTC"), None);
+        assert_eq!(
+            resting_orders_for(&serde_json::json!({"code":500}), "BTC"),
+            None
+        );
+    }
+
     fn test_config() -> Config {
         let dir = std::env::temp_dir();
         Config {
@@ -5198,6 +5282,8 @@ mod tests {
             stop_slippage_bps: 500,
             reconcile_tolerance_pct: 2.0,
             reconcile_every_secs: 600,
+            lighter_account_url: "http://127.0.0.1:1".into(),
+            lighter_account_index: "1".into(),
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
             add_path: dir.join("ADD"),
