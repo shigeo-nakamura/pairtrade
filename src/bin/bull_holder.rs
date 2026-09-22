@@ -502,29 +502,27 @@ fn lighter_env(name: &str, instance_id: &str) -> Option<String> {
 
 fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
     let account = v.get("accounts")?.as_array()?.first()?;
-    let n = |o: &serde_json::Value, k: &str| o.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    let mut total = n(account, "pending_order_count");
-    let mut seen = false;
+    // Strict: a count that is absent or not a number makes the response
+    // unreadable, never zero. Reading a malformed reply as "no orders"
+    // would clear a stop that is still live.
+    let n = |o: &serde_json::Value, k: &str| -> Option<u64> { o.get(k)?.as_u64() };
+    let mut total = n(account, "pending_order_count")?;
     for p in account.get("positions")?.as_array()? {
         if p.get("symbol").and_then(|x| x.as_str()) != Some(symbol) {
             continue;
         }
-        seen = true;
-        total += n(p, "open_order_count")
-            + n(p, "position_tied_order_count")
-            + n(p, "pending_order_count");
-    }
-    if seen {
-        return Some(total);
+        return Some(
+            total
+                + n(p, "open_order_count")?
+                + n(p, "position_tied_order_count")?
+                + n(p, "pending_order_count")?,
+        );
     }
     // The market row can be omitted when it carries neither a position nor
     // an order. That is only evidence of absence if the account as a whole
-    // reports no orders — and the count must be PRESENT, or the response is
-    // simply not understood.
-    let account_total = account.get("total_order_count").and_then(|x| x.as_u64())?
-        + n(account, "total_isolated_order_count")
-        + n(account, "pending_order_count");
-    Some(account_total)
+    // reports no orders — and those counts must be present too.
+    total += n(account, "total_order_count")? + n(account, "total_isolated_order_count")?;
+    Some(total)
 }
 
 /// A holding the book does not carry counts as flat below this notional.
@@ -5424,15 +5422,26 @@ mod tests {
             {"symbol":"ETH","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
         assert_eq!(resting_orders_for(&flat, "BTC"), Some(0));
         let resting = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
-            {"symbol":"BTC","open_order_count":1,"position_tied_order_count":0}]}]});
+            {"symbol":"BTC","open_order_count":1,"position_tied_order_count":0,"pending_order_count":0}]}]});
         assert_eq!(resting_orders_for(&resting, "BTC"), Some(1));
         let tied = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
-            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":1}]}]});
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":1,"pending_order_count":0}]}]});
         assert_eq!(resting_orders_for(&tied, "BTC"), Some(1));
         // An account-wide pending order counts: it may be this stop.
         let pending = serde_json::json!({"accounts":[{"pending_order_count":1,"positions":[
-            {"symbol":"BTC","open_order_count":0}]}]});
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
         assert_eq!(resting_orders_for(&pending, "BTC"), Some(1));
+        // A count that is missing, or not a number, makes the response
+        // unreadable — it must never settle as "zero orders".
+        let missing = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&missing, "BTC"), None);
+        let wrong_type = serde_json::json!({"accounts":[{"pending_order_count":0,"positions":[
+            {"symbol":"BTC","open_order_count":"0","position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&wrong_type, "BTC"), None);
+        let no_account_count = serde_json::json!({"accounts":[{"positions":[
+            {"symbol":"BTC","open_order_count":0,"position_tied_order_count":0,"pending_order_count":0}]}]});
+        assert_eq!(resting_orders_for(&no_account_count, "BTC"), None);
         // An omitted market row settles only against account-wide counts:
         // all zero means nothing rests anywhere, so nothing rests here.
         let omitted_flat = serde_json::json!({"accounts":[{"total_order_count":0,
@@ -5441,6 +5450,7 @@ mod tests {
         assert_eq!(resting_orders_for(&omitted_flat, "BTC"), Some(0));
         // ...but not while the account carries orders somewhere.
         let omitted_busy = serde_json::json!({"accounts":[{"total_order_count":1,
+            "total_isolated_order_count":0,"pending_order_count":0,
             "positions":[{"symbol":"ETH","open_order_count":1}]}]});
         assert_eq!(resting_orders_for(&omitted_busy, "BTC"), Some(1));
         // Neither the market row nor a count: unknown, NOT zero.
