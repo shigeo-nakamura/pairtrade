@@ -2504,10 +2504,18 @@ impl Engine {
                 leg.spot_cost_usd += fs * hq.price;
             }
             self.state.legs.insert(sym.clone(), leg.clone());
+            // Completion is measured against what was actually ORDERED, not
+            // the tranche's target: `size_from_notional` rounds down to the
+            // venue's size decimals, so a $99 target can only ever be a
+            // $98.19 order on a 5-decimal market. Comparing the fill with
+            // the target read that rounding as a short fill and halted the
+            // ladder (live, 2026-09-23). The lost fraction is a fraction of
+            // one size tick and is settled as dust by `remainder_is_dust`.
+            let spot_ordered = spot_size.to_f64().unwrap_or(0.0) * hq.price;
             let spot_done = {
                 let pr = self.state.tranche_progress.entry(sym.clone()).or_default();
                 pr.spot_usd += fs * hq.price;
-                pr.spot_done = !need_spot || fill_complete(pr.spot_usd, spot_notional);
+                pr.spot_done = !need_spot || fill_complete(fs * hq.price, spot_ordered);
                 pr.spot_done
             };
             // Real exposure now exists: flip to On (only once) so a crash or
@@ -2528,7 +2536,7 @@ impl Engine {
                     log::error!("[STOP] stop for the partial {market} entry failed, reconcile will retry: {e:?}");
                 }
                 bail!(
-                    "{market}: spot {why} tranche {n_th} filled only {fs} (${:.0} of ${spot_notional:.0}); recorded, remainder retried on RISK_ACK",
+                    "{market}: spot {why} tranche {n_th} filled only {fs} (${:.2} of the ${spot_ordered:.2} ordered, target ${spot_notional:.0}); recorded, remainder retried on RISK_ACK",
                     fs * hq.price
                 );
             }
@@ -2548,10 +2556,11 @@ impl Engine {
                 leg.perp_cost_usd += fp * lq.price;
                 self.state.legs.insert(sym.clone(), leg.clone());
             }
+            let perp_ordered = perp_size.to_f64().unwrap_or(0.0) * lq.price;
             let perp_done = {
                 let pr = self.state.tranche_progress.entry(sym.clone()).or_default();
                 pr.perp_usd += fp * lq.price;
-                pr.perp_done = !need_perp || fill_complete(pr.perp_usd, perp_notional);
+                pr.perp_done = !need_perp || fill_complete(fp * lq.price, perp_ordered);
                 pr.perp_done
             };
             self.persist();
@@ -2572,7 +2581,7 @@ impl Engine {
             }
             if !perp_done {
                 bail!(
-                    "{sym}: perp {why} tranche {n_th} filled only {fp} (${:.0} of ${perp_notional:.0}); recorded and stop-covered, remainder retried on RISK_ACK",
+                    "{sym}: perp {why} tranche {n_th} filled only {fp} (${:.2} of the ${perp_ordered:.2} ordered, target ${perp_notional:.0}); recorded and stop-covered, remainder retried on RISK_ACK",
                     fp * lq.price
                 );
             }
@@ -4802,6 +4811,23 @@ mod tests {
         assert!(settle_fill("t", req, Err(anyhow!("rejected")), Ok(0.0)).is_err());
         // Holding unreadable → error even with a clean ack.
         assert!(settle_fill("t", req, ack(), Err(anyhow!("503"))).is_err());
+    }
+
+    #[test]
+    fn size_rounding_is_not_a_short_fill() {
+        // The live case (2026-09-23): a $99 perp tranche at ~$86,127 on a
+        // 5-decimal market. The largest orderable size is 0.00114 =
+        // $98.18, so measuring the fill against the $99 TARGET reads a
+        // full fill as 0.8% short — past the tolerance — and halts the
+        // ladder. Against what was ordered it is complete.
+        let price = 86_127.0;
+        let size = size_from_notional(99.0, price, 5);
+        let ordered = size.to_f64().unwrap() * price;
+        assert!(ordered < 99.0 && ordered > 98.0, "ordered {ordered}");
+        assert!(!fill_complete(ordered, 99.0), "the old comparison halts");
+        assert!(fill_complete(ordered, ordered), "the new one completes");
+        // A genuinely short fill is still short.
+        assert!(!fill_complete(ordered * 0.9, ordered));
     }
 
     #[test]
