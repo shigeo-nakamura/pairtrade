@@ -2770,6 +2770,15 @@ impl Engine {
                     ""
                 }
             );
+            // This read SUCCEEDED and found no such approval — revoked,
+            // renamed, or never there. Keeping the last known expiry would
+            // advertise an authorisation that no longer exists, which is
+            // the opposite of what this field is for. The observation time
+            // is recorded so the gap is visible as "checked, unknown".
+            self.state.hl_agent_name = None;
+            self.state.hl_agent_valid_until = None;
+            self.state.hl_agent_as_of = Some(now_secs());
+            self.persist();
             return;
         };
         let days = (valid_until - now_secs() as i64) as f64 / 86_400.0;
