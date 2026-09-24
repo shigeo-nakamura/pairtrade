@@ -3287,6 +3287,18 @@ impl Engine {
     /// KILL_SWITCH (which blocks stop re-placement by design).
     async fn ensure_stops(&mut self) {
         if self.sentinels.kill_switch_engaged() {
+            // Nothing is observed while stop checking is off, so no
+            // elapsed time accrues against a stop: counting a KILL
+            // interval as "continuously unlisted" would let the first
+            // ambiguous read after it cancel a live stop with no grace.
+            let symbols: Vec<String> = self.state.legs.keys().cloned().collect();
+            let mut changed = false;
+            for sym in symbols {
+                changed |= self.clear_unlisted_since(&sym);
+            }
+            if changed {
+                self.persist();
+            }
             return;
         }
         for (sym, leg) in self.state.legs.clone() {
