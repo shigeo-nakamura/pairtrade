@@ -1217,6 +1217,21 @@ struct LegState {
     stop_absence_confirmed: bool,
 }
 
+impl LegState {
+    /// Does the recorded stop count as protection? A stop believed to
+    /// have been dropped does not, however complete its record looks: the
+    /// level and size are kept so they can be trusted again if the id
+    /// turns up listed (`stop_seen_listed`), not so they can vouch for
+    /// cover that is not there. Every reader of "is this leg protected"
+    /// goes through here — the replacement guard in `place_stop` and the
+    /// margin monitor's `[MARGIN] ok`, which would otherwise keep
+    /// publishing `margin.ok=true` for a leg this code has established
+    /// has no covering stop.
+    fn stop_is_cover(&self) -> bool {
+        self.stop_order_id.is_some() && !self.stop_presumed_gone
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct State {
     #[serde(default)]
@@ -1805,8 +1820,7 @@ impl Engine {
         // reported no order, named it cancelled, or stopped listing it for
         // the whole grace. Counting it here would turn a failed margin
         // read into an indefinitely uncovered leg that never even tried.
-        let has_stop = (leg.stop_order_id.is_some() && !leg.stop_presumed_gone)
-            || leg.stop_unconfirmed_id.is_some();
+        let has_stop = leg.stop_is_cover() || leg.stop_unconfirmed_id.is_some();
         if carried == Some(false) || (carried.is_none() && has_stop) {
             // Keep the refreshed peak even though the move is refused: the
             // peak is the exit rule's own record, and dropping a new high
@@ -2681,7 +2695,7 @@ impl Engine {
         for (sym, size) in &sizes {
             let leg = self.state.legs.get(sym);
             let covered = leg
-                .map(|l| stop_covers(l.stop_order_id.is_some(), l.stop_size, *size))
+                .map(|l| stop_covers(l.stop_is_cover(), l.stop_size, *size))
                 .unwrap_or(false);
             match (leg.and_then(|l| l.stop_level), marks.get(sym), covered) {
                 (Some(level), Some(&mark), true) => {
@@ -5900,6 +5914,39 @@ mod tests {
                 .all(|l| l.stop_order_id.is_none() && !l.stop_presumed_gone),
             "the id and the doubt about it are both dropped"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop believed gone protects nothing, and every reader of "is
+    /// this leg protected" must agree — including the margin monitor,
+    /// which would otherwise publish `margin.ok=true` for a leg this
+    /// code has established has no covering stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_believed_gone_protects_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_cover_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        let leg = &e.state.legs["BTC"];
+        let size = leg.perp_size;
+        assert!(leg.stop_is_cover());
+        assert!(stop_covers(leg.stop_is_cover(), leg.stop_size, size));
+
+        // The venue says it is not there. The id and its metadata stay —
+        // they may yet be vindicated — but nothing may call the leg
+        // protected on their strength.
+        e.mark_stop_presumed_gone("BTC", false);
+        let leg = &e.state.legs["BTC"];
+        assert!(leg.stop_order_id.is_some() && leg.stop_size.is_some());
+        assert!(!leg.stop_is_cover());
+        assert!(!stop_covers(leg.stop_is_cover(), leg.stop_size, size));
+
+        // Listed again: the record is trusted once more, unchanged.
+        assert!(e.stop_seen_listed("BTC"));
+        assert!(e.state.legs["BTC"].stop_is_cover());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
