@@ -576,6 +576,20 @@ enum AgentLookup {
     Unreadable,
 }
 
+/// Whose approved-agent list covers `account`: its master when the venue
+/// names one, the account itself when the venue calls it a master.
+/// `None` for anything else — an unrecognised role must not be read as
+/// "this account is its own master".
+fn agent_owner(role: &serde_json::Value, account: &str) -> Option<String> {
+    if let Some(master) = role.pointer("/data/master").and_then(|x| x.as_str()) {
+        return Some(master.to_string());
+    }
+    match role.get("role").and_then(|x| x.as_str()) {
+        Some("master") | Some("user") => Some(account.to_string()),
+        _ => None,
+    }
+}
+
 fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> AgentLookup {
     let read = |a: &serde_json::Value| -> Option<(String, i64)> {
         let until = a.get("validUntil")?.as_i64()? / 1_000;
@@ -2809,12 +2823,17 @@ impl Engine {
             }
         };
         // A sub-account's agents are approved on its master; a master
-        // answers for itself.
-        let owner = role
-            .pointer("/data/master")
-            .and_then(|x| x.as_str())
-            .unwrap_or(&self.cfg.hl_account_address)
-            .to_string();
+        // answers for itself. Anything else is an unrecognised response,
+        // not permission to treat this account as its own master: that
+        // would query the wrong owner, find no agents, and erase a valid
+        // approval as "conclusively absent" (Codex review).
+        let Some(owner) = agent_owner(&role, &self.cfg.hl_account_address) else {
+            log::warn!(
+                "[AGENT] userRole did not identify {} as a master or name one; expiry not refreshed",
+                self.cfg.hl_account_address
+            );
+            return;
+        };
         let Some(agents) = post(serde_json::json!({"type": "extraAgents", "user": owner})).await
         else {
             log::warn!("[AGENT] extraAgents read failed; expiry not refreshed");
@@ -5723,6 +5742,32 @@ mod tests {
         assert_eq!(
             resting_orders_for(&serde_json::json!({"code":500}), "BTC"),
             None
+        );
+    }
+
+    #[test]
+    fn the_agent_owner_is_only_resolved_from_a_recognised_role() {
+        let acct = "0x7a4c";
+        // A sub-account names its master.
+        let sub = serde_json::json!({"role":"subAccount","data":{"master":"0xa2c7"}});
+        assert_eq!(agent_owner(&sub, acct).as_deref(), Some("0xa2c7"));
+        // A master (or a plain user) answers for itself.
+        for role in ["master", "user"] {
+            let v = serde_json::json!({"role": role});
+            assert_eq!(agent_owner(&v, acct).as_deref(), Some(acct));
+        }
+        // Anything unrecognised is NOT permission to query this account
+        // as its own master: that finds no agents and would erase a valid
+        // approval as conclusively absent.
+        assert_eq!(agent_owner(&serde_json::json!({}), acct), None);
+        assert_eq!(
+            agent_owner(&serde_json::json!({"role":"vault"}), acct),
+            None
+        );
+        assert_eq!(
+            agent_owner(&serde_json::json!({"role":"subAccount"}), acct),
+            None,
+            "a sub-account with no master named is unreadable, not self-owned"
         );
     }
 
