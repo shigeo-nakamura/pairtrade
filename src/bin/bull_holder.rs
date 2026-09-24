@@ -1167,6 +1167,14 @@ struct LegState {
     /// there in the first place.
     #[serde(default)]
     stop_presumed_gone: bool,
+    /// ...and that absence came from the venue naming it, not from an
+    /// inference: no order at all rests for this market, or the venue
+    /// listed this id among its cancelled orders. The unlisted-for-the-
+    /// whole-grace fallback does NOT set this — it is strong enough to
+    /// attempt a replacement (which cancels first, in the right order)
+    /// but not to throw the id away on a cancel that merely errored.
+    #[serde(default)]
+    stop_absence_confirmed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1914,6 +1922,7 @@ impl Engine {
             // replaces.
             l.stop_unlisted_since = None;
             l.stop_presumed_gone = false;
+            l.stop_absence_confirmed = false;
         }
         self.persist();
         Ok(())
@@ -1964,6 +1973,7 @@ impl Engine {
             Some(l) if l.stop_unlisted_since.is_some() || l.stop_presumed_gone => {
                 l.stop_unlisted_since = None;
                 l.stop_presumed_gone = false;
+                l.stop_absence_confirmed = false;
                 true
             }
             _ => false,
@@ -2316,15 +2326,20 @@ impl Engine {
         if !self.cfg.dry_run {
             if let Err(e) = self.lt.cancel_order(symbol, &id).await {
                 // Keeping it tracked is right while the order MIGHT be
-                // resting — but not when the venue already said it is
-                // not. `stop_presumed_gone` is set from the venue's own
-                // answers (no order rests for this market, the id is
-                // named cancelled, or it stayed unlisted for the whole
-                // grace), and cancelling something absent is exactly what
-                // fails here. Holding the id then would keep the book
-                // On/halted forever on an order that is not there, and no
-                // retried DISARM could ever clear it.
-                if !leg.stop_presumed_gone {
+                // resting — but not when the VENUE already said it is
+                // not: no order rests for this market, or it named this
+                // id cancelled. Cancelling something absent is exactly
+                // what fails here, so holding the id would keep the book
+                // On/halted forever and no retried DISARM could ever
+                // clear it.
+                //
+                // Deliberately not `stop_presumed_gone`: that is also set
+                // by the unlisted-for-the-whole-grace fallback, which is
+                // an inference about a stale WebSocket cache. A transient
+                // transport error on top of it would drop an id whose
+                // reduce-only trigger may still rest — and a later ARM
+                // would inherit it against the new position.
+                if !leg.stop_absence_confirmed {
                     log::warn!(
                         "[STOP] cancel {id} failed, leaving it tracked in state (order may still be resting): {e:?}"
                     );
@@ -2343,6 +2358,7 @@ impl Engine {
             // nothing left to attach to.
             l.stop_unlisted_since = None;
             l.stop_presumed_gone = false;
+            l.stop_absence_confirmed = false;
         }
         // Persist now, before the (slow) exit orders that follow: a crash
         // in between would otherwise restart with the cancelled id still
@@ -2836,6 +2852,7 @@ impl Engine {
                         stop_unconfirmed_id: None,
                         stop_unlisted_since: None,
                         stop_presumed_gone: false,
+                        stop_absence_confirmed: false,
                     }
                 }
             };
@@ -3683,9 +3700,15 @@ impl Engine {
             // start (live, 2026-09-23). The count cannot say WHICH order
             // rests, but this account is dedicated and the bot rests
             // nothing but this stop.
+            // `Some((rests, confirmed))`. `confirmed` is true only when
+            // the VENUE named the absence — nothing rests for this market,
+            // or it listed this id as cancelled. The unlisted-for-the-
+            // whole-grace fallback is an inference and leaves it false:
+            // enough to re-place (that path cancels first), not enough to
+            // throw the id away on a cancel that merely errored.
             let rests = match (&leg.stop_order_id, self.cfg.dry_run) {
-                (None, _) => Some(false),
-                (Some(_), true) => Some(true), // no venue book in DRY_RUN
+                (None, _) => Some((false, false)),
+                (Some(_), true) => Some((true, false)), // no venue book in DRY_RUN
                 (Some(id), false) => {
                     match self.lighter_resting_orders(&sym).await {
                         // Nothing rests for this market: conclusive, whatever
@@ -3694,7 +3717,7 @@ impl Engine {
                             if self.end_unlisted_observation(&sym) {
                                 self.persist();
                             }
-                            Some(false)
+                            Some((false, true))
                         }
                         // Something rests, but the count cannot say what. The
                         // connector's order view names ids, so require it to
@@ -3713,7 +3736,7 @@ impl Engine {
                                 if self.stop_seen_listed(&sym) {
                                     self.persist();
                                 }
-                                Some(true)
+                                Some((true, false))
                             }
                             // The id is not listed. That is absence only
                             // if the list is from the CURRENT connection:
@@ -3758,7 +3781,7 @@ impl Engine {
                                             format!("unlisted for {}s", elapsed)
                                         }
                                     );
-                                    Some(false)
+                                    Some((false, cancelled))
                                 } else {
                                     log::warn!(
                                         "[STOP] {sym}: {id} not listed yet ({elapsed}s of {STOP_UNLISTED_GRACE_SECS}s) — deferring, the cache may still be catching up"
@@ -3789,7 +3812,9 @@ impl Engine {
                     }
                 }
             };
-            let Some(rests) = rests else { continue };
+            let Some((rests, absence_confirmed)) = rests else {
+                continue;
+            };
             if !rests && leg.stop_order_id.is_some() {
                 log::error!(
                     "[STOP] {sym}: recorded stop {:?} is NOT resting — it stops counting as cover and a replacement follows",
@@ -3808,6 +3833,7 @@ impl Engine {
                     l.stop_size = None;
                     l.stop_unlisted_since = None;
                     l.stop_presumed_gone = true;
+                    l.stop_absence_confirmed = absence_confirmed;
                 }
                 self.persist();
             }
@@ -5333,6 +5359,7 @@ mod tests {
                     stop_unconfirmed_id: None,
                     stop_unlisted_since: None,
                     stop_presumed_gone: false,
+                    stop_absence_confirmed: false,
                 },
             );
         }
@@ -5748,10 +5775,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The same exit, but the venue already told the bot the stop is
-    /// gone. Cancelling an absent order fails by definition, so holding
-    /// the id for "a retried DISARM" would halt the book on an order that
-    /// does not exist and no retry could ever clear.
+    /// The same exit, but the venue itself already said the stop is gone
+    /// (nothing rests for the market / the id is listed as cancelled).
+    /// Cancelling an absent order fails by definition, so holding the id
+    /// for "a retried DISARM" would halt the book on an order that does
+    /// not exist and no retry could ever clear.
     #[tokio::test(start_paused = true)]
     async fn exit_drops_a_stop_the_venue_already_reported_gone() {
         let dir = std::env::temp_dir().join(format!(
@@ -5776,6 +5804,7 @@ mod tests {
             leg.spot_size = 0.0;
             leg.perp_size = 0.0;
             leg.stop_presumed_gone = true;
+            leg.stop_absence_confirmed = true;
         }
         e.exit_all("test").await;
         assert_eq!(
@@ -5790,6 +5819,51 @@ mod tests {
                 .values()
                 .all(|l| l.stop_order_id.is_none() && !l.stop_presumed_gone),
             "the id and the doubt about it are both dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unlisted-for-the-whole-grace fallback is an inference about a
+    /// stale WebSocket cache, not the venue naming an absence. A cancel
+    /// that merely errors — a transport blip is enough — must not be
+    /// allowed to drop that id: the reduce-only trigger may still rest,
+    /// and a later ARM would inherit it against the new position.
+    #[tokio::test(start_paused = true)]
+    async fn exit_keeps_a_stop_only_inferred_to_be_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_inferred_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: true,
+            perp_position: None,
+            trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+            leg.stop_presumed_gone = true; // inferred from the grace only
+            leg.stop_absence_confirmed = false;
+        }
+        e.exit_all("test").await;
+        assert_eq!(
+            e.state.mode,
+            Mode::On,
+            "an inference must not be enough to reach Exited"
+        );
+        assert!(e.state.halted);
+        assert!(
+            e.state.legs.values().all(|l| l.stop_order_id.is_some()),
+            "the id stays tracked for a retried DISARM"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
