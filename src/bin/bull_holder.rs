@@ -500,6 +500,22 @@ fn lighter_env(name: &str, instance_id: &str) -> Option<String> {
         .or_else(|| std::env::var(name).ok().filter(|v| !v.is_empty()))
 }
 
+/// `initial_margin_fraction` (percent) for `symbol` in a Lighter
+/// `/api/v1/account` response — the margin behind a position, which bounds
+/// how far a stop may sit from the mark.
+fn margin_fraction_for(v: &serde_json::Value, symbol: &str) -> Option<f64> {
+    let account = v.get("accounts")?.as_array()?.first()?;
+    account
+        .get("positions")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("symbol").and_then(|x| x.as_str()) == Some(symbol))?
+        .get("initial_margin_fraction")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
     let account = v.get("accounts")?.as_array()?.first()?;
     // Strict: a count that is absent or not a number makes the response
@@ -1613,6 +1629,15 @@ impl Engine {
         let order_id = if self.cfg.dry_run {
             format!("dry-run-stop-{}", now_secs())
         } else {
+            // Refuse to submit a stop the market's leverage cannot carry:
+            // Lighter would accept the transaction and drop it, leaving the
+            // leg silently uncovered (bot-strategy#950).
+            if self.stop_distance_supported(symbol).await == Some(false) {
+                bail!(
+                    "Lighter stop {symbol}: this market's leverage cannot carry a {:.0}% stop; lower it (see [STOP] above)",
+                    self.cfg.stop_dd_pct
+                );
+            }
             // An earlier stop whose existence is unknown must be cancelled
             // by id first — the sweep below cannot see what the WS cache
             // does not carry, so placing a replacement while it is still
@@ -1811,6 +1836,33 @@ impl Engine {
         log::info!("[STOP] resolved Lighter account index {idx} from the wallet address");
         *cached = Some(idx.clone());
         Some(idx)
+    }
+
+    /// Can a stop sit `stop_dd_pct` below the peak on this market? Lighter
+    /// validates a trigger order against the market's leverage: a move that
+    /// would cost more than the margin behind the position is refused, and
+    /// the refusal is silent (the transaction is accepted over REST and
+    /// dropped during execution — bot-strategy#950). `initial_margin_fraction`
+    /// is that margin as a percentage, so the stop distance must fit inside
+    /// it. `None` = the account could not be read.
+    async fn stop_distance_supported(&self, symbol: &str) -> Option<bool> {
+        let index = self.lighter_account_index().await?;
+        let url = format!(
+            "{}/api/v1/account?by=index&value={index}",
+            self.cfg.lighter_account_url.trim_end_matches('/'),
+        );
+        let v: serde_json::Value = self.http.get(&url).send().await.ok()?.json().await.ok()?;
+        let imf = margin_fraction_for(&v, symbol)?;
+        if imf + 1e-9 < self.cfg.stop_dd_pct {
+            log::error!(
+                "[STOP] {symbol}: the market's initial margin is {imf:.2}% but the stop sits {:.2}% below the peak — Lighter will refuse it. Lower this market's leverage to {:.1}x or less (currently {:.1}x).",
+                self.cfg.stop_dd_pct,
+                100.0 / self.cfg.stop_dd_pct,
+                100.0 / imf.max(f64::EPSILON)
+            );
+            return Some(false);
+        }
+        Some(true)
     }
 
     /// Which of `candidates` carries this bot's API key — the account the
@@ -3193,18 +3245,17 @@ impl Engine {
             // stop can be dropped after its `sendTx` was acknowledged, or
             // cancelled outside the bot; in both cases state's id is a
             // ghost and nothing else would ever re-place it.
+            // The venue's own order count for this market, not the
+            // connector's WebSocket cache: that cache is empty for a moment
+            // after every restart, which read a live stop as missing and
+            // had the bot cancel and re-place a perfectly good one on each
+            // start (live, 2026-09-23). The count cannot say WHICH order
+            // rests, but this account is dedicated and the bot rests
+            // nothing but this stop.
             let rests = match (&leg.stop_order_id, self.cfg.dry_run) {
                 (None, _) => Some(false),
                 (Some(_), true) => Some(true), // no venue book in DRY_RUN
-                (Some(id), false) => match self.lt.get_open_orders(&sym).await {
-                    Ok(resp) => Some(resp.orders.iter().any(|o| &o.order_id == id)),
-                    Err(e) => {
-                        log::warn!(
-                            "[STOP] {sym}: open-order read failed, stop check deferred: {e:?}"
-                        );
-                        None
-                    }
-                },
+                (Some(_), false) => self.lighter_resting_orders(&sym).await.map(|n| n > 0),
             };
             let Some(rests) = rests else { continue };
             if !rests && leg.stop_order_id.is_some() {
@@ -5445,6 +5496,37 @@ mod tests {
         std::env::remove_var("BULL_HOLDER_TEST_IDX");
         std::env::remove_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER");
         assert_eq!(lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder"), None);
+    }
+
+    #[test]
+    fn the_margin_fraction_bounds_how_far_a_stop_may_sit() {
+        // Lighter reports the margin behind a position as a percentage:
+        // "50.00" is 2x, "2.00" is 50x. A 35% stop needs at least 35%
+        // margin behind it, or the venue accepts the transaction and
+        // drops it (bot-strategy#950).
+        let at = |imf: &str| {
+            serde_json::json!({"accounts":[{"positions":[
+                {"symbol":"BTC","initial_margin_fraction":imf}]}]})
+        };
+        assert_eq!(margin_fraction_for(&at("50.00"), "BTC"), Some(50.0)); // 2x
+        assert_eq!(margin_fraction_for(&at("2.00"), "BTC"), Some(2.0)); // 50x
+        assert_eq!(margin_fraction_for(&at("33.33"), "BTC"), Some(33.33)); // 3x
+                                                                           // 2x carries a 35% stop; 3x and 50x do not.
+        assert!(50.0 >= 35.0);
+        assert!(33.33 < 35.0);
+        // Anything unreadable is unknown, never a number.
+        assert_eq!(margin_fraction_for(&at("50.00"), "ETH"), None);
+        assert_eq!(
+            margin_fraction_for(&serde_json::json!({"accounts":[{"positions":[]}]}), "BTC"),
+            None
+        );
+        let numeric = serde_json::json!({"accounts":[{"positions":[
+            {"symbol":"BTC","initial_margin_fraction":50.0}]}]});
+        assert_eq!(
+            margin_fraction_for(&numeric, "BTC"),
+            None,
+            "the venue sends it as a string"
+        );
     }
 
     #[test]
