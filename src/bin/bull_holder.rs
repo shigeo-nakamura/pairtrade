@@ -228,6 +228,15 @@ struct Config {
     /// address on first use.
     lighter_account_index: String,
     lighter_wallet_address: String,
+    /// Hyperliquid account the spot leg trades. The API wallet that signs
+    /// for it is approved on that account's MASTER and expires; the bot
+    /// cannot renew it (re-approval needs the master's own signature), so
+    /// it publishes the date and lets the operator act.
+    hl_account_address: String,
+    /// Name of the API wallet this bot signs with, as it appears in
+    /// Hyperliquid's approved-agent list. Only needed when the master has
+    /// more than one.
+    hl_agent_name: String,
     arm_path: PathBuf,
     add_path: PathBuf,
     disarm_path: PathBuf,
@@ -297,6 +306,9 @@ impl Config {
                 .unwrap_or_default(),
             lighter_wallet_address: lighter_env("LIGHTER_WALLET_ADDRESS", &instance_id)
                 .unwrap_or_default(),
+            hl_account_address: lighter_env("HYPERLIQUID_ACCOUNT_ADDRESS", &instance_id)
+                .unwrap_or_default(),
+            hl_agent_name: env_string("BULL_HOLDER_HL_AGENT_NAME", ""),
             hl_info_url: env_string(
                 "BULL_HOLDER_HL_INFO_URL",
                 "https://api.hyperliquid.xyz/info",
@@ -529,6 +541,43 @@ fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
         + n(account, "total_isolated_order_count")?
         + n(account, "pending_order_count")?;
     Some(account_total)
+}
+
+/// An API-wallet approval closer than this is reported as an error: the
+/// operator needs lead time to approve a new one on the master wallet.
+const AGENT_EXPIRY_WARN_DAYS: f64 = 30.0;
+const AGENT_POLL_EVERY_SECS: u64 = 86_400;
+
+/// This bot's approved agent, as (name, valid_until_secs). Matched by
+/// name when one is configured; otherwise only an unambiguous single
+/// agent counts — guessing among several could watch the wrong wallet's
+/// expiry and report safety that is not there. Hyperliquid reports
+/// `validUntil` in milliseconds.
+fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> Option<(String, i64)> {
+    let read = |a: &serde_json::Value| -> Option<(String, i64)> {
+        let until = a.get("validUntil")?.as_i64()? / 1_000;
+        let name = a
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        Some((name, until))
+    };
+    let agents = agents.as_array()?;
+    if configured_name.is_empty() {
+        return match agents.as_slice() {
+            [only] => read(only),
+            _ => None,
+        };
+    }
+    agents
+        .iter()
+        .find(|a| {
+            a.get("name")
+                .and_then(|x| x.as_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(configured_name))
+        })
+        .and_then(read)
 }
 
 /// A holding the book does not carry counts as flat below this notional.
@@ -1077,6 +1126,17 @@ struct State {
     /// See [`PendingOrder`].
     #[serde(default)]
     pending_order: Option<PendingOrder>,
+    /// The Hyperliquid API wallet this bot signs with, and when its
+    /// approval expires (unix seconds). Read from the venue, refreshed
+    /// once a day; `None` until a read succeeds. The bot cannot renew it —
+    /// re-approval is a master-wallet signature — so the value exists to
+    /// be watched (bot-strategy#1054).
+    #[serde(default)]
+    hl_agent_name: Option<String>,
+    #[serde(default)]
+    hl_agent_valid_until: Option<i64>,
+    #[serde(default)]
+    hl_agent_as_of: Option<u64>,
 }
 
 /// Does the persisted book carry exposure that the process must not touch
@@ -2656,6 +2716,74 @@ impl Engine {
         }
     }
 
+    /// Refresh the API wallet's expiry from Hyperliquid: the configured
+    /// account's master, then that master's approved agents, matched on
+    /// the signer address the connector reports. Read-only and best
+    /// effort — a failure leaves the last known value in place.
+    async fn poll_hl_agent(&mut self) {
+        if self.cfg.dry_run || self.cfg.hl_account_address.is_empty() {
+            return;
+        }
+        let post = |body: serde_json::Value| {
+            let http = self.http.clone();
+            let url = self.cfg.hl_info_url.clone();
+            async move {
+                http.post(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .ok()?
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+            }
+        };
+        let role = match post(serde_json::json!({
+            "type": "userRole", "user": self.cfg.hl_account_address
+        }))
+        .await
+        {
+            Some(v) => v,
+            None => {
+                log::warn!("[AGENT] userRole read failed; expiry not refreshed");
+                return;
+            }
+        };
+        // A sub-account's agents are approved on its master; a master
+        // answers for itself.
+        let owner = role
+            .pointer("/data/master")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&self.cfg.hl_account_address)
+            .to_string();
+        let Some(agents) = post(serde_json::json!({"type": "extraAgents", "user": owner})).await
+        else {
+            log::warn!("[AGENT] extraAgents read failed; expiry not refreshed");
+            return;
+        };
+        let Some((name, valid_until)) = agent_expiry(&agents, &self.cfg.hl_agent_name) else {
+            log::error!(
+                "[AGENT] cannot identify this bot's API wallet among {owner}'s approved agents{} — expiry unknown",
+                if self.cfg.hl_agent_name.is_empty() {
+                    ": set BULL_HOLDER_HL_AGENT_NAME to the one it signs with"
+                } else {
+                    ""
+                }
+            );
+            return;
+        };
+        let days = (valid_until - now_secs() as i64) as f64 / 86_400.0;
+        if days < AGENT_EXPIRY_WARN_DAYS {
+            log::error!("[AGENT] API wallet {name} expires in {days:.1} d — approve a new one on the master wallet");
+        } else {
+            log::info!("[AGENT] API wallet {name} expires in {days:.0} d");
+        }
+        self.state.hl_agent_name = Some(name);
+        self.state.hl_agent_valid_until = Some(valid_until);
+        self.state.hl_agent_as_of = Some(now_secs());
+        self.persist();
+    }
+
     /// Best-effort reference price for PnL accounting: a live quote, falling
     /// back to the last known daily close from state. Returns `None` (never
     /// `0.0`) when nothing trustworthy is available, so a leg that closed
@@ -3514,6 +3642,12 @@ impl Engine {
             self.last_reconcile = now;
             let _ = self.reconcile().await;
         }
+        // Once a day: the API wallet's approval is a slow-moving fact the
+        // operator has to act on, not a tick-rate signal. Runs while
+        // halted too — an expiry does not wait for a RISK_ACK.
+        if now.saturating_sub(self.state.hl_agent_as_of.unwrap_or(0)) >= AGENT_POLL_EVERY_SECS {
+            self.poll_hl_agent().await;
+        }
         // Read-only, so it runs while halted and for a day after EXIT (the
         // last settlements land after the perp leg is closed); gated on ARM
         // because the total is per holding period.
@@ -3618,6 +3752,11 @@ fn status_value(
         "cum_funding_usdc": state.cum_funding_usdc,
         "cum_funding_as_of": state.cum_funding_as_of,
         "cum_fees_usdc": serde_json::Value::Null,
+        // The Hyperliquid API wallet's approval. The bot cannot renew it,
+        // so the date is published to be watched (bot-strategy#1054).
+        "hl_agent_name": state.hl_agent_name,
+        "hl_agent_valid_until": state.hl_agent_valid_until,
+        "hl_agent_as_of": state.hl_agent_as_of,
         // The configured book, which `legs` only describes once a tranche
         // has filled. A monitor checking that its buy & hold anchor covers
         // the whole book has nothing to check against before ARM
@@ -5506,6 +5645,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_api_wallets_expiry_is_only_read_when_it_is_unambiguous() {
+        let agents = serde_json::json!([
+            {"name":"hype-accumulator","address":"0x07","validUntil":1804084485748i64},
+            {"name":"bull-holder","address":"0x80","validUntil":1805606835174i64},
+        ]);
+        // Named: that wallet's expiry, in seconds.
+        let (name, until) = agent_expiry(&agents, "bull-holder").unwrap();
+        assert_eq!(name, "bull-holder");
+        assert_eq!(until, 1805606835);
+        assert_eq!(agent_expiry(&agents, "BULL-HOLDER").unwrap().1, 1805606835);
+        // Unnamed with several agents: no guess — watching another
+        // wallet's expiry would report safety that is not there.
+        assert_eq!(agent_expiry(&agents, ""), None);
+        assert_eq!(agent_expiry(&agents, "nope"), None);
+        // Unnamed with exactly one agent is unambiguous.
+        let one = serde_json::json!([{"name":"solo","validUntil":1805606835174i64}]);
+        assert_eq!(
+            agent_expiry(&one, "").unwrap(),
+            ("solo".to_string(), 1805606835)
+        );
+        // Nothing approved, or a malformed entry.
+        assert_eq!(agent_expiry(&serde_json::json!([]), ""), None);
+        assert_eq!(agent_expiry(&serde_json::json!([{"name":"x"}]), "x"), None);
+    }
+
     fn test_config() -> Config {
         let dir = std::env::temp_dir();
         Config {
@@ -5536,6 +5701,8 @@ mod tests {
             lighter_account_url: "http://127.0.0.1:1".into(),
             lighter_account_index: "1".into(),
             lighter_wallet_address: String::new(),
+            hl_account_address: String::new(),
+            hl_agent_name: String::new(),
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
             add_path: dir.join("ADD"),
