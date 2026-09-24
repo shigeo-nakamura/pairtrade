@@ -1590,6 +1590,14 @@ impl Engine {
             .await
             == Some(false)
         {
+            // Keep the refreshed peak even though the move is refused: the
+            // peak is the exit rule's own record, and dropping a new high
+            // here would place the stop off a stale one once the leverage
+            // is corrected.
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.lighter_peak = leg.lighter_peak;
+            }
+            self.persist();
             bail!(
                 "Lighter stop {symbol}: this market's leverage cannot carry a stop at {level:.2} (see [STOP] above); the existing stop is left alone"
             );
