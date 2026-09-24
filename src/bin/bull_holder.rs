@@ -2027,7 +2027,14 @@ impl Engine {
         if let Some(l) = self.state.legs.get_mut(symbol) {
             l.stop_unlisted_since = None;
             l.stop_presumed_gone = true;
-            l.stop_absence_confirmed = absence_confirmed;
+            // Never downgrade. Once the venue itself has said the order is
+            // not there, a later pass that only re-observes the absence
+            // (another order rests, this id still unlisted) says nothing
+            // new — and demoting to "inferred" would make a failed cancel
+            // of the already-absent id defer forever, for as long as that
+            // unrelated order rests. Only a new stop, or the id turning up
+            // listed, clears it.
+            l.stop_absence_confirmed |= absence_confirmed;
         }
         self.persist();
     }
@@ -5893,6 +5900,39 @@ mod tests {
                 .all(|l| l.stop_order_id.is_none() && !l.stop_presumed_gone),
             "the id and the doubt about it are both dropped"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Knowledge is not undone by a weaker later read — here at the one
+    /// site that records an absence. Re-observing the same absence says
+    /// nothing new, so it must not demote the venue's own answer to an
+    /// inference.
+    #[tokio::test(start_paused = true)]
+    async fn re_marking_an_absence_never_downgrades_a_confirmed_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_no_downgrade_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        // The venue's own answer: nothing rests / named cancelled.
+        e.mark_stop_presumed_gone("BTC", true);
+        assert!(e.state.legs["BTC"].stop_absence_confirmed);
+        // A later pass only re-observes it (another order rests, this id
+        // still unlisted) — `unlisted_verdict(false, None)`.
+        e.mark_stop_presumed_gone("BTC", false);
+        assert!(
+            e.state.legs["BTC"].stop_absence_confirmed,
+            "a re-observation must not demote the venue's own answer"
+        );
+        // Only the id turning up listed clears it.
+        assert!(e.stop_seen_listed("BTC"));
+        assert!(!e.state.legs["BTC"].stop_absence_confirmed);
+        // ...and an inference alone never sets it.
+        e.mark_stop_presumed_gone("BTC", false);
+        assert!(e.state.legs["BTC"].stop_presumed_gone);
+        assert!(!e.state.legs["BTC"].stop_absence_confirmed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
