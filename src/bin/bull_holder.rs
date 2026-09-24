@@ -3277,7 +3277,34 @@ impl Engine {
             let rests = match (&leg.stop_order_id, self.cfg.dry_run) {
                 (None, _) => Some(false),
                 (Some(_), true) => Some(true), // no venue book in DRY_RUN
-                (Some(_), false) => self.lighter_resting_orders(&sym).await.map(|n| n > 0),
+                (Some(id), false) => {
+                    match self.lighter_resting_orders(&sym).await {
+                        // Nothing rests for this market: conclusive, whatever
+                        // the connector's cache thinks.
+                        Some(0) => Some(false),
+                        // Something rests, but the count cannot say what. The
+                        // connector's order view names ids, so require it to
+                        // carry this one before calling the leg covered —
+                        // otherwise an order placed outside the bot would
+                        // vouch for a stop that is no longer there. Right
+                        // after a restart that view is briefly empty, so
+                        // "unknown" defers instead of cancelling a live stop.
+                        Some(_) => match self.lt.get_open_orders(&sym).await {
+                            Ok(resp) if resp.orders.iter().any(|o| &o.order_id == id) => Some(true),
+                            Ok(_) => {
+                                log::warn!(
+                                "[STOP] {sym}: the market has a resting order but the connector does not list {id} — deferring rather than guessing"
+                            );
+                                None
+                            }
+                            Err(e) => {
+                                log::warn!("[STOP] {sym}: order list unreadable, stop check deferred: {e:?}");
+                                None
+                            }
+                        },
+                        None => None,
+                    }
+                }
             };
             let Some(rests) = rests else { continue };
             if !rests && leg.stop_order_id.is_some() {
