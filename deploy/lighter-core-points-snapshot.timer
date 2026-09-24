@@ -1,0 +1,14 @@
+[Unit]
+Description=Hourly Lighter Core points snapshot (bot-strategy#938)
+
+[Timer]
+# Hourly, matching the Robinhood host's cadence so the two series share a
+# day boundary. :10 rather than :05 only to keep the two hosts' rows
+# distinguishable at a glance when they are read side by side.
+OnCalendar=*-*-* *:10:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+Unit=lighter-core-points-snapshot.service
+
+[Install]
+WantedBy=timers.target
