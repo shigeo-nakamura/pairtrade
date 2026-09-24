@@ -2790,6 +2790,21 @@ impl Engine {
         if self.cfg.dry_run || self.cfg.hl_account_address.is_empty() {
             return;
         }
+        if self.cfg.hl_agent_address.is_empty() {
+            // The watch is off: without the signer's address an approval
+            // cannot be attributed to this process, so there is nothing
+            // the two requests could establish. Record the observation so
+            // this says so once a day rather than on every tick.
+            log::error!(
+                "[AGENT] BULL_HOLDER_HL_AGENT_ADDRESS is not set — no expiry is published. Set it to the API wallet whose key HYPERLIQUID_SIGNER_PRIVATE_KEY holds."
+            );
+            self.state.hl_agent_as_of = Some(now_secs());
+            self.state.hl_agent_key = Some(self.agent_key());
+            self.state.hl_agent_name = None;
+            self.state.hl_agent_valid_until = None;
+            self.persist();
+            return;
+        }
         // A changed identity makes the stored values describe a different
         // wallet. Drop them before the read rather than after it succeeds:
         // a refresh that fails would otherwise keep publishing the old
