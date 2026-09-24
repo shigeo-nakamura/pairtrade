@@ -1907,10 +1907,17 @@ impl Engine {
         );
         let v: serde_json::Value = self.http.get(&url).send().await.ok()?.json().await.ok()?;
         let imf = margin_fraction_for(&v, symbol)?;
-        if imf + 1e-9 < distance_pct {
+        // The margin has to outlast the drawdown AND the maintenance
+        // requirement that bites on the way there — the same floor the
+        // collateral guard uses. An initial margin a hair above the
+        // trigger distance is liquidated before the stop can fire, and
+        // Lighter refuses such an order silently.
+        let floor = liquidation_floor_pct(distance_pct, self.cfg.lighter_mmr_pct);
+        if imf + 1e-9 < floor {
             log::error!(
-                "[STOP] {symbol}: the market's initial margin is {imf:.2}% but the stop at {trigger:.2} sits {distance_pct:.2}% below the mark {mark:.2} — Lighter will refuse it. Lower this market's leverage to {:.1}x or less (currently {:.1}x).",
-                100.0 / distance_pct,
+                "[STOP] {symbol}: the market's initial margin is {imf:.2}% but a stop at {trigger:.2}, {distance_pct:.2}% below the mark {mark:.2}, needs {floor:.2}% to survive liquidation at {:.2}% maintenance — Lighter will refuse it. Lower this market's leverage to {:.1}x or less (currently {:.1}x).",
+                self.cfg.lighter_mmr_pct,
+                100.0 / floor,
                 100.0 / imf.max(f64::EPSILON)
             );
             return Some(false);
@@ -5678,6 +5685,24 @@ mod tests {
         assert!(33.33 < 35.0);
         // At the peak the two agree.
         assert!((distance(100.0, trigger) - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_margin_must_outlast_the_drawdown_and_maintenance() {
+        // A stop 35% below the mark is not carried by 35.5% of initial
+        // margin: maintenance bites on the way down, and the real floor
+        // is 35 + 1.2 × (1 − 0.35) = 35.78% — the same number the
+        // collateral guard uses.
+        let floor = liquidation_floor_pct(35.0, 1.2);
+        assert!((floor - 35.78).abs() < 1e-9, "floor {floor}");
+        assert!(35.5 < floor, "35.5% initial margin must NOT pass");
+        assert!(50.0 >= floor, "2x (50%) carries it");
+        // Closer stops need less, and the floor still exceeds the bare
+        // distance at every level.
+        for d in [5.0, 18.75, 35.0] {
+            let f = liquidation_floor_pct(d, 1.2);
+            assert!(f > d, "floor {f} must exceed the distance {d}");
+        }
     }
 
     #[test]
