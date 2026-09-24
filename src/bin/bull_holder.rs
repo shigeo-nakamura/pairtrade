@@ -713,6 +713,23 @@ fn order_rejected_definitively(e: &dex_connector::DexError) -> bool {
     )
 }
 
+/// May a tracked stop id leave state? The ONE rule for every site that
+/// drops one, because the cost of being wrong is the same everywhere: an
+/// untracked reduce-only trigger that a later ARM inherits against a new
+/// position. Only the venue's own word counts — the cancel just
+/// succeeded, or the venue already said the order is not there
+/// (`stop_absence_confirmed`: nothing rests for this market, or it named
+/// the id among its cancelled orders).
+///
+/// A cancel that merely errored proves nothing: a transport blip looks
+/// exactly like an absent order. Neither does the unlisted-for-the-whole-
+/// grace inference, which is about a stale WebSocket cache — that is
+/// enough to ATTEMPT a replacement (the attempt cancels first, in the
+/// right order) but not to forget the id.
+fn may_forget_stop(cancel_ok: bool, absence_confirmed: bool) -> bool {
+    cancel_ok || absence_confirmed
+}
+
 /// Is the outcome of a live order settled? Only when the holding could be
 /// read AND (it changed, or the order was definitively rejected and the
 /// holding did not change).
@@ -1789,13 +1806,13 @@ impl Engine {
         if let Some(old) = &leg.stop_order_id {
             if !self.cfg.dry_run {
                 if let Err(e) = self.lt.cancel_order(symbol, old).await {
-                    if leg.stop_presumed_gone {
-                        // Cancelling an order the venue has already
-                        // stopped listing fails for the obvious reason.
+                    if may_forget_stop(false, leg.stop_absence_confirmed) {
+                        // Cancelling an order the VENUE has already
+                        // reported gone fails for the obvious reason.
                         // Deferring on that would block the replacement
                         // this verdict exists to trigger.
                         log::warn!(
-                            "[STOP] cancel of {old} failed and it is not expected to be resting; replacing it: {e:?}"
+                            "[STOP] cancel of {old} failed and the venue already reported it gone; replacing it: {e:?}"
                         );
                     } else {
                         log::warn!(
@@ -2339,7 +2356,7 @@ impl Engine {
                 // transport error on top of it would drop an id whose
                 // reduce-only trigger may still rest — and a later ARM
                 // would inherit it against the new position.
-                if !leg.stop_absence_confirmed {
+                if !may_forget_stop(false, leg.stop_absence_confirmed) {
                     log::warn!(
                         "[STOP] cancel {id} failed, leaving it tracked in state (order may still be resting): {e:?}"
                     );
@@ -5819,6 +5836,76 @@ mod tests {
                 .values()
                 .all(|l| l.stop_order_id.is_none() && !l.stop_presumed_gone),
             "the id and the doubt about it are both dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one rule, and the two sites that drop a stop id, agree: only
+    /// the venue's own word lets the bot stop tracking one.
+    #[test]
+    fn a_stop_id_is_forgotten_only_on_the_venues_own_word() {
+        // The cancel went through: the order is gone, whatever was
+        // inferred about it beforehand.
+        assert!(may_forget_stop(true, false));
+        assert!(may_forget_stop(true, true));
+        // The venue already named the absence: cancelling something that
+        // is not there fails by definition, so that failure may not hold
+        // the id hostage.
+        assert!(may_forget_stop(false, true));
+        // A cancel that merely errored, with nothing but an inference
+        // behind it — a transport blip looks exactly like an absent
+        // order, and the trigger may still rest.
+        assert!(!may_forget_stop(false, false));
+    }
+
+    /// `place_stop` cancels the order it replaces. When absence is only
+    /// inferred and that cancel errors, it must defer rather than forget
+    /// the id — the same rule `cancel_stop` follows, at the other site.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_defers_when_the_previous_stop_is_only_inferred_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_replace_inferred_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,
+            perp_position: Some(0.005),
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
+        for leg in e.state.legs.values_mut() {
+            leg.stop_level = Some(1.0); // stale, so a replacement is due
+            leg.stop_presumed_gone = true; // inferred from the grace only
+            leg.stop_absence_confirmed = false;
+        }
+        let err = format!("{:#}", e.place_stop("BTC").await.unwrap_err());
+        assert!(
+            err.contains("could not cancel the previous stop"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            e.state.legs["BTC"].stop_order_id.as_deref(),
+            Some("stop-BTC"),
+            "an id that may still be resting stays tracked for the retry"
+        );
+        assert!(
+            venue
+                .trigger_calls
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "and no second trigger is rested on top of it"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
