@@ -1619,7 +1619,12 @@ impl Engine {
         // it and then having Lighter drop the replacement would leave the
         // leg uncovered on the strength of a failed read. With no stop to
         // lose, an attempt is the better bet.
-        let has_stop = leg.stop_order_id.is_some() || leg.stop_unconfirmed_id.is_some();
+        // A presumed-gone id is not protection to preserve: the venue
+        // reported no order, named it cancelled, or stopped listing it for
+        // the whole grace. Counting it here would turn a failed margin
+        // read into an indefinitely uncovered leg that never even tried.
+        let has_stop = (leg.stop_order_id.is_some() && !leg.stop_presumed_gone)
+            || leg.stop_unconfirmed_id.is_some();
         if carried == Some(false) || (carried.is_none() && has_stop) {
             // Keep the refreshed peak even though the move is refused: the
             // peak is the exit rule's own record, and dropping a new high
