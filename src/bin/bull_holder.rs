@@ -1850,6 +1850,12 @@ impl Engine {
     /// is that margin as a percentage, so the stop distance must fit inside
     /// it. `None` = the account could not be read.
     async fn stop_distance_supported(&self, symbol: &str, mark: f64, trigger: f64) -> Option<bool> {
+        if self.cfg.dry_run {
+            // The simulated stop is never submitted, so the venue never
+            // judges it. Refusing here would leave a DRY_RUN book recorded
+            // as uncovered on an account whose leverage is irrelevant to it.
+            return Some(true);
+        }
         // What Lighter validates is how far the TRIGGER sits from the
         // current mark, not the trailing percentage: after a drawdown the
         // peak-based level can be much closer to the mark than
