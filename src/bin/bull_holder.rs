@@ -3299,12 +3299,30 @@ impl Engine {
                         // "unknown" defers instead of cancelling a live stop.
                         Some(_) => match self.lt.get_open_orders(&sym).await {
                             Ok(resp) if resp.orders.iter().any(|o| &o.order_id == id) => Some(true),
-                            Ok(_) => {
-                                log::warn!(
-                                "[STOP] {sym}: the market has a resting order but the connector does not list {id} — deferring rather than guessing"
-                            );
-                                None
-                            }
+                            // The id is not listed. That is absence only
+                            // if the list is from the CURRENT connection:
+                            // the connector clears its positions-ready
+                            // flag on every reconnect and fails that read
+                            // until the account snapshot arrives
+                            // (bot-strategy#911), so a successful
+                            // `get_positions` is the readiness proof.
+                            // Treating the two alike would defer forever
+                            // once an operator cancelled the stop while
+                            // another order rested on the market.
+                            Ok(_) => match self.lt.get_positions().await {
+                                Ok(_) => {
+                                    log::error!(
+                                        "[STOP] {sym}: {id} is gone from the venue's order list while another order rests — re-placing"
+                                    );
+                                    Some(false)
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[STOP] {sym}: order list not yet from this connection, stop check deferred: {e:?}"
+                                    );
+                                    None
+                                }
+                            },
                             Err(e) => {
                                 log::warn!("[STOP] {sym}: order list unreadable, stop check deferred: {e:?}");
                                 None
