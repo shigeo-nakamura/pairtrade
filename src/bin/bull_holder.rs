@@ -1764,6 +1764,20 @@ impl Engine {
         Ok(())
     }
 
+    /// Every leg's observation ends — used where stop checking itself
+    /// stops, so an interval nobody was watching cannot be counted as
+    /// time the stop went unlisted.
+    fn clear_all_unlisted_since(&mut self) {
+        let symbols: Vec<String> = self.state.legs.keys().cloned().collect();
+        let mut changed = false;
+        for sym in symbols {
+            changed |= self.clear_unlisted_since(&sym);
+        }
+        if changed {
+            self.persist();
+        }
+    }
+
     /// Forget any run of "the list does not name this stop": returns
     /// whether something was actually cleared, so the caller only writes
     /// state when it changed.
@@ -3287,18 +3301,7 @@ impl Engine {
     /// KILL_SWITCH (which blocks stop re-placement by design).
     async fn ensure_stops(&mut self) {
         if self.sentinels.kill_switch_engaged() {
-            // Nothing is observed while stop checking is off, so no
-            // elapsed time accrues against a stop: counting a KILL
-            // interval as "continuously unlisted" would let the first
-            // ambiguous read after it cancel a live stop with no grace.
-            let symbols: Vec<String> = self.state.legs.keys().cloned().collect();
-            let mut changed = false;
-            for sym in symbols {
-                changed |= self.clear_unlisted_since(&sym);
-            }
-            if changed {
-                self.persist();
-            }
+            self.clear_all_unlisted_since();
             return;
         }
         for (sym, leg) in self.state.legs.clone() {
@@ -3586,6 +3589,13 @@ impl Engine {
             self.persist();
         }
         let kill = self.sentinels.kill_switch_engaged();
+        if kill {
+            // Stop checking is off while KILL is engaged, so no elapsed
+            // time accrues against a stop. Doing this on the tick rather
+            // than inside `ensure_stops` covers a KILL that comes and goes
+            // between two reconciles, which that function never sees.
+            self.clear_all_unlisted_since();
+        }
         let intent = resolve_operator_intent(
             self.state.mode,
             self.state.halted,
