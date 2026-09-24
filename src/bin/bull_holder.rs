@@ -2728,10 +2728,16 @@ impl Engine {
             let http = self.http.clone();
             let url = self.cfg.hl_info_url.clone();
             async move {
+                // A 429 or a 5xx still carries a JSON body — an error
+                // object, not an agent list. Letting it through would read
+                // as "no such approval" and clear a live expiry on a
+                // transient failure (Codex review).
                 http.post(&url)
                     .json(&body)
                     .send()
                     .await
+                    .ok()?
+                    .error_for_status()
                     .ok()?
                     .json::<serde_json::Value>()
                     .await
@@ -2761,6 +2767,10 @@ impl Engine {
             log::warn!("[AGENT] extraAgents read failed; expiry not refreshed");
             return;
         };
+        if agents.as_array().is_none() {
+            log::warn!("[AGENT] extraAgents did not return a list; expiry not refreshed");
+            return;
+        }
         let Some((name, valid_until)) = agent_expiry(&agents, &self.cfg.hl_agent_name) else {
             log::error!(
                 "[AGENT] cannot identify this bot's API wallet among {owner}'s approved agents{} — expiry unknown",
