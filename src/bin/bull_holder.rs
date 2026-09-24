@@ -1771,6 +1771,11 @@ impl Engine {
         leg.lighter_peak = leg.lighter_peak.max(lighter_price);
         let level = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
         if leg.stop_unconfirmed_id.is_none()
+            // A stop the venue is believed to have dropped is never
+            // "already current", however well its recorded level and size
+            // match. The metadata is kept precisely so it can be trusted
+            // again if the id turns up listed (`stop_seen_listed`).
+            && !leg.stop_presumed_gone
             && stop_is_current(
                 leg.stop_level,
                 leg.stop_size,
@@ -2004,6 +2009,27 @@ impl Engine {
             }
             _ => false,
         }
+    }
+
+    /// Record that the tracked stop is believed not to be resting.
+    /// `absence_confirmed` says whether the VENUE gave that answer (see
+    /// `may_forget_stop`) or it was inferred from the grace.
+    ///
+    /// `stop_level` and `stop_size` are deliberately KEPT. They used to
+    /// be cleared so the leg could not read as covered, but
+    /// `stop_presumed_gone` says that now — and throwing the metadata
+    /// away is unrecoverable: if the absence was only inferred and the
+    /// order turns out to still rest, the leg has no level or size to be
+    /// judged current against, so the next pass cancels and re-places a
+    /// perfectly good stop. That churn is exactly the live failure of
+    /// 2026-09-23, and each round of it can leave the leg uncovered.
+    fn mark_stop_presumed_gone(&mut self, symbol: &str, absence_confirmed: bool) {
+        if let Some(l) = self.state.legs.get_mut(symbol) {
+            l.stop_unlisted_since = None;
+            l.stop_presumed_gone = true;
+            l.stop_absence_confirmed = absence_confirmed;
+        }
+        self.persist();
     }
 
     /// The venue's order list names the tracked stop: it rests. Both the
@@ -3882,14 +3908,7 @@ impl Engine {
                 // The id stays for that path to cancel in the right
                 // order; `stop_presumed_gone` tells it a failing cancel is
                 // expected rather than a reason to defer.
-                if let Some(l) = self.state.legs.get_mut(&sym) {
-                    l.stop_level = None;
-                    l.stop_size = None;
-                    l.stop_unlisted_since = None;
-                    l.stop_presumed_gone = true;
-                    l.stop_absence_confirmed = absence_confirmed;
-                }
-                self.persist();
+                self.mark_stop_presumed_gone(&sym, absence_confirmed);
             }
             // Covered in size AND resting at the level the refreshed peak
             // calls for: a move whose cancel failed leaves the old, lower
@@ -5874,6 +5893,71 @@ mod tests {
                 .all(|l| l.stop_order_id.is_none() && !l.stop_presumed_gone),
             "the id and the doubt about it are both dropped"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop believed gone is never "already current", so the recorded
+    /// level and size can be KEPT — and if the absence was only inferred
+    /// and the order turns out to still rest, the leg is judged against
+    /// them again instead of being cancelled and re-placed for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_believed_gone_is_replaced_though_its_metadata_still_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_gone_meta_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: Some(0.005),
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
+        // Exactly what `engine_with_stops` recorded: at this price the
+        // stop IS current, so only the flag can make a replacement due.
+        let before = e.state.legs["BTC"].clone();
+        assert!(stop_is_current(
+            before.stop_level,
+            before.stop_size,
+            true,
+            level_below_peak(80_000.0, e.cfg.stop_dd_pct),
+            before.perp_size
+        ));
+        e.state.legs.get_mut("BTC").unwrap().stop_presumed_gone = true;
+        let _ = e.place_stop("BTC").await;
+        assert!(
+            !venue
+                .trigger_calls
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a stop believed gone must be replaced, not read as current"
+        );
+        // And the metadata was never thrown away, so a leg whose stop
+        // turns out to still rest can be judged current again.
+        e.state.legs.insert("BTC".into(), before.clone());
+        e.mark_stop_presumed_gone("BTC", false);
+        assert!(e.stop_seen_listed("BTC"));
+        let after = &e.state.legs["BTC"];
+        assert_eq!(after.stop_level, before.stop_level);
+        assert_eq!(after.stop_size, before.stop_size);
+        assert!(stop_is_current(
+            after.stop_level,
+            after.stop_size,
+            true,
+            level_below_peak(80_000.0, e.cfg.stop_dd_pct),
+            after.perp_size
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
