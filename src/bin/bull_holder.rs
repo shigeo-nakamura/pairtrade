@@ -547,6 +547,12 @@ fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
     Some(account_total)
 }
 
+/// How many consecutive checks may report a resting order without the
+/// tracked stop among them before it is treated as gone. The connector's
+/// order view is WebSocket-fed and briefly empty after a reconnect;
+/// reconciles are ~10 min apart, so this is a ~30 min grace.
+const STOP_UNLISTED_TOLERANCE: u32 = 3;
+
 /// A holding the book does not carry counts as flat below this notional.
 const RECONCILE_DUST_USD: f64 = 5.0;
 
@@ -1027,6 +1033,12 @@ struct LegState {
     /// next stop is placed, and cleared only when that cancel succeeds.
     #[serde(default)]
     stop_unconfirmed_id: Option<String>,
+    /// Consecutive checks where the venue reported a resting order for the
+    /// market but the connector's order list did not name the tracked
+    /// stop. One or two are the WebSocket cache catching up after a
+    /// restart; a run of them is an order that is really gone.
+    #[serde(default)]
+    stop_unlisted_checks: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -2574,6 +2586,7 @@ impl Engine {
                         cost_basis_unknown: false,
                         perp_cost_basis_unknown: false,
                         stop_unconfirmed_id: None,
+                        stop_unlisted_checks: 0,
                     }
                 }
             };
@@ -3298,7 +3311,12 @@ impl Engine {
                         // after a restart that view is briefly empty, so
                         // "unknown" defers instead of cancelling a live stop.
                         Some(_) => match self.lt.get_open_orders(&sym).await {
-                            Ok(resp) if resp.orders.iter().any(|o| &o.order_id == id) => Some(true),
+                            Ok(resp) if resp.orders.iter().any(|o| &o.order_id == id) => {
+                                if let Some(l) = self.state.legs.get_mut(&sym) {
+                                    l.stop_unlisted_checks = 0;
+                                }
+                                Some(true)
+                            }
                             // The id is not listed. That is absence only
                             // if the list is from the CURRENT connection:
                             // the connector clears its positions-ready
@@ -3309,20 +3327,49 @@ impl Engine {
                             // Treating the two alike would defer forever
                             // once an operator cancelled the stop while
                             // another order rested on the market.
-                            Ok(_) => match self.lt.get_positions().await {
-                                Ok(_) => {
+                            Ok(_) => {
+                                // The id is not listed. Positions being
+                                // readable proves nothing here — this
+                                // iteration already read them — and the
+                                // connector exposes no readiness flag for
+                                // the ORDER snapshot. Two signals settle
+                                // it instead: the venue naming the id as
+                                // cancelled, or the same answer repeating.
+                                // A cache catching up after a restart
+                                // agrees within a check or two; an order
+                                // that is really gone never comes back.
+                                let cancelled = matches!(
+                                    self.lt.get_canceled_orders(&sym).await,
+                                    Ok(c) if c.orders.iter().any(|o| &o.order_id == id)
+                                );
+                                let seen = self
+                                    .state
+                                    .legs
+                                    .get_mut(&sym)
+                                    .map(|l| {
+                                        l.stop_unlisted_checks =
+                                            l.stop_unlisted_checks.saturating_add(1);
+                                        l.stop_unlisted_checks
+                                    })
+                                    .unwrap_or(0);
+                                self.persist();
+                                if cancelled || seen >= STOP_UNLISTED_TOLERANCE {
                                     log::error!(
-                                        "[STOP] {sym}: {id} is gone from the venue's order list while another order rests — re-placing"
+                                        "[STOP] {sym}: {id} is gone from the venue's order list ({}) while another order rests — re-placing",
+                                        if cancelled {
+                                            "reported cancelled".to_string()
+                                        } else {
+                                            format!("{seen} consecutive checks")
+                                        }
                                     );
                                     Some(false)
-                                }
-                                Err(e) => {
+                                } else {
                                     log::warn!(
-                                        "[STOP] {sym}: order list not yet from this connection, stop check deferred: {e:?}"
+                                        "[STOP] {sym}: {id} not listed yet (check {seen}/{STOP_UNLISTED_TOLERANCE}) — deferring, the cache may still be catching up"
                                     );
                                     None
                                 }
-                            },
+                            }
                             Err(e) => {
                                 log::warn!("[STOP] {sym}: order list unreadable, stop check deferred: {e:?}");
                                 None
@@ -4837,6 +4884,7 @@ mod tests {
                     cost_basis_unknown: false,
                     perp_cost_basis_unknown: false,
                     stop_unconfirmed_id: None,
+                    stop_unlisted_checks: 0,
                 },
             );
         }
@@ -5680,6 +5728,52 @@ mod tests {
         assert_eq!(
             resting_orders_for(&serde_json::json!({"code":500}), "BTC"),
             None
+        );
+    }
+
+    /// The connector's order view is WebSocket-fed with no readiness
+    /// flag, so "not listed" is ambiguous. The tolerance bounds both
+    /// mistakes: a cache catching up after a restart agrees within a
+    /// check or two, an order that is really gone never reappears.
+    #[test]
+    fn an_unlisted_stop_is_tolerated_briefly_then_treated_as_gone() {
+        let mut leg = LegState {
+            stop_unlisted_checks: 0,
+            ..Default::default()
+        };
+        // Each unlisted answer counts; only the last one acts.
+        for expected in 1..STOP_UNLISTED_TOLERANCE {
+            leg.stop_unlisted_checks = leg.stop_unlisted_checks.saturating_add(1);
+            assert_eq!(leg.stop_unlisted_checks, expected);
+            assert!(
+                leg.stop_unlisted_checks < STOP_UNLISTED_TOLERANCE,
+                "check {expected} must still defer"
+            );
+        }
+        leg.stop_unlisted_checks = leg.stop_unlisted_checks.saturating_add(1);
+        assert!(leg.stop_unlisted_checks >= STOP_UNLISTED_TOLERANCE);
+        // Seeing it listed again clears the run: a reconnect mid-way must
+        // not accumulate towards cancelling a live stop.
+        leg.stop_unlisted_checks = 0;
+        assert!(leg.stop_unlisted_checks < STOP_UNLISTED_TOLERANCE);
+        // The counter survives a restart, so the grace is not restarted
+        // by the very event that empties the cache.
+        let js = serde_json::to_string(&LegState {
+            stop_unlisted_checks: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let back: LegState = serde_json::from_str(&js).unwrap();
+        assert_eq!(back.stop_unlisted_checks, 2);
+        let old: LegState = serde_json::from_str(
+            r#"{"spot_size":0,"spot_cost_usd":0,"perp_size":0,"perp_cost_usd":0,
+                "peak_close":0,"exit_level":0,"last_close_date":null,"last_close":null,
+                "close_fetch_failures":0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.stop_unlisted_checks, 0,
+            "a pre-existing state file reads as 0"
         );
     }
 
