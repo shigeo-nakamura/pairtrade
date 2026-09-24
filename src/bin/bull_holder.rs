@@ -237,6 +237,11 @@ struct Config {
     /// Hyperliquid's approved-agent list. Only needed when the master has
     /// more than one.
     hl_agent_name: String,
+    /// Address of the API wallet whose key this bot signs with. The only
+    /// identity that proves the watched approval belongs to the signer:
+    /// a rotated key leaves the old named agent approved, and watching
+    /// its expiry would report authorisation the bot does not have.
+    hl_agent_address: String,
     arm_path: PathBuf,
     add_path: PathBuf,
     disarm_path: PathBuf,
@@ -309,6 +314,7 @@ impl Config {
             hl_account_address: lighter_env("HYPERLIQUID_ACCOUNT_ADDRESS", &instance_id)
                 .unwrap_or_default(),
             hl_agent_name: env_string("BULL_HOLDER_HL_AGENT_NAME", ""),
+            hl_agent_address: env_string("BULL_HOLDER_HL_AGENT_ADDRESS", ""),
             // Follows the connector's own network selector, so a testnet
             // deployment does not silently read mainnet candles and
             // mainnet agent approvals (`HYPERLIQUID_IS_MAINNET=false` is
@@ -590,7 +596,11 @@ fn agent_owner(role: &serde_json::Value, account: &str) -> Option<String> {
     }
 }
 
-fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> AgentLookup {
+fn agent_expiry(
+    agents: &serde_json::Value,
+    configured_address: &str,
+    configured_name: &str,
+) -> AgentLookup {
     let read = |a: &serde_json::Value| -> Option<(String, i64)> {
         let until = a.get("validUntil")?.as_i64()? / 1_000;
         let name = a
@@ -603,7 +613,17 @@ fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> AgentLooku
     let Some(agents) = agents.as_array() else {
         return AgentLookup::Unreadable;
     };
-    let found = if configured_name.is_empty() {
+    // The signer's address is the identity that matters: a rotated key
+    // leaves the old named agent approved, and its expiry would advertise
+    // authorisation this bot no longer has. The name is a convenience for
+    // deployments that have not set the address.
+    let found = if !configured_address.is_empty() {
+        agents.iter().find(|a| {
+            a.get("address")
+                .and_then(|x| x.as_str())
+                .is_some_and(|addr| addr.eq_ignore_ascii_case(configured_address))
+        })
+    } else if configured_name.is_empty() {
         match agents.as_slice() {
             [only] => Some(only),
             // Several agents and no name: this bot's own wallet cannot be
@@ -2780,8 +2800,9 @@ impl Engine {
         // networks must not leave the daily timer serving the other one's
         // date.
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}|{}",
             self.cfg.hl_account_address.to_ascii_lowercase(),
+            self.cfg.hl_agent_address.to_ascii_lowercase(),
             self.cfg.hl_agent_name.to_ascii_lowercase(),
             self.cfg.hl_info_url.to_ascii_lowercase()
         )
@@ -2790,6 +2811,20 @@ impl Engine {
     async fn poll_hl_agent(&mut self) {
         if self.cfg.dry_run || self.cfg.hl_account_address.is_empty() {
             return;
+        }
+        // A changed identity makes the stored values describe a different
+        // wallet. Drop them before the read rather than after it succeeds:
+        // a refresh that fails would otherwise keep publishing the old
+        // wallet's expiry as this one's (Codex review).
+        if self.state.hl_agent_key.as_deref() != Some(self.agent_key().as_str())
+            && self.state.hl_agent_key.is_some()
+        {
+            log::warn!("[AGENT] the watched API wallet changed; dropping the previous expiry");
+            self.state.hl_agent_name = None;
+            self.state.hl_agent_valid_until = None;
+            self.state.hl_agent_key = Some(self.agent_key());
+            self.state.hl_agent_as_of = None;
+            self.persist();
         }
         let post = |body: serde_json::Value| {
             let http = self.http.clone();
@@ -2839,13 +2874,17 @@ impl Engine {
             log::warn!("[AGENT] extraAgents read failed; expiry not refreshed");
             return;
         };
-        let (name, valid_until) = match agent_expiry(&agents, &self.cfg.hl_agent_name) {
+        let (name, valid_until) = match agent_expiry(
+            &agents,
+            &self.cfg.hl_agent_address,
+            &self.cfg.hl_agent_name,
+        ) {
             AgentLookup::Found(name, until) => (name, until),
             AgentLookup::Unreadable => {
                 log::warn!(
                     "[AGENT] {owner}'s approved agents could not be read{} — the last known expiry stands",
-                    if self.cfg.hl_agent_name.is_empty() {
-                        "; set BULL_HOLDER_HL_AGENT_NAME to name the wallet this bot signs with"
+                    if self.cfg.hl_agent_address.is_empty() && self.cfg.hl_agent_name.is_empty() {
+                        "; set BULL_HOLDER_HL_AGENT_ADDRESS to the API wallet this bot signs with"
                     } else {
                         ""
                     }
@@ -5780,33 +5819,49 @@ mod tests {
         ]);
         // Named: that wallet's expiry, in seconds.
         assert_eq!(
-            agent_expiry(&agents, "bull-holder"),
+            agent_expiry(&agents, "", "bull-holder"),
             Found("bull-holder".into(), 1805606835)
         );
         assert_eq!(
-            agent_expiry(&agents, "BULL-HOLDER"),
+            agent_expiry(&agents, "", "BULL-HOLDER"),
             Found("bull-holder".into(), 1805606835)
         );
         // Named but not approved: conclusive — the caller clears the date.
-        assert_eq!(agent_expiry(&agents, "nope"), Absent);
+        assert_eq!(agent_expiry(&agents, "", "nope"), Absent);
         // Unnamed among several: this bot's wallet cannot be told from
         // another's, so nothing is concluded and the last value stands.
-        assert_eq!(agent_expiry(&agents, ""), Unreadable);
+        assert_eq!(agent_expiry(&agents, "", ""), Unreadable);
         // Unnamed with exactly one agent is unambiguous.
         let one = serde_json::json!([{"name":"solo","validUntil":1805606835174i64}]);
-        assert_eq!(agent_expiry(&one, ""), Found("solo".into(), 1805606835));
+        assert_eq!(agent_expiry(&one, "", ""), Found("solo".into(), 1805606835));
         // An empty list IS an answer: nothing is approved.
-        assert_eq!(agent_expiry(&serde_json::json!([]), ""), Absent);
-        assert_eq!(agent_expiry(&serde_json::json!([]), "bull-holder"), Absent);
+        assert_eq!(agent_expiry(&serde_json::json!([]), "", ""), Absent);
+        assert_eq!(
+            agent_expiry(&serde_json::json!([]), "", "bull-holder"),
+            Absent
+        );
+        // The signer's address decides, not the label: a rotated key
+        // leaves the old named wallet approved, and publishing its expiry
+        // would claim authorisation this bot does not have.
+        assert_eq!(
+            agent_expiry(&agents, "0x80", "hype-accumulator"),
+            Found("bull-holder".into(), 1805606835),
+            "the address names the wallet even when the name disagrees"
+        );
+        assert_eq!(
+            agent_expiry(&agents, "0xdead", "bull-holder"),
+            Absent,
+            "the configured signer holds no approval, whatever is named"
+        );
         // A record without a usable expiry is not evidence of absence —
         // clearing a live approval's date on a malformed field would be
         // the opposite of what this watch is for.
         assert_eq!(
-            agent_expiry(&serde_json::json!([{"name":"x"}]), "x"),
+            agent_expiry(&serde_json::json!([{"name":"x"}]), "", "x"),
             Unreadable
         );
         assert_eq!(
-            agent_expiry(&serde_json::json!({"code":429}), "x"),
+            agent_expiry(&serde_json::json!({"code":429}), "", "x"),
             Unreadable
         );
     }
@@ -5843,6 +5898,7 @@ mod tests {
             lighter_wallet_address: String::new(),
             hl_account_address: String::new(),
             hl_agent_name: String::new(),
+            hl_agent_address: String::new(),
             hl_info_url: "http://127.0.0.1:1/info".into(),
             arm_path: dir.join("ARM"),
             add_path: dir.join("ADD"),
