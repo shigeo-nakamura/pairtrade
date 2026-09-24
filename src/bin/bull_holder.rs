@@ -1581,6 +1581,19 @@ impl Engine {
             self.persist();
             return Ok(());
         }
+        // Before touching the stop that is already there: a stop the
+        // market's leverage cannot carry would be accepted over REST and
+        // dropped, and cancelling first would turn a protected leg into a
+        // permanently uncovered one (Codex review).
+        if self
+            .stop_distance_supported(symbol, lighter_price, level)
+            .await
+            == Some(false)
+        {
+            bail!(
+                "Lighter stop {symbol}: this market's leverage cannot carry a stop at {level:.2} (see [STOP] above); the existing stop is left alone"
+            );
+        }
         // Cancel the previous stop first so we never rest two. Only clear the
         // old id/level once the cancel actually succeeds (or there was
         // nothing to cancel) — on a failed cancel the old order may still be
@@ -1629,15 +1642,6 @@ impl Engine {
         let order_id = if self.cfg.dry_run {
             format!("dry-run-stop-{}", now_secs())
         } else {
-            // Refuse to submit a stop the market's leverage cannot carry:
-            // Lighter would accept the transaction and drop it, leaving the
-            // leg silently uncovered (bot-strategy#950).
-            if self.stop_distance_supported(symbol).await == Some(false) {
-                bail!(
-                    "Lighter stop {symbol}: this market's leverage cannot carry a {:.0}% stop; lower it (see [STOP] above)",
-                    self.cfg.stop_dd_pct
-                );
-            }
             // An earlier stop whose existence is unknown must be cancelled
             // by id first — the sweep below cannot see what the WS cache
             // does not carry, so placing a replacement while it is still
@@ -1845,7 +1849,20 @@ impl Engine {
     /// dropped during execution — bot-strategy#950). `initial_margin_fraction`
     /// is that margin as a percentage, so the stop distance must fit inside
     /// it. `None` = the account could not be read.
-    async fn stop_distance_supported(&self, symbol: &str) -> Option<bool> {
+    async fn stop_distance_supported(&self, symbol: &str, mark: f64, trigger: f64) -> Option<bool> {
+        // What Lighter validates is how far the TRIGGER sits from the
+        // current mark, not the trailing percentage: after a drawdown the
+        // peak-based level can be much closer to the mark than
+        // `stop_dd_pct` suggests, and rejecting that would leave the leg
+        // uncovered for no reason (Codex review).
+        let distance_pct = if mark > 0.0 {
+            100.0 * (1.0 - trigger / mark)
+        } else {
+            return None;
+        };
+        if distance_pct <= 0.0 {
+            return Some(true); // at or above the mark: not this guard's case
+        }
         let index = self.lighter_account_index().await?;
         let url = format!(
             "{}/api/v1/account?by=index&value={index}",
@@ -1853,11 +1870,10 @@ impl Engine {
         );
         let v: serde_json::Value = self.http.get(&url).send().await.ok()?.json().await.ok()?;
         let imf = margin_fraction_for(&v, symbol)?;
-        if imf + 1e-9 < self.cfg.stop_dd_pct {
+        if imf + 1e-9 < distance_pct {
             log::error!(
-                "[STOP] {symbol}: the market's initial margin is {imf:.2}% but the stop sits {:.2}% below the peak — Lighter will refuse it. Lower this market's leverage to {:.1}x or less (currently {:.1}x).",
-                self.cfg.stop_dd_pct,
-                100.0 / self.cfg.stop_dd_pct,
+                "[STOP] {symbol}: the market's initial margin is {imf:.2}% but the stop at {trigger:.2} sits {distance_pct:.2}% below the mark {mark:.2} — Lighter will refuse it. Lower this market's leverage to {:.1}x or less (currently {:.1}x).",
+                100.0 / distance_pct,
                 100.0 / imf.max(f64::EPSILON)
             );
             return Some(false);
@@ -5496,6 +5512,26 @@ mod tests {
         std::env::remove_var("BULL_HOLDER_TEST_IDX");
         std::env::remove_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER");
         assert_eq!(lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder"), None);
+    }
+
+    #[test]
+    fn the_guard_measures_the_trigger_against_the_mark_not_the_peak() {
+        // What Lighter validates is the distance from the CURRENT mark to
+        // the trigger. After a drawdown a 35%-below-peak stop can sit much
+        // closer than 35% below the mark, and a margin that carries it
+        // must not be rejected (Codex review).
+        let distance = |mark: f64, trigger: f64| 100.0 * (1.0 - trigger / mark);
+        // Peak 100, mark 80, 35% trailing → trigger 65 = 18.75% below mark.
+        let trigger = level_below_peak(100.0, 35.0);
+        assert!((trigger - 65.0).abs() < 1e-9);
+        let d = distance(80.0, trigger);
+        assert!((d - 18.75).abs() < 1e-9, "distance {d}");
+        // 3x (33.33% margin) carries that; measuring against the peak's
+        // 35% would have refused it forever.
+        assert!(33.33 >= d);
+        assert!(33.33 < 35.0);
+        // At the peak the two agree.
+        assert!((distance(100.0, trigger) - 35.0).abs() < 1e-9);
     }
 
     #[test]
