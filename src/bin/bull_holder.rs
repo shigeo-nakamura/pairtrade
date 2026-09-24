@@ -1597,11 +1597,15 @@ impl Engine {
         // market's leverage cannot carry would be accepted over REST and
         // dropped, and cancelling first would turn a protected leg into a
         // permanently uncovered one (Codex review).
-        if self
+        let carried = self
             .stop_distance_supported(symbol, lighter_price, level)
-            .await
-            == Some(false)
-        {
+            .await;
+        // Unknown counts as "do not touch a stop that exists": cancelling
+        // it and then having Lighter drop the replacement would leave the
+        // leg uncovered on the strength of a failed read. With no stop to
+        // lose, an attempt is the better bet.
+        let has_stop = leg.stop_order_id.is_some() || leg.stop_unconfirmed_id.is_some();
+        if carried == Some(false) || (carried.is_none() && has_stop) {
             // Keep the refreshed peak even though the move is refused: the
             // peak is the exit rule's own record, and dropping a new high
             // here would place the stop off a stale one once the leverage
@@ -1611,7 +1615,12 @@ impl Engine {
             }
             self.persist();
             bail!(
-                "Lighter stop {symbol}: this market's leverage cannot carry a stop at {level:.2} (see [STOP] above); the existing stop is left alone"
+                "Lighter stop {symbol}: {} for a stop at {level:.2}; the existing stop is left alone",
+                if carried.is_none() {
+                    "the market's leverage could not be read"
+                } else {
+                    "this market's leverage cannot carry one (see [STOP] above)"
+                }
             );
         }
         // Cancel the previous stop first so we never rest two. Only clear the
@@ -1742,6 +1751,8 @@ impl Engine {
             l.stop_level = Some(level);
             l.stop_size = Some(leg.perp_size);
             l.stop_order_id = Some(order_id);
+            // The run of misses belonged to the order this one replaces.
+            l.stop_unlisted_checks = 0;
         }
         self.persist();
         Ok(())
@@ -3312,8 +3323,21 @@ impl Engine {
                         // "unknown" defers instead of cancelling a live stop.
                         Some(_) => match self.lt.get_open_orders(&sym).await {
                             Ok(resp) if resp.orders.iter().any(|o| &o.order_id == id) => {
-                                if let Some(l) = self.state.legs.get_mut(&sym) {
-                                    l.stop_unlisted_checks = 0;
+                                // Persist the reset: a run of misses that
+                                // only cleared in memory would be reloaded
+                                // after a restart, and the empty cache
+                                // that restart produces could then supply
+                                // the final miss and cancel a live stop.
+                                if self
+                                    .state
+                                    .legs
+                                    .get(&sym)
+                                    .is_some_and(|l| l.stop_unlisted_checks != 0)
+                                {
+                                    if let Some(l) = self.state.legs.get_mut(&sym) {
+                                        l.stop_unlisted_checks = 0;
+                                    }
+                                    self.persist();
                                 }
                                 Some(true)
                             }
@@ -5544,7 +5568,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = engine_with_stops(&dir);
         e.cfg.dry_run = false;
-        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+        let venue = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: true,         // the uncertain stop cannot be settled
             perp_position: Some(0.005), // ready snapshot...
@@ -5552,19 +5576,34 @@ mod tests {
             stop_rests: Some("ghost-9".into()), // ...and it shows the stop IS resting
             canceled: Vec::new(),
         });
-        e.lt = venue.clone();
-        e.hl = venue;
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
         for leg in e.state.legs.values_mut() {
             leg.stop_order_id = None;
             leg.stop_level = None;
             leg.stop_size = None;
             leg.stop_unconfirmed_id = Some("ghost-9".into());
         }
-        // No replacement while it is unsettled.
+        // No replacement while it is unsettled. (The leverage read also
+        // fails against this stub, which blocks for the same reason: a
+        // leg that already carries a stop is never left without one on
+        // the strength of a read that did not answer.)
         let err = e.place_stop("BTC").await.unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("could not be cancelled"),
-            "unexpected error: {err:#}"
+            msg.contains("could not be cancelled") || msg.contains("could not be read"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            venue
+                .trigger_calls
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no trigger order may be submitted while a stop is unsettled"
         );
         assert_eq!(
             e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
