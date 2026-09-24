@@ -1033,10 +1033,12 @@ struct LegState {
     /// next stop is placed, and cleared only when that cancel succeeds.
     #[serde(default)]
     stop_unconfirmed_id: Option<String>,
-    /// Consecutive checks where the venue reported a resting order for the
-    /// market but the connector's order list did not name the tracked
-    /// stop. One or two are the WebSocket cache catching up after a
-    /// restart; a run of them is an order that is really gone.
+    /// Consecutive checks, WITHIN ONE CONNECTION, where the venue
+    /// reported a resting order for the market but the connector's order
+    /// list did not name the tracked stop. One or two are the WebSocket
+    /// cache catching up; a run of them is an order that is really gone.
+    /// Zeroed at startup: a new process has a new, empty cache, so its
+    /// first miss is expected rather than evidence.
     #[serde(default)]
     stop_unlisted_checks: u32,
 }
@@ -3851,7 +3853,17 @@ async fn main() -> Result<()> {
 
     // Before any connector (and any signer) is built: an open book is only
     // operated in the mode that created it.
-    let state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    let mut state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    // The unlisted-stop tolerance counts misses within ONE connection.
+    // Every start brings a fresh connector whose order cache is empty
+    // until the venue's first snapshot, so the miss it produces is
+    // expected — carrying counts across restarts would let three quick
+    // restarts (or a crash loop) add up to "the stop is gone" and cancel
+    // a live one, while carrying them in the other direction would let a
+    // stale count plus this start's own miss do it immediately.
+    for leg in state.legs.values_mut() {
+        leg.stop_unlisted_checks = 0;
+    }
     log::info!(
         "[STARTUP] mode={:?} legs={} halted={} book_dry_run={:?} realized_total=${:.2}",
         state.mode,
@@ -5799,6 +5811,27 @@ mod tests {
     /// flag, so "not listed" is ambiguous. The tolerance bounds both
     /// mistakes: a cache catching up after a restart agrees within a
     /// check or two, an order that is really gone never reappears.
+    #[test]
+    fn the_unlisted_tolerance_does_not_span_connections() {
+        // A restart brings a new connector with an empty order cache, so
+        // its first miss is expected. Counts from before must not add to
+        // it: three quick restarts would otherwise reach the tolerance on
+        // three expected misses and cancel a live stop.
+        let mut state = State::default();
+        state.legs.insert(
+            "BTC".into(),
+            LegState {
+                stop_unlisted_checks: STOP_UNLISTED_TOLERANCE - 1,
+                ..Default::default()
+            },
+        );
+        // What `main` does after loading the file.
+        for leg in state.legs.values_mut() {
+            leg.stop_unlisted_checks = 0;
+        }
+        assert_eq!(state.legs["BTC"].stop_unlisted_checks, 0);
+    }
+
     #[test]
     fn an_unlisted_stop_is_tolerated_briefly_then_treated_as_gone() {
         let mut leg = LegState {
