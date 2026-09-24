@@ -1045,6 +1045,15 @@ struct LegState {
     /// whether a live stop gets cancelled.
     #[serde(default)]
     stop_unlisted_since: Option<u64>,
+    /// The tracked stop is believed gone on evidence (see `rests` in
+    /// `ensure_stops`), but the cancel that proves it has not been sent
+    /// yet. It stops counting as cover immediately; the id is kept so the
+    /// replacement path cancels it in the right order — after its own
+    /// quote and leverage checks — and a cancel that then fails does not
+    /// block the replacement, because the order is not expected to be
+    /// there in the first place.
+    #[serde(default)]
+    stop_presumed_gone: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1638,10 +1647,20 @@ impl Engine {
         if let Some(old) = &leg.stop_order_id {
             if !self.cfg.dry_run {
                 if let Err(e) = self.lt.cancel_order(symbol, old).await {
-                    log::warn!(
-                        "[STOP] cancel previous stop {old} failed, keeping it tracked for retry: {e:?}"
-                    );
-                    prior_cancel_failed = true;
+                    if leg.stop_presumed_gone {
+                        // Cancelling an order the venue has already
+                        // stopped listing fails for the obvious reason.
+                        // Deferring on that would block the replacement
+                        // this verdict exists to trigger.
+                        log::warn!(
+                            "[STOP] cancel of {old} failed and it is not expected to be resting; replacing it: {e:?}"
+                        );
+                    } else {
+                        log::warn!(
+                            "[STOP] cancel previous stop {old} failed, keeping it tracked for retry: {e:?}"
+                        );
+                        prior_cancel_failed = true;
+                    }
                 }
             }
             if !prior_cancel_failed {
@@ -1757,8 +1776,10 @@ impl Engine {
             l.stop_level = Some(level);
             l.stop_size = Some(leg.perp_size);
             l.stop_order_id = Some(order_id);
-            // The run belonged to the order this one replaces.
+            // The run, and the doubt, belonged to the order this one
+            // replaces.
             l.stop_unlisted_since = None;
+            l.stop_presumed_gone = false;
         }
         self.persist();
         Ok(())
@@ -1783,8 +1804,11 @@ impl Engine {
     /// state when it changed.
     fn clear_unlisted_since(&mut self, symbol: &str) -> bool {
         match self.state.legs.get_mut(symbol) {
-            Some(l) if l.stop_unlisted_since.is_some() => {
+            Some(l) if l.stop_unlisted_since.is_some() || l.stop_presumed_gone => {
                 l.stop_unlisted_since = None;
+                // Seen again, or the observation ended: whatever doubt the
+                // run raised is over too.
+                l.stop_presumed_gone = false;
                 true
             }
             _ => false,
@@ -2638,6 +2662,7 @@ impl Engine {
                         perp_cost_basis_unknown: false,
                         stop_unconfirmed_id: None,
                         stop_unlisted_since: None,
+                        stop_presumed_gone: false,
                     }
                 }
             };
@@ -3455,33 +3480,23 @@ impl Engine {
             };
             let Some(rests) = rests else { continue };
             if !rests && leg.stop_order_id.is_some() {
-                let id = leg.stop_order_id.clone().unwrap_or_default();
                 log::error!(
-                    "[STOP] {sym}: recorded stop {id} is NOT resting — it stops counting as cover and a replacement follows"
+                    "[STOP] {sym}: recorded stop {:?} is NOT resting — it stops counting as cover and a replacement follows",
+                    leg.stop_order_id
                 );
-                // `rests == Some(false)` is only ever reached on evidence:
-                // the venue reporting no order for this market at all, the
-                // cancelled feed naming this id, or the grace expiring on
-                // a continuous run of it being unlisted. So the id is
-                // cleared, not demoted. Demoting it would hand it to the
-                // unconfirmed-stop gate, which cannot settle an id the
-                // cancelled feed never names while an unrelated order
-                // keeps the market's count non-zero — and the leg would
-                // then be blocked from ever getting a stop again.
-                //
-                // A best-effort cancel first, in case the venue still has
-                // it: cancelling something already gone is harmless,
-                // forgetting something still resting is not.
-                if !self.cfg.dry_run {
-                    if let Err(e) = self.lt.cancel_order(&sym, &id).await {
-                        log::warn!("[STOP] {sym}: cancel of {id} before its replacement failed (it is not resting anyway): {e:?}");
-                    }
-                }
+                // No cancel from here. `place_stop` checks the quote and
+                // the market's leverage BEFORE it touches an existing
+                // stop, precisely so a replacement that cannot be placed
+                // never costs the protection already there — and this
+                // verdict, however well evidenced, is still an inference.
+                // The id stays for that path to cancel in the right
+                // order; `stop_presumed_gone` tells it a failing cancel is
+                // expected rather than a reason to defer.
                 if let Some(l) = self.state.legs.get_mut(&sym) {
-                    l.stop_order_id = None;
                     l.stop_level = None;
                     l.stop_size = None;
                     l.stop_unlisted_since = None;
+                    l.stop_presumed_gone = true;
                 }
                 self.persist();
             }
@@ -4993,6 +5008,7 @@ mod tests {
                     perp_cost_basis_unknown: false,
                     stop_unconfirmed_id: None,
                     stop_unlisted_since: None,
+                    stop_presumed_gone: false,
                 },
             );
         }
