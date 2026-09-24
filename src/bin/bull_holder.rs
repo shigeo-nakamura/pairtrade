@@ -309,9 +309,19 @@ impl Config {
             hl_account_address: lighter_env("HYPERLIQUID_ACCOUNT_ADDRESS", &instance_id)
                 .unwrap_or_default(),
             hl_agent_name: env_string("BULL_HOLDER_HL_AGENT_NAME", ""),
+            // Follows the connector's own network selector, so a testnet
+            // deployment does not silently read mainnet candles and
+            // mainnet agent approvals (`HYPERLIQUID_IS_MAINNET=false` is
+            // supported by `get_hyperliquid_account_config_from_env`).
             hl_info_url: env_string(
                 "BULL_HOLDER_HL_INFO_URL",
-                "https://api.hyperliquid.xyz/info",
+                if lighter_env("HYPERLIQUID_IS_MAINNET", &instance_id).is_some_and(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no")
+                }) {
+                    "https://api.hyperliquid-testnet.xyz/info"
+                } else {
+                    "https://api.hyperliquid.xyz/info"
+                },
             ),
             arm_path: PathBuf::from(env_string(
                 "BULL_HOLDER_ARM_PATH",
@@ -553,7 +563,20 @@ const AGENT_POLL_EVERY_SECS: u64 = 86_400;
 /// agent counts — guessing among several could watch the wrong wallet's
 /// expiry and report safety that is not there. Hyperliquid reports
 /// `validUntil` in milliseconds.
-fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> Option<(String, i64)> {
+#[derive(Debug, PartialEq)]
+enum AgentLookup {
+    /// The wallet, with its approval's expiry in seconds.
+    Found(String, i64),
+    /// Read successfully, and this wallet holds no approval — revoked,
+    /// renamed, or never there. Conclusive.
+    Absent,
+    /// The record exists but could not be read (no numeric `validUntil`),
+    /// or several agents and no name to pick one. Not evidence of
+    /// anything: the last known expiry stands.
+    Unreadable,
+}
+
+fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> AgentLookup {
     let read = |a: &serde_json::Value| -> Option<(String, i64)> {
         let until = a.get("validUntil")?.as_i64()? / 1_000;
         let name = a
@@ -563,21 +586,31 @@ fn agent_expiry(agents: &serde_json::Value, configured_name: &str) -> Option<(St
             .to_string();
         Some((name, until))
     };
-    let agents = agents.as_array()?;
-    if configured_name.is_empty() {
-        return match agents.as_slice() {
-            [only] => read(only),
+    let Some(agents) = agents.as_array() else {
+        return AgentLookup::Unreadable;
+    };
+    let found = if configured_name.is_empty() {
+        match agents.as_slice() {
+            [only] => Some(only),
+            // Several agents and no name: this bot's own wallet cannot be
+            // told from another's, so nothing is concluded.
+            _ if !agents.is_empty() => return AgentLookup::Unreadable,
             _ => None,
-        };
-    }
-    agents
-        .iter()
-        .find(|a| {
+        }
+    } else {
+        agents.iter().find(|a| {
             a.get("name")
                 .and_then(|x| x.as_str())
                 .is_some_and(|n| n.eq_ignore_ascii_case(configured_name))
         })
-        .and_then(read)
+    };
+    match found {
+        None => AgentLookup::Absent,
+        Some(a) => match read(a) {
+            Some((name, until)) => AgentLookup::Found(name, until),
+            None => AgentLookup::Unreadable,
+        },
+    }
 }
 
 /// A holding the book does not carry counts as flat below this notional.
@@ -1137,6 +1170,11 @@ struct State {
     hl_agent_valid_until: Option<i64>,
     #[serde(default)]
     hl_agent_as_of: Option<u64>,
+    /// Which account+wallet the recorded expiry belongs to. A change here
+    /// (the operator repointed the bot) makes the stored value describe
+    /// something else, so the daily timer must not suppress the refresh.
+    #[serde(default)]
+    hl_agent_key: Option<String>,
 }
 
 /// Does the persisted book carry exposure that the process must not touch
@@ -2720,6 +2758,16 @@ impl Engine {
     /// account's master, then that master's approved agents, matched on
     /// the signer address the connector reports. Read-only and best
     /// effort — a failure leaves the last known value in place.
+    /// Identifies the approval being watched: a change means the stored
+    /// expiry is about a different wallet.
+    fn agent_key(&self) -> String {
+        format!(
+            "{}|{}",
+            self.cfg.hl_account_address.to_ascii_lowercase(),
+            self.cfg.hl_agent_name.to_ascii_lowercase()
+        )
+    }
+
     async fn poll_hl_agent(&mut self) {
         if self.cfg.dry_run || self.cfg.hl_account_address.is_empty() {
             return;
@@ -2767,29 +2815,35 @@ impl Engine {
             log::warn!("[AGENT] extraAgents read failed; expiry not refreshed");
             return;
         };
-        if agents.as_array().is_none() {
-            log::warn!("[AGENT] extraAgents did not return a list; expiry not refreshed");
-            return;
-        }
-        let Some((name, valid_until)) = agent_expiry(&agents, &self.cfg.hl_agent_name) else {
-            log::error!(
-                "[AGENT] cannot identify this bot's API wallet among {owner}'s approved agents{} — expiry unknown",
-                if self.cfg.hl_agent_name.is_empty() {
-                    ": set BULL_HOLDER_HL_AGENT_NAME to the one it signs with"
-                } else {
-                    ""
-                }
-            );
-            // This read SUCCEEDED and found no such approval — revoked,
-            // renamed, or never there. Keeping the last known expiry would
-            // advertise an authorisation that no longer exists, which is
-            // the opposite of what this field is for. The observation time
-            // is recorded so the gap is visible as "checked, unknown".
-            self.state.hl_agent_name = None;
-            self.state.hl_agent_valid_until = None;
-            self.state.hl_agent_as_of = Some(now_secs());
-            self.persist();
-            return;
+        let (name, valid_until) = match agent_expiry(&agents, &self.cfg.hl_agent_name) {
+            AgentLookup::Found(name, until) => (name, until),
+            AgentLookup::Unreadable => {
+                log::warn!(
+                    "[AGENT] {owner}'s approved agents could not be read{} — the last known expiry stands",
+                    if self.cfg.hl_agent_name.is_empty() {
+                        "; set BULL_HOLDER_HL_AGENT_NAME to name the wallet this bot signs with"
+                    } else {
+                        ""
+                    }
+                );
+                return;
+            }
+            AgentLookup::Absent => {
+                log::error!(
+                    "[AGENT] {owner} holds no approval for this bot's API wallet — the spot leg cannot sign"
+                );
+                // Conclusive: revoked, renamed, or never there. Keeping the
+                // last known expiry would advertise an authorisation that
+                // no longer exists. The observation time is recorded, so
+                // the card reads "checked, unknown" rather than a stale
+                // future date.
+                self.state.hl_agent_name = None;
+                self.state.hl_agent_valid_until = None;
+                self.state.hl_agent_as_of = Some(now_secs());
+                self.state.hl_agent_key = Some(self.agent_key());
+                self.persist();
+                return;
+            }
         };
         let days = (valid_until - now_secs() as i64) as f64 / 86_400.0;
         if days < AGENT_EXPIRY_WARN_DAYS {
@@ -2800,6 +2854,7 @@ impl Engine {
         self.state.hl_agent_name = Some(name);
         self.state.hl_agent_valid_until = Some(valid_until);
         self.state.hl_agent_as_of = Some(now_secs());
+        self.state.hl_agent_key = Some(self.agent_key());
         self.persist();
     }
 
@@ -3664,7 +3719,9 @@ impl Engine {
         // Once a day: the API wallet's approval is a slow-moving fact the
         // operator has to act on, not a tick-rate signal. Runs while
         // halted too — an expiry does not wait for a RISK_ACK.
-        if now.saturating_sub(self.state.hl_agent_as_of.unwrap_or(0)) >= AGENT_POLL_EVERY_SECS {
+        if now.saturating_sub(self.state.hl_agent_as_of.unwrap_or(0)) >= AGENT_POLL_EVERY_SECS
+            || self.state.hl_agent_key.as_deref() != Some(self.agent_key().as_str())
+        {
             self.poll_hl_agent().await;
         }
         // Read-only, so it runs while halted and for a day after EXIT (the
@@ -5666,28 +5723,42 @@ mod tests {
 
     #[test]
     fn the_api_wallets_expiry_is_only_read_when_it_is_unambiguous() {
+        use AgentLookup::*;
         let agents = serde_json::json!([
             {"name":"hype-accumulator","address":"0x07","validUntil":1804084485748i64},
             {"name":"bull-holder","address":"0x80","validUntil":1805606835174i64},
         ]);
         // Named: that wallet's expiry, in seconds.
-        let (name, until) = agent_expiry(&agents, "bull-holder").unwrap();
-        assert_eq!(name, "bull-holder");
-        assert_eq!(until, 1805606835);
-        assert_eq!(agent_expiry(&agents, "BULL-HOLDER").unwrap().1, 1805606835);
-        // Unnamed with several agents: no guess — watching another
-        // wallet's expiry would report safety that is not there.
-        assert_eq!(agent_expiry(&agents, ""), None);
-        assert_eq!(agent_expiry(&agents, "nope"), None);
+        assert_eq!(
+            agent_expiry(&agents, "bull-holder"),
+            Found("bull-holder".into(), 1805606835)
+        );
+        assert_eq!(
+            agent_expiry(&agents, "BULL-HOLDER"),
+            Found("bull-holder".into(), 1805606835)
+        );
+        // Named but not approved: conclusive — the caller clears the date.
+        assert_eq!(agent_expiry(&agents, "nope"), Absent);
+        // Unnamed among several: this bot's wallet cannot be told from
+        // another's, so nothing is concluded and the last value stands.
+        assert_eq!(agent_expiry(&agents, ""), Unreadable);
         // Unnamed with exactly one agent is unambiguous.
         let one = serde_json::json!([{"name":"solo","validUntil":1805606835174i64}]);
+        assert_eq!(agent_expiry(&one, ""), Found("solo".into(), 1805606835));
+        // An empty list IS an answer: nothing is approved.
+        assert_eq!(agent_expiry(&serde_json::json!([]), ""), Absent);
+        assert_eq!(agent_expiry(&serde_json::json!([]), "bull-holder"), Absent);
+        // A record without a usable expiry is not evidence of absence —
+        // clearing a live approval's date on a malformed field would be
+        // the opposite of what this watch is for.
         assert_eq!(
-            agent_expiry(&one, "").unwrap(),
-            ("solo".to_string(), 1805606835)
+            agent_expiry(&serde_json::json!([{"name":"x"}]), "x"),
+            Unreadable
         );
-        // Nothing approved, or a malformed entry.
-        assert_eq!(agent_expiry(&serde_json::json!([]), ""), None);
-        assert_eq!(agent_expiry(&serde_json::json!([{"name":"x"}]), "x"), None);
+        assert_eq!(
+            agent_expiry(&serde_json::json!({"code":429}), "x"),
+            Unreadable
+        );
     }
 
     fn test_config() -> Config {
