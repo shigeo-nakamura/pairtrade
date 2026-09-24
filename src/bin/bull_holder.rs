@@ -3455,16 +3455,33 @@ impl Engine {
             };
             let Some(rests) = rests else { continue };
             if !rests && leg.stop_order_id.is_some() {
+                let id = leg.stop_order_id.clone().unwrap_or_default();
                 log::error!(
-                    "[STOP] {sym}: recorded stop {:?} is NOT in the venue's order list — it stops counting as cover and is cancelled by id before the replacement",
-                    leg.stop_order_id
+                    "[STOP] {sym}: recorded stop {id} is NOT resting — it stops counting as cover and a replacement follows"
                 );
+                // `rests == Some(false)` is only ever reached on evidence:
+                // the venue reporting no order for this market at all, the
+                // cancelled feed naming this id, or the grace expiring on
+                // a continuous run of it being unlisted. So the id is
+                // cleared, not demoted. Demoting it would hand it to the
+                // unconfirmed-stop gate, which cannot settle an id the
+                // cancelled feed never names while an unrelated order
+                // keeps the market's count non-zero — and the leg would
+                // then be blocked from ever getting a stop again.
+                //
+                // A best-effort cancel first, in case the venue still has
+                // it: cancelling something already gone is harmless,
+                // forgetting something still resting is not.
+                if !self.cfg.dry_run {
+                    if let Err(e) = self.lt.cancel_order(&sym, &id).await {
+                        log::warn!("[STOP] {sym}: cancel of {id} before its replacement failed (it is not resting anyway): {e:?}");
+                    }
+                }
                 if let Some(l) = self.state.legs.get_mut(&sym) {
-                    // Demote, never delete: the read may be an empty WS
-                    // cache rather than proof the order is gone.
-                    l.stop_unconfirmed_id = l.stop_order_id.take();
+                    l.stop_order_id = None;
                     l.stop_level = None;
                     l.stop_size = None;
+                    l.stop_unlisted_since = None;
                 }
                 self.persist();
             }
