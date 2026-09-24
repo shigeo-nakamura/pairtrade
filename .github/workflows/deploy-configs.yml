@@ -98,6 +98,8 @@ jobs:
           systemd-analyze verify debot/deploy/book-signal-fetch-exdiv-lighter.timer
           systemd-analyze verify debot/deploy/robinhood-points-snapshot.service
           systemd-analyze verify debot/deploy/robinhood-points-snapshot.timer
+          systemd-analyze verify debot/deploy/lighter-core-points-snapshot.service
+          systemd-analyze verify debot/deploy/lighter-core-points-snapshot.timer
 
   deploy-configs:
     needs: validate-config-artifacts
@@ -173,6 +175,13 @@ jobs:
           for u in robinhood-points-snapshot.service robinhood-points-snapshot.timer; do
             aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
           done
+          # Lighter Core points snapshot units (bot-strategy#938): the
+          # Frankfurt twin of the above, same rule -- delivered to the host,
+          # installed once by the owner with
+          # install_lighter_core_points_snapshot.sh, never by CI.
+          for u in lighter-core-points-snapshot.service lighter-core-points-snapshot.timer; do
+            aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
+          done
           ENGINE_B_PREFIX="debot/engine-b-phase0/releases/${GITHUB_SHA}"
           aws s3 cp debot/scripts/engine_b_phase0.py "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0.py"
           aws s3 cp debot/scripts/engine_b_phase0_archive.sh "s3://${S3_BUCKET}/${ENGINE_B_PREFIX}/scripts/engine_b_phase0_archive.sh"
@@ -196,10 +205,12 @@ jobs:
           cat > /tmp/ssm-params.json <<'JSON'
           {
             "commands": [
-              "sudo mkdir -p __INSTALL_DIR__/scripts __INSTALL_DIR__/configs",
+              "sudo mkdir -p __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/deploy",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exact-timestamps --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs --exact-timestamps",
-              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh"
+              "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
+              "# Lighter Core points snapshot units (bot-strategy#938): delivered only. The owner installs the timer once with install_lighter_core_points_snapshot.sh; debot-bull-holder is not involved and is never restarted by this job.",
+              "for u in lighter-core-points-snapshot.service lighter-core-points-snapshot.timer; do sudo aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done"
             ]
           }
           JSON

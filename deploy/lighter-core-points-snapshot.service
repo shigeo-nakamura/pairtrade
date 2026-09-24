@@ -1,0 +1,33 @@
+[Unit]
+Description=Snapshot the Lighter Core points tally for the Frankfurt accounts (bot-strategy#938)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# root, unlike the Robinhood host's twin: the arm credentials here live in
+# /opt/debot/scripts/debot-bull-holder.env (0600 root), and the holder
+# itself is a root unit reading that same file. Running as root is what
+# keeps this unit read-only towards it -- the alternative, relaxing the
+# holder's env to 0640, widens who can read a live trading key just to run
+# a KPI collector. This unit never touches debot-bull-holder.
+WorkingDirectory=/opt/debot
+# The Robinhood host mirrors to .../robinhood-lighter/points_history.jsonl
+# from its own timer. The mirror is a whole-file `aws s3 cp`, so the two
+# hosts must never share one URI: each appends locally and overwrites its
+# own object (bot-strategy#938).
+Environment=ROBINHOOD_POINTS_S3_URI=s3://debot-dashboard/debot/status/lighter-core/points_history.jsonl
+# One arm for now: the bull-holder's Lighter Core sub-account, the only
+# Frankfurt account trading on Core since the pairtrade A/B/C sunset
+# (bot-strategy#935). Its env spells the Lighter keys unsuffixed, which
+# the collector's `core` instance already falls back to.
+ExecStart=/usr/bin/python3 /opt/debot/scripts/robinhood_points_collector.py \
+  --arm bull-holder:/opt/debot/scripts/debot-bull-holder.env:core \
+  --common /opt/debot/scripts/debot_secrets_common.env \
+  --env /opt/debot/scripts/debot.env \
+  --libsigner /opt/debot-bull-holder/lib/libsigner.so \
+  --out /opt/debot/status/lighter-core/points_history.jsonl
+ProtectSystem=strict
+ReadWritePaths=/opt/debot/status/lighter-core
+PrivateTmp=true
+NoNewPrivileges=true
