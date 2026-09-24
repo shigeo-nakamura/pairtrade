@@ -617,11 +617,24 @@ fn agent_expiry(agents: &serde_json::Value, configured_address: &str) -> AgentLo
     if configured_address.is_empty() {
         return AgentLookup::Unreadable;
     }
-    let found = agents.iter().find(|a| {
-        a.get("address")
-            .and_then(|x| x.as_str())
-            .is_some_and(|addr| addr.eq_ignore_ascii_case(configured_address))
-    });
+    let mut found = None;
+    let mut unidentifiable = false;
+    for a in agents {
+        match a.get("address").and_then(|x| x.as_str()) {
+            Some(addr) if addr.eq_ignore_ascii_case(configured_address) => {
+                found = Some(a);
+                break;
+            }
+            Some(_) => {}
+            // A record whose address cannot be read might be the wallet
+            // being looked for, so the rest not matching is not proof of
+            // absence — and absence is what clears a live expiry.
+            None => unidentifiable = true,
+        }
+    }
+    if found.is_none() && unidentifiable {
+        return AgentLookup::Unreadable;
+    }
     match found {
         None => AgentLookup::Absent,
         Some(a) => match read(a) {
@@ -5838,6 +5851,22 @@ mod tests {
         assert_eq!(
             agent_expiry(&serde_json::json!({"code":429}), "0x80"),
             Unreadable
+        );
+        // A record whose address cannot be read might be the one being
+        // looked for, so the rest not matching is not proof of absence.
+        let opaque = serde_json::json!([
+            {"name":"other","address":"0x07","validUntil":1804084485748i64},
+            {"name":"???","validUntil":1805606835174i64},
+        ]);
+        assert_eq!(agent_expiry(&opaque, "0x80"), Unreadable);
+        // ...but a real match still wins over an unreadable neighbour.
+        let mixed = serde_json::json!([
+            {"name":"???","validUntil":1805606835174i64},
+            {"name":"bull-holder","address":"0x80","validUntil":1805606835174i64},
+        ]);
+        assert_eq!(
+            agent_expiry(&mixed, "0x80"),
+            Found("bull-holder".into(), 1805606835)
         );
     }
 
