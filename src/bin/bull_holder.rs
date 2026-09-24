@@ -2761,10 +2761,15 @@ impl Engine {
     /// Identifies the approval being watched: a change means the stored
     /// expiry is about a different wallet.
     fn agent_key(&self) -> String {
+        // The endpoint is part of the identity: the same account and
+        // wallet name on testnet is a different approval, and switching
+        // networks must not leave the daily timer serving the other one's
+        // date.
         format!(
-            "{}|{}",
+            "{}|{}|{}",
             self.cfg.hl_account_address.to_ascii_lowercase(),
-            self.cfg.hl_agent_name.to_ascii_lowercase()
+            self.cfg.hl_agent_name.to_ascii_lowercase(),
+            self.cfg.hl_info_url.to_ascii_lowercase()
         )
     }
 
