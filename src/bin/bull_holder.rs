@@ -547,11 +547,12 @@ fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
     Some(account_total)
 }
 
-/// How many consecutive checks may report a resting order without the
-/// tracked stop among them before it is treated as gone. The connector's
-/// order view is WebSocket-fed and briefly empty after a reconnect;
-/// reconciles are ~10 min apart, so this is a ~30 min grace.
-const STOP_UNLISTED_TOLERANCE: u32 = 3;
+/// How long the connector's order list may keep omitting the tracked
+/// stop, while the venue reports a resting order for the market, before
+/// it is treated as gone. The list is WebSocket-fed and briefly empty
+/// after a reconnect; measuring elapsed time rather than attempts keeps
+/// the answer independent of how often anything retries.
+const STOP_UNLISTED_GRACE_SECS: u64 = 30 * 60;
 
 /// A holding the book does not carry counts as flat below this notional.
 const RECONCILE_DUST_USD: f64 = 5.0;
@@ -1033,14 +1034,17 @@ struct LegState {
     /// next stop is placed, and cleared only when that cancel succeeds.
     #[serde(default)]
     stop_unconfirmed_id: Option<String>,
-    /// Consecutive checks, WITHIN ONE CONNECTION, where the venue
-    /// reported a resting order for the market but the connector's order
-    /// list did not name the tracked stop. One or two are the WebSocket
-    /// cache catching up; a run of them is an order that is really gone.
-    /// Zeroed at startup: a new process has a new, empty cache, so its
-    /// first miss is expected rather than evidence.
+    /// When the connector's order list first stopped naming the tracked
+    /// stop while the venue still reported a resting order for the
+    /// market. A cache catching up answers that way for moments; an order
+    /// that is really gone answers that way forever, so the elapsed time
+    /// tells them apart. Cleared whenever the order is seen, the list
+    /// cannot be read (a reconnect), a new stop is placed, or the process
+    /// restarts — all of which end the continuous observation this
+    /// measures. Time, not a count: retry frequency then has no say in
+    /// whether a live stop gets cancelled.
     #[serde(default)]
-    stop_unlisted_checks: u32,
+    stop_unlisted_since: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1753,11 +1757,24 @@ impl Engine {
             l.stop_level = Some(level);
             l.stop_size = Some(leg.perp_size);
             l.stop_order_id = Some(order_id);
-            // The run of misses belonged to the order this one replaces.
-            l.stop_unlisted_checks = 0;
+            // The run belonged to the order this one replaces.
+            l.stop_unlisted_since = None;
         }
         self.persist();
         Ok(())
+    }
+
+    /// Forget any run of "the list does not name this stop": returns
+    /// whether something was actually cleared, so the caller only writes
+    /// state when it changed.
+    fn clear_unlisted_since(&mut self, symbol: &str) -> bool {
+        match self.state.legs.get_mut(symbol) {
+            Some(l) if l.stop_unlisted_since.is_some() => {
+                l.stop_unlisted_since = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Cancel a previously unconfirmed stop by id (no WS cache involved)
@@ -2606,7 +2623,7 @@ impl Engine {
                         cost_basis_unknown: false,
                         perp_cost_basis_unknown: false,
                         stop_unconfirmed_id: None,
-                        stop_unlisted_checks: 0,
+                        stop_unlisted_since: None,
                     }
                 }
             };
@@ -3337,15 +3354,7 @@ impl Engine {
                                 // after a restart, and the empty cache
                                 // that restart produces could then supply
                                 // the final miss and cancel a live stop.
-                                if self
-                                    .state
-                                    .legs
-                                    .get(&sym)
-                                    .is_some_and(|l| l.stop_unlisted_checks != 0)
-                                {
-                                    if let Some(l) = self.state.legs.get_mut(&sym) {
-                                        l.stop_unlisted_checks = 0;
-                                    }
+                                if self.clear_unlisted_since(&sym) {
                                     self.persist();
                                 }
                                 Some(true)
@@ -3375,35 +3384,39 @@ impl Engine {
                                     self.lt.get_canceled_orders(&sym).await,
                                     Ok(c) if c.orders.iter().any(|o| &o.order_id == id)
                                 );
-                                let seen = self
+                                let now = now_secs();
+                                let since = self
                                     .state
                                     .legs
                                     .get_mut(&sym)
-                                    .map(|l| {
-                                        l.stop_unlisted_checks =
-                                            l.stop_unlisted_checks.saturating_add(1);
-                                        l.stop_unlisted_checks
-                                    })
-                                    .unwrap_or(0);
+                                    .map(|l| *l.stop_unlisted_since.get_or_insert(now))
+                                    .unwrap_or(now);
                                 self.persist();
-                                if cancelled || seen >= STOP_UNLISTED_TOLERANCE {
+                                let elapsed = now.saturating_sub(since);
+                                if cancelled || elapsed >= STOP_UNLISTED_GRACE_SECS {
                                     log::error!(
                                         "[STOP] {sym}: {id} is gone from the venue's order list ({}) while another order rests — re-placing",
                                         if cancelled {
                                             "reported cancelled".to_string()
                                         } else {
-                                            format!("{seen} consecutive checks")
+                                            format!("unlisted for {}s", elapsed)
                                         }
                                     );
                                     Some(false)
                                 } else {
                                     log::warn!(
-                                        "[STOP] {sym}: {id} not listed yet (check {seen}/{STOP_UNLISTED_TOLERANCE}) — deferring, the cache may still be catching up"
+                                        "[STOP] {sym}: {id} not listed yet ({elapsed}s of {STOP_UNLISTED_GRACE_SECS}s) — deferring, the cache may still be catching up"
                                     );
                                     None
                                 }
                             }
                             Err(e) => {
+                                // The list could not be read at all: the
+                                // connection is not the one the run was
+                                // observed on, so the run ends here.
+                                if self.clear_unlisted_since(&sym) {
+                                    self.persist();
+                                }
                                 log::warn!("[STOP] {sym}: order list unreadable, stop check deferred: {e:?}");
                                 None
                             }
@@ -3862,7 +3875,7 @@ async fn main() -> Result<()> {
     // a live one, while carrying them in the other direction would let a
     // stale count plus this start's own miss do it immediately.
     for leg in state.legs.values_mut() {
-        leg.stop_unlisted_checks = 0;
+        leg.stop_unlisted_since = None;
     }
     log::info!(
         "[STARTUP] mode={:?} legs={} halted={} book_dry_run={:?} realized_total=${:.2}",
@@ -4927,7 +4940,7 @@ mod tests {
                     cost_basis_unknown: false,
                     perp_cost_basis_unknown: false,
                     stop_unconfirmed_id: None,
-                    stop_unlisted_checks: 0,
+                    stop_unlisted_since: None,
                 },
             );
         }
@@ -5811,67 +5824,39 @@ mod tests {
     /// flag, so "not listed" is ambiguous. The tolerance bounds both
     /// mistakes: a cache catching up after a restart agrees within a
     /// check or two, an order that is really gone never reappears.
+    /// A cache catching up answers "not listed" for moments; an order
+    /// that is really gone answers that way forever. Measuring elapsed
+    /// time rather than attempts keeps retry frequency — startup retries,
+    /// a crash loop, a busy tick — out of the decision entirely.
     #[test]
-    fn the_unlisted_tolerance_does_not_span_connections() {
-        // A restart brings a new connector with an empty order cache, so
-        // its first miss is expected. Counts from before must not add to
-        // it: three quick restarts would otherwise reach the tolerance on
-        // three expected misses and cancel a live stop.
-        let mut state = State::default();
-        state.legs.insert(
-            "BTC".into(),
-            LegState {
-                stop_unlisted_checks: STOP_UNLISTED_TOLERANCE - 1,
-                ..Default::default()
-            },
-        );
-        // What `main` does after loading the file.
-        for leg in state.legs.values_mut() {
-            leg.stop_unlisted_checks = 0;
+    fn an_unlisted_stop_is_judged_by_elapsed_time_not_attempts() {
+        let gone = |since: u64, now: u64| now.saturating_sub(since) >= STOP_UNLISTED_GRACE_SECS;
+        let t0 = 1_000_000u64;
+        // Moments, however many reads land in them, decide nothing.
+        for t in [t0, t0 + 1, t0 + 60, t0 + STOP_UNLISTED_GRACE_SECS - 1] {
+            assert!(!gone(t0, t), "must still defer at {}s", t - t0);
         }
-        assert_eq!(state.legs["BTC"].stop_unlisted_checks, 0);
-    }
-
-    #[test]
-    fn an_unlisted_stop_is_tolerated_briefly_then_treated_as_gone() {
+        assert!(gone(t0, t0 + STOP_UNLISTED_GRACE_SECS));
+        // Any interruption ends the observation, so the window restarts
+        // from the next miss rather than resuming.
         let mut leg = LegState {
-            stop_unlisted_checks: 0,
+            stop_unlisted_since: Some(t0),
             ..Default::default()
         };
-        // Each unlisted answer counts; only the last one acts.
-        for expected in 1..STOP_UNLISTED_TOLERANCE {
-            leg.stop_unlisted_checks = leg.stop_unlisted_checks.saturating_add(1);
-            assert_eq!(leg.stop_unlisted_checks, expected);
-            assert!(
-                leg.stop_unlisted_checks < STOP_UNLISTED_TOLERANCE,
-                "check {expected} must still defer"
-            );
-        }
-        leg.stop_unlisted_checks = leg.stop_unlisted_checks.saturating_add(1);
-        assert!(leg.stop_unlisted_checks >= STOP_UNLISTED_TOLERANCE);
-        // Seeing it listed again clears the run: a reconnect mid-way must
-        // not accumulate towards cancelling a live stop.
-        leg.stop_unlisted_checks = 0;
-        assert!(leg.stop_unlisted_checks < STOP_UNLISTED_TOLERANCE);
-        // The counter survives a restart, so the grace is not restarted
-        // by the very event that empties the cache.
+        leg.stop_unlisted_since = None; // seen again / unreadable / restart
+        let restarted = *leg
+            .stop_unlisted_since
+            .get_or_insert(t0 + STOP_UNLISTED_GRACE_SECS);
+        assert!(!gone(restarted, t0 + STOP_UNLISTED_GRACE_SECS));
+        // It survives within a connection, so a slow cadence cannot
+        // stretch the grace indefinitely either.
         let js = serde_json::to_string(&LegState {
-            stop_unlisted_checks: 2,
+            stop_unlisted_since: Some(t0),
             ..Default::default()
         })
         .unwrap();
         let back: LegState = serde_json::from_str(&js).unwrap();
-        assert_eq!(back.stop_unlisted_checks, 2);
-        let old: LegState = serde_json::from_str(
-            r#"{"spot_size":0,"spot_cost_usd":0,"perp_size":0,"perp_cost_usd":0,
-                "peak_close":0,"exit_level":0,"last_close_date":null,"last_close":null,
-                "close_fetch_failures":0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            old.stop_unlisted_checks, 0,
-            "a pre-existing state file reads as 0"
-        );
+        assert_eq!(back.stop_unlisted_since, Some(t0));
     }
 
     fn test_config() -> Config {
