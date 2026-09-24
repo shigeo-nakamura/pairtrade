@@ -713,6 +713,29 @@ fn order_rejected_definitively(e: &dex_connector::DexError) -> bool {
     )
 }
 
+/// The verdict on a tracked stop the venue's order list does not name,
+/// while some order still rests for the market. `Some((rests,
+/// absence_confirmed))`, or `None` to defer.
+///
+/// `elapsed` is how long the id has been unlisted — or `None` when the
+/// absence is ALREADY established, which must not be re-timed. The same
+/// answer repeating is not a fresh doubt: restarting the window would
+/// leave an externally cancelled stop uncovered for another whole grace
+/// after every failed cancel retry, instead of retrying on the next
+/// reconcile. Only the id turning up listed undoes it.
+///
+/// `cancelled` — the venue naming the id among its cancelled orders — is
+/// the venue's own word, so it alone confirms the absence. Running out
+/// the grace is an inference about a stale WebSocket cache and does not.
+fn unlisted_verdict(cancelled: bool, elapsed: Option<u64>) -> Option<(bool, bool)> {
+    match elapsed {
+        // Established: act now.
+        None => Some((false, cancelled)),
+        Some(e) if cancelled || e >= STOP_UNLISTED_GRACE_SECS => Some((false, cancelled)),
+        Some(_) => None,
+    }
+}
+
 /// May a tracked stop id leave state? The ONE rule for every site that
 /// drops one, because the cost of being wrong is the same everywhere: an
 /// untracked reduce-only trigger that a later ARM inherits against a new
@@ -3780,31 +3803,45 @@ impl Engine {
                                     self.lt.get_canceled_orders(&sym).await,
                                     Ok(c) if c.orders.iter().any(|o| &o.order_id == id)
                                 );
-                                let now = now_secs();
-                                let since = self
-                                    .state
-                                    .legs
-                                    .get_mut(&sym)
-                                    .map(|l| *l.stop_unlisted_since.get_or_insert(now))
-                                    .unwrap_or(now);
-                                self.persist();
-                                let elapsed = now.saturating_sub(since);
-                                if cancelled || elapsed >= STOP_UNLISTED_GRACE_SECS {
-                                    log::error!(
+                                // An absence already established is not
+                                // re-timed (see `unlisted_verdict`), so
+                                // the window is only started, and only
+                                // persisted, while there is still a
+                                // question to answer.
+                                let elapsed = if leg.stop_presumed_gone {
+                                    None
+                                } else {
+                                    let now = now_secs();
+                                    let since = self
+                                        .state
+                                        .legs
+                                        .get_mut(&sym)
+                                        .map(|l| *l.stop_unlisted_since.get_or_insert(now))
+                                        .unwrap_or(now);
+                                    self.persist();
+                                    Some(now.saturating_sub(since))
+                                };
+                                let verdict = unlisted_verdict(cancelled, elapsed);
+                                match (verdict, elapsed) {
+                                    (Some(_), None) => log::error!(
+                                        "[STOP] {sym}: {id} is still not listed and already presumed gone — retrying the replacement"
+                                    ),
+                                    (Some(_), Some(e)) => log::error!(
                                         "[STOP] {sym}: {id} is gone from the venue's order list ({}) while another order rests — re-placing",
                                         if cancelled {
                                             "reported cancelled".to_string()
                                         } else {
-                                            format!("unlisted for {}s", elapsed)
+                                            format!("unlisted for {e}s")
                                         }
-                                    );
-                                    Some((false, cancelled))
-                                } else {
-                                    log::warn!(
-                                        "[STOP] {sym}: {id} not listed yet ({elapsed}s of {STOP_UNLISTED_GRACE_SECS}s) — deferring, the cache may still be catching up"
-                                    );
-                                    None
+                                    ),
+                                    (None, Some(e)) => log::warn!(
+                                        "[STOP] {sym}: {id} not listed yet ({e}s of {STOP_UNLISTED_GRACE_SECS}s) — deferring, the cache may still be catching up"
+                                    ),
+                                    (None, None) => unreachable!(
+                                        "an established absence is never deferred"
+                                    ),
                                 }
+                                verdict
                             }
                             Err(e) => {
                                 // The list could not be read at all: the
@@ -5838,6 +5875,32 @@ mod tests {
             "the id and the doubt about it are both dropped"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An absence the bot already established is acted on NOW, not
+    /// re-timed. Restarting the window on every repeat of the same
+    /// answer would leave an externally cancelled stop uncovered for
+    /// another whole grace after each failed cancel retry.
+    #[test]
+    fn an_established_absence_is_not_re_timed() {
+        // Still unlisted, already established: act, and the grace has no
+        // say in it.
+        assert_eq!(unlisted_verdict(false, None), Some((false, false)));
+        // The venue naming it cancelled is its own word, so the absence
+        // is confirmed — that is what lets the id be forgotten later.
+        assert_eq!(unlisted_verdict(true, None), Some((false, true)));
+        assert_eq!(unlisted_verdict(true, Some(0)), Some((false, true)));
+        // Not yet established: moments decide nothing, however many
+        // reads land in them.
+        for e in [0, 1, 60, STOP_UNLISTED_GRACE_SECS - 1] {
+            assert_eq!(unlisted_verdict(false, Some(e)), None, "must defer at {e}s");
+        }
+        // Running out the grace is an inference about a stale cache: it
+        // is enough to re-place, never enough to confirm.
+        assert_eq!(
+            unlisted_verdict(false, Some(STOP_UNLISTED_GRACE_SECS)),
+            Some((false, false))
+        );
     }
 
     /// The one rule, and the two sites that drop a stop id, agree: only
