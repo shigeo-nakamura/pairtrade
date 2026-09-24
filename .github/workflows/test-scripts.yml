@@ -32,6 +32,8 @@ jobs:
           python3 scripts/test_robinhood_points_collector.py -v
       - name: Run Robinhood points snapshot installer tests
         run: bash scripts/test_install_robinhood_points_snapshot.sh
+      - name: Run Lighter Core points snapshot installer tests
+        run: bash scripts/test_install_lighter_core_points_snapshot.sh
       - name: Install Engine B Phase 0 test dependency
         run: python3 -m pip install -r scripts/engine_b_phase0_requirements.txt
       - name: Run Engine B Phase 0 observer tests
