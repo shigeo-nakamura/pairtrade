@@ -309,7 +309,12 @@ impl Config {
                 .unwrap_or_default(),
             hl_account_address: lighter_env("HYPERLIQUID_ACCOUNT_ADDRESS", &instance_id)
                 .unwrap_or_default(),
-            hl_agent_address: env_string("BULL_HOLDER_HL_AGENT_ADDRESS", ""),
+            // Instance-suffixed like every other venue setting: two
+            // bull-holders sharing an environment sign with different
+            // wallets, and an unsuffixed value would have both watch one
+            // of them (Codex review).
+            hl_agent_address: lighter_env("BULL_HOLDER_HL_AGENT_ADDRESS", &instance_id)
+                .unwrap_or_default(),
             // Follows the connector's own network selector, so a testnet
             // deployment does not silently read mainnet candles and
             // mainnet agent approvals (`HYPERLIQUID_IS_MAINNET=false` is
