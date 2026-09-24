@@ -3339,7 +3339,12 @@ impl Engine {
                     match self.lighter_resting_orders(&sym).await {
                         // Nothing rests for this market: conclusive, whatever
                         // the connector's cache thinks.
-                        Some(0) => Some(false),
+                        Some(0) => {
+                            if self.clear_unlisted_since(&sym) {
+                                self.persist();
+                            }
+                            Some(false)
+                        }
                         // Something rests, but the count cannot say what. The
                         // connector's order view names ids, so require it to
                         // carry this one before calling the leg covered —
@@ -3421,7 +3426,15 @@ impl Engine {
                                 None
                             }
                         },
-                        None => None,
+                        // The venue's own count could not be read, so
+                        // neither answer was reached: the observation is
+                        // broken, like any other interruption.
+                        None => {
+                            if self.clear_unlisted_since(&sym) {
+                                self.persist();
+                            }
+                            None
+                        }
                     }
                 }
             };
