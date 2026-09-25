@@ -33,11 +33,22 @@ if ! aws s3 cp --only-show-errors "$SRC" "$TMP"; then
   echo "book_signal_fetch: download failed: $SRC" >&2
   exit 1
 fi
+# A byte-identical re-download changes nothing on disk. An interval_days
+# producer only republishes on decision days, so between them the
+# unchanged object is older than BOOK_SIGNAL_MAX_AGE_SECS and the age
+# check alone would fail this unit on every tick. Skip only that check,
+# and only on a date-keyed grid, where the decision-key check still runs
+# and fails the unit once the next decision is due and unpublished.
+UNCHANGED=
+if [ -f "$DST" ] && cmp -s "$TMP" "$DST"; then
+  UNCHANGED=1
+fi
 # Full schema-v1 check plus the payload hash (same canonical form as
 # scripts/book_signal_file.py / src/book/signal.rs) before the download can
 # displace the last valid local file; a file the runtime would reject must
 # never replace one it accepted.
 if ! SUMMARY=$(BOOK_SIGNAL_MAX_AGE_SECS="${BOOK_SIGNAL_MAX_AGE_SECS:-}" \
+  BOOK_SIGNAL_UNCHANGED="$UNCHANGED" \
   BOOK_SIGNAL_PRODUCER_ID="${BOOK_SIGNAL_PRODUCER_ID:-}" \
   BOOK_DECISION_TIME_UTC="${BOOK_DECISION_TIME_UTC:-}" \
   BOOK_MAX_SYMBOL_WEIGHT="${BOOK_MAX_SYMBOL_WEIGHT:-}" \
@@ -103,7 +114,8 @@ if want_producer and d["producer_id"] != want_producer:
     raise SystemExit(f"producer_id {d['producer_id']!r} != configured {want_producer!r}")
 kind = os.environ.get("BOOK_SCHEDULE_KIND", "").strip()
 decision_time = os.environ.get("BOOK_DECISION_TIME_UTC", "").strip()
-if decision_time and kind in ("interval_days", "daily"):
+key_checked = bool(decision_time and kind in ("interval_days", "daily"))
+if key_checked:
     # The runtime only accepts the key of the decision that is current at
     # the time it reads the file. Accept that key or the next one (the
     # producer publishes a few minutes before the decision instant); any
@@ -174,7 +186,12 @@ if decision_time:
             f"as_of {d['as_of']} is after the {d['decision_key']} decision at {decision_at:%H:%M}Z (look-ahead)"
         )
 max_age = os.environ.get("BOOK_SIGNAL_MAX_AGE_SECS", "").strip()
-if max_age:
+if os.environ.get("BOOK_SIGNAL_UNCHANGED") and key_checked:
+    # The file in place, re-downloaded, on a date-keyed grid: the key check
+    # above already fails it once the next decision is due. A calendar
+    # schedule has no key check, so its age stays the only bound.
+    pass
+elif max_age:
     if age > int(max_age):
         # An S3 rollback or a lagging producer must not displace a signal
         # the runtime can still use.
@@ -226,7 +243,7 @@ PY
   echo "book_signal_fetch: $SRC failed schema/hash validation; keeping the current file" >&2
   exit 1
 fi
-if [ -f "$DST" ] && cmp -s "$TMP" "$DST"; then
+if [ -n "$UNCHANGED" ]; then
   exit 0
 fi
 chmod 0640 "$TMP"

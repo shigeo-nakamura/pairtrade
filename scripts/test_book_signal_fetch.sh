@@ -140,4 +140,29 @@ python3 "$HERE/book_signal_file.py" --out "$T/utf8.json" --producer 'prîd_日�
 BOOK_SIGNAL_PRODUCER_ID='prîd_日本語' bash "$HERE/book_signal_fetch.sh" "$T/utf8.json" "$T/dst2/signal.json" \
   | grep -q "updated " || { echo "FAIL: non-ASCII producer id was refused (ensure_ascii mismatch)" >&2; exit 1; }
 cmp -s "$T/utf8.json" "$T/dst2/signal.json" || { echo "FAIL: non-ASCII fixture not promoted" >&2; exit 1; }
+
+# Between an interval_days producer's decision days the S3 object is the
+# file already in place, now older than BOOK_SIGNAL_MAX_AGE_SECS: that
+# unchanged re-download must succeed silently, not fail the unit every tick.
+# (A different stale file is still refused -- bad_stale above.)
+mkdir -p "$T/dst3"
+cp "$T/bad_stale.json" "$T/dst3/signal.json"
+out=$(bash "$HERE/book_signal_fetch.sh" "$T/bad_stale.json" "$T/dst3/signal.json") \
+  || { echo "FAIL: unchanged stale re-download failed the fetch" >&2; exit 1; }
+[ -z "$out" ] || { echo "FAIL: unchanged stale re-download should be silent, got: $out" >&2; exit 1; }
+cmp -s "$T/bad_stale.json" "$T/dst3/signal.json" || { echo "FAIL: the file in place was modified" >&2; exit 1; }
+# ...but only the age check is skipped: once the decision the file in place
+# answers is no longer current (the producer missed the next one), the
+# unchanged re-download must fail again instead of masking it.
+mkdir -p "$T/dst4"
+cp "$T/bad_old_key.json" "$T/dst4/signal.json"
+if bash "$HERE/book_signal_fetch.sh" "$T/bad_old_key.json" "$T/dst4/signal.json" 2>/dev/null; then
+  echo "FAIL: unchanged re-download of a no-longer-current decision passed" >&2; exit 1
+fi
+# A calendar schedule has no decision-key check (no BOOK_DECISION_TIME_UTC),
+# so there the age bound stays the only temporal check, unchanged or not.
+if BOOK_SCHEDULE_KIND=calendar BOOK_DECISION_TIME_UTC= \
+  bash "$HERE/book_signal_fetch.sh" "$T/bad_stale.json" "$T/dst3/signal.json" 2>/dev/null; then
+  echo "FAIL: unchanged stale re-download passed on a calendar schedule" >&2; exit 1
+fi
 echo "book_signal_fetch tests OK"
