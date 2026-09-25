@@ -654,6 +654,31 @@ fn planned_growth_usd(plan: &[(String, Vec<Order>)], snap: &Snapshot, leg: Leg) 
         .sum()
 }
 
+/// The tick's plan with every growth order removed (reductions — DISARM
+/// unwinds, levelling down — still run while halted).
+fn drop_growth(plan: Vec<(String, Vec<Order>)>) -> Vec<(String, Vec<Order>)> {
+    plan.into_iter()
+        .map(|(sym, os)| {
+            (
+                sym,
+                os.into_iter().filter(|o| o.qty < 0.0).collect::<Vec<_>>(),
+            )
+        })
+        .filter(|(_, os)| !os.is_empty())
+        .collect()
+}
+
+/// Whether an accepted ARM restarts the campaign baselines (armed_at,
+/// equity / points at ARM, cycles).
+fn resets_baseline(symbols: usize, any_book_on: bool) -> bool {
+    symbols == 1 || !any_book_on
+}
+
+/// Whether a book's feed must be readable for the tick to proceed.
+fn gates_feed(mode: Mode) -> bool {
+    mode != Mode::Off
+}
+
 /// Base-unit size for `notional_usd` at `mark`, floored to `size_decimals`.
 fn qty_for_notional(notional_usd: f64, mark: f64, size_decimals: u32) -> f64 {
     if !positive(mark) || !positive(notional_usd) {
@@ -1029,10 +1054,37 @@ impl Engine {
 
     async fn venue_snapshot(&self, venue: &Venue, leg: Leg) -> Result<VenueSnapshot> {
         let mut snap = VenueSnapshot::default();
+        // Only books the bot manages gate the tick on their feed: an Off
+        // symbol whose ticker is unavailable is left unpriced (mark absent)
+        // instead of failing the whole read — otherwise one dead unused
+        // market would stall DISARM, the guards and every armed book. An
+        // Off symbol that turns out to be HELD is refused below: margin on
+        // an unpriced position cannot be measured.
+        let mut unpriced: Vec<&str> = Vec::new();
         for c in &self.cfg.symbols {
-            let (mark, _, _) = venue.mark(&c.symbol).await?;
-            snap.mark.insert(c.symbol.clone(), mark);
+            match venue.mark(&c.symbol).await {
+                Ok((mark, _, _)) => {
+                    snap.mark.insert(c.symbol.clone(), mark);
+                }
+                Err(e) if !gates_feed(self.state.book(&c.symbol).mode) => {
+                    log::warn!("[FEED] {} unpriced (book Off): {e}", c.symbol);
+                    unpriced.push(&c.symbol);
+                }
+                Err(e) => return Err(e),
+            }
         }
+        let refuse_held_unpriced = |snap: &VenueSnapshot| -> Result<()> {
+            for sym in &unpriced {
+                if snap.qty(sym) != 0.0 {
+                    bail!(
+                        "{} holds {} {sym} but its ticker is unavailable",
+                        venue.name,
+                        snap.qty(sym)
+                    );
+                }
+            }
+            Ok(())
+        };
         if self.cfg.dry_run {
             snap.equity_usd = self.cfg.dry_run_equity_usd;
             for c in &self.cfg.symbols {
@@ -1043,6 +1095,7 @@ impl Engine {
                 };
                 snap.qty.insert(c.symbol.clone(), q);
             }
+            refuse_held_unpriced(&snap)?;
             return Ok(snap);
         }
         let held = venue.positions().await?;
@@ -1052,6 +1105,7 @@ impl Engine {
                 held.get(&c.symbol).copied().unwrap_or(0.0),
             );
         }
+        refuse_held_unpriced(&snap)?;
         snap.equity_usd = venue.equity().await?;
         Ok(snap)
     }
@@ -1266,11 +1320,17 @@ impl Engine {
                     .iter()
                     .find(|(sym, _, q)| *q < self.meta(sym).min_qty || *q <= 0.0)
                 {
-                    log::warn!("[ARM] ignored: {sym} ${usd:.0} is below the venue minimum");
+                    if snap.long.mark(sym) > 0.0 {
+                        log::warn!("[ARM] ignored: {sym} ${usd:.0} is below the venue minimum");
+                    } else {
+                        log::warn!("[ARM] ignored: {sym} has no price on the long venue right now — ARM again");
+                    }
                 } else {
                     // A new campaign (no book On) resets the baselines the
-                    // subsidy / PnL-since-ARM figures are measured from.
-                    if !self.state.any_mode(Mode::On) {
+                    // subsidy / PnL-since-ARM figures are measured from; with
+                    // one symbol every ARM does, as before (a resize starts
+                    // a new measurement).
+                    if resets_baseline(self.cfg.symbols.len(), self.state.any_mode(Mode::On)) {
                         self.state.armed_at = Some(now);
                         self.state.equity_at_arm_usd =
                             Some(snap.long.equity_usd + snap.short.equity_usd);
@@ -1313,6 +1373,11 @@ impl Engine {
         // reason, so the card says why the bot is idle instead of going
         // stale.
         for c in &self.cfg.symbols {
+            if !gates_feed(self.state.book(&c.symbol).mode)
+                && (snap.long.mark(&c.symbol) == 0.0 || snap.short.mark(&c.symbol) == 0.0)
+            {
+                continue;
+            }
             let (lm, sm) = (snap.long.mark(&c.symbol), snap.short.mark(&c.symbol));
             let divergence = (lm / sm - 1.0).abs();
             // NaN (a zero mark) counts as divergent.
@@ -1461,7 +1526,7 @@ impl Engine {
                         self.cfg.max_leverage,
                         snap.equity(leg)
                     ));
-                    plan.clear();
+                    plan = drop_growth(plan);
                     break;
                 }
             }
@@ -2376,6 +2441,95 @@ mod tests {
             + planned_growth_usd(&plan, &s, Leg::Short);
         assert!(!leverage_ok(after, 4_000.0, 5.0));
         assert!(leverage_ok(after, 4_000.0, 6.0));
+    }
+
+    #[test]
+    fn leverage_trip_keeps_reductions_and_drops_growth() {
+        let plan = vec![
+            (
+                "BTC".to_string(),
+                vec![
+                    Order {
+                        leg: Leg::Short,
+                        qty: -0.1,
+                    },
+                    Order {
+                        leg: Leg::Long,
+                        qty: -0.1,
+                    },
+                ],
+            ),
+            (
+                "META".to_string(),
+                vec![
+                    Order {
+                        leg: Leg::Long,
+                        qty: 10.0,
+                    },
+                    Order {
+                        leg: Leg::Short,
+                        qty: 10.0,
+                    },
+                ],
+            ),
+            (
+                "AMZN".to_string(),
+                vec![Order {
+                    leg: Leg::Long,
+                    qty: -3.0,
+                }],
+            ),
+        ];
+        let kept = drop_growth(plan);
+        assert_eq!(
+            kept,
+            vec![
+                (
+                    "BTC".to_string(),
+                    vec![
+                        Order {
+                            leg: Leg::Short,
+                            qty: -0.1
+                        },
+                        Order {
+                            leg: Leg::Long,
+                            qty: -0.1
+                        }
+                    ]
+                ),
+                (
+                    "AMZN".to_string(),
+                    vec![Order {
+                        leg: Leg::Long,
+                        qty: -3.0
+                    }]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_symbol_rearm_resets_baselines_multi_only_for_a_new_campaign() {
+        assert!(
+            resets_baseline(1, true),
+            "single-symbol resize = new measurement, as before"
+        );
+        assert!(resets_baseline(1, false));
+        assert!(resets_baseline(3, false));
+        assert!(
+            !resets_baseline(3, true),
+            "adding a book mid-campaign keeps the baseline"
+        );
+    }
+
+    #[test]
+    fn only_managed_books_gate_the_feed() {
+        assert!(!gates_feed(Mode::Off));
+        assert!(gates_feed(Mode::On));
+        assert!(
+            gates_feed(Mode::Exited),
+            "a closing book must still be priced"
+        );
     }
 
     fn cfg_for_test_multi_btc_meta() -> Config {
