@@ -33,6 +33,14 @@ if ! aws s3 cp --only-show-errors "$SRC" "$TMP"; then
   echo "book_signal_fetch: download failed: $SRC" >&2
   exit 1
 fi
+# A byte-identical re-download changes nothing on disk, and the file in
+# place already passed these checks when it was promoted. Stop here: an
+# interval_days producer only republishes on decision days, so between
+# them the unchanged object is older than BOOK_SIGNAL_MAX_AGE_SECS and the
+# age check below would fail this unit on every tick.
+if [ -f "$DST" ] && cmp -s "$TMP" "$DST"; then
+  exit 0
+fi
 # Full schema-v1 check plus the payload hash (same canonical form as
 # scripts/book_signal_file.py / src/book/signal.rs) before the download can
 # displace the last valid local file; a file the runtime would reject must
@@ -225,9 +233,6 @@ PY
 ); then
   echo "book_signal_fetch: $SRC failed schema/hash validation; keeping the current file" >&2
   exit 1
-fi
-if [ -f "$DST" ] && cmp -s "$TMP" "$DST"; then
-  exit 0
 fi
 chmod 0640 "$TMP"
 mv -f "$TMP" "$DST"
