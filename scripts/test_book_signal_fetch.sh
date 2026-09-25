@@ -151,4 +151,12 @@ out=$(bash "$HERE/book_signal_fetch.sh" "$T/bad_stale.json" "$T/dst3/signal.json
   || { echo "FAIL: unchanged stale re-download failed the fetch" >&2; exit 1; }
 [ -z "$out" ] || { echo "FAIL: unchanged stale re-download should be silent, got: $out" >&2; exit 1; }
 cmp -s "$T/bad_stale.json" "$T/dst3/signal.json" || { echo "FAIL: the file in place was modified" >&2; exit 1; }
+# ...but only the age check is skipped: once the decision the file in place
+# answers is no longer current (the producer missed the next one), the
+# unchanged re-download must fail again instead of masking it.
+mkdir -p "$T/dst4"
+cp "$T/bad_old_key.json" "$T/dst4/signal.json"
+if bash "$HERE/book_signal_fetch.sh" "$T/bad_old_key.json" "$T/dst4/signal.json" 2>/dev/null; then
+  echo "FAIL: unchanged re-download of a no-longer-current decision passed" >&2; exit 1
+fi
 echo "book_signal_fetch tests OK"
