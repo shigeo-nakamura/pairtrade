@@ -159,4 +159,10 @@ cp "$T/bad_old_key.json" "$T/dst4/signal.json"
 if bash "$HERE/book_signal_fetch.sh" "$T/bad_old_key.json" "$T/dst4/signal.json" 2>/dev/null; then
   echo "FAIL: unchanged re-download of a no-longer-current decision passed" >&2; exit 1
 fi
+# A calendar schedule has no decision-key check (no BOOK_DECISION_TIME_UTC),
+# so there the age bound stays the only temporal check, unchanged or not.
+if BOOK_SCHEDULE_KIND=calendar BOOK_DECISION_TIME_UTC= \
+  bash "$HERE/book_signal_fetch.sh" "$T/bad_stale.json" "$T/dst3/signal.json" 2>/dev/null; then
+  echo "FAIL: unchanged stale re-download passed on a calendar schedule" >&2; exit 1
+fi
 echo "book_signal_fetch tests OK"
