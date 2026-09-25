@@ -5,7 +5,7 @@ use dex_connector::create_extended_connector;
 use dex_connector::{create_arcus_connector, ArcusConnectorConfig};
 #[cfg(feature = "hyperliquid-sdk")]
 use dex_connector::{
-    create_hyperliquid_account_connector, create_hyperliquid_connector, HyperliquidConnectorConfig,
+    create_hyperliquid_connector, HyperliquidConnector, HyperliquidConnectorConfig,
 };
 #[cfg(feature = "lighter-sdk")]
 use dex_connector::{create_lighter_connector, LighterConnector, LighterConnectorConfig};
@@ -63,9 +63,28 @@ fn mentions_http_429(text: &str) -> bool {
 
 pub struct DexConnectorBox {
     pub inner: Box<dyn DexConnector>,
+    /// Address of the API wallet the connector signs with, when it signs
+    /// at all. Only the live `hyperliquid-account` factory sets it; a
+    /// dry-run or read-only connector has no signer and leaves it `None`.
+    /// Public, derived from the decrypted key, no signing material.
+    api_wallet_address: Option<String>,
 }
 
 impl DexConnectorBox {
+    fn wrap(inner: Box<dyn DexConnector>) -> Self {
+        DexConnectorBox {
+            inner,
+            api_wallet_address: None,
+        }
+    }
+
+    /// The API wallet this connector will actually sign with — the one
+    /// identity that proves a venue-side approval belongs to this process
+    /// (bot-strategy#1054). `None` when the connector cannot sign.
+    pub fn api_wallet_address(&self) -> Option<&str> {
+        self.api_wallet_address.as_deref()
+    }
+
     fn report_rate_limit(&self, operation: &str, detail: &str, err: &DexError) {
         // New structured form of the Lighter WAF cooldown (HTTP 405 +
         // x-amzn-waf-action: captcha or HTTP 429). Send a single deduped email
@@ -152,12 +171,10 @@ impl DexConnectorBox {
 
                 if dry_run {
                     let connector = LighterConnector::new(connector_config)?;
-                    Ok(DexConnectorBox {
-                        inner: Box::new(connector),
-                    })
+                    Ok(DexConnectorBox::wrap(Box::new(connector)))
                 } else {
                     let connector = create_lighter_connector(connector_config)?;
-                    Ok(DexConnectorBox { inner: connector })
+                    Ok(DexConnectorBox::wrap(connector))
                 }
             }
             #[cfg(feature = "extended-sdk")]
@@ -177,7 +194,7 @@ impl DexConnectorBox {
                 )
                 .await?;
 
-                Ok(DexConnectorBox { inner: connector })
+                Ok(DexConnectorBox::wrap(connector))
             }
             #[cfg(feature = "arcus-sdk")]
             "arcus" => {
@@ -208,7 +225,7 @@ impl DexConnectorBox {
                     api_key: None,
                     api_private_key_hex: None,
                 })?;
-                Ok(DexConnectorBox { inner: connector })
+                Ok(DexConnectorBox::wrap(connector))
             }
             #[cfg(feature = "hyperliquid-sdk")]
             "hyperliquid" => {
@@ -220,7 +237,7 @@ impl DexConnectorBox {
                     base_url,
                     tracked_symbols: token_list.to_vec(),
                 })?;
-                Ok(DexConnectorBox { inner: connector })
+                Ok(DexConnectorBox::wrap(connector))
             }
             // Hyperliquid connector bound to an account (bot-strategy#894):
             // read-side (spot balances, fills) without a signer key, spot
@@ -244,17 +261,26 @@ impl DexConnectorBox {
                 // decrypting the signer key is skipped entirely rather than
                 // loaded-then-ignored, so a `false` in one call site can
                 // never leak a live-capable connector into another.
-                let connector = if dry_run {
-                    create_hyperliquid_connector(connector_config)?
-                } else {
-                    let account = get_hyperliquid_account_config_from_env(instance_id)
-                        .await
-                        .map_err(|e| {
-                            DexError::Permanent(format!("hyperliquid account config: {e}"))
-                        })?;
-                    create_hyperliquid_account_connector(connector_config, account)?
-                };
-                Ok(DexConnectorBox { inner: connector })
+                if dry_run {
+                    return Ok(DexConnectorBox::wrap(create_hyperliquid_connector(
+                        connector_config,
+                    )?));
+                }
+                let account = get_hyperliquid_account_config_from_env(instance_id)
+                    .await
+                    .map_err(|e| DexError::Permanent(format!("hyperliquid account config: {e}")))?;
+                let connector =
+                    HyperliquidConnector::new(connector_config)?.with_account(account)?;
+                // Captured while the concrete type is still in hand: the
+                // boxed trait object cannot answer it, and the caller needs
+                // it to check the venue-side approval against the key that
+                // will sign (bot-strategy#1054). A read-only account (no
+                // signer key configured) simply has none.
+                let api_wallet_address = connector.api_wallet_address().ok();
+                Ok(DexConnectorBox {
+                    inner: Box::new(connector),
+                    api_wallet_address,
+                })
             }
             _ => Err(DexError::Permanent(format!("Unsupported dex: {dex_name}"))),
         }
