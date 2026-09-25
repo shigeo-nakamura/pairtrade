@@ -237,6 +237,9 @@ struct Config {
     /// identity that proves the watched approval belongs to the signer:
     /// a rotated key leaves the old named agent approved, and watching
     /// its expiry would report authorisation the bot does not have.
+    /// Live, `main` replaces it with the address derived from the
+    /// decrypted signer key — and refuses to start when the operator's
+    /// value names a different wallet (`attest_hl_signer`).
     hl_agent_address: String,
     arm_path: PathBuf,
     add_path: PathBuf,
@@ -1323,6 +1326,45 @@ fn book_is_open(state: &State) -> bool {
             .legs
             .values()
             .any(|l| l.spot_size > 0.0 || l.perp_size > 0.0)
+}
+
+/// What the live signer key says about the API wallet the operator named.
+#[derive(Debug, PartialEq)]
+enum SignerAttestation {
+    /// `BULL_HOLDER_HL_AGENT_ADDRESS` names the wallet the key derives.
+    Matches(String),
+    /// `BULL_HOLDER_HL_AGENT_ADDRESS` is unset; the derived wallet is the
+    /// one to watch.
+    Unconfigured(String),
+}
+
+/// Startup gate for the live spot leg's identity (bot-strategy#1054).
+/// `signer` is the API-wallet address the connector derived from
+/// `HYPERLIQUID_SIGNER_PRIVATE_KEY`; `configured` is the operator's
+/// `BULL_HOLDER_HL_AGENT_ADDRESS`. The expiry watch and the dashboard only
+/// ever proved that the configured address is approved on the master —
+/// not that the key in the env belongs to it. After a rotation both
+/// wallets stay approved until the old one expires, so a spot order that
+/// goes through cannot tell which key signed it; this is the one place
+/// the two are compared. `Err` = refuse to start: the env names a wallet
+/// this process cannot sign for, and the operator must fix the key or the
+/// address rather than run with an expiry that is not the signer's.
+fn attest_hl_signer(signer: Option<&str>, configured: &str) -> Result<SignerAttestation> {
+    let Some(signer) = signer.map(str::trim).filter(|s| !s.is_empty()) else {
+        bail!(
+            "LIVE but the Hyperliquid connector has no signer (HYPERLIQUID_SIGNER_PRIVATE_KEY unset or unreadable) — the spot leg could not place or exit; refusing to start"
+        );
+    };
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return Ok(SignerAttestation::Unconfigured(signer.to_string()));
+    }
+    if configured.eq_ignore_ascii_case(signer) {
+        return Ok(SignerAttestation::Matches(signer.to_string()));
+    }
+    bail!(
+        "HYPERLIQUID_SIGNER_PRIVATE_KEY derives API wallet {signer} but BULL_HOLDER_HL_AGENT_ADDRESS={configured}: the env names a wallet this process cannot sign for. Fix the key or the address (docs/bull-holder.md §3.1); refusing to start"
+    );
 }
 
 /// Startup gate for the persisted state vs the configured execution mode.
@@ -4407,6 +4449,28 @@ async fn main() -> Result<()> {
     )
     .await
     .context("init Hyperliquid account connector")?;
+    // Live: the wallet the key derives is the one whose approval the
+    // expiry watch reads — never the operator's word alone. Decided here,
+    // before the perp connector exists, so a mismatch stops the process
+    // with nothing built that could act on either venue.
+    let mut cfg = cfg;
+    if !cfg.dry_run {
+        cfg.hl_agent_address = match attest_hl_signer(
+            hl.api_wallet_address(),
+            &cfg.hl_agent_address,
+        )? {
+            SignerAttestation::Matches(signer) => {
+                log::info!("[AGENT] signer={signer} matches BULL_HOLDER_HL_AGENT_ADDRESS");
+                signer
+            }
+            SignerAttestation::Unconfigured(signer) => {
+                log::warn!(
+                    "[AGENT] signer={signer} — BULL_HOLDER_HL_AGENT_ADDRESS is unset, watching the signer's own approval; set it to this address to pin the rotation"
+                );
+                signer
+            }
+        };
+    }
     let lt = DexConnectorBox::create(
         "lighter",
         cfg.dry_run,
@@ -6757,6 +6821,48 @@ mod tests {
             None,
             "a sub-account with no master named is unreadable, not self-owned"
         );
+    }
+
+    #[test]
+    fn the_live_signer_decides_which_approval_is_watched() {
+        use SignerAttestation::*;
+        let key = "0x80a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3";
+        // The operator's address agrees, in any case: the canonical form
+        // from the key is what the watch keys on.
+        assert_eq!(
+            attest_hl_signer(Some(key), key).unwrap(),
+            Matches(key.to_string())
+        );
+        assert_eq!(
+            attest_hl_signer(Some(key), &format!(" {} ", key.to_ascii_uppercase())).unwrap(),
+            Matches(key.to_string())
+        );
+        // Nothing configured: the key's wallet is watched, not nothing.
+        assert_eq!(
+            attest_hl_signer(Some(key), "").unwrap(),
+            Unconfigured(key.to_string())
+        );
+        assert_eq!(
+            attest_hl_signer(Some(&format!("{key}\n")), "  ").unwrap(),
+            Unconfigured(key.to_string())
+        );
+        // A different wallet in the env is the rotated-key mistake this
+        // gate exists for: refuse, never "watch the configured one".
+        let err = attest_hl_signer(Some(key), "0xdead")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(key) && err.contains("0xdead"), "{err}");
+        assert!(err.contains("refusing to start"), "{err}");
+        // Live without a signer cannot exit the spot leg: also a refusal,
+        // whatever the env says the wallet is.
+        for configured in ["", key] {
+            let err = attest_hl_signer(None, configured).unwrap_err().to_string();
+            assert!(err.contains("no signer"), "{err}");
+            let err = attest_hl_signer(Some(" "), configured)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no signer"), "{err}");
+        }
     }
 
     #[test]
