@@ -528,6 +528,22 @@ fn lighter_env(name: &str, instance_id: &str) -> Option<String> {
         .or_else(|| std::env::var(name).ok().filter(|v| !v.is_empty()))
 }
 
+/// `initial_margin_fraction` (percent) for `symbol` in a Lighter
+/// `/api/v1/account` response — the margin behind a position, which bounds
+/// how far a stop may sit from the mark.
+fn margin_fraction_for(v: &serde_json::Value, symbol: &str) -> Option<f64> {
+    let account = v.get("accounts")?.as_array()?.first()?;
+    account
+        .get("positions")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("symbol").and_then(|x| x.as_str()) == Some(symbol))?
+        .get("initial_margin_fraction")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
     let account = v.get("accounts")?.as_array()?.first()?;
     // Strict: a count that is absent or not a number makes the response
@@ -558,6 +574,13 @@ fn resting_orders_for(v: &serde_json::Value, symbol: &str) -> Option<u64> {
         + n(account, "pending_order_count")?;
     Some(account_total)
 }
+
+/// How long the connector's order list may keep omitting the tracked
+/// stop, while the venue reports a resting order for the market, before
+/// it is treated as gone. The list is WebSocket-fed and briefly empty
+/// after a reconnect; measuring elapsed time rather than attempts keeps
+/// the answer independent of how often anything retries.
+const STOP_UNLISTED_GRACE_SECS: u64 = 30 * 60;
 
 /// An API-wallet approval closer than this is reported as an error: the
 /// operator needs lead time to approve a new one on the master wallet.
@@ -688,6 +711,46 @@ fn order_rejected_definitively(e: &dex_connector::DexError) -> bool {
             | RateLimited { .. }
             | NoConnection
     )
+}
+
+/// The verdict on a tracked stop the venue's order list does not name,
+/// while some order still rests for the market. `Some((rests,
+/// absence_confirmed))`, or `None` to defer.
+///
+/// `elapsed` is how long the id has been unlisted — or `None` when the
+/// absence is ALREADY established, which must not be re-timed. The same
+/// answer repeating is not a fresh doubt: restarting the window would
+/// leave an externally cancelled stop uncovered for another whole grace
+/// after every failed cancel retry, instead of retrying on the next
+/// reconcile. Only the id turning up listed undoes it.
+///
+/// `cancelled` — the venue naming the id among its cancelled orders — is
+/// the venue's own word, so it alone confirms the absence. Running out
+/// the grace is an inference about a stale WebSocket cache and does not.
+fn unlisted_verdict(cancelled: bool, elapsed: Option<u64>) -> Option<(bool, bool)> {
+    match elapsed {
+        // Established: act now.
+        None => Some((false, cancelled)),
+        Some(e) if cancelled || e >= STOP_UNLISTED_GRACE_SECS => Some((false, cancelled)),
+        Some(_) => None,
+    }
+}
+
+/// May a tracked stop id leave state? The ONE rule for every site that
+/// drops one, because the cost of being wrong is the same everywhere: an
+/// untracked reduce-only trigger that a later ARM inherits against a new
+/// position. Only the venue's own word counts — the cancel just
+/// succeeded, or the venue already said the order is not there
+/// (`stop_absence_confirmed`: nothing rests for this market, or it named
+/// the id among its cancelled orders).
+///
+/// A cancel that merely errored proves nothing: a transport blip looks
+/// exactly like an absent order. Neither does the unlisted-for-the-whole-
+/// grace inference, which is about a stale WebSocket cache — that is
+/// enough to ATTEMPT a replacement (the attempt cancels first, in the
+/// right order) but not to forget the id.
+fn may_forget_stop(cancel_ok: bool, absence_confirmed: bool) -> bool {
+    cancel_ok || absence_confirmed
 }
 
 /// Is the outcome of a live order settled? Only when the holding could be
@@ -1124,6 +1187,49 @@ struct LegState {
     /// next stop is placed, and cleared only when that cancel succeeds.
     #[serde(default)]
     stop_unconfirmed_id: Option<String>,
+    /// When the connector's order list first stopped naming the tracked
+    /// stop while the venue still reported a resting order for the
+    /// market. A cache catching up answers that way for moments; an order
+    /// that is really gone answers that way forever, so the elapsed time
+    /// tells them apart. Cleared whenever the order is seen, the list
+    /// cannot be read (a reconnect), a new stop is placed, or the process
+    /// restarts — all of which end the continuous observation this
+    /// measures. Time, not a count: retry frequency then has no say in
+    /// whether a live stop gets cancelled.
+    #[serde(default)]
+    stop_unlisted_since: Option<u64>,
+    /// The tracked stop is believed gone on evidence (see `rests` in
+    /// `ensure_stops`), but the cancel that proves it has not been sent
+    /// yet. It stops counting as cover immediately; the id is kept so the
+    /// replacement path cancels it in the right order — after its own
+    /// quote and leverage checks — and a cancel that then fails does not
+    /// block the replacement, because the order is not expected to be
+    /// there in the first place.
+    #[serde(default)]
+    stop_presumed_gone: bool,
+    /// ...and that absence came from the venue naming it, not from an
+    /// inference: no order at all rests for this market, or the venue
+    /// listed this id among its cancelled orders. The unlisted-for-the-
+    /// whole-grace fallback does NOT set this — it is strong enough to
+    /// attempt a replacement (which cancels first, in the right order)
+    /// but not to throw the id away on a cancel that merely errored.
+    #[serde(default)]
+    stop_absence_confirmed: bool,
+}
+
+impl LegState {
+    /// Does the recorded stop count as protection? A stop believed to
+    /// have been dropped does not, however complete its record looks: the
+    /// level and size are kept so they can be trusted again if the id
+    /// turns up listed (`stop_seen_listed`), not so they can vouch for
+    /// cover that is not there. Every reader of "is this leg protected"
+    /// goes through here — the replacement guard in `place_stop` and the
+    /// margin monitor's `[MARGIN] ok`, which would otherwise keep
+    /// publishing `margin.ok=true` for a leg this code has established
+    /// has no covering stop.
+    fn stop_is_cover(&self) -> bool {
+        self.stop_order_id.is_some() && !self.stop_presumed_gone
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1680,6 +1786,11 @@ impl Engine {
         leg.lighter_peak = leg.lighter_peak.max(lighter_price);
         let level = level_below_peak(leg.lighter_peak, self.cfg.stop_dd_pct);
         if leg.stop_unconfirmed_id.is_none()
+            // A stop the venue is believed to have dropped is never
+            // "already current", however well its recorded level and size
+            // match. The metadata is kept precisely so it can be trusted
+            // again if the id turns up listed (`stop_seen_listed`).
+            && !leg.stop_presumed_gone
             && stop_is_current(
                 leg.stop_level,
                 leg.stop_size,
@@ -1694,6 +1805,40 @@ impl Engine {
             self.persist();
             return Ok(());
         }
+        // Before touching the stop that is already there: a stop the
+        // market's leverage cannot carry would be accepted over REST and
+        // dropped, and cancelling first would turn a protected leg into a
+        // permanently uncovered one (Codex review).
+        let carried = self
+            .stop_distance_supported(symbol, lighter_price, level)
+            .await;
+        // Unknown counts as "do not touch a stop that exists": cancelling
+        // it and then having Lighter drop the replacement would leave the
+        // leg uncovered on the strength of a failed read. With no stop to
+        // lose, an attempt is the better bet.
+        // A presumed-gone id is not protection to preserve: the venue
+        // reported no order, named it cancelled, or stopped listing it for
+        // the whole grace. Counting it here would turn a failed margin
+        // read into an indefinitely uncovered leg that never even tried.
+        let has_stop = leg.stop_is_cover() || leg.stop_unconfirmed_id.is_some();
+        if carried == Some(false) || (carried.is_none() && has_stop) {
+            // Keep the refreshed peak even though the move is refused: the
+            // peak is the exit rule's own record, and dropping a new high
+            // here would place the stop off a stale one once the leverage
+            // is corrected.
+            if let Some(l) = self.state.legs.get_mut(symbol) {
+                l.lighter_peak = leg.lighter_peak;
+            }
+            self.persist();
+            bail!(
+                "Lighter stop {symbol}: {} for a stop at {level:.2}; the existing stop is left alone",
+                if carried.is_none() {
+                    "the market's leverage could not be read"
+                } else {
+                    "this market's leverage cannot carry one (see [STOP] above)"
+                }
+            );
+        }
         // Cancel the previous stop first so we never rest two. Only clear the
         // old id/level once the cancel actually succeeds (or there was
         // nothing to cancel) — on a failed cancel the old order may still be
@@ -1703,10 +1848,20 @@ impl Engine {
         if let Some(old) = &leg.stop_order_id {
             if !self.cfg.dry_run {
                 if let Err(e) = self.lt.cancel_order(symbol, old).await {
-                    log::warn!(
-                        "[STOP] cancel previous stop {old} failed, keeping it tracked for retry: {e:?}"
-                    );
-                    prior_cancel_failed = true;
+                    if may_forget_stop(false, leg.stop_absence_confirmed) {
+                        // Cancelling an order the VENUE has already
+                        // reported gone fails for the obvious reason.
+                        // Deferring on that would block the replacement
+                        // this verdict exists to trigger.
+                        log::warn!(
+                            "[STOP] cancel of {old} failed and the venue already reported it gone; replacing it: {e:?}"
+                        );
+                    } else {
+                        log::warn!(
+                            "[STOP] cancel previous stop {old} failed, keeping it tracked for retry: {e:?}"
+                        );
+                        prior_cancel_failed = true;
+                    }
                 }
             }
             if !prior_cancel_failed {
@@ -1822,9 +1977,94 @@ impl Engine {
             l.stop_level = Some(level);
             l.stop_size = Some(leg.perp_size);
             l.stop_order_id = Some(order_id);
+            // The run, and the doubt, belonged to the order this one
+            // replaces.
+            l.stop_unlisted_since = None;
+            l.stop_presumed_gone = false;
+            l.stop_absence_confirmed = false;
         }
         self.persist();
         Ok(())
+    }
+
+    /// Every leg's observation ends — used where stop checking itself
+    /// stops, so an interval nobody was watching cannot be counted as
+    /// time the stop went unlisted.
+    fn clear_all_unlisted_since(&mut self) {
+        let symbols: Vec<String> = self.state.legs.keys().cloned().collect();
+        let mut changed = false;
+        for sym in symbols {
+            changed |= self.end_unlisted_observation(&sym);
+        }
+        if changed {
+            self.persist();
+        }
+    }
+
+    /// The observation ends without a verdict: the connection, the read
+    /// or the check itself went away, so the elapsed time stops counting
+    /// towards "gone" and the window restarts from the next miss.
+    ///
+    /// An absence ALREADY established stays established. An answer that
+    /// could not be read is not evidence the order came back, and
+    /// forgetting that would let `place_stop` count the absent id as
+    /// cover it must preserve — leaving the leg uncovered for as long as
+    /// the reads stay inconclusive, without ever attempting a
+    /// replacement. Only seeing the id listed, or placing a new stop,
+    /// clears that (`stop_seen_listed` / `place_stop`).
+    ///
+    /// Returns whether anything changed, so the caller only writes state
+    /// when it did.
+    fn end_unlisted_observation(&mut self, symbol: &str) -> bool {
+        match self.state.legs.get_mut(symbol) {
+            Some(l) if l.stop_unlisted_since.is_some() => {
+                l.stop_unlisted_since = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Record that the tracked stop is believed not to be resting.
+    /// `absence_confirmed` says whether the VENUE gave that answer (see
+    /// `may_forget_stop`) or it was inferred from the grace.
+    ///
+    /// `stop_level` and `stop_size` are deliberately KEPT. They used to
+    /// be cleared so the leg could not read as covered, but
+    /// `stop_presumed_gone` says that now — and throwing the metadata
+    /// away is unrecoverable: if the absence was only inferred and the
+    /// order turns out to still rest, the leg has no level or size to be
+    /// judged current against, so the next pass cancels and re-places a
+    /// perfectly good stop. That churn is exactly the live failure of
+    /// 2026-09-23, and each round of it can leave the leg uncovered.
+    fn mark_stop_presumed_gone(&mut self, symbol: &str, absence_confirmed: bool) {
+        if let Some(l) = self.state.legs.get_mut(symbol) {
+            l.stop_unlisted_since = None;
+            l.stop_presumed_gone = true;
+            // Never downgrade. Once the venue itself has said the order is
+            // not there, a later pass that only re-observes the absence
+            // (another order rests, this id still unlisted) says nothing
+            // new — and demoting to "inferred" would make a failed cancel
+            // of the already-absent id defer forever, for as long as that
+            // unrelated order rests. Only a new stop, or the id turning up
+            // listed, clears it.
+            l.stop_absence_confirmed |= absence_confirmed;
+        }
+        self.persist();
+    }
+
+    /// The venue's order list names the tracked stop: it rests. Both the
+    /// run and the doubt it raised are over.
+    fn stop_seen_listed(&mut self, symbol: &str) -> bool {
+        match self.state.legs.get_mut(symbol) {
+            Some(l) if l.stop_unlisted_since.is_some() || l.stop_presumed_gone => {
+                l.stop_unlisted_since = None;
+                l.stop_presumed_gone = false;
+                l.stop_absence_confirmed = false;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Cancel a previously unconfirmed stop by id (no WS cache involved)
@@ -1940,6 +2180,58 @@ impl Engine {
         log::info!("[STOP] resolved Lighter account index {idx} from the wallet address");
         *cached = Some(idx.clone());
         Some(idx)
+    }
+
+    /// Can a stop sit `stop_dd_pct` below the peak on this market? Lighter
+    /// validates a trigger order against the market's leverage: a move that
+    /// would cost more than the margin behind the position is refused, and
+    /// the refusal is silent (the transaction is accepted over REST and
+    /// dropped during execution — bot-strategy#950). `initial_margin_fraction`
+    /// is that margin as a percentage, so the stop distance must fit inside
+    /// it. `None` = the account could not be read.
+    async fn stop_distance_supported(&self, symbol: &str, mark: f64, trigger: f64) -> Option<bool> {
+        if self.cfg.dry_run {
+            // The simulated stop is never submitted, so the venue never
+            // judges it. Refusing here would leave a DRY_RUN book recorded
+            // as uncovered on an account whose leverage is irrelevant to it.
+            return Some(true);
+        }
+        // What Lighter validates is how far the TRIGGER sits from the
+        // current mark, not the trailing percentage: after a drawdown the
+        // peak-based level can be much closer to the mark than
+        // `stop_dd_pct` suggests, and rejecting that would leave the leg
+        // uncovered for no reason (Codex review).
+        let distance_pct = if mark > 0.0 {
+            100.0 * (1.0 - trigger / mark)
+        } else {
+            return None;
+        };
+        if distance_pct <= 0.0 {
+            return Some(true); // at or above the mark: not this guard's case
+        }
+        let index = self.lighter_account_index().await?;
+        let url = format!(
+            "{}/api/v1/account?by=index&value={index}",
+            self.cfg.lighter_account_url.trim_end_matches('/'),
+        );
+        let v: serde_json::Value = self.http.get(&url).send().await.ok()?.json().await.ok()?;
+        let imf = margin_fraction_for(&v, symbol)?;
+        // The margin has to outlast the drawdown AND the maintenance
+        // requirement that bites on the way there — the same floor the
+        // collateral guard uses. An initial margin a hair above the
+        // trigger distance is liquidated before the stop can fire, and
+        // Lighter refuses such an order silently.
+        let floor = liquidation_floor_pct(distance_pct, self.cfg.lighter_mmr_pct);
+        if imf + 1e-9 < floor {
+            log::error!(
+                "[STOP] {symbol}: the market's initial margin is {imf:.2}% but a stop at {trigger:.2}, {distance_pct:.2}% below the mark {mark:.2}, needs {floor:.2}% to survive liquidation at {:.2}% maintenance — Lighter will refuse it. Lower this market's leverage to {:.1}x or less (currently {:.1}x).",
+                self.cfg.lighter_mmr_pct,
+                100.0 / floor,
+                100.0 / imf.max(f64::EPSILON)
+            );
+            return Some(false);
+        }
+        Some(true)
     }
 
     /// Which of `candidates` carries this bot's API key — the account the
@@ -2120,16 +2412,40 @@ impl Engine {
         };
         if !self.cfg.dry_run {
             if let Err(e) = self.lt.cancel_order(symbol, &id).await {
+                // Keeping it tracked is right while the order MIGHT be
+                // resting — but not when the VENUE already said it is
+                // not: no order rests for this market, or it named this
+                // id cancelled. Cancelling something absent is exactly
+                // what fails here, so holding the id would keep the book
+                // On/halted forever and no retried DISARM could ever
+                // clear it.
+                //
+                // Deliberately not `stop_presumed_gone`: that is also set
+                // by the unlisted-for-the-whole-grace fallback, which is
+                // an inference about a stale WebSocket cache. A transient
+                // transport error on top of it would drop an id whose
+                // reduce-only trigger may still rest — and a later ARM
+                // would inherit it against the new position.
+                if !may_forget_stop(false, leg.stop_absence_confirmed) {
+                    log::warn!(
+                        "[STOP] cancel {id} failed, leaving it tracked in state (order may still be resting): {e:?}"
+                    );
+                    return;
+                }
                 log::warn!(
-                    "[STOP] cancel {id} failed, leaving it tracked in state (order may still be resting): {e:?}"
+                    "[STOP] cancel {id} failed, but the venue already reported it gone — dropping it: {e:?}"
                 );
-                return;
             }
         }
         if let Some(l) = self.state.legs.get_mut(symbol) {
             l.stop_order_id = None;
             l.stop_level = None;
             l.stop_size = None;
+            // The id is gone from state, so the doubt about it has
+            // nothing left to attach to.
+            l.stop_unlisted_since = None;
+            l.stop_presumed_gone = false;
+            l.stop_absence_confirmed = false;
         }
         // Persist now, before the (slow) exit orders that follow: a crash
         // in between would otherwise restart with the cancelled id still
@@ -2379,7 +2695,7 @@ impl Engine {
         for (sym, size) in &sizes {
             let leg = self.state.legs.get(sym);
             let covered = leg
-                .map(|l| stop_covers(l.stop_order_id.is_some(), l.stop_size, *size))
+                .map(|l| stop_covers(l.stop_is_cover(), l.stop_size, *size))
                 .unwrap_or(false);
             match (leg.and_then(|l| l.stop_level), marks.get(sym), covered) {
                 (Some(level), Some(&mark), true) => {
@@ -2621,6 +2937,9 @@ impl Engine {
                         cost_basis_unknown: false,
                         perp_cost_basis_unknown: false,
                         stop_unconfirmed_id: None,
+                        stop_unlisted_since: None,
+                        stop_presumed_gone: false,
+                        stop_absence_confirmed: false,
                     }
                 }
             };
@@ -3422,6 +3741,7 @@ impl Engine {
     /// KILL_SWITCH (which blocks stop re-placement by design).
     async fn ensure_stops(&mut self) {
         if self.sentinels.kill_switch_engaged() {
+            self.clear_all_unlisted_since();
             return;
         }
         for (sym, leg) in self.state.legs.clone() {
@@ -3460,33 +3780,156 @@ impl Engine {
             // stop can be dropped after its `sendTx` was acknowledged, or
             // cancelled outside the bot; in both cases state's id is a
             // ghost and nothing else would ever re-place it.
+            // The venue's own order count for this market, not the
+            // connector's WebSocket cache: that cache is empty for a moment
+            // after every restart, which read a live stop as missing and
+            // had the bot cancel and re-place a perfectly good one on each
+            // start (live, 2026-09-23). The count cannot say WHICH order
+            // rests, but this account is dedicated and the bot rests
+            // nothing but this stop.
+            // `Some((rests, confirmed))`. `confirmed` is true only when
+            // the VENUE named the absence — nothing rests for this market,
+            // or it listed this id as cancelled. The unlisted-for-the-
+            // whole-grace fallback is an inference and leaves it false:
+            // enough to re-place (that path cancels first), not enough to
+            // throw the id away on a cancel that merely errored.
             let rests = match (&leg.stop_order_id, self.cfg.dry_run) {
-                (None, _) => Some(false),
-                (Some(_), true) => Some(true), // no venue book in DRY_RUN
-                (Some(id), false) => match self.lt.get_open_orders(&sym).await {
-                    Ok(resp) => Some(resp.orders.iter().any(|o| &o.order_id == id)),
-                    Err(e) => {
-                        log::warn!(
-                            "[STOP] {sym}: open-order read failed, stop check deferred: {e:?}"
-                        );
-                        None
+                (None, _) => Some((false, false)),
+                (Some(_), true) => Some((true, false)), // no venue book in DRY_RUN
+                (Some(id), false) => {
+                    match self.lighter_resting_orders(&sym).await {
+                        // Nothing rests for this market: conclusive, whatever
+                        // the connector's cache thinks.
+                        Some(0) => {
+                            if self.end_unlisted_observation(&sym) {
+                                self.persist();
+                            }
+                            Some((false, true))
+                        }
+                        // Something rests, but the count cannot say what. The
+                        // connector's order view names ids, so require it to
+                        // carry this one before calling the leg covered —
+                        // otherwise an order placed outside the bot would
+                        // vouch for a stop that is no longer there. Right
+                        // after a restart that view is briefly empty, so
+                        // "unknown" defers instead of cancelling a live stop.
+                        Some(_) => match self.lt.get_open_orders(&sym).await {
+                            Ok(resp) if resp.orders.iter().any(|o| &o.order_id == id) => {
+                                // Persist the reset: a run of misses that
+                                // only cleared in memory would be reloaded
+                                // after a restart, and the empty cache
+                                // that restart produces could then supply
+                                // the final miss and cancel a live stop.
+                                if self.stop_seen_listed(&sym) {
+                                    self.persist();
+                                }
+                                Some((true, false))
+                            }
+                            // The id is not listed. That is absence only
+                            // if the list is from the CURRENT connection:
+                            // the connector clears its positions-ready
+                            // flag on every reconnect and fails that read
+                            // until the account snapshot arrives
+                            // (bot-strategy#911), so a successful
+                            // `get_positions` is the readiness proof.
+                            // Treating the two alike would defer forever
+                            // once an operator cancelled the stop while
+                            // another order rested on the market.
+                            Ok(_) => {
+                                // The id is not listed. Positions being
+                                // readable proves nothing here — this
+                                // iteration already read them — and the
+                                // connector exposes no readiness flag for
+                                // the ORDER snapshot. Two signals settle
+                                // it instead: the venue naming the id as
+                                // cancelled, or the same answer repeating.
+                                // A cache catching up after a restart
+                                // agrees within a check or two; an order
+                                // that is really gone never comes back.
+                                let cancelled = matches!(
+                                    self.lt.get_canceled_orders(&sym).await,
+                                    Ok(c) if c.orders.iter().any(|o| &o.order_id == id)
+                                );
+                                // An absence already established is not
+                                // re-timed (see `unlisted_verdict`), so
+                                // the window is only started, and only
+                                // persisted, while there is still a
+                                // question to answer.
+                                let elapsed = if leg.stop_presumed_gone {
+                                    None
+                                } else {
+                                    let now = now_secs();
+                                    let since = self
+                                        .state
+                                        .legs
+                                        .get_mut(&sym)
+                                        .map(|l| *l.stop_unlisted_since.get_or_insert(now))
+                                        .unwrap_or(now);
+                                    self.persist();
+                                    Some(now.saturating_sub(since))
+                                };
+                                let verdict = unlisted_verdict(cancelled, elapsed);
+                                match (verdict, elapsed) {
+                                    (Some(_), None) => log::error!(
+                                        "[STOP] {sym}: {id} is still not listed and already presumed gone — retrying the replacement"
+                                    ),
+                                    (Some(_), Some(e)) => log::error!(
+                                        "[STOP] {sym}: {id} is gone from the venue's order list ({}) while another order rests — re-placing",
+                                        if cancelled {
+                                            "reported cancelled".to_string()
+                                        } else {
+                                            format!("unlisted for {e}s")
+                                        }
+                                    ),
+                                    (None, Some(e)) => log::warn!(
+                                        "[STOP] {sym}: {id} not listed yet ({e}s of {STOP_UNLISTED_GRACE_SECS}s) — deferring, the cache may still be catching up"
+                                    ),
+                                    (None, None) => unreachable!(
+                                        "an established absence is never deferred"
+                                    ),
+                                }
+                                verdict
+                            }
+                            Err(e) => {
+                                // The list could not be read at all: the
+                                // connection is not the one the run was
+                                // observed on, so the run ends here.
+                                if self.end_unlisted_observation(&sym) {
+                                    self.persist();
+                                }
+                                log::warn!("[STOP] {sym}: order list unreadable, stop check deferred: {e:?}");
+                                None
+                            }
+                        },
+                        // The venue's own count could not be read, so
+                        // neither answer was reached: the observation is
+                        // broken, like any other interruption.
+                        None => {
+                            if self.end_unlisted_observation(&sym) {
+                                self.persist();
+                            }
+                            None
+                        }
                     }
-                },
+                }
             };
-            let Some(rests) = rests else { continue };
+            let Some((rests, absence_confirmed)) = rests else {
+                continue;
+            };
             if !rests && leg.stop_order_id.is_some() {
                 log::error!(
-                    "[STOP] {sym}: recorded stop {:?} is NOT in the venue's order list — it stops counting as cover and is cancelled by id before the replacement",
+                    "[STOP] {sym}: recorded stop {:?} is NOT resting — it stops counting as cover and a replacement follows",
                     leg.stop_order_id
                 );
-                if let Some(l) = self.state.legs.get_mut(&sym) {
-                    // Demote, never delete: the read may be an empty WS
-                    // cache rather than proof the order is gone.
-                    l.stop_unconfirmed_id = l.stop_order_id.take();
-                    l.stop_level = None;
-                    l.stop_size = None;
-                }
-                self.persist();
+                // No cancel from here. `place_stop` checks the quote and
+                // the market's leverage BEFORE it touches an existing
+                // stop, precisely so a replacement that cannot be placed
+                // never costs the protection already there — and this
+                // verdict, however well evidenced, is still an inference.
+                // The id stays for that path to cancel in the right
+                // order; `stop_presumed_gone` tells it a failing cancel is
+                // expected rather than a reason to defer.
+                self.mark_stop_presumed_gone(&sym, absence_confirmed);
             }
             // Covered in size AND resting at the level the refreshed peak
             // calls for: a move whose cancel failed leaves the old, lower
@@ -3609,6 +4052,13 @@ impl Engine {
             self.persist();
         }
         let kill = self.sentinels.kill_switch_engaged();
+        if kill {
+            // Stop checking is off while KILL is engaged, so no elapsed
+            // time accrues against a stop. Doing this on the tick rather
+            // than inside `ensure_stops` covers a KILL that comes and goes
+            // between two reconciles, which that function never sees.
+            self.clear_all_unlisted_since();
+        }
         let intent = resolve_operator_intent(
             self.state.mode,
             self.state.halted,
@@ -3927,7 +4377,17 @@ async fn main() -> Result<()> {
 
     // Before any connector (and any signer) is built: an open book is only
     // operated in the mode that created it.
-    let state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    let mut state: State = load_json(&cfg.state_path)?.unwrap_or_default();
+    // The unlisted-stop tolerance counts misses within ONE connection.
+    // Every start brings a fresh connector whose order cache is empty
+    // until the venue's first snapshot, so the miss it produces is
+    // expected — carrying counts across restarts would let three quick
+    // restarts (or a crash loop) add up to "the stop is gone" and cancel
+    // a live one, while carrying them in the other direction would let a
+    // stale count plus this start's own miss do it immediately.
+    for leg in state.legs.values_mut() {
+        leg.stop_unlisted_since = None;
+    }
     log::info!(
         "[STARTUP] mode={:?} legs={} halted={} book_dry_run={:?} realized_total=${:.2}",
         state.mode,
@@ -4991,6 +5451,9 @@ mod tests {
                     cost_basis_unknown: false,
                     perp_cost_basis_unknown: false,
                     stop_unconfirmed_id: None,
+                    stop_unlisted_since: None,
+                    stop_presumed_gone: false,
+                    stop_absence_confirmed: false,
                 },
             );
         }
@@ -5406,6 +5869,369 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same exit, but the venue itself already said the stop is gone
+    /// (nothing rests for the market / the id is listed as cancelled).
+    /// Cancelling an absent order fails by definition, so holding the id
+    /// for "a retried DISARM" would halt the book on an order that does
+    /// not exist and no retry could ever clear.
+    #[tokio::test(start_paused = true)]
+    async fn exit_drops_a_stop_the_venue_already_reported_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_gone_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: true,
+            perp_position: None,
+            trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+            leg.stop_presumed_gone = true;
+            leg.stop_absence_confirmed = true;
+        }
+        e.exit_all("test").await;
+        assert_eq!(
+            e.state.mode,
+            Mode::Exited,
+            "an absence the venue established must not block the exit"
+        );
+        assert!(!e.state.halted);
+        assert!(
+            e.state
+                .legs
+                .values()
+                .all(|l| l.stop_order_id.is_none() && !l.stop_presumed_gone),
+            "the id and the doubt about it are both dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop believed gone protects nothing, and every reader of "is
+    /// this leg protected" must agree — including the margin monitor,
+    /// which would otherwise publish `margin.ok=true` for a leg this
+    /// code has established has no covering stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_believed_gone_protects_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_cover_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        let leg = &e.state.legs["BTC"];
+        let size = leg.perp_size;
+        assert!(leg.stop_is_cover());
+        assert!(stop_covers(leg.stop_is_cover(), leg.stop_size, size));
+
+        // The venue says it is not there. The id and its metadata stay —
+        // they may yet be vindicated — but nothing may call the leg
+        // protected on their strength.
+        e.mark_stop_presumed_gone("BTC", false);
+        let leg = &e.state.legs["BTC"];
+        assert!(leg.stop_order_id.is_some() && leg.stop_size.is_some());
+        assert!(!leg.stop_is_cover());
+        assert!(!stop_covers(leg.stop_is_cover(), leg.stop_size, size));
+
+        // Listed again: the record is trusted once more, unchanged.
+        assert!(e.stop_seen_listed("BTC"));
+        assert!(e.state.legs["BTC"].stop_is_cover());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Knowledge is not undone by a weaker later read — here at the one
+    /// site that records an absence. Re-observing the same absence says
+    /// nothing new, so it must not demote the venue's own answer to an
+    /// inference.
+    #[tokio::test(start_paused = true)]
+    async fn re_marking_an_absence_never_downgrades_a_confirmed_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_no_downgrade_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        // The venue's own answer: nothing rests / named cancelled.
+        e.mark_stop_presumed_gone("BTC", true);
+        assert!(e.state.legs["BTC"].stop_absence_confirmed);
+        // A later pass only re-observes it (another order rests, this id
+        // still unlisted) — `unlisted_verdict(false, None)`.
+        e.mark_stop_presumed_gone("BTC", false);
+        assert!(
+            e.state.legs["BTC"].stop_absence_confirmed,
+            "a re-observation must not demote the venue's own answer"
+        );
+        // Only the id turning up listed clears it.
+        assert!(e.stop_seen_listed("BTC"));
+        assert!(!e.state.legs["BTC"].stop_absence_confirmed);
+        // ...and an inference alone never sets it.
+        e.mark_stop_presumed_gone("BTC", false);
+        assert!(e.state.legs["BTC"].stop_presumed_gone);
+        assert!(!e.state.legs["BTC"].stop_absence_confirmed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop believed gone is never "already current", so the recorded
+    /// level and size can be KEPT — and if the absence was only inferred
+    /// and the order turns out to still rest, the leg is judged against
+    /// them again instead of being cancelled and re-placed for nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_believed_gone_is_replaced_though_its_metadata_still_matches() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_gone_meta_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: false,
+            perp_position: Some(0.005),
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
+        // Exactly what `engine_with_stops` recorded: at this price the
+        // stop IS current, so only the flag can make a replacement due.
+        let before = e.state.legs["BTC"].clone();
+        assert!(stop_is_current(
+            before.stop_level,
+            before.stop_size,
+            true,
+            level_below_peak(80_000.0, e.cfg.stop_dd_pct),
+            before.perp_size
+        ));
+        e.state.legs.get_mut("BTC").unwrap().stop_presumed_gone = true;
+        let _ = e.place_stop("BTC").await;
+        assert!(
+            !venue
+                .trigger_calls
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a stop believed gone must be replaced, not read as current"
+        );
+        // And the metadata was never thrown away, so a leg whose stop
+        // turns out to still rest can be judged current again.
+        e.state.legs.insert("BTC".into(), before.clone());
+        e.mark_stop_presumed_gone("BTC", false);
+        assert!(e.stop_seen_listed("BTC"));
+        let after = &e.state.legs["BTC"];
+        assert_eq!(after.stop_level, before.stop_level);
+        assert_eq!(after.stop_size, before.stop_size);
+        assert!(stop_is_current(
+            after.stop_level,
+            after.stop_size,
+            true,
+            level_below_peak(80_000.0, e.cfg.stop_dd_pct),
+            after.perp_size
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An absence the bot already established is acted on NOW, not
+    /// re-timed. Restarting the window on every repeat of the same
+    /// answer would leave an externally cancelled stop uncovered for
+    /// another whole grace after each failed cancel retry.
+    #[test]
+    fn an_established_absence_is_not_re_timed() {
+        // Still unlisted, already established: act, and the grace has no
+        // say in it.
+        assert_eq!(unlisted_verdict(false, None), Some((false, false)));
+        // The venue naming it cancelled is its own word, so the absence
+        // is confirmed — that is what lets the id be forgotten later.
+        assert_eq!(unlisted_verdict(true, None), Some((false, true)));
+        assert_eq!(unlisted_verdict(true, Some(0)), Some((false, true)));
+        // Not yet established: moments decide nothing, however many
+        // reads land in them.
+        for e in [0, 1, 60, STOP_UNLISTED_GRACE_SECS - 1] {
+            assert_eq!(unlisted_verdict(false, Some(e)), None, "must defer at {e}s");
+        }
+        // Running out the grace is an inference about a stale cache: it
+        // is enough to re-place, never enough to confirm.
+        assert_eq!(
+            unlisted_verdict(false, Some(STOP_UNLISTED_GRACE_SECS)),
+            Some((false, false))
+        );
+    }
+
+    /// The one rule, and the two sites that drop a stop id, agree: only
+    /// the venue's own word lets the bot stop tracking one.
+    #[test]
+    fn a_stop_id_is_forgotten_only_on_the_venues_own_word() {
+        // The cancel went through: the order is gone, whatever was
+        // inferred about it beforehand.
+        assert!(may_forget_stop(true, false));
+        assert!(may_forget_stop(true, true));
+        // The venue already named the absence: cancelling something that
+        // is not there fails by definition, so that failure may not hold
+        // the id hostage.
+        assert!(may_forget_stop(false, true));
+        // A cancel that merely errored, with nothing but an inference
+        // behind it — a transport blip looks exactly like an absent
+        // order, and the trigger may still rest.
+        assert!(!may_forget_stop(false, false));
+    }
+
+    /// `place_stop` cancels the order it replaces. When absence is only
+    /// inferred and that cancel errors, it must defer rather than forget
+    /// the id — the same rule `cancel_stop` follows, at the other site.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_defers_when_the_previous_stop_is_only_inferred_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_replace_inferred_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue = Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,
+            perp_position: Some(0.005),
+            trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
+        for leg in e.state.legs.values_mut() {
+            leg.stop_level = Some(1.0); // stale, so a replacement is due
+            leg.stop_presumed_gone = true; // inferred from the grace only
+            leg.stop_absence_confirmed = false;
+        }
+        let err = format!("{:#}", e.place_stop("BTC").await.unwrap_err());
+        assert!(
+            err.contains("could not cancel the previous stop"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            e.state.legs["BTC"].stop_order_id.as_deref(),
+            Some("stop-BTC"),
+            "an id that may still be resting stays tracked for the retry"
+        );
+        assert!(
+            venue
+                .trigger_calls
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "and no second trigger is rested on top of it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unlisted-for-the-whole-grace fallback is an inference about a
+    /// stale WebSocket cache, not the venue naming an absence. A cancel
+    /// that merely errors — a transport blip is enough — must not be
+    /// allowed to drop that id: the reduce-only trigger may still rest,
+    /// and a later ARM would inherit it against the new position.
+    #[tokio::test(start_paused = true)]
+    async fn exit_keeps_a_stop_only_inferred_to_be_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_inferred_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+            price: Decimal::from(1),
+            cancel_fails: true,
+            perp_position: None,
+            trigger_calls: None,
+            stop_rests: None,
+            canceled: Vec::new(),
+        });
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+            leg.stop_presumed_gone = true; // inferred from the grace only
+            leg.stop_absence_confirmed = false;
+        }
+        e.exit_all("test").await;
+        assert_eq!(
+            e.state.mode,
+            Mode::On,
+            "an inference must not be enough to reach Exited"
+        );
+        assert!(e.state.halted);
+        assert!(
+            e.state.legs.values().all(|l| l.stop_order_id.is_some()),
+            "the id stays tracked for a retried DISARM"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An absence the venue established is knowledge; a read that failed
+    /// is not. Only the id turning up listed (or a new stop replacing it)
+    /// may undo it — otherwise an inconclusive check would restore the
+    /// absent id as cover `place_stop` must preserve, and the leg would
+    /// sit uncovered without ever attempting a replacement.
+    #[tokio::test(start_paused = true)]
+    async fn an_established_absence_survives_an_inconclusive_check() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_absence_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        let leg = e.state.legs.get_mut("BTC").unwrap();
+        leg.stop_presumed_gone = true;
+        leg.stop_unlisted_since = Some(now_secs());
+
+        // An interruption ends the observation and nothing else.
+        assert!(e.end_unlisted_observation("BTC"));
+        let leg = &e.state.legs["BTC"];
+        assert_eq!(leg.stop_unlisted_since, None, "the window restarts");
+        assert!(
+            leg.stop_presumed_gone,
+            "an unreadable answer is not the order coming back"
+        );
+        // It is the absence, so the replacement guard does not count the
+        // recorded id as protection to preserve.
+        assert!(
+            !(leg.stop_order_id.is_some() && !leg.stop_presumed_gone)
+                && leg.stop_unconfirmed_id.is_none(),
+            "a presumed-gone id must not read as cover"
+        );
+        // Idempotent: with nothing left to end, nothing changed.
+        assert!(!e.end_unlisted_observation("BTC"));
+
+        // Seeing it listed is the one read that settles it the other way.
+        assert!(e.stop_seen_listed("BTC"));
+        assert!(!e.state.legs["BTC"].stop_presumed_gone);
+        assert!(!e.stop_seen_listed("BTC"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live exit where the venue shows a SHORT where the book has a long
     /// (manual action / unrecorded order): never "closed", no order sent
     /// for it, the book halts with the leg as recorded.
@@ -5650,7 +6476,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = engine_with_stops(&dir);
         e.cfg.dry_run = false;
-        let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
+        let venue = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: true,         // the uncertain stop cannot be settled
             perp_position: Some(0.005), // ready snapshot...
@@ -5658,19 +6484,34 @@ mod tests {
             stop_rests: Some("ghost-9".into()), // ...and it shows the stop IS resting
             canceled: Vec::new(),
         });
-        e.lt = venue.clone();
-        e.hl = venue;
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
         for leg in e.state.legs.values_mut() {
             leg.stop_order_id = None;
             leg.stop_level = None;
             leg.stop_size = None;
             leg.stop_unconfirmed_id = Some("ghost-9".into());
         }
-        // No replacement while it is unsettled.
+        // No replacement while it is unsettled. (The leverage read also
+        // fails against this stub, which blocks for the same reason: a
+        // leg that already carries a stop is never left without one on
+        // the strength of a read that did not answer.)
         let err = e.place_stop("BTC").await.unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("could not be cancelled"),
-            "unexpected error: {err:#}"
+            msg.contains("could not be cancelled") || msg.contains("could not be read"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            venue
+                .trigger_calls
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no trigger order may be submitted while a stop is unsettled"
         );
         assert_eq!(
             e.state.legs["BTC"].stop_unconfirmed_id.as_deref(),
@@ -5725,6 +6566,75 @@ mod tests {
         std::env::remove_var("BULL_HOLDER_TEST_IDX");
         std::env::remove_var("BULL_HOLDER_TEST_IDX_BULL_HOLDER");
         assert_eq!(lighter_env("BULL_HOLDER_TEST_IDX", "bull-holder"), None);
+    }
+
+    #[test]
+    fn the_guard_measures_the_trigger_against_the_mark_not_the_peak() {
+        // What Lighter validates is the distance from the CURRENT mark to
+        // the trigger. After a drawdown a 35%-below-peak stop can sit much
+        // closer than 35% below the mark, and a margin that carries it
+        // must not be rejected (Codex review).
+        let distance = |mark: f64, trigger: f64| 100.0 * (1.0 - trigger / mark);
+        // Peak 100, mark 80, 35% trailing → trigger 65 = 18.75% below mark.
+        let trigger = level_below_peak(100.0, 35.0);
+        assert!((trigger - 65.0).abs() < 1e-9);
+        let d = distance(80.0, trigger);
+        assert!((d - 18.75).abs() < 1e-9, "distance {d}");
+        // 3x (33.33% margin) carries that; measuring against the peak's
+        // 35% would have refused it forever.
+        assert!(33.33 >= d);
+        assert!(33.33 < 35.0);
+        // At the peak the two agree.
+        assert!((distance(100.0, trigger) - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_margin_must_outlast_the_drawdown_and_maintenance() {
+        // A stop 35% below the mark is not carried by 35.5% of initial
+        // margin: maintenance bites on the way down, and the real floor
+        // is 35 + 1.2 × (1 − 0.35) = 35.78% — the same number the
+        // collateral guard uses.
+        let floor = liquidation_floor_pct(35.0, 1.2);
+        assert!((floor - 35.78).abs() < 1e-9, "floor {floor}");
+        assert!(35.5 < floor, "35.5% initial margin must NOT pass");
+        assert!(50.0 >= floor, "2x (50%) carries it");
+        // Closer stops need less, and the floor still exceeds the bare
+        // distance at every level.
+        for d in [5.0, 18.75, 35.0] {
+            let f = liquidation_floor_pct(d, 1.2);
+            assert!(f > d, "floor {f} must exceed the distance {d}");
+        }
+    }
+
+    #[test]
+    fn the_margin_fraction_bounds_how_far_a_stop_may_sit() {
+        // Lighter reports the margin behind a position as a percentage:
+        // "50.00" is 2x, "2.00" is 50x. A 35% stop needs at least 35%
+        // margin behind it, or the venue accepts the transaction and
+        // drops it (bot-strategy#950).
+        let at = |imf: &str| {
+            serde_json::json!({"accounts":[{"positions":[
+                {"symbol":"BTC","initial_margin_fraction":imf}]}]})
+        };
+        assert_eq!(margin_fraction_for(&at("50.00"), "BTC"), Some(50.0)); // 2x
+        assert_eq!(margin_fraction_for(&at("2.00"), "BTC"), Some(2.0)); // 50x
+        assert_eq!(margin_fraction_for(&at("33.33"), "BTC"), Some(33.33)); // 3x
+                                                                           // 2x carries a 35% stop; 3x and 50x do not.
+        assert!(50.0 >= 35.0);
+        assert!(33.33 < 35.0);
+        // Anything unreadable is unknown, never a number.
+        assert_eq!(margin_fraction_for(&at("50.00"), "ETH"), None);
+        assert_eq!(
+            margin_fraction_for(&serde_json::json!({"accounts":[{"positions":[]}]}), "BTC"),
+            None
+        );
+        let numeric = serde_json::json!({"accounts":[{"positions":[
+            {"symbol":"BTC","initial_margin_fraction":50.0}]}]});
+        assert_eq!(
+            margin_fraction_for(&numeric, "BTC"),
+            None,
+            "the venue sends it as a string"
+        );
     }
 
     #[test]
@@ -5784,6 +6694,43 @@ mod tests {
             resting_orders_for(&serde_json::json!({"code":500}), "BTC"),
             None
         );
+    }
+
+    /// The connector's order view is WebSocket-fed with no readiness
+    /// flag, so "not listed" is ambiguous.
+    /// A cache catching up answers "not listed" for moments; an order
+    /// that is really gone answers that way forever. Measuring elapsed
+    /// time rather than attempts keeps retry frequency — startup retries,
+    /// a crash loop, a busy tick — out of the decision entirely.
+    #[test]
+    fn an_unlisted_stop_is_judged_by_elapsed_time_not_attempts() {
+        let gone = |since: u64, now: u64| now.saturating_sub(since) >= STOP_UNLISTED_GRACE_SECS;
+        let t0 = 1_000_000u64;
+        // Moments, however many reads land in them, decide nothing.
+        for t in [t0, t0 + 1, t0 + 60, t0 + STOP_UNLISTED_GRACE_SECS - 1] {
+            assert!(!gone(t0, t), "must still defer at {}s", t - t0);
+        }
+        assert!(gone(t0, t0 + STOP_UNLISTED_GRACE_SECS));
+        // Any interruption ends the observation, so the window restarts
+        // from the next miss rather than resuming.
+        let mut leg = LegState {
+            stop_unlisted_since: Some(t0),
+            ..Default::default()
+        };
+        leg.stop_unlisted_since = None; // seen again / unreadable / restart
+        let restarted = *leg
+            .stop_unlisted_since
+            .get_or_insert(t0 + STOP_UNLISTED_GRACE_SECS);
+        assert!(!gone(restarted, t0 + STOP_UNLISTED_GRACE_SECS));
+        // It survives within a connection, so a slow cadence cannot
+        // stretch the grace indefinitely either.
+        let js = serde_json::to_string(&LegState {
+            stop_unlisted_since: Some(t0),
+            ..Default::default()
+        })
+        .unwrap();
+        let back: LegState = serde_json::from_str(&js).unwrap();
+        assert_eq!(back.stop_unlisted_since, Some(t0));
     }
 
     #[test]
