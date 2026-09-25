@@ -724,7 +724,10 @@ fn parse_arm(body: &str, cfg: &Config) -> std::result::Result<ArmRequest, String
             .split(|c: char| c.is_whitespace() || c == '=' || c == ':')
             .filter(|p| !p.is_empty())
             .collect();
-        let sym = parts[0].to_ascii_uppercase();
+        let Some(first) = parts.first() else {
+            return Err(format!("'{line}': want `SYMBOL USD`"));
+        };
+        let sym = first.to_ascii_uppercase();
         if !cfg.symbols.iter().any(|c| c.symbol == sym) {
             return Err(format!("{sym} is not in HEDGE_SYMBOLS"));
         }
@@ -1483,11 +1486,15 @@ impl Engine {
                 match self.execute(&sym, &order, mark).await {
                     Ok(filled) if filled < min_qty || filled <= 0.0 => {
                         log::warn!(
-                            "[EXEC] {sym} {:?} {} unfilled (got {filled}) — will retry next tick",
+                            "[EXEC] {sym} {:?} {} unfilled (got {filled}) — no further orders this tick",
                             order.leg,
                             order.qty
                         );
-                        break;
+                        // Stop every symbol, not just this one: an unfilled second
+                        // leg means the other venue is not taking orders, and
+                        // carrying on would open one naked first leg per
+                        // remaining symbol.
+                        break 'symbols;
                     }
                     Ok(filled) => {
                         if let Some(next) = orders.get_mut(i + 1) {
@@ -2279,6 +2286,11 @@ mod tests {
         assert!(parse_arm("META 10000\nMETA 5000", &c).is_err());
         assert!(parse_arm("META ten", &c).is_err());
         assert!(parse_arm("META 10000 extra", &c).is_err());
+        // Delimiter-only lines are rejected, not a panic (Codex P2 on #352).
+        for junk in [":", "=", " : = ", "META 10000\n=="] {
+            assert!(parse_arm(junk, &c).is_err(), "{junk:?}");
+        }
+        assert!(parse_arm(":", &cfg_for_test()).is_err());
     }
 
     #[test]
