@@ -314,15 +314,11 @@ impl Config {
         if self.taker_slippage_bps == 0 || self.taker_slippage_bps > 50 {
             bail!("HEDGE_TAKER_SLIPPAGE_BPS must be 1..=50");
         }
-        for c in &self.symbols {
-            if !positive(self.liq_guard_pct - c.mmr_pct) {
-                bail!(
-                    "HEDGE_LIQ_GUARD_PCT {} must exceed {}'s MMR {}",
-                    self.liq_guard_pct,
-                    c.symbol,
-                    c.mmr_pct
-                );
-            }
+        // Headroom is measured ABOVE the maintenance requirement (it already
+        // subtracts every book's MMR), so the guard only has to be positive:
+        // a 5 % guard with a 6 % MMR stock is a valid setting.
+        if !positive(self.liq_guard_pct) {
+            bail!("HEDGE_LIQ_GUARD_PCT must be > 0");
         }
         if !self.max_leverage.is_finite() || self.max_leverage < 1.0 {
             bail!("HEDGE_MAX_LEVERAGE must be >= 1");
@@ -2224,9 +2220,13 @@ mod tests {
         assert!(parse_symbols("BTC:0").is_err());
         assert!(parse_symbols("BTC:x").is_err());
         assert!(parse_symbols(" , ").is_err());
-        // The liquidation guard must sit above every symbol's MMR.
+        // Headroom already nets out the MMR, so a guard below a symbol's
+        // MMR is fine (5 % guard with AMZN at 6 %); only guard <= 0 is not.
         let mut c = cfg_for_test();
-        c.symbols = parse_symbols("BTC:1.2,XYZ:10").unwrap();
+        c.symbols = parse_symbols("BTC:1.2,AMZN:6").unwrap();
+        c.liq_guard_pct = 5.0;
+        assert!(c.validate().is_ok());
+        c.liq_guard_pct = 0.0;
         assert!(c.validate().is_err());
     }
 
