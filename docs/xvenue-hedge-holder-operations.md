@@ -67,12 +67,51 @@ Instance suffixes: `_RH` / `_CORE` on `LIGHTER_*`, `REST_ENDPOINT`,
    what the first actually filled); the book completes over
    `ceil(target/clip)` ticks.
 
+## Several symbols (option C, bot-strategy#1046 2026-09-25)
+
+`HEDGE_SYMBOLS` lists every hedged market with the venue's maintenance
+margin for it, primary first:
+
+```bash
+export HEDGE_SYMBOLS="BTC:1.2,META:3,AMZN:6,GOOGL:3"
+```
+
+The MMR is `maintenance_margin_fraction / 100` from
+`/api/v1/orderBookDetails` (BTC/ETH 120 → 1.2; META/GOOGL/AAPL/TSLA/NVDA
+300 → 3; AMZN/AMD/MU/INTC 600 → 6 as of 2026-09-25) — required per symbol,
+because the guards weight each book's notional by it. Unset,
+`HEDGE_SYMBOL` + `HEDGE_MMR_PCT` behave exactly as before (same config
+fingerprint, same state.json; a one-book state.json from an older binary
+becomes the primary symbol's book).
+
+Each symbol is its own book (own target, own mode, own net-exposure
+counter), all on the same two accounts. **Margin is per account**: Lighter
+cross-margins every position, so
+
+- `liq_headroom_pct` = `(equity − Σ notional_i × mmr_i) / Σ notional_i`
+  over every hedged book on that venue; under `HEDGE_LIQ_GUARD_PCT` →
+  **every armed book is closed** and the bot halts;
+- the leverage guard adds up every growth order of the tick, across
+  symbols, before sending any of them.
+
+Positions on markets NOT in `HEDGE_SYMBOLS` are invisible to both guards —
+keep the accounts to hedged markets only, or leave margin for them.
+`HEDGE_MAX_NOTIONAL_USD` caps each symbol's per-leg notional.
+
+Status: the single-symbol fields the card reads (`target_qty`, `net_*`,
+`basis_bps`, `legs.*.qty`/`mark`) describe the primary symbol;
+`legs.*.notional_usd` / `equity_usd` / `liq_headroom_pct` are the account
+figures the guards use; `hedge_holder.books.<SYM>` has every book's own
+target / held sizes / net / basis.
+
 ## Operator files
 
 | file | effect |
 |---|---|
-| `ARM` (empty or `<usd>`) | build the book at `HEDGE_TARGET_NOTIONAL_USD` (or `<usd>`) per leg |
-| `DISARM` | unwind both legs (short leg first), then `mode: Off` |
+| `ARM`, one symbol (empty or `<usd>`) | build the book at `HEDGE_TARGET_NOTIONAL_USD` (or `<usd>`) per leg |
+| `ARM`, several symbols (`SYMBOL USD` per line) | (re)arm each listed book at `USD` per leg; books not listed are left as they are. Empty file or a bare number is rejected (ambiguous), and so is the whole file if any line is bad |
+| `DISARM` (empty) | unwind every book (short leg first per symbol), then `mode: Off` |
+| `DISARM` (`SYMBOL` per line) | unwind only those books; an unknown symbol closes ALL books (protective) |
 | `KILL_SWITCH` (present) | no growth; reductions and DISARM still run |
 | `RISK_ACK` | clear a halt |
 
@@ -82,7 +121,7 @@ Instance suffixes: `_RH` / `_CORE` on `LIGHTER_*`, `REST_ENDPOINT`,
 |---|---|---|
 | `net exposure ...` | legs unequal by > `HEDGE_NET_TOLERANCE_USD` for `HEDGE_NET_BREACH_TICKS` ticks (an IOC keeps failing on one venue) | check the failing venue / book; while halted the bot only *reduces* the larger leg; `RISK_ACK` |
 | `leverage: ...` | a growth order this tick would exceed `HEDGE_MAX_LEVERAGE` × that venue's equity; nothing was sent (checked before the first leg) — also what fires after a liquidation | deposit, `RISK_ACK`, re-`ARM` |
-| `liq_guard: ...` | a venue's headroom fell under `HEDGE_LIQ_GUARD_PCT`; **both legs were closed** | rebalance collateral, `RISK_ACK`, re-`ARM` |
+| `liq_guard: ...` | a venue's account headroom (over every hedged book) fell under `HEDGE_LIQ_GUARD_PCT`; **every armed book was closed** | rebalance collateral, `RISK_ACK`, re-`ARM` |
 
 A halt never leaves the book lopsided on purpose: the tick loop keeps
 reducing the larger leg toward the smaller one while halted.
