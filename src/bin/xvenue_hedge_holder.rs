@@ -302,6 +302,17 @@ impl Config {
         if self.symbols.is_empty() {
             bail!("no hedged symbol configured");
         }
+        // `parse_symbols` checks its own entries; the legacy HEDGE_SYMBOL +
+        // HEDGE_MMR_PCT pair is built directly and must pass the same bar
+        // (a NaN MMR makes every headroom comparison false while holding).
+        for c in &self.symbols {
+            if c.symbol.is_empty() || !positive(c.mmr_pct) {
+                bail!(
+                    "symbol '{}': empty name or MMR_PCT <= 0 / non-finite (HEDGE_SYMBOLS or HEDGE_MMR_PCT)",
+                    c.symbol
+                );
+            }
+        }
         if !positive(self.target_notional_usd) || !positive(self.max_notional_usd) {
             bail!("HEDGE_TARGET_NOTIONAL_USD and HEDGE_MAX_NOTIONAL_USD must be > 0");
         }
@@ -679,6 +690,27 @@ fn gates_feed(mode: Mode) -> bool {
     mode != Mode::Off
 }
 
+/// Both venues' quote for `symbol`, reduced to the size metadata a book
+/// needs: the coarser decimals and the larger minimum, so every order is
+/// representable on both legs. Returns the long-leg mark alongside.
+async fn fetch_meta(long: &Venue, short: &Venue, symbol: &str) -> Result<(f64, SymMeta)> {
+    let (mark, sd1, min1) = long
+        .mark(symbol)
+        .await
+        .with_context(|| format!("long-leg quote {symbol}"))?;
+    let (_, sd2, min2) = short
+        .mark(symbol)
+        .await
+        .with_context(|| format!("short-leg quote {symbol}"))?;
+    Ok((
+        mark,
+        SymMeta {
+            size_decimals: sd1.min(sd2),
+            min_qty: min1.max(min2),
+        },
+    ))
+}
+
 /// Base-unit size for `notional_usd` at `mark`, floored to `size_decimals`.
 fn qty_for_notional(notional_usd: f64, mark: f64, size_decimals: u32) -> f64 {
     if !positive(mark) || !positive(notional_usd) {
@@ -737,6 +769,12 @@ fn parse_arm(body: &str, cfg: &Config) -> std::result::Result<ArmRequest, String
             }
             if !positive(usd) {
                 return Err(format!("notional '{line}' must be > 0"));
+            }
+            if !out.is_empty() {
+                return Err(format!(
+                    "'{line}': {} appears twice (two bare notionals)",
+                    cfg.primary()
+                ));
             }
             out.push((cfg.primary().to_string(), usd));
             continue;
@@ -1052,6 +1090,24 @@ impl Engine {
         })
     }
 
+    /// Size metadata for a symbol that was unpriced at startup (book Off
+    /// then): fetched from both venues the first time it is armed. Errors
+    /// leave the ARM unapplied — sizing a book on default decimals and a
+    /// zero minimum is exactly what the startup quote protects against.
+    async fn ensure_meta(&mut self, symbol: &str) -> Result<()> {
+        if self.meta.contains_key(symbol) {
+            return Ok(());
+        }
+        let (mark, m) = fetch_meta(&self.long, &self.short, symbol).await?;
+        log::info!(
+            "[ARM] {symbol} mark={mark:.2} size_decimals={} min_qty={} (metadata fetched on ARM)",
+            m.size_decimals,
+            m.min_qty
+        );
+        self.meta.insert(symbol.to_string(), m);
+        Ok(())
+    }
+
     async fn venue_snapshot(&self, venue: &Venue, leg: Leg) -> Result<VenueSnapshot> {
         let mut snap = VenueSnapshot::default();
         // Only books the bot manages gate the tick on their feed: an Off
@@ -1304,6 +1360,17 @@ impl Engine {
                     "[ARM] ignored: {sym} ${usd:.0} exceeds HEDGE_MAX_NOTIONAL_USD ${:.0}",
                     self.cfg.max_notional_usd
                 );
+            } else if let Some((sym, e)) = {
+                let mut missing = None;
+                for (sym, _) in &reqs {
+                    if let Err(e) = self.ensure_meta(sym).await {
+                        missing = Some((sym.clone(), e));
+                        break;
+                    }
+                }
+                missing
+            } {
+                log::warn!("[ARM] ignored: {sym} size metadata unavailable ({e}) — ARM again");
             } else {
                 let sized: Vec<(String, f64, f64)> = reqs
                     .iter()
@@ -1869,31 +1936,32 @@ async fn main() -> Result<()> {
         instance: cfg.short_instance.clone(),
         dex: Arc::new(short_dex),
     };
-    let mut meta = std::collections::BTreeMap::new();
-    for sym in &symbols {
-        let (mark, sd1, min1) = long
-            .mark(sym)
-            .await
-            .with_context(|| format!("initial long-leg quote {sym}"))?;
-        let (_, sd2, min2) = short
-            .mark(sym)
-            .await
-            .with_context(|| format!("initial short-leg quote {sym}"))?;
-        let m = SymMeta {
-            size_decimals: sd1.min(sd2),
-            min_qty: min1.max(min2),
-        };
-        log::info!(
-            "[STARTUP] {sym} mark={mark:.2} size_decimals={} min_qty={}",
-            m.size_decimals,
-            m.min_qty
-        );
-        meta.insert(sym.clone(), m);
-    }
     let mut state: State = load_json(&cfg.state_path)?.unwrap_or_default();
     state = migrate_legacy(state, cfg.primary());
     state = reconcile_state_mode(state, cfg.dry_run);
     state.process_started_at = Some(now_secs());
+    // Size metadata (decimals / venue minimum) per symbol. Only books the
+    // bot manages must be quotable at startup: an Off symbol whose market
+    // is unavailable is skipped and its metadata fetched when it is armed
+    // (`ensure_meta`), so one dead unused market cannot keep the process
+    // from managing, guarding or DISARMing the healthy books.
+    let mut meta = std::collections::BTreeMap::new();
+    for sym in &symbols {
+        match fetch_meta(&long, &short, sym).await {
+            Ok((mark, m)) => {
+                log::info!(
+                    "[STARTUP] {sym} mark={mark:.2} size_decimals={} min_qty={}",
+                    m.size_decimals,
+                    m.min_qty
+                );
+                meta.insert(sym.clone(), m);
+            }
+            Err(e) if !gates_feed(state.book(sym).mode) => {
+                log::warn!("[STARTUP] {sym} unpriced (book Off): {e} — metadata is fetched when it is armed");
+            }
+            Err(e) => return Err(e),
+        }
+    }
     for (sym, b) in &state.books {
         if !symbols.contains(sym) && b.mode != Mode::Off {
             // The config dropped a symbol whose book is still armed: it is
@@ -2328,6 +2396,26 @@ mod tests {
         );
         assert!(parse_arm("-5", &c).is_err());
         assert!(parse_arm("META 10000", &c).is_err(), "not configured");
+        // Two bare notionals name the primary twice: rejected like `BTC 1\nBTC 2`.
+        assert!(parse_arm("20000\n25000", &c).is_err());
+        assert!(parse_arm("20000\nBTC 25000", &c).is_err());
+        assert!(parse_arm("BTC 25000\n20000", &c).is_err());
+    }
+
+    #[test]
+    fn legacy_single_symbol_mmr_is_validated_like_parse_symbols() {
+        let mut c = cfg_for_test();
+        assert!(c.validate().is_ok());
+        c.symbols[0].mmr_pct = f64::NAN;
+        assert!(
+            c.validate().is_err(),
+            "NaN MMR would make every headroom check false"
+        );
+        c.symbols[0].mmr_pct = 0.0;
+        assert!(c.validate().is_err());
+        c.symbols[0].mmr_pct = 1.2;
+        c.symbols[0].symbol = String::new();
+        assert!(c.validate().is_err());
     }
 
     #[test]
