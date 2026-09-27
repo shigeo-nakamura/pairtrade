@@ -24,7 +24,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 
-use super::config::BookConfig;
+use super::config::{BookConfig, UniverseMode};
 use super::engine::{BookEngine, DirSignalSource};
 use super::executor::{Executor, PaperExecutor};
 use super::rebalance::LotMeta;
@@ -194,6 +194,17 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
         });
         exec.set_lot(s, lot).await;
     }
+    // `venue_listed` (bot-strategy#941): there is no venue to ask, so
+    // `lots.json` stands in for the listing -- a symbol it names is
+    // admitted with that lot, one it does not name (and the seed does not
+    // cover) is refused like an unlisted market.
+    if cfg.universe.mode == UniverseMode::VenueListed {
+        for (s, lot) in &lots {
+            if !cfg.universe.symbols.contains(s) {
+                exec.set_lot(s, *lot).await;
+            }
+        }
+    }
     let scheduler = Scheduler::from_config(&cfg.schedule)?;
     let status = StatusWriter::new(cfg.paths.status.clone(), None);
     let signals = Box::new(DirSignalSource::new(replay_dir.join("signals")));
@@ -355,7 +366,15 @@ pub async fn run(cfg: BookConfig, replay_dir: &Path, out_dir: &Path) -> Result<R
                 .collect::<Vec<_>>()
         );
     }
-    let prices = exec.prices(&cfg.universe.symbols).await;
+    // Every leg still held, not just the seed: in `venue_listed` the book
+    // can hold names outside it.
+    let mut final_symbols = cfg.universe.symbols.clone();
+    for s in engine.state.positions.keys() {
+        if !final_symbols.contains(s) {
+            final_symbols.push(s.clone());
+        }
+    }
+    let prices = exec.prices(&final_symbols).await;
     summary.final_equity = cfg.risk.equity_reference_usd + engine.state.cum_realized_usd
         - engine.state.cum_fees_usd
         + engine.state.cum_funding_est_usd

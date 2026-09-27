@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use debot::book::config::{BookConfig, ScheduleKind};
-use debot::book::engine::{BookEngine, FileSignalSource};
+use debot::book::config::{BookConfig, ScheduleKind, UniverseMode};
+use debot::book::engine::{AdmitError, BookEngine, FileSignalSource, SymbolFeed};
 use debot::book::executor::{Executor, LiveExecutor, PaperExecutor, VenuePosition};
 use debot::book::rebalance::LotMeta;
 use debot::book::replay;
@@ -33,7 +33,7 @@ use debot::book::status::StatusWriter;
 use debot::infra::logger::init_logger;
 use debot::infra::s3_mirror::S3Mirror;
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
-use dex_connector::{DexConnector, PriceUpdate};
+use dex_connector::{DexConnector, DexError, PriceUpdate};
 use fs2::FileExt;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -200,7 +200,7 @@ fn fetch_env(cfg: &BookConfig) -> Result<String> {
         .every_days
         .map(|n| n.to_string())
         .unwrap_or_default();
-    let pairs: [(&str, &str); 11] = [
+    let pairs: [(&str, &str); 12] = [
         ("BOOK_SCHEDULE_KIND", kind),
         ("BOOK_CALENDAR_PATH", &calendar_path),
         ("BOOK_ANCHOR_DATE", &anchor_date),
@@ -220,7 +220,17 @@ fn fetch_env(cfg: &BookConfig) -> Result<String> {
             "BOOK_MAX_SYMBOL_WEIGHT",
             &cfg.sizing.max_symbol_weight.to_string(),
         ),
-        ("BOOK_UNIVERSE", &cfg.universe.symbols.join(",")),
+        // `venue_listed` has no whitelist to hand the fetcher: the venue's
+        // listing is the bound, checked by the runtime when it admits a
+        // symbol (bot-strategy#941). Empty = the fetcher skips the check.
+        (
+            "BOOK_UNIVERSE",
+            &match cfg.universe.mode {
+                UniverseMode::Fixed => cfg.universe.symbols.join(","),
+                UniverseMode::VenueListed => String::new(),
+            },
+        ),
+        ("BOOK_UNIVERSE_MODE", cfg.universe.mode.label()),
     ];
     let mut out = String::new();
     for (key, value) in pairs {
@@ -243,6 +253,56 @@ async fn fetch_lot(
             None
         }
     }
+}
+
+/// `universe.mode: venue_listed` (bot-strategy#941): a new symbol is
+/// admitted by subscribing it on the open connector -- which refuses, as
+/// `Permanent`, anything the venue does not list and have open for trading
+/// -- and then loading its lot metadata, into the paper book too when
+/// running DRY_RUN.
+struct ConnectorSymbolFeed {
+    connector: Arc<dyn DexConnector + Send + Sync>,
+    paper: Option<Arc<PaperExecutor>>,
+}
+
+#[async_trait::async_trait]
+impl SymbolFeed for ConnectorSymbolFeed {
+    async fn admit(&self, symbol: &str) -> std::result::Result<LotMeta, AdmitError> {
+        admit_via_connector(&self.connector, self.paper.as_deref(), symbol).await
+    }
+
+    /// `subscribe_symbols` re-checks the (connector-memoised, 30 s)
+    /// listing on every call, already-subscribed symbols included, and
+    /// subscribes nothing twice.
+    async fn revalidate(&self, symbol: &str) -> std::result::Result<(), AdmitError> {
+        subscribe_one(&self.connector, symbol).await
+    }
+}
+
+async fn subscribe_one(
+    connector: &Arc<dyn DexConnector + Send + Sync>,
+    symbol: &str,
+) -> std::result::Result<(), AdmitError> {
+    match connector.subscribe_symbols(&[symbol.to_string()]).await {
+        Ok(()) => Ok(()),
+        Err(DexError::Permanent(m)) => Err(AdmitError::Refused(m)),
+        Err(e) => Err(AdmitError::Unavailable(format!("subscribe: {e:?}"))),
+    }
+}
+
+async fn admit_via_connector(
+    connector: &Arc<dyn DexConnector + Send + Sync>,
+    paper: Option<&PaperExecutor>,
+    symbol: &str,
+) -> std::result::Result<LotMeta, AdmitError> {
+    subscribe_one(connector, symbol).await?;
+    let lot = fetch_lot(connector, symbol)
+        .await
+        .ok_or_else(|| AdmitError::Unavailable(format!("no lot metadata for {symbol} yet")))?;
+    if let Some(p) = paper {
+        p.set_lot(symbol, lot).await;
+    }
+    Ok(lot)
 }
 
 /// Process-wide ownership of one instance's state: held for the lifetime
@@ -338,10 +398,19 @@ async fn main() -> Result<()> {
     let persisted_state =
         debot::book::state::BookState::load_or_new(&cfg.paths.state, &cfg.instance_id)?;
     let mut symbols = cfg.universe.symbols.clone();
+    // The accepted target of an in-flight decision too: in `venue_listed`
+    // a leg whose opening is still a residual may be outside the seed
+    // (bot-strategy#941), and its retry needs a feed after a restart.
+    let target_symbols: Vec<String> = persisted_state
+        .last_decision
+        .as_ref()
+        .map(|r| r.target_qty.keys().cloned().collect())
+        .unwrap_or_default();
     for s in persisted_state
         .positions
         .keys()
         .chain(persisted_state.pending_funding_qty_hours.keys())
+        .chain(target_symbols.iter())
     {
         if !symbols.contains(s) {
             symbols.push(s.clone());
@@ -391,6 +460,12 @@ async fn main() -> Result<()> {
     };
 
     let mut engine = BookEngine::new(cfg.clone(), scheduler, exec.clone(), signals, status)?;
+    if cfg.universe.mode == UniverseMode::VenueListed {
+        engine.set_symbol_feed(Arc::new(ConnectorSymbolFeed {
+            connector: connector.clone(),
+            paper: paper.clone(),
+        }));
+    }
     if let Some(p) = &paper {
         // Restart: the paper book continues from state.json.
         let seed: BTreeMap<String, VenuePosition> = engine
@@ -558,7 +633,13 @@ async fn main() -> Result<()> {
                     // handle SIGTERM. Concurrent requests bound the stall
                     // to the slowest single one instead.
                     let mut refreshes = tokio::task::JoinSet::new();
-                    for s in symbols.clone() {
+                    let mut refresh = symbols.clone();
+                    for s in engine.admitted_symbols() {
+                        if !refresh.contains(s) {
+                            refresh.push(s.clone());
+                        }
+                    }
+                    for s in refresh {
                         let connector = connector.clone();
                         let p = p.clone();
                         refreshes.spawn(async move {
@@ -758,6 +839,23 @@ paths:
         assert_eq!(e["BOOK_MAX_SYMBOL_WEIGHT"], "0.15");
         assert_eq!(e["BOOK_UNIVERSE"], "BTC,ETH");
         assert_eq!(e["BOOK_CALENDAR_PATH"], "");
+    }
+
+    #[test]
+    fn fetch_env_hands_the_fetcher_no_whitelist_in_venue_listed_mode() {
+        let sched = "  kind: interval_days\n  anchor_date: 2026-07-03\n  every_days: 5\n  decision_time_utc: \"00:30\"\n  signal_grace_secs: 5400\n";
+        let fixed = env_of(&cfg_yaml(sched, "xsmom_695"));
+        assert_eq!(fixed["BOOK_UNIVERSE_MODE"], "fixed");
+        assert_eq!(fixed["BOOK_UNIVERSE"], "BTC,ETH");
+        // The seed is a subscription seed, not a whitelist: passing it on
+        // would make the fetcher refuse exactly the new listings this mode
+        // exists for (bot-strategy#941).
+        let vl = env_of(&cfg_yaml(sched, "xsmom_695").replace(
+            "universe:\n  symbols:",
+            "universe:\n  mode: venue_listed\n  symbols:",
+        ));
+        assert_eq!(vl["BOOK_UNIVERSE_MODE"], "venue_listed");
+        assert_eq!(vl["BOOK_UNIVERSE"], "");
     }
 
     #[test]

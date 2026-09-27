@@ -123,6 +123,63 @@ class ProducerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 xp.universe_from_config(bad)
 
+    def test_venue_listed_config_notes_new_symbols_instead_of_refusing(self):
+        """bot-strategy#941: with universe.mode: venue_listed the runtime
+        admits any symbol Lighter lists as active, so a name outside the
+        seed is not a reason to withhold the signal."""
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, "cfg.yaml")
+            with open(cfg, "w") as f:
+                f.write("universe:\n  mode: venue_listed  # dynamic\n  symbols:\n    - LIT\n    - GRAM\n    - APT\n"
+                        "schedule:\n  kind: daily\n"
+                        "signal:\n  net_tolerance: 0.15\nsizing:\n  max_symbol_weight: 0.15\n")
+            self.assertEqual(xp.universe_mode_from_config(cfg), "venue_listed")
+            ledger = os.path.join(d, "ledger.jsonl")
+            write_ledger(ledger, [ROW])
+            out = os.path.join(d, "signal.json")
+            cmd = [sys.executable, os.path.join(HERE, "xsmom_signal_producer.py"),
+                   "--ledger", ledger, "--out", out, "--date", "2026-09-06", "--config", cfg]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("ENA", r.stderr)
+            self.assertIn("venue_listed", r.stderr)
+            self.assertTrue(os.path.exists(out))
+            # Absent = fixed; anything else is refused rather than guessed.
+            plain = os.path.join(d, "plain.yaml")
+            with open(plain, "w") as f:
+                f.write("universe:\n  symbols:\n    - LIT\nschedule:\n  kind: daily\n")
+            self.assertEqual(xp.universe_mode_from_config(plain), "fixed")
+            odd = os.path.join(d, "odd.yaml")
+            with open(odd, "w") as f:
+                f.write("universe:\n  mode: dynamic\n  symbols:\n    - LIT\nschedule:\n  kind: daily\n")
+            with self.assertRaises(SystemExit):
+                xp.universe_mode_from_config(odd)
+
+    def test_universe_mode_accepts_yaml_quoting_and_refuses_the_unrecognised(self):
+        """Codex on pairtrade#354: `mode: "venue_listed"` is the same YAML
+        value as the bare word and must not read as `fixed`; anything the
+        parser cannot recognise is an error, never the default."""
+        def mode_of(line):
+            with tempfile.TemporaryDirectory() as d:
+                cfg = os.path.join(d, "c.yaml")
+                with open(cfg, "w") as f:
+                    f.write(f"universe:\n{line}  symbols:\n    - LIT\nschedule:\n  kind: daily\n")
+                return xp.universe_mode_from_config(cfg)
+        for line, want in [
+            ('  mode: venue_listed\n', "venue_listed"),
+            ('  mode: "venue_listed"\n', "venue_listed"),
+            ("  mode: 'venue_listed'  # dynamic\n", "venue_listed"),
+            ('  mode: "fixed"\n', "fixed"),
+            ("  mode:   fixed\n", "fixed"),
+            ("", "fixed"),
+        ]:
+            self.assertEqual(mode_of(line), want, line)
+        for line in ['  mode: "venue listed"\n', "  mode: venue-listed\n", "  mode:\n",
+                     '  mode: "venue_listed\n', "  mode: VENUE_LISTED\n",
+                     "  mode: fixed\n  mode: venue_listed\n"]:
+            with self.assertRaises(SystemExit, msg=line):
+                mode_of(line)
+
     def test_caps_come_from_the_deployed_config(self):
         """bot-strategy#937: the shadow carries surviving legs at drifted
         notional, so its rows are not dollar-neutral by construction. The
@@ -275,6 +332,26 @@ class PoolTest(unittest.TestCase):
                 xu.fetch_pool = lambda: ["BTC"]
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(xu.main(["--check", cfg]), 0)
+            finally:
+                xu.fetch_pool = real
+
+    def test_check_passes_a_venue_listed_config_that_lacks_pool_symbols(self):
+        cfg_text = ("schema_version: 1\nuniverse:\n  mode: venue_listed\n  symbols:\n    - BTC\n"
+                    "schedule:\n  kind: daily\n")
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, "x.yaml")
+            with open(cfg, "w") as f:
+                f.write(cfg_text)
+            real = xu.fetch_pool
+            xu.fetch_pool = lambda: ["ARB", "BTC", "OP"]
+            try:
+                import io
+                import contextlib
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = xu.main(["--check", cfg])
+                self.assertEqual(rc, 0)
+                self.assertIn("admitted at runtime: ARB, OP", out.getvalue())
             finally:
                 xu.fetch_pool = real
 

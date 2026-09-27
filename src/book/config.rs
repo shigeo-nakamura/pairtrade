@@ -28,9 +28,58 @@ pub struct BookConfig {
     pub paths: PathsConfig,
 }
 
+/// How a signal's symbols are bounded (bot-strategy#941).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UniverseMode {
+    /// `symbols` is a whitelist: a signal naming anything else is rejected
+    /// whole (`unknown_symbol`). For single- or few-symbol strategies
+    /// (Engine B, ex-div) and the default.
+    #[default]
+    Fixed,
+    /// Any symbol the venue lists *and* has open for trading right now is
+    /// accepted: the runtime subscribes it when it first appears in a
+    /// signal (`DexConnector::subscribe_symbols`) and takes its lot
+    /// metadata from the venue. A signal naming a symbol the venue refuses
+    /// is still rejected whole (`unlisted_symbol`) -- fail closed, same as
+    /// `fixed`. `symbols` stays as the connect-time subscription seed.
+    /// For producers that re-screen their universe every rebalance
+    /// (XSMOM, #695); the per-symbol weight cap and the gross / net caps
+    /// are then the only bound on *which* names the book holds, so review
+    /// them for any config that turns this on.
+    VenueListed,
+}
+
+impl UniverseMode {
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, UniverseMode::Fixed)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            UniverseMode::Fixed => "fixed",
+            UniverseMode::VenueListed => "venue_listed",
+        }
+    }
+}
+
+/// A symbol the runtime will hand to a venue in `venue_listed` mode: ASCII
+/// letters, digits and `_`, 1..=32 characters. Nothing a producer bug could
+/// smuggle past it reaches the connector (no separators, no whitespace, no
+/// spot pair notation), and it is what the fetcher's comma-joined env var
+/// can carry.
+pub fn is_plain_symbol(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UniverseConfig {
+    /// Omitted = `fixed`, and left out of the serialized form then, so an
+    /// existing config's fingerprint is unchanged by this field's
+    /// introduction.
+    #[serde(default, skip_serializing_if = "UniverseMode::is_fixed")]
+    pub mode: UniverseMode,
     pub symbols: Vec<String>,
 }
 
@@ -239,6 +288,20 @@ impl BookConfig {
             }
             if !seen.insert(s.clone()) {
                 bail!("universe symbol {s:?} listed twice");
+            }
+        }
+        if self.universe.mode == UniverseMode::VenueListed {
+            // Only Lighter implements `subscribe_symbols`; any other venue
+            // would accept the config and then reject every new symbol at
+            // runtime.
+            if self.venue != "lighter" {
+                bail!(
+                    "universe.mode: venue_listed needs a connector with post-connect subscribe (lighter); venue is {:?}",
+                    self.venue
+                );
+            }
+            if let Some(s) = self.universe.symbols.iter().find(|s| !is_plain_symbol(s)) {
+                bail!("universe symbol {s:?} is not a plain venue symbol (A-Z, 0-9, _)");
             }
         }
         let sc = &self.schedule;
@@ -474,12 +537,13 @@ impl BookConfig {
     /// One-line `[CONFIG]` summary for the startup log.
     pub fn log_line(&self) -> String {
         format!(
-            "[CONFIG] instance={} venue={} dry_run={} schedule={:?} universe={} gross=${:.0} max_w={} max_gross=${:.0} max_net=${:.0} session_loss_bps={} daily_loss_bps={} producer={} fp={}",
+            "[CONFIG] instance={} venue={} dry_run={} schedule={:?} universe={} universe_mode={} gross=${:.0} max_w={} max_gross=${:.0} max_net=${:.0} session_loss_bps={} daily_loss_bps={} producer={} fp={}",
             self.instance_id,
             self.venue,
             self.dry_run,
             self.schedule.kind,
             self.universe.symbols.len(),
+            self.universe.mode.label(),
             self.sizing.gross_notional_usd,
             self.sizing.max_symbol_weight,
             self.sizing.max_gross_usd,
@@ -721,6 +785,65 @@ mod tests {
             .symbols
             .iter()
             .all(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')));
+    }
+
+    #[test]
+    fn universe_mode_defaults_to_fixed_and_leaves_the_fingerprint_alone() {
+        let a = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        assert_eq!(a.universe.mode, UniverseMode::Fixed);
+        // Spelling the default out is the same config, byte for byte.
+        let explicit = test_config_yaml().replace(
+            "universe:\n  symbols:",
+            "universe:\n  mode: fixed\n  symbols:",
+        );
+        let b = BookConfig::from_yaml_str(&explicit).unwrap();
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        assert!(!serde_json::to_string(&a).unwrap().contains("mode"));
+
+        let vl = test_config_yaml().replace(
+            "universe:\n  symbols:",
+            "universe:\n  mode: venue_listed\n  symbols:",
+        );
+        let c = BookConfig::from_yaml_str(&vl).unwrap();
+        assert_eq!(c.universe.mode, UniverseMode::VenueListed);
+        assert_ne!(a.fingerprint(), c.fingerprint());
+        assert!(c.log_line().contains("universe_mode=venue_listed"));
+    }
+
+    #[test]
+    fn venue_listed_refuses_a_venue_without_post_connect_subscribe_and_odd_seeds() {
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.universe.mode = UniverseMode::VenueListed;
+        c.validate().unwrap();
+        c.venue = "hyperliquid".to_string();
+        assert!(c.validate().is_err());
+        let mut c = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        c.universe.mode = UniverseMode::VenueListed;
+        c.universe.symbols.push("LIT/USDC".to_string());
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("plain venue symbol"), "{e}");
+        let bad = test_config_yaml().replace(
+            "universe:\n  symbols:",
+            "universe:\n  mode: dynamic\n  symbols:",
+        );
+        assert!(BookConfig::from_yaml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn plain_symbols() {
+        for s in ["BTC", "0G", "1000PEPE", "2Z", "kPEPE", "A_B"] {
+            assert!(is_plain_symbol(s), "{s}");
+        }
+        for s in [
+            "",
+            " BTC",
+            "BTC,ETH",
+            "LIT/USDC",
+            "BTC-PERP",
+            &"X".repeat(33),
+        ] {
+            assert!(!is_plain_symbol(s), "{s:?}");
+        }
     }
 
     #[test]

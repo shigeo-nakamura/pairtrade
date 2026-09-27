@@ -72,6 +72,10 @@ shadow's, the runtime only mirrors it.
 
 ## Universe drift (a Lighter listing, not every rebalance)
 
+This section describes `universe.mode: fixed` (the default, and
+xsmom-695's mode until it is switched over — see the `venue_listed`
+subsection at the end, which removes the manual step).
+
 The shadow watcher re-screens its universe point-in-time at every
 rebalance, on purpose: pinning it would put survivorship back into the
 track (bot-strategy#695). So the book's membership genuinely moves — over
@@ -150,11 +154,69 @@ concurrent startup lot fetch hits Lighter's REST rate limit on a few
 more names (`[LOT] no lot metadata yet … will retry`; the 10-minute
 retry loop clears it, so restart well before a decision).
 
-Making the bound dynamic (accept any symbol the venue lists, keeping the
-per-symbol and gross/net caps as the real guard) remains the structural
-fix, tracked as bot-strategy#941: it needs a post-connect subscribe in
-dex-connector before the whitelist can go. With the pool listed in full,
-the manual step should only recur on a new listing.
+### `universe.mode: venue_listed` (bot-strategy#941)
+
+The structural fix for all of the above. With
+
+```yaml
+universe:
+  mode: venue_listed
+  symbols: [...]   # now only the connect-time WS subscription seed
+```
+
+the runtime no longer checks membership. It admits any symbol that
+**Lighter lists and has open for trading right now** (`status: active`,
+not `hidden`, not `force_reduce_only` — the pool's Lighter-side predicate
+minus `trading_hours`, which the producer's own screen still applies):
+
+- **Ahead of the decision.** Every 60 s the runtime re-reads the pending
+  signal file (only one that is ours, hashes, and is younger than
+  `signal.max_age_secs`; nothing is traded on it) and admits its new
+  symbols: `DexConnector::subscribe_symbols` adds `order_book/<id>` +
+  `market_stats/<id>` to the open WS connection (and to every reconnect),
+  then the lot metadata is fetched. The producer writes at :25 for a
+  00:30 decision, so the feed — and, live, the touch an entry needs
+  (bot-strategy#971) — is running by the decision. Log:
+  `[UNIVERSE] admitted ARB (venue_listed)`, and in dex-connector
+  `[MARKET_INFO] Added market ARB (market_id=…) after startup` for a
+  listing newer than the process.
+- **At the decision.** The full `signal.rs` validation still runs (hash,
+  freshness, caps, neutrality, and a symbol-shape check — ASCII letters,
+  digits, `_`). Then every symbol is checked against the venue's current
+  listing — including ones already subscribed (the seed, held legs,
+  earlier admissions), since a market can be delisted, hidden or turned
+  reduce-only after it was subscribed — and admitted if it was not
+  already. The connector memoises the listing for 30 s, so this is one
+  `orderBookDetails` read per decision, not one per symbol:
+  - the venue **refuses** one (not listed, inactive, hidden, reduce-only):
+    the **whole signal is rejected** — `rejected:unlisted_symbol`,
+    previous book held — the same fail-closed rule as `unknown_symbol` in
+    `fixed` mode. The refusal is remembered for 5 minutes, so a window
+    retried every tick does not turn into a REST loop.
+  - the listing or lot metadata **cannot be read** (REST error, rate
+    limit): `rejected:symbol_unavailable` for this tick, retried after
+    30 s inside the window; a reject spends no attempt.
+- The per-symbol weight cap and the gross / net caps are then the only
+  bound on *which* names the book holds: review them for any config that
+  turns this mode on (xsmom-695: `max_symbol_weight` 0.15 = $150 at
+  $1,000 gross).
+
+With the mode on, the producer's `--config` cross-check and
+`xsmom_universe_pool.py --check` only **note** names outside the seed
+(exit 0), the fetcher gets an empty `BOOK_UNIVERSE` (no whitelist to
+apply; `BOOK_UNIVERSE_MODE=venue_listed` in the fetch env), and none of
+the manual steps above are needed for a new listing. The seed can stay the
+current pool list: it only decides what is subscribed at startup.
+
+**Switching xsmom-695 over** needs, in order: the dex-connector release
+with `subscribe_symbols` (dex-connector#105) tagged and pinned in
+`Cargo.lock`, a book-runtime binary built from that lock deployed, then
+the one-line config change (`mode: venue_listed`) through Deploy Configs
+and a restart of `book-runtime-xsmom-695` (outside a decision window). A
+binary older than the mode fails to parse the config
+(`deny_unknown_fields`), and the installer's staged `--validate` catches
+that before promotion, so the binary must go first. After the restart,
+the `[CONFIG]` line shows `universe_mode=venue_listed`.
 
 ## Host install (CI, no start)
 

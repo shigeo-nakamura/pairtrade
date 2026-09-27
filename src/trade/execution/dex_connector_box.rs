@@ -732,6 +732,10 @@ impl DexConnector for DexConnectorBox {
     ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError> {
         self.inner.subscribe_price_updates()
     }
+
+    async fn subscribe_symbols(&self, symbols: &[String]) -> Result<(), DexError> {
+        self.inner.subscribe_symbols(symbols).await
+    }
 }
 
 #[cfg(test)]

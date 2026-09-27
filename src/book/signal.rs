@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::config::{SignalConfig, SizingConfig, UniverseConfig};
+use super::config::{is_plain_symbol, SignalConfig, SizingConfig, UniverseConfig, UniverseMode};
 
 /// `t` rounded *up* to the next whole second when it carries a fractional
 /// remainder, otherwise unchanged. Every engine tick time, window end,
@@ -90,6 +90,23 @@ pub enum SignalReject {
         actual: String,
     },
     UnknownSymbol(String),
+    /// `venue_listed`: a key that is not a plain venue symbol (see
+    /// `config::is_plain_symbol`); never handed to the connector.
+    MalformedSymbol(String),
+    /// `venue_listed`: the venue refused the symbol -- not listed, or not
+    /// open for trading (bot-strategy#941). Fail closed, like
+    /// `UnknownSymbol` in `fixed` mode.
+    UnlistedSymbol {
+        symbol: String,
+        reason: String,
+    },
+    /// `venue_listed`: the symbol could not be admitted *yet* (the listing
+    /// or its lot metadata could not be read). Retried on the next tick
+    /// inside the decision window.
+    SymbolUnavailable {
+        symbol: String,
+        reason: String,
+    },
     NonFiniteWeight(String),
     WeightAboveCap {
         symbol: String,
@@ -124,6 +141,9 @@ impl SignalReject {
             SignalReject::AsOfAfterGenerated => "as_of_after_generated",
             SignalReject::DecisionKeyMismatch { .. } => "decision_key_mismatch",
             SignalReject::UnknownSymbol(_) => "unknown_symbol",
+            SignalReject::MalformedSymbol(_) => "malformed_symbol",
+            SignalReject::UnlistedSymbol { .. } => "unlisted_symbol",
+            SignalReject::SymbolUnavailable { .. } => "symbol_unavailable",
             SignalReject::NonFiniteWeight(_) => "non_finite_weight",
             SignalReject::WeightAboveCap { .. } => "weight_above_cap",
             SignalReject::GrossAboveOne(_) => "gross_above_one",
@@ -255,34 +275,7 @@ pub fn validate(
     universe: &UniverseConfig,
     ctx: &DecisionContext<'_>,
 ) -> Result<ValidSignal, SignalReject> {
-    let file: SignalFile =
-        serde_json::from_str(body).map_err(|e| SignalReject::Unparseable(e.to_string()))?;
-    if file.schema_version != SCHEMA_VERSION {
-        return Err(SignalReject::SchemaVersion(file.schema_version));
-    }
-    if file.producer_id != signal_cfg.producer_id {
-        return Err(SignalReject::ProducerMismatch(file.producer_id));
-    }
-    // The exact string the producer wrote, not `file.as_of` re-formatted
-    // from the parsed DateTime<Utc> (see `canonical_payload`'s doc): both
-    // parses read the same already-validated body, so this one failing
-    // when the first succeeded is not reachable in practice.
-    let as_of_raw: String = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("as_of")?.as_str().map(str::to_string))
-        .ok_or_else(|| SignalReject::Unparseable("as_of is not a string".into()))?;
-    let expected = payload_sha256(
-        &file.producer_id,
-        &as_of_raw,
-        &file.decision_key,
-        &file.weights,
-    );
-    if !expected.eq_ignore_ascii_case(file.payload_sha256.trim()) {
-        return Err(SignalReject::HashMismatch {
-            expected,
-            actual: file.payload_sha256,
-        });
-    }
+    let (file, expected) = parse_verified(body, signal_cfg)?;
     let age = (ctx.now - file.generated_at).num_seconds();
     if age < -60 {
         return Err(SignalReject::FutureGenerated { ahead_secs: -age });
@@ -311,8 +304,20 @@ pub fn validate(
     let mut gross = 0.0;
     let mut net = 0.0;
     for (sym, w) in &file.weights {
-        if !universe.symbols.iter().any(|u| u == sym) {
-            return Err(SignalReject::UnknownSymbol(sym.clone()));
+        match universe.mode {
+            UniverseMode::Fixed => {
+                if !universe.symbols.iter().any(|u| u == sym) {
+                    return Err(SignalReject::UnknownSymbol(sym.clone()));
+                }
+            }
+            // Membership is the venue's listing, checked by the engine
+            // when it admits the symbol (bot-strategy#941); only the shape
+            // is checked here.
+            UniverseMode::VenueListed => {
+                if !is_plain_symbol(sym) {
+                    return Err(SignalReject::MalformedSymbol(sym.clone()));
+                }
+            }
         }
         if !w.is_finite() {
             return Err(SignalReject::NonFiniteWeight(sym.clone()));
@@ -344,6 +349,63 @@ pub fn validate(
         weights: file.weights,
         payload_sha256: expected,
     })
+}
+
+/// The symbols of a producer file that parses, is ours and hashes
+/// correctly -- without any decision-bound check. For admitting
+/// (subscribing) a `venue_listed` signal's new symbols ahead of the
+/// decision (bot-strategy#941): the producer writes the file minutes to
+/// hours before the decision, and a price feed has to be running by then.
+/// Nothing is *traded* on the strength of this; `validate` still runs in
+/// full at the decision. A file older than `max_age_secs` (the previous
+/// decision's, still on disk) is ignored.
+pub fn peek_symbols(
+    body: &str,
+    signal_cfg: &SignalConfig,
+    now: DateTime<Utc>,
+) -> Option<Vec<String>> {
+    let (file, _) = parse_verified(body, signal_cfg).ok()?;
+    if (now - file.generated_at).num_seconds() > signal_cfg.max_age_secs {
+        return None;
+    }
+    Some(file.weights.into_keys().collect())
+}
+
+/// Parse → schema_version → producer_id → hash. Returns the file and the
+/// recomputed payload hash.
+fn parse_verified(
+    body: &str,
+    signal_cfg: &SignalConfig,
+) -> Result<(SignalFile, String), SignalReject> {
+    let file: SignalFile =
+        serde_json::from_str(body).map_err(|e| SignalReject::Unparseable(e.to_string()))?;
+    if file.schema_version != SCHEMA_VERSION {
+        return Err(SignalReject::SchemaVersion(file.schema_version));
+    }
+    if file.producer_id != signal_cfg.producer_id {
+        return Err(SignalReject::ProducerMismatch(file.producer_id));
+    }
+    // The exact string the producer wrote, not `file.as_of` re-formatted
+    // from the parsed DateTime<Utc> (see `canonical_payload`'s doc): both
+    // parses read the same already-validated body, so this one failing
+    // when the first succeeded is not reachable in practice.
+    let as_of_raw: String = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("as_of")?.as_str().map(str::to_string))
+        .ok_or_else(|| SignalReject::Unparseable("as_of is not a string".into()))?;
+    let expected = payload_sha256(
+        &file.producer_id,
+        &as_of_raw,
+        &file.decision_key,
+        &file.weights,
+    );
+    if !expected.eq_ignore_ascii_case(file.payload_sha256.trim()) {
+        return Err(SignalReject::HashMismatch {
+            expected,
+            actual: file.payload_sha256,
+        });
+    }
+    Ok((file, expected))
 }
 
 #[cfg(test)]
@@ -719,6 +781,102 @@ mod tests {
         assert_eq!(
             sha256_hex(&s),
             "201ad4492e66594c520ce52afba3d269c61d1b7158e334a4d0ec008ab14258af"
+        );
+    }
+
+    fn venue_listed(mut c: BookConfig) -> BookConfig {
+        c.universe.mode = crate::book::config::UniverseMode::VenueListed;
+        c
+    }
+
+    #[test]
+    fn venue_listed_accepts_a_symbol_outside_the_seed_but_not_a_malformed_one() {
+        let fixed = cfg();
+        let vl = venue_listed(cfg());
+        let k = ctx("2026-09-06");
+        let outside = signal_json(
+            "test_producer",
+            ts("2026-09-06T00:20:00Z"),
+            ts("2026-09-06T00:00:00Z"),
+            "2026-09-06",
+            &[("BTC", 0.1), ("ARB", -0.1)],
+        );
+        // The whitelist still rules a fixed universe...
+        assert_eq!(
+            validate(&outside, &fixed.signal, &fixed.sizing, &fixed.universe, &k)
+                .unwrap_err()
+                .label(),
+            "unknown_symbol"
+        );
+        // ...but not a venue-listed one: the venue's listing is checked
+        // later, when the engine admits the symbol.
+        let v = validate(&outside, &vl.signal, &vl.sizing, &vl.universe, &k).unwrap();
+        assert!(v.weights.contains_key("ARB"));
+        // Everything else still applies (cap 0.5 in the test config).
+        let over = signal_json(
+            "test_producer",
+            ts("2026-09-06T00:20:00Z"),
+            ts("2026-09-06T00:00:00Z"),
+            "2026-09-06",
+            &[("ARB", 0.6), ("OP", -0.4)],
+        );
+        assert_eq!(
+            validate(&over, &vl.signal, &vl.sizing, &vl.universe, &k)
+                .unwrap_err()
+                .label(),
+            "weight_above_cap"
+        );
+        for bad in ["LIT/USDC", "BTC-PERP", "arb usd", ""] {
+            let b = signal_json(
+                "test_producer",
+                ts("2026-09-06T00:20:00Z"),
+                ts("2026-09-06T00:00:00Z"),
+                "2026-09-06",
+                &[("BTC", 0.1), (bad, -0.1)],
+            );
+            assert_eq!(
+                validate(&b, &vl.signal, &vl.sizing, &vl.universe, &k)
+                    .unwrap_err()
+                    .label(),
+                "malformed_symbol",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn peek_reads_only_a_fresh_file_that_is_ours_and_hashes() {
+        let c = cfg();
+        let now = ts("2026-09-06T00:40:00Z");
+        let body = signal_json(
+            "test_producer",
+            ts("2026-09-06T00:20:00Z"),
+            ts("2026-09-06T00:00:00Z"),
+            "2026-09-06",
+            &[("ARB", 0.1), ("OP", -0.1)],
+        );
+        assert_eq!(
+            peek_symbols(&body, &c.signal, now),
+            Some(vec!["ARB".to_string(), "OP".to_string()])
+        );
+        // Tampered weights: the hash no longer matches.
+        let tampered = body.replace("\"OP\":-0.1", "\"XRP\":-0.1");
+        assert_ne!(tampered, body);
+        assert_eq!(peek_symbols(&tampered, &c.signal, now), None);
+        // Someone else's file.
+        let other = signal_json(
+            "other",
+            ts("2026-09-06T00:20:00Z"),
+            ts("2026-09-06T00:00:00Z"),
+            "2026-09-06",
+            &[("ARB", 0.1)],
+        );
+        assert_eq!(peek_symbols(&other, &c.signal, now), None);
+        // The previous decision's file (max_age_secs 7200 in the test
+        // config) is not a reason to subscribe anything.
+        assert_eq!(
+            peek_symbols(&body, &c.signal, ts("2026-09-06T02:21:00Z")),
+            None
         );
     }
 }
