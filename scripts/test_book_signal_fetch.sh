@@ -165,4 +165,39 @@ if BOOK_SCHEDULE_KIND=calendar BOOK_DECISION_TIME_UTC= \
   bash "$HERE/book_signal_fetch.sh" "$T/bad_stale.json" "$T/dst3/signal.json" 2>/dev/null; then
   echo "FAIL: unchanged stale re-download passed on a calendar schedule" >&2; exit 1
 fi
+# universe.mode: venue_listed (bot-strategy#941): no whitelist, so a
+# symbol outside BTC,ETH is fine, but a key the runtime's
+# `config::is_plain_symbol` refuses (ASCII letters, digits, `_`, 1..=32)
+# must not displace the last good file.
+python3 - "$T" <<'PY'
+import hashlib, json, sys
+t = sys.argv[1]
+d = json.load(open(f"{t}/good.json"))
+def write(name, weights):
+    o = json.loads(json.dumps(d))
+    o["weights"] = weights
+    o["payload_sha256"] = hashlib.sha256(json.dumps(
+        {"as_of": o["as_of"], "decision_key": o["decision_key"],
+         "producer_id": o["producer_id"], "weights": o["weights"]},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+    json.dump(o, open(f"{t}/{name}.json", "w"), ensure_ascii=False)
+write("vl_good", {"BTC": 0.1, "ARB": -0.1})
+write("vl_edge", {"1000PEPE": 0.1, "k_" + "X" * 30: -0.1})
+for i, bad in enumerate(["BTC-PERP", "LIT/USDC", "BTC ", "X" * 33, "ÄRB", "A,B"]):
+    write(f"vl_bad{i}", {"BTC": 0.1, bad: -0.1})
+PY
+mkdir -p "$T/dst5"
+export BOOK_UNIVERSE= BOOK_UNIVERSE_MODE=venue_listed
+bash "$HERE/book_signal_fetch.sh" "$T/vl_good.json" "$T/dst5/signal.json" | grep -q "updated " \
+  || { echo "FAIL: venue_listed refused a symbol outside the seed" >&2; exit 1; }
+for i in 0 1 2 3 4 5; do
+  if bash "$HERE/book_signal_fetch.sh" "$T/vl_bad$i.json" "$T/dst5/signal.json" 2>/dev/null; then
+    echo "FAIL: venue_listed promoted malformed symbol fixture vl_bad$i" >&2; exit 1
+  fi
+  cmp -s "$T/vl_good.json" "$T/dst5/signal.json" || { echo "FAIL: vl_bad$i displaced the current file" >&2; exit 1; }
+done
+bash "$HERE/book_signal_fetch.sh" "$T/vl_edge.json" "$T/dst5/signal.json" | grep -q "updated " \
+  || { echo "FAIL: venue_listed refused a plain symbol at the length bound" >&2; exit 1; }
+export BOOK_UNIVERSE=BTC,ETH BOOK_UNIVERSE_MODE=
+
 echo "book_signal_fetch tests OK"

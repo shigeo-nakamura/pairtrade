@@ -12,7 +12,8 @@
 # BOOK_SIGNAL_PRODUCER_ID (producer identity) and BOOK_DECISION_TIME_UTC
 # (the decision time a date-keyed schedule derives from decision_key, for
 # the as_of look-ahead bound; empty for calendar schedules), plus the
-# weight constraints BOOK_UNIVERSE / BOOK_MAX_SYMBOL_WEIGHT /
+# weight constraints BOOK_UNIVERSE (+ BOOK_UNIVERSE_MODE: venue_listed has no
+# whitelist but refuses non-plain symbol keys) / BOOK_MAX_SYMBOL_WEIGHT /
 # BOOK_NET_TOLERANCE / BOOK_REQUIRE_DOLLAR_NEUTRAL, and the grid
 # (BOOK_SCHEDULE_KIND / BOOK_ANCHOR_DATE / BOOK_EVERY_DAYS) that says
 # which decision key is current. Any of them
@@ -55,11 +56,12 @@ if ! SUMMARY=$(BOOK_SIGNAL_MAX_AGE_SECS="${BOOK_SIGNAL_MAX_AGE_SECS:-}" \
   BOOK_NET_TOLERANCE="${BOOK_NET_TOLERANCE:-}" \
   BOOK_REQUIRE_DOLLAR_NEUTRAL="${BOOK_REQUIRE_DOLLAR_NEUTRAL:-}" \
   BOOK_UNIVERSE="${BOOK_UNIVERSE:-}" \
+  BOOK_UNIVERSE_MODE="${BOOK_UNIVERSE_MODE:-}" \
   BOOK_SCHEDULE_KIND="${BOOK_SCHEDULE_KIND:-}" \
   BOOK_ANCHOR_DATE="${BOOK_ANCHOR_DATE:-}" \
   BOOK_EVERY_DAYS="${BOOK_EVERY_DAYS:-}" \
   python3 - "$TMP" "$DST" <<'PY'
-import hashlib, json, math, os, sys
+import hashlib, json, math, os, re, sys
 from datetime import datetime, timedelta, timezone
 def _reject_constant(token):
     raise SystemExit(f"non-standard JSON constant {token} (the runtime's parser rejects it)")
@@ -218,6 +220,15 @@ if sha != str(d["payload_sha256"]).lower():
 # The weight constraints signal.rs enforces. Each is skipped when its
 # value is absent, but the installer always writes them.
 universe = {s for s in os.environ.get("BOOK_UNIVERSE", "").split(",") if s}
+if os.environ.get("BOOK_UNIVERSE_MODE", "").strip() == "venue_listed":
+    # No whitelist in this mode (bot-strategy#941): the runtime checks the
+    # venue's listing. It still refuses a key that is not a plain venue
+    # symbol (`config::is_plain_symbol`: ASCII letters, digits and `_`,
+    # 1..=32 chars -- mirrored exactly), so such a file must not displace
+    # the last good one here either.
+    bad = sorted(s for s in d["weights"] if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", s))
+    if bad:
+        raise SystemExit(f"weights name {len(bad)} malformed symbol(s): {', '.join(map(repr, bad))}")
 if universe:
     outside = sorted(set(d["weights"]) - universe)
     if outside:
