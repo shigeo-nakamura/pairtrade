@@ -29,7 +29,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from xsmom_signal_producer import universe_from_config  # noqa: E402
+from xsmom_signal_producer import universe_from_config, universe_mode_from_config  # noqa: E402
 
 LIGHTER = "https://mainnet.zklighter.elliot.ai/api/v1"
 FAPI = "https://fapi.binance.com"
@@ -93,6 +93,12 @@ def main(argv=None) -> int:
         # config so a leg the book still holds keeps its price feed.
         print(f"note: {len(extra)} configured symbol(s) outside the current "
               f"pool: {', '.join(extra)}", file=sys.stderr)
+    if missing and universe_mode_from_config(a.check) == "venue_listed":
+        # universe.symbols is only the subscription seed there; the runtime
+        # admits any symbol Lighter lists as active (bot-strategy#941).
+        print(f"{a.check}: universe.mode is venue_listed; {len(missing)} pool symbol(s) "
+              f"outside the seed are admitted at runtime: {', '.join(missing)}")
+        return 0
     if missing:
         print(f"{a.check}: {len(missing)} pool symbol(s) not in universe.symbols: "
               f"{', '.join(missing)}", file=sys.stderr)

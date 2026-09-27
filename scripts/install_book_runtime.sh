@@ -212,7 +212,11 @@ case "$KIND" in
     fi
     ;;
 esac
-if [ -z "$BOOK_UNIVERSE" ]; then
+# An empty list is only right for `universe.mode: venue_listed`, where the
+# venue's listing is the bound and the fetcher has no whitelist to check
+# (bot-strategy#941). A fetch env from a binary that predates the mode has
+# no BOOK_UNIVERSE_MODE and is treated as fixed.
+if [ -z "$BOOK_UNIVERSE" ] && [ "${BOOK_UNIVERSE_MODE:-fixed}" != "venue_listed" ]; then
   echo "universe.symbols is empty in $CONFIG_SOURCE" >&2
   exit 1
 fi

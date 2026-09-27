@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 
-use super::config::BookConfig;
+use super::config::{BookConfig, UniverseMode};
 use super::executor::{Executor, FillReport, PreSendAbort};
 use super::ledger::Ledger;
 use super::rebalance::{self, IntentKind, LotMeta, OrderIntent, Plan, Side};
@@ -90,6 +90,36 @@ impl SignalSource for DirSignalSource {
     }
 }
 
+/// Makes a symbol outside the configured seed tradable in `universe.mode:
+/// venue_listed` (bot-strategy#941): subscribe its price feed and return
+/// its lot metadata. `book_runtime` implements it on the connector
+/// (`DexConnector::subscribe_symbols`, which is also the venue-listing
+/// bound); without one (replay, tests) a symbol is admitted when the
+/// executor has lot metadata for it.
+#[async_trait::async_trait]
+pub trait SymbolFeed: Send + Sync {
+    async fn admit(&self, symbol: &str) -> std::result::Result<LotMeta, AdmitError>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdmitError {
+    /// The venue does not list the symbol, or does not have it open for
+    /// trading. A signal naming it is rejected whole (fail closed).
+    Refused(String),
+    /// The listing or the lot metadata could not be read right now; the
+    /// next attempt may succeed.
+    Unavailable(String),
+}
+
+/// How often the pending signal file is re-read to admit its new symbols
+/// ahead of the decision.
+const PEEK_INTERVAL_SECS: i64 = 60;
+/// How long a failed admission is remembered before the venue is asked
+/// again, so a decision window retried every tick does not become a REST
+/// loop.
+const REFUSED_RETRY_SECS: i64 = 300;
+const UNAVAILABLE_RETRY_SECS: i64 = 30;
+
 pub struct BookEngine {
     pub cfg: BookConfig,
     scheduler: Scheduler,
@@ -118,6 +148,15 @@ pub struct BookEngine {
     /// stale number); reductions and flattens still run.
     equity_ready: bool,
     config_fp: String,
+    /// `venue_listed` only (bot-strategy#941): how new symbols are made
+    /// tradable, the symbols admitted so far this process (on top of the
+    /// seed, the book and the persisted target), the last failed
+    /// admission per symbol, and the last time the signal file was
+    /// peeked.
+    symbol_feed: Option<Arc<dyn SymbolFeed>>,
+    admitted: BTreeSet<String>,
+    admission_failures: HashMap<String, (i64, AdmitError)>,
+    last_peek: Option<i64>,
 }
 
 /// Fold `from` (a later accrual attempt's per-symbol breakdown) onto
@@ -253,7 +292,21 @@ impl BookEngine {
             positions_ready: true,
             equity_ready: true,
             config_fp,
+            symbol_feed: None,
+            admitted: BTreeSet::new(),
+            admission_failures: HashMap::new(),
+            last_peek: None,
         })
+    }
+
+    /// How `venue_listed` admits a new symbol (see [`SymbolFeed`]).
+    pub fn set_symbol_feed(&mut self, feed: Arc<dyn SymbolFeed>) {
+        self.symbol_feed = Some(feed);
+    }
+
+    /// Symbols admitted after startup (`venue_listed`), for the status line.
+    pub fn admitted_symbols(&self) -> &BTreeSet<String> {
+        &self.admitted
     }
 
     pub fn state_path(&self) -> &Path {
@@ -282,7 +335,136 @@ impl BookEngine {
                 v.push(s.clone());
             }
         }
+        // The accepted target of the current decision: a leg whose opening
+        // is still a residual must stay priced for the retry.
+        if let Some(r) = &self.state.last_decision {
+            for s in r.target_qty.keys() {
+                if !v.contains(s) {
+                    v.push(s.clone());
+                }
+            }
+        }
+        for s in &self.admitted {
+            if !v.contains(s) {
+                v.push(s.clone());
+            }
+        }
         v
+    }
+
+    fn venue_listed(&self) -> bool {
+        self.cfg.universe.mode == UniverseMode::VenueListed
+    }
+
+    /// Admit every symbol of `symbols` that is not tracked yet
+    /// (`venue_listed`): subscribe its feed and load its lot metadata.
+    /// Returns the ones that could not be admitted, refusals first. A
+    /// symbol whose last attempt failed recently is not retried until its
+    /// backoff has passed; its recorded failure is returned instead.
+    async fn admit(&mut self, now: i64, symbols: &[String]) -> Vec<(String, AdmitError)> {
+        let tracked = self.tracked_symbols();
+        let mut failed = Vec::new();
+        let mut todo = Vec::new();
+        for s in symbols {
+            if tracked.contains(s) {
+                continue;
+            }
+            if let Some((at, err)) = self.admission_failures.get(s) {
+                let wait = match err {
+                    AdmitError::Refused(_) => REFUSED_RETRY_SECS,
+                    AdmitError::Unavailable(_) => UNAVAILABLE_RETRY_SECS,
+                };
+                if now - at < wait {
+                    failed.push((s.clone(), err.clone()));
+                    continue;
+                }
+            }
+            todo.push(s.clone());
+        }
+        let results: Vec<(String, std::result::Result<LotMeta, AdmitError>)> =
+            match &self.symbol_feed {
+                Some(feed) => {
+                    // Concurrent: this runs inside `tick`, so one venue
+                    // round-trip per symbol in sequence would hold the
+                    // runtime's select! loop for their sum.
+                    let mut set = tokio::task::JoinSet::new();
+                    for s in todo {
+                        let feed = Arc::clone(feed);
+                        set.spawn(async move {
+                            let r = feed.admit(&s).await;
+                            (s, r)
+                        });
+                    }
+                    let mut out = Vec::new();
+                    while let Some(res) = set.join_next().await {
+                        match res {
+                            Ok(r) => out.push(r),
+                            Err(e) => log::error!("[UNIVERSE] admission task panicked: {e}"),
+                        }
+                    }
+                    out
+                }
+                None => {
+                    let mut out = Vec::new();
+                    for s in todo {
+                        let r = self
+                            .exec
+                            .lot_meta(&s)
+                            .await
+                            .map_err(|e| AdmitError::Refused(e.to_string()));
+                        out.push((s, r));
+                    }
+                    out
+                }
+            };
+        for (s, r) in results {
+            match r {
+                Ok(lot) => {
+                    log::info!("[UNIVERSE] admitted {s} (venue_listed)");
+                    self.lots.insert(s.clone(), lot);
+                    self.admission_failures.remove(&s);
+                    self.admitted.insert(s);
+                }
+                Err(e) => {
+                    log::warn!("[UNIVERSE] {s} not admitted: {e:?}");
+                    self.admission_failures.insert(s.clone(), (now, e.clone()));
+                    failed.push((s, e));
+                }
+            }
+        }
+        failed.sort_by_key(|(s, e)| (!matches!(e, AdmitError::Refused(_)), s.clone()));
+        failed
+    }
+
+    /// `venue_listed`: read the pending signal file and admit its new
+    /// symbols now, so their feed is running by the decision. The file is
+    /// written minutes to hours ahead (XSMOM: 00:25 for 00:30). Only a file
+    /// that is ours, hashes and is fresh counts; nothing is traded on it.
+    async fn peek_and_admit(&mut self, now: i64) {
+        // The decision whose window is open, else the next one (a live
+        // `FileSignalSource` ignores the key; the per-key replay source
+        // needs the right one).
+        let Some(d) = self
+            .scheduler
+            .current(now)
+            .filter(|d| now <= d.window_end)
+            .or_else(|| self.scheduler.next_after(now))
+        else {
+            return;
+        };
+        let body = match self.signals.read(&d.key, now) {
+            Ok(Some(b)) => b,
+            _ => return,
+        };
+        let now_dt = Utc.timestamp_opt(now, 0).single().unwrap_or_else(Utc::now);
+        let Some(symbols) = signal::peek_symbols(&body, &self.cfg.signal, now_dt) else {
+            return;
+        };
+        let symbols: Vec<String> = symbols
+            .into_iter()
+            .filter(|s| crate::book::config::is_plain_symbol(s))
+            .collect();
+        let _ = self.admit(now, &symbols).await;
     }
 
     async fn lot_for(&mut self, symbol: &str) -> Option<LotMeta> {
@@ -313,6 +495,10 @@ impl BookEngine {
 
     /// One engine step at `now` (unix seconds).
     pub async fn tick(&mut self, now: i64) -> Result<()> {
+        if self.venue_listed() && self.last_peek.is_none_or(|t| now - t >= PEEK_INTERVAL_SECS) {
+            self.last_peek = Some(now);
+            self.peek_and_admit(now).await;
+        }
         let symbols = self.tracked_symbols();
         let mut prices = self.exec.prices(&symbols).await;
 
@@ -1155,7 +1341,38 @@ impl BookEngine {
                 return;
             }
         };
-        self.apply_signal(now, d, &sig, prices, attempts).await;
+        if !self.venue_listed() {
+            self.apply_signal(now, d, &sig, prices, attempts).await;
+            return;
+        }
+        // `venue_listed` (bot-strategy#941): the venue's listing is the
+        // bound. A symbol it refuses rejects the whole signal, as an
+        // unknown symbol does in `fixed` mode; one that cannot be admitted
+        // *yet* rejects this tick and is retried inside the window.
+        let symbols: Vec<String> = sig.weights.keys().cloned().collect();
+        if let Some((symbol, err)) = self.admit(now, &symbols).await.into_iter().next() {
+            let r = match err {
+                AdmitError::Refused(reason) => SignalReject::UnlistedSymbol { symbol, reason },
+                AdmitError::Unavailable(reason) => {
+                    SignalReject::SymbolUnavailable { symbol, reason }
+                }
+            };
+            self.record_reject(now, d, r.label(), r.to_string(), attempts);
+            return;
+        }
+        // A symbol admitted this very tick was not in the tick's price
+        // request.
+        let unpriced: Vec<String> = symbols
+            .into_iter()
+            .filter(|s| !prices.contains_key(s))
+            .collect();
+        if unpriced.is_empty() {
+            self.apply_signal(now, d, &sig, prices, attempts).await;
+        } else {
+            let mut prices = prices.clone();
+            prices.extend(self.exec.prices(&unpriced).await);
+            self.apply_signal(now, d, &sig, &prices, attempts).await;
+        }
     }
 
     async fn apply_signal(
@@ -4146,5 +4363,204 @@ mod tests {
         assert!(engine.positions_ready);
         assert_eq!(engine.state.positions["SOL"].qty, 2.0);
         assert_eq!(engine.state.positions["SOL"].avg_price, 210.0);
+    }
+
+    // ------------------------------------------------------------------
+    // universe.mode: venue_listed (bot-strategy#941)
+    // ------------------------------------------------------------------
+
+    /// A venue as the connector presents it: `listed` symbols are admitted
+    /// (and, like the WS snapshot after a subscribe, start pricing in the
+    /// paper book); `unavailable_first` fail once as a transient; anything
+    /// else is refused.
+    struct FakeVenue {
+        exec: Arc<PaperExecutor>,
+        listed: Vec<(&'static str, f64)>,
+        unavailable_first: Mutex<Vec<&'static str>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SymbolFeed for FakeVenue {
+        async fn admit(&self, symbol: &str) -> std::result::Result<LotMeta, AdmitError> {
+            self.calls.lock().unwrap().push(symbol.to_string());
+            {
+                let mut first = self.unavailable_first.lock().unwrap();
+                if let Some(i) = first.iter().position(|s| *s == symbol) {
+                    first.remove(i);
+                    return Err(AdmitError::Unavailable("listing read failed".into()));
+                }
+            }
+            let Some((_, px)) = self.listed.iter().find(|(s, _)| *s == symbol) else {
+                return Err(AdmitError::Refused(format!("{symbol}: not listed")));
+            };
+            let lot = LotMeta {
+                size_decimals: 1,
+                min_order_qty: None,
+            };
+            self.exec.set_lot(symbol, lot).await;
+            self.exec.set_price(symbol, *px).await;
+            Ok(lot)
+        }
+    }
+
+    async fn venue_listed_engine(
+        dir: &Path,
+        listed: Vec<(&'static str, f64)>,
+        unavailable_first: Vec<&'static str>,
+    ) -> (BookEngine, Arc<FakeVenue>, BookConfig) {
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir);
+        cfg.universe.mode = UniverseMode::VenueListed;
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir, vec![]).await;
+        let venue = Arc::new(FakeVenue {
+            exec,
+            listed,
+            unavailable_first: Mutex::new(unavailable_first),
+            calls: Mutex::new(Vec::new()),
+        });
+        engine.set_symbol_feed(venue.clone());
+        (engine, venue, cfg)
+    }
+
+    #[tokio::test]
+    async fn venue_listed_subscribes_a_new_listing_before_the_decision_and_trades_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec![]).await;
+        let d = ts("2026-09-06T00:30:00Z");
+        // ARB is not in the seed (BTC/ETH/SOL/DOT): a fixed universe
+        // rejects this whole file as unknown_symbol.
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("ARB", -0.5)]);
+
+        // Five minutes before the decision, the file is already there
+        // (written at d - 10 min): its new symbol is subscribed now, so a
+        // feed is running when the decision comes.
+        engine.tick(d.timestamp() - 300).await.unwrap();
+        assert_eq!(*venue.calls.lock().unwrap(), vec!["ARB".to_string()]);
+        assert!(engine.admitted_symbols().contains("ARB"));
+        assert!(
+            engine
+                .state
+                .last_decision
+                .as_ref()
+                .is_none_or(|r| r.key != "2026-09-06"),
+            "nothing is decided ahead of the decision time"
+        );
+        assert!(engine.state.is_flat());
+
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Applied, "{:?}", rec);
+        assert!(engine.state.positions["ARB"].qty < 0.0);
+        assert!(engine.state.positions["BTC"].qty > 0.0);
+        // Admitted once; the decision did not ask again.
+        assert_eq!(venue.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn venue_listed_rejects_the_whole_signal_when_the_venue_refuses_a_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec![]).await;
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(
+            dir.path(),
+            "2026-09-06",
+            d,
+            &[("BTC", 0.25), ("ARB", 0.25), ("NOPE", -0.5)],
+        );
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Rejected);
+        assert!(
+            rec.reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unlisted_symbol") && r.contains("NOPE")),
+            "{:?}",
+            rec.reject_reason
+        );
+        assert_eq!(engine.signal_status, "rejected:unlisted_symbol");
+        // Fail closed: nothing traded, not even the listed legs.
+        assert!(engine.state.is_flat());
+        // The refusal is remembered: the next ticks inside the window do
+        // not turn into a request per tick.
+        let asked = venue.calls.lock().unwrap().len();
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        engine.tick(d.timestamp() + 10).await.unwrap();
+        assert_eq!(venue.calls.lock().unwrap().len(), asked);
+        assert!(engine.state.is_flat());
+    }
+
+    #[tokio::test]
+    async fn a_symbol_that_cannot_be_admitted_yet_is_retried_inside_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec!["ARB"]).await;
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("ARB", -0.5)]);
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Rejected);
+        assert_eq!(engine.signal_status, "rejected:symbol_unavailable");
+        assert_eq!(rec.attempts, 0, "a reject spends no attempt");
+        // Inside the backoff: not asked again.
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        assert_eq!(venue.calls.lock().unwrap().len(), 1);
+        // After it: admitted, and the decision goes through.
+        engine
+            .tick(d.timestamp() + UNAVAILABLE_RETRY_SECS + 5)
+            .await
+            .unwrap();
+        assert_eq!(venue.calls.lock().unwrap().len(), 2);
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Applied, "{:?}", rec);
+        assert!(engine.state.positions["ARB"].qty < 0.0);
+    }
+
+    #[tokio::test]
+    async fn fixed_mode_never_asks_the_venue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec![]).await;
+        engine.cfg.universe.mode = UniverseMode::Fixed;
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("ARB", -0.5)]);
+        engine.tick(d.timestamp() - 300).await.unwrap();
+        engine.tick(d.timestamp()).await.unwrap();
+        assert!(venue.calls.lock().unwrap().is_empty());
+        assert_eq!(engine.signal_status, "rejected:unknown_symbol");
+        assert!(engine.state.is_flat());
+    }
+
+    #[tokio::test]
+    async fn without_a_feed_venue_listed_admits_what_the_executor_has_lot_metadata_for() {
+        // Replay's path: lots.json stands in for the listing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        cfg.universe.mode = UniverseMode::VenueListed;
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        exec.set_lot(
+            "ARB",
+            LotMeta {
+                size_decimals: 1,
+                min_order_qty: None,
+            },
+        )
+        .await;
+        exec.set_price("ARB", 0.5).await;
+        exec.set_price("XYZ", 1.0).await;
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("XYZ", -0.5)]);
+        engine.tick(d.timestamp()).await.unwrap();
+        assert_eq!(engine.signal_status, "rejected:unlisted_symbol");
+
+        let d2 = ts("2026-09-11T00:30:00Z");
+        write_signal(dir.path(), "2026-09-11", d2, &[("BTC", 0.5), ("ARB", -0.5)]);
+        engine.tick(d2.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.outcome, DecisionOutcome::Applied, "{:?}", rec);
+        assert!(engine.state.positions["ARB"].qty < 0.0);
     }
 }

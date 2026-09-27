@@ -37,7 +37,10 @@ venue: lighter                    # must be a connector this binary was built wi
 dry_run: true                     # paper fills; live requires BOOK_CONFIRM_LIVE=yes-i-mean-it too
 
 universe:
-  symbols: [BTC, ETH, SOL, ...]   # whitelist; weights on other symbols reject the signal
+  mode: fixed                     # fixed (default) | venue_listed (bot-strategy#941)
+  symbols: [BTC, ETH, SOL, ...]   # fixed: whitelist, weights on other symbols reject the signal
+                                  # venue_listed: WS subscription seed only; any symbol Lighter
+                                  # lists as active is admitted, one it refuses rejects the signal
 
 schedule:
   kind: interval_days             # interval_days | daily | calendar
@@ -127,7 +130,9 @@ as bot-strategy#580).
   runtime applies each key at most once; a file for a key already applied
   or skipped is ignored.
 - `weights` are fractions of `sizing.gross_notional_usd`; `sum |w| <= 1`,
-  each `|w| <= max_symbol_weight`, every symbol in `universe.symbols`. When
+  each `|w| <= max_symbol_weight`, every symbol in `universe.symbols`
+  (`fixed`) or listed and active on the venue (`venue_listed`, see
+  `book-runtime-operations.md`). When
   `require_dollar_neutral`, `|sum w| <= net_tolerance`. An empty map is a
   valid "go flat" instruction.
 - `payload_sha256` is the sha256 of the canonical JSON
@@ -318,7 +323,8 @@ reduce_only }`.
   stays on the book, trading stays suppressed) rather than closing against
   the stored basis, which would realize exactly zero and then drop the
   leg, destroying the evidence of what it actually made. A leg the venue no longer holds is dropped once it has been booked. The
-  runtime subscribes prices for the universe plus every persisted leg, and
+  runtime subscribes prices for the universe plus every persisted leg (and,
+  in `venue_listed`, each symbol it admits at runtime), and
   a leg adopted outside that set is priced from the venue ticker (60 s
   cache) so a reduce-only close can always be planned *and* sent on the
   same tick, including a halt flatten. A WS mid older than 30 s is treated

@@ -5486,6 +5486,15 @@ mod tests {
         > {
             unimplemented!("QuoteOnly stub: subscribe_price_updates must not be called on the DRY_RUN exit path")
         }
+
+        async fn subscribe_symbols(
+            &self,
+            _symbols: &[String],
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!(
+                "QuoteOnly stub: subscribe_symbols must not be called on the DRY_RUN exit path"
+            )
+        }
     }
 
     fn engine_with_stops(dir: &std::path::Path) -> Engine {

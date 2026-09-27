@@ -7968,6 +7968,13 @@ mod tests {
         {
             unimplemented!("the test drives latest_price directly")
         }
+
+        async fn subscribe_symbols(
+            &self,
+            _symbols: &[String],
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!("the test drives latest_price directly")
+        }
     }
 
     struct Harness {

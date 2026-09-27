@@ -160,6 +160,23 @@ def universe_from_config(path: str) -> set:
     return syms
 
 
+def universe_mode_from_config(path: str) -> str:
+    """`universe.mode` of the deployed config: "fixed" (the default) or
+    "venue_listed" (bot-strategy#941). In venue_listed the runtime admits
+    any symbol Lighter lists and has open for trading, so `universe.symbols`
+    is only its subscription seed, not a whitelist. Same regex reading as
+    `universe_from_config`; an unknown value is an error, not a guess."""
+    text = open(path).read()
+    block = re.search(r"^universe:\s*$(.*?)^[a-z_]+:", text, re.M | re.S)
+    if not block:
+        raise SystemExit(f"{path}: no universe: block")
+    m = re.search(r"^\s+mode:\s*([A-Za-z_]+)\s*(?:#.*)?$", block.group(1), re.M)
+    mode = m.group(1) if m else "fixed"
+    if mode not in ("fixed", "venue_listed"):
+        raise SystemExit(f"{path}: universe.mode {mode!r} is not fixed or venue_listed")
+    return mode
+
+
 def _scalar_from_config(text: str, section: str, key: str, path: str) -> float:
     block = re.search(rf"^{section}:\s*$(.*?)(?:^[a-z_]+:|\Z)", text, re.M | re.S)
     if not block:
@@ -235,7 +252,17 @@ def main() -> int:
         # reject the entire signal and hold the previous book. Surface it
         # here, named, instead of leaving it to be found in status.json.
         outside = sorted(set(sig["weights"]) - universe_from_config(a.config))
-        if outside:
+        if outside and universe_mode_from_config(a.config) == "venue_listed":
+            # Not a rejection there: the runtime subscribes them when the
+            # file arrives and rejects the file only if Lighter does not
+            # list one of them as active (bot-strategy#941).
+            print(
+                f"note: {today} book has {len(outside)} symbol(s) outside the subscription seed "
+                f"of {a.config} (universe.mode: venue_listed, admitted at runtime): "
+                f"{', '.join(outside)}",
+                file=sys.stderr,
+            )
+        elif outside:
             print(
                 f"refusing: {today} book has {len(outside)} symbol(s) outside the deployed "
                 f"universe ({a.config}): {', '.join(outside)}. Add them to universe.symbols "
