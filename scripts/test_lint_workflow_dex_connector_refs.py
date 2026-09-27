@@ -396,7 +396,7 @@ class RepositoryTree(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             workflows = Path(tmp) / "workflows"
             shutil.copytree(REPO_ROOT / ".github" / "workflows", workflows)
-            target = workflows / "deploy-arcus-spot-executor.yml"
+            target = workflows / "deploy-bull-holder.yml"
             body = target.read_text()
             mutated = body.replace(
                 "      dex-connector-ref: ${{ needs.resolve-ref.outputs.ref }}",
