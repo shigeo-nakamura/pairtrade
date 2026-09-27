@@ -1,10 +1,15 @@
-#[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
+#[cfg(any(
+    feature = "lighter-sdk",
+    feature = "hyperliquid-sdk",
+    feature = "arcus-sdk"
+))]
 use debot_utils::decrypt_data_with_kms;
 use rust_decimal::Error as DecimalParseError;
 #[cfg(any(
     feature = "lighter-sdk",
     feature = "extended-sdk",
-    feature = "hyperliquid-sdk"
+    feature = "hyperliquid-sdk",
+    feature = "arcus-sdk"
 ))]
 use std::env;
 use std::fmt;
@@ -39,7 +44,11 @@ pub enum ConfigError {
     ParseIntError(ParseIntError),
     ParseFloatError(ParseFloatError),
     DecimalParseError(DecimalParseError),
-    #[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
+    #[cfg(any(
+        feature = "lighter-sdk",
+        feature = "hyperliquid-sdk",
+        feature = "arcus-sdk"
+    ))]
     OtherError(String),
 }
 
@@ -49,7 +58,11 @@ impl fmt::Display for ConfigError {
             ConfigError::ParseIntError(e) => write!(f, "Parse int error: {}", e),
             ConfigError::ParseFloatError(e) => write!(f, "Parse float error: {}", e),
             ConfigError::DecimalParseError(e) => write!(f, "Decimal parse error: {}", e),
-            #[cfg(any(feature = "lighter-sdk", feature = "hyperliquid-sdk"))]
+            #[cfg(any(
+                feature = "lighter-sdk",
+                feature = "hyperliquid-sdk",
+                feature = "arcus-sdk"
+            ))]
             ConfigError::OtherError(e) => write!(f, "Other error: {}", e),
         }
     }
@@ -246,7 +259,7 @@ pub async fn get_extended_config_from_env() -> Result<ExtendedConfig, ConfigErro
 
 /// Instance-suffixed env lookup shared by the venue loaders: `NAME_<SUFFIX>`
 /// (suffix = upper-cased instance id, '-' -> '_') wins over bare `NAME`.
-#[cfg(feature = "hyperliquid-sdk")]
+#[cfg(any(feature = "hyperliquid-sdk", feature = "arcus-sdk"))]
 fn suffixed_env(name: &str, instance_id: Option<&str>) -> Option<String> {
     if let Some(id) = instance_id {
         let suffix = id.to_uppercase().replace('-', "_");
@@ -352,5 +365,117 @@ pub async fn get_hyperliquid_account_config_from_env(
         max_taker_notional,
         max_taker_slippage_bps,
         max_taker_book_age_ms,
+    })
+}
+
+/// Arcus Perps connector config (bot-strategy#1080). Every variable accepts
+/// the `_<INSTANCE>` suffix (same rule as the Lighter / Hyperliquid loaders).
+///
+/// - `ARCUS_REST_ENDPOINT` / `ARCUS_WEBSOCKET_ENDPOINT` — default mainnet
+///   (`https://api.arcus.xyz`, `wss://api.arcus.xyz/v1/ws`); point both at
+///   `api.testnet.arcus.xyz` for the testnet smoke.
+/// - `ARCUS_ADDRESS` — master Ethereum address that owns the API key.
+///   Optional when `with_signer` is false (public market data only).
+/// - `ARCUS_ACCOUNT_INDEX` — subaccount 0-9 (default 0).
+/// - `ARCUS_API_PRIVATE_KEY` — Ed25519 seed hex, KMS-encrypted with
+///   `ENCRYPTED_DATA_KEY` exactly like the Lighter keys, or
+///   `ARCUS_PLAIN_API_PRIVATE_KEY` (testing only). Required when
+///   `with_signer`; never read otherwise, so a dry-run connector is
+///   structurally unable to sign.
+/// - `ARCUS_API_KEY` — optional public key; dex-connector rejects it when it
+///   does not match the private key.
+#[cfg(feature = "arcus-sdk")]
+pub struct ArcusConfig {
+    pub base_url: String,
+    pub websocket_url: String,
+    pub address: Option<String>,
+    pub account_index: u8,
+    pub api_key: Option<String>,
+    pub api_private_key_hex: Option<String>,
+}
+
+#[cfg(feature = "arcus-sdk")]
+impl fmt::Debug for ArcusConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArcusConfig")
+            .field("base_url", &self.base_url)
+            .field("websocket_url", &self.websocket_url)
+            .field("address", &self.address)
+            .field("account_index", &self.account_index)
+            .field("api_key", &self.api_key)
+            .field(
+                "api_private_key_hex",
+                &self.api_private_key_hex.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[cfg(feature = "arcus-sdk")]
+pub async fn get_arcus_config_from_env(
+    instance_id: Option<&str>,
+    with_signer: bool,
+) -> Result<ArcusConfig, ConfigError> {
+    let base_url = suffixed_env("ARCUS_REST_ENDPOINT", instance_id)
+        .unwrap_or_else(|| "https://api.arcus.xyz".to_string());
+    let websocket_url = suffixed_env("ARCUS_WEBSOCKET_ENDPOINT", instance_id)
+        .unwrap_or_else(|| "wss://api.arcus.xyz/v1/ws".to_string());
+    let address = suffixed_env("ARCUS_ADDRESS", instance_id);
+    let account_index = match suffixed_env("ARCUS_ACCOUNT_INDEX", instance_id) {
+        Some(raw) => raw.trim().parse::<u8>().map_err(|_| {
+            ConfigError::OtherError(format!("ARCUS_ACCOUNT_INDEX '{raw}' is not 0-9"))
+        })?,
+        None => 0,
+    };
+    if !with_signer {
+        return Ok(ArcusConfig {
+            base_url,
+            websocket_url,
+            address,
+            account_index,
+            api_key: None,
+            api_private_key_hex: None,
+        });
+    }
+    let address = address.ok_or_else(|| {
+        ConfigError::OtherError("ARCUS_ADDRESS must be set for a live Arcus connector".to_owned())
+    })?;
+    let plain = suffixed_env("ARCUS_PLAIN_API_PRIVATE_KEY", instance_id);
+    let encrypted = suffixed_env("ARCUS_API_PRIVATE_KEY", instance_id);
+    let private_key = match (plain, encrypted) {
+        (Some(plain), _) => {
+            log::warn!("[arcus] using PLAIN API private key (testing only)");
+            plain
+        }
+        (None, Some(encrypted)) => {
+            let encrypted_data_key = env::var("ENCRYPTED_DATA_KEY")
+                .map_err(|_| {
+                    ConfigError::OtherError(
+                        "ENCRYPTED_DATA_KEY must be set to decrypt ARCUS_API_PRIVATE_KEY"
+                            .to_owned(),
+                    )
+                })?
+                .replace(' ', "");
+            let bytes = decrypt_data_with_kms(&encrypted_data_key, encrypted, true)
+                .await
+                .map_err(|_| ConfigError::OtherError("decrypt ARCUS_API_PRIVATE_KEY".to_owned()))?;
+            String::from_utf8(bytes).map_err(|_| {
+                ConfigError::OtherError("ARCUS_API_PRIVATE_KEY is not UTF-8 hex".to_owned())
+            })?
+        }
+        (None, None) => {
+            return Err(ConfigError::OtherError(
+                "ARCUS_API_PRIVATE_KEY (or ARCUS_PLAIN_API_PRIVATE_KEY) must be set for a live Arcus connector"
+                    .to_owned(),
+            ))
+        }
+    };
+    Ok(ArcusConfig {
+        base_url,
+        websocket_url,
+        address: Some(address),
+        account_index,
+        api_key: suffixed_env("ARCUS_API_KEY", instance_id),
+        api_private_key_hex: Some(private_key.trim().to_string()),
     })
 }

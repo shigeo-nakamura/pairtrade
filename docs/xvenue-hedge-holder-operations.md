@@ -104,6 +104,85 @@ Status: the single-symbol fields the card reads (`target_qty`, `net_*`,
 figures the guards use; `hedge_holder.books.<SYM>` has every book's own
 target / held sizes / net / basis.
 
+## Short leg on Arcus Perps (bot-strategy#1080)
+
+Either leg can run on Arcus Perps: `HEDGE_SHORT_VENUE=arcus` (or
+`HEDGE_LONG_VENUE`), default `lighter`. The purpose is RH-Lighter long /
+Arcus short: the RH long keeps earning RH points (they come from held
+hedged OI; the Core short earned 0), and the short leg can earn Arcus
+points. An env without the venue variables runs exactly as before, with the
+same config fingerprint.
+
+**Env** (see the commented block at the end of
+`scripts/debot-xvenue-hedge-holder.env.example`). Every name takes the
+`_<INSTANCE>` suffix of `HEDGE_SHORT_INSTANCE`.
+
+| variable | meaning |
+|---|---|
+| `HEDGE_SHORT_VENUE=arcus` | short leg on Arcus |
+| `ARCUS_ADDRESS` | master wallet that owns the API key (required live) |
+| `ARCUS_ACCOUNT_INDEX` | subaccount 0-9 (default 0) |
+| `ARCUS_API_PRIVATE_KEY` | Ed25519 seed hex, KMS-encrypted (`ENCRYPTED_DATA_KEY`) — or `ARCUS_PLAIN_API_PRIVATE_KEY` for testing |
+| `ARCUS_API_KEY` | public key hex, optional cross-check |
+| `ARCUS_REST_ENDPOINT` / `ARCUS_WEBSOCKET_ENDPOINT` | default mainnet; testnet `api.testnet.arcus.xyz` |
+| `HEDGE_SYMBOLS=BTC:1.2/1.667` | per-leg MMR `LONG/SHORT` (Arcus BTC 1.667 %, stocks 6.667 %; off-hours stock IMF is 15 %) |
+| `HEDGE_FILL_WAIT_SECS=3,6,10` | Arcus acks orders asynchronously (202); re-read positions longer |
+| `HEDGE_ARCUS_LIVE_CONFIRM=1080` | second live gate for any Arcus leg, on top of `HEDGE_LIVE_CONFIRM` |
+
+A dry-run Arcus connector never loads the signer key (it only reads public
+market data). A live one refuses to start without `ARCUS_ADDRESS` and a
+private key. Status and events carry `exchange` (`lighter` / `arcus`) next
+to the existing `instance` / `venue` fields.
+
+Differences from Core to keep in mind:
+
+- **Funding is not identical** (Arcus BTC median +0.00125 %/h vs the
+  Lighter +0.0012 %/h cap). The pair's carry is real and must be measured,
+  not assumed to be zero.
+- **Oracles differ.** Basis and liquidation timing on the two accounts are
+  less correlated than RH vs Core. Keep `HEDGE_LIQ_GUARD_PCT` at least as
+  wide.
+- **BTC first.** Arcus single-stock books are thin ($10k taker impact of
+  7–8 bp) and stock margin jumps off-hours.
+
+### Testnet smoke (owner, before any mainnet move)
+
+1. Create a **testnet** API key (testnet.arcus.xyz/api-keys) and fund it
+   with **Testnet Deposit**.
+2. Run the dex-connector ignored smoke tests first (they place a post-only
+   order, cancel it, arm/disarm the dead man's switch, then IOC + close):
+   `ARCUS_TESTNET_ADDRESS=0x… ARCUS_TESTNET_API_PRIVATE_KEY_HEX=… cargo test --features arcus-sdk -- --ignored arcus`
+   in dex-connector.
+3. Then run the holder in DRY_RUN against testnet, with the short leg on
+   Arcus (`ARCUS_*_ENDPOINT` = testnet) and the long leg on the usual RH
+   instance. Check `[CONFIG] ... short=arcus:<instance>` and that marks and
+   `basis_bps` look sane.
+
+### Migration outline (mainnet, owner-run; keep the RH long open)
+
+**`DISARM` closes BOTH legs. Do not use it for this move.** The goal is to
+swap the short leg while the RH long stays open:
+
+1. Pre-fund Arcus. The short needs its full notional at the chosen
+   leverage + guard, sized on **initial** margin plus a buffer.
+2. Open the Arcus short by hand (UI, taker or maker) at the held RH-long
+   size, then **close the Core short by hand**. Do it close in time: the
+   gap is unhedged exposure. The bot never trades the old Core short once
+   the short venue is switched, and it stays on that account until closed.
+3. Stop the bot. In the env: `HEDGE_SHORT_VENUE=arcus`,
+   `HEDGE_SHORT_INSTANCE=<arcus instance>`, the `ARCUS_*` variables, the
+   `LONG/SHORT` MMR, `HEDGE_FILL_WAIT_SECS`, and
+   `HEDGE_ARCUS_LIVE_CONFIRM=1080`.
+4. Start. The config fingerprint changes; `state.json` is kept, so a book
+   that was `On` stays `On` at its `target_qty` and is re-read from the
+   venues. With both legs already at the target, no order is sent. If the
+   Arcus short was **not** opened by hand, the bot builds it itself (IOC
+   clips, net-exposure rules as usual): this is a valid alternative to
+   step 2's manual open, at taker cost. If the book was `Off`/`Exited`,
+   **ARM with the held size** (`BTC <usd>` = held qty × mark + 1) to adopt
+   the pair without an order. Check `status.json`:
+   `legs.short.exchange == "arcus"`, net ≈ 0, headroom on both accounts.
+
 ## Operator files
 
 | file | effect |

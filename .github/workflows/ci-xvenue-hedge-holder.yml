@@ -102,11 +102,16 @@ jobs:
           workspaces: |
             debot -> target
 
+      # arcus-sdk on top of the default lighter-sdk: either leg may run on
+      # Arcus Perps (bot-strategy#1080, HEDGE_*_VENUE=arcus).
       - name: Cargo check (xvenue_hedge_holder only)
-        run: cargo check --bin xvenue_hedge_holder --locked
+        run: cargo check --bin xvenue_hedge_holder --locked --features arcus-sdk
 
       - name: Cargo test (xvenue_hedge_holder only)
-        run: cargo test --bin xvenue_hedge_holder --locked
+        run: cargo test --bin xvenue_hedge_holder --locked --features arcus-sdk
+
+      - name: Cargo test (DexConnectorBox Arcus factory)
+        run: cargo test --lib --locked --features arcus-sdk arcus_factory
 
   # Native ARM64 runner, matching ci.yml's current deploy job (bot-strategy#805
   # migrated it off QEMU). An earlier version of this workflow copied the
@@ -188,7 +193,7 @@ jobs:
             -e LIGHTER_GO_PATH=/workspace/lighter-go/build \
             -e LD_LIBRARY_PATH=/workspace/lighter-go/build \
             ${AL2023_IMAGE_RESOLVED} \
-            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --bin xvenue_hedge_holder; chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
+            /bin/bash -lc "set -euo pipefail; uname -m | grep -qx aarch64; grep -q Amazon /etc/os-release; grep -q 2023 /etc/os-release; dnf -y install gcc gcc-c++ make openssl-devel pkgconf-pkg-config git curl-minimal tar gzip; if [ ! -x /workspace/.cache/cargo/bin/rustup ]; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN}; else /workspace/.cache/cargo/bin/rustup toolchain install ${RUST_TOOLCHAIN} --profile minimal; /workspace/.cache/cargo/bin/rustup default ${RUST_TOOLCHAIN}; fi; export PATH=/workspace/.cache/cargo/bin:\$PATH; rustc -V; cargo -V; cd debot && cargo build --release --locked --features arcus-sdk --bin xvenue_hedge_holder; chown -R \${HOST_UID}:\${HOST_GID} /workspace/debot/target /workspace/.cache/cargo /workspace/.cache/rustup"
 
       - name: Fix cargo cache permissions
         if: steps.build_hedge.outcome == 'success'

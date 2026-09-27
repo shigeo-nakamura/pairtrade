@@ -17,6 +17,8 @@ use dex_connector::{
 
 use rust_decimal::Decimal;
 
+#[cfg(feature = "arcus-sdk")]
+use crate::config::get_arcus_config_from_env;
 #[cfg(feature = "extended-sdk")]
 use crate::config::get_extended_config_from_env;
 #[cfg(feature = "hyperliquid-sdk")]
@@ -196,34 +198,35 @@ impl DexConnectorBox {
 
                 Ok(DexConnectorBox::wrap(connector))
             }
+            // Arcus Perps (bot-strategy#749 / #1080). `dry_run` is authoritative:
+            // a dry-run connector never loads signer material, so it is
+            // structurally unable to place orders (an account address, when
+            // configured, only enables the public account reads). A live
+            // connector requires ARCUS_ADDRESS + ARCUS_API_PRIVATE_KEY; without
+            // them Arcus stays read-only and the factory refuses to build it.
+            // Env contract: `config::get_arcus_config_from_env`.
             #[cfg(feature = "arcus-sdk")]
             "arcus" => {
-                if !dry_run {
-                    return Err(DexError::Permanent(
-                        "Arcus support is read-only; set DRY_RUN=true".to_string(),
-                    ));
-                }
-                let base_url = env::var("ARCUS_REST_ENDPOINT")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "https://api.arcus.xyz".to_string());
-                let websocket_url = env::var("ARCUS_WEBSOCKET_ENDPOINT")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "wss://api.arcus.xyz/v1/ws".to_string());
+                let config = get_arcus_config_from_env(instance_id, !dry_run)
+                    .await
+                    .map_err(|e| {
+                        DexError::Permanent(if dry_run {
+                            format!("arcus config: {e}")
+                        } else {
+                            format!(
+                                "arcus config: {e} (without credentials Arcus is read-only; set DRY_RUN=true)"
+                            )
+                        })
+                    })?;
                 let connector = create_arcus_connector(ArcusConnectorConfig {
-                    base_url,
-                    websocket_url,
+                    base_url: config.base_url,
+                    websocket_url: config.websocket_url,
                     tracked_symbols: token_list.to_vec(),
                     ob_stale_secs: None,
-                    // This wiring stays read-only (enforced by the dry_run
-                    // check above); authenticated mutations were added by
-                    // dex-connector's Arcus auth/execution slice
-                    // (bot-strategy#749) but are out of scope here.
-                    address: None,
-                    account_index: 0,
-                    api_key: None,
-                    api_private_key_hex: None,
+                    address: config.address,
+                    account_index: config.account_index,
+                    api_key: config.api_key,
+                    api_private_key_hex: config.api_private_key_hex,
                 })?;
                 Ok(DexConnectorBox::wrap(connector))
             }

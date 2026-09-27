@@ -16,11 +16,29 @@
 //! basis (mean −1.3 bps, sd 1 bps). The bot therefore does as little as
 //! possible: build both legs, keep them equal, and get out cleanly.
 //!
+//! **Venues (bot-strategy#1080).** Each leg's exchange is configurable:
+//! `HEDGE_LONG_VENUE` / `HEDGE_SHORT_VENUE` ∈ {`lighter` (default), `arcus`}
+//! (Arcus Perps). The instance (`HEDGE_*_INSTANCE`) selects that venue's
+//! credentials and endpoints (`LIGHTER_*_<INSTANCE>` / `ARCUS_*_<INSTANCE>`,
+//! see `config::get_arcus_config_from_env`). The intended use is RH-Lighter
+//! long / Arcus short, so the short leg can earn Arcus points while the long
+//! leg keeps earning RH points. Arcus reports markets as `BTC-USD`; books are
+//! keyed by the bare symbol. An env without the venue variables behaves, and
+//! fingerprints, exactly as before. A live leg on Arcus needs a second token,
+//! `HEDGE_ARCUS_LIVE_CONFIRM=1080`, on top of `HEDGE_LIVE_CONFIRM`. Arcus
+//! acknowledges orders asynchronously (HTTP 202), so an Arcus deployment
+//! should lengthen the post-IOC position re-reads (`HEDGE_FILL_WAIT_SECS`,
+//! default `2,4`, e.g. `3,6,10`). Arcus and Lighter funding are NOT
+//! identical, unlike RH vs Core: the carry on the pair is a real (measured)
+//! cost or income, not assumed zero.
+//!
 //! Several symbols (`HEDGE_SYMBOLS=BTC:1.2,META:3,...`, each with the
-//! venue's maintenance-margin % for it) are held as independent books on
+//! venue's maintenance-margin % for it, or `SYM:LONG_MMR/SHORT_MMR` when the
+//! two legs' venues charge different MMRs, e.g. `BTC:1.2/1.667` for
+//! RH-Lighter long / Arcus short) are held as independent books on
 //! the same two accounts. Lighter margins cross-collateral, so the
 //! liquidation and leverage guards are per ACCOUNT over every hedged book
-//! (notional weighted by each symbol's MMR), never per symbol; a breach
+//! (notional weighted by each symbol's MMR for that leg), never per symbol; a breach
 //! closes every armed book. The legacy one-symbol env (`HEDGE_SYMBOL` +
 //! `HEDGE_MMR_PCT`) and its state.json still load unchanged.
 //!
@@ -87,6 +105,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BOT: &str = "xvenue_hedge_holder";
 const LIVE_CONFIRM_TOKEN: &str = "1046-G0-PASSED";
+/// Second live gate for any leg on Arcus Perps (bot-strategy#1080): the
+/// venue's execution path is new, so a stray `HEDGE_*_VENUE=arcus` flip on a
+/// live deployment must not trade without an explicit, separate token.
+const ARCUS_LIVE_CONFIRM_TOKEN: &str = "1080";
+/// Default position re-reads after an IOC (`HEDGE_FILL_WAIT_SECS`).
+const DEFAULT_FILL_WAIT_SECS: &[u64] = &[2, 4];
 
 fn init_logger() {
     Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -156,13 +180,45 @@ fn env_bool(name: &str, default: bool) -> bool {
 /// orderBookDetails: BTC/ETH 1.2, most single stocks 3 or 6). The guards
 /// weight each symbol's notional by it, so it is required per symbol —
 /// a stock booked at the BTC rate would overstate the headroom 2.5–5x.
+///
+/// The two legs may sit on venues with different MMRs (Arcus BTC 1.667 %
+/// vs Lighter 1.2 %, Arcus stocks 6.667 %): `SYM:LONG/SHORT` gives each leg
+/// its own, and the liquidation / headroom guard of a leg's account uses
+/// that leg's figure. `SYM:MMR` applies one MMR to both legs (use the max of
+/// the two venues when they differ).
 #[derive(Debug, Clone, PartialEq)]
 struct SymbolCfg {
     symbol: String,
+    /// Long-leg MMR (%). Also the single-MMR value of the legacy forms.
     mmr_pct: f64,
+    /// Short-leg MMR (%); equals `mmr_pct` unless `SYM:LONG/SHORT` is used.
+    short_mmr_pct: f64,
 }
 
-/// `HEDGE_SYMBOLS` = `SYM:MMR[,SYM:MMR...]`, e.g. `BTC:1.2,META:3,AMZN:6`.
+impl SymbolCfg {
+    fn mmr(&self, leg: Leg) -> f64 {
+        match leg {
+            Leg::Long => self.mmr_pct,
+            Leg::Short => self.short_mmr_pct,
+        }
+    }
+
+    /// `SYM:MMR`, or `SYM:LONG/SHORT` when the legs differ — the form the
+    /// fingerprint and logs use, identical to the legacy one when they don't.
+    fn spec(&self, decimals: usize) -> String {
+        if self.short_mmr_pct == self.mmr_pct {
+            format!("{}:{:.*}", self.symbol, decimals, self.mmr_pct)
+        } else {
+            format!(
+                "{}:{:.*}/{:.*}",
+                self.symbol, decimals, self.mmr_pct, decimals, self.short_mmr_pct
+            )
+        }
+    }
+}
+
+/// `HEDGE_SYMBOLS` = `SYM:MMR[,SYM:MMR...]`, e.g. `BTC:1.2,META:3,AMZN:6`;
+/// a per-leg pair is `SYM:LONG_MMR/SHORT_MMR`, e.g. `BTC:1.2/1.667`.
 /// Symbols are upper-cased; the first one is the primary (the one the
 /// single-symbol status fields describe).
 fn parse_symbols(spec: &str) -> Result<Vec<SymbolCfg>> {
@@ -172,22 +228,95 @@ fn parse_symbols(spec: &str) -> Result<Vec<SymbolCfg>> {
             .split_once(':')
             .ok_or_else(|| anyhow!("HEDGE_SYMBOLS entry '{item}' needs SYMBOL:MMR_PCT"))?;
         let symbol = sym.trim().to_ascii_uppercase();
-        let mmr_pct: f64 = mmr
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("HEDGE_SYMBOLS entry '{item}': MMR_PCT is not a number"))?;
-        if symbol.is_empty() || !positive(mmr_pct) {
+        let num = |raw: &str| -> Result<f64> {
+            raw.trim()
+                .parse()
+                .map_err(|_| anyhow!("HEDGE_SYMBOLS entry '{item}': MMR_PCT is not a number"))
+        };
+        let (mmr_pct, short_mmr_pct) = match mmr.split_once('/') {
+            Some((l, s)) => (num(l)?, num(s)?),
+            None => {
+                let v = num(mmr)?;
+                (v, v)
+            }
+        };
+        if symbol.is_empty() || !positive(mmr_pct) || !positive(short_mmr_pct) {
             bail!("HEDGE_SYMBOLS entry '{item}': empty symbol or MMR_PCT <= 0");
         }
         if out.iter().any(|c| c.symbol == symbol) {
             bail!("HEDGE_SYMBOLS lists {symbol} twice");
         }
-        out.push(SymbolCfg { symbol, mmr_pct });
+        out.push(SymbolCfg {
+            symbol,
+            mmr_pct,
+            short_mmr_pct,
+        });
     }
     if out.is_empty() {
         bail!("HEDGE_SYMBOLS is empty");
     }
     Ok(out)
+}
+
+/// Which exchange a leg trades on (`HEDGE_LONG_VENUE` / `HEDGE_SHORT_VENUE`).
+/// The instance id (`HEDGE_*_INSTANCE`) picks that venue's credentials and
+/// endpoints (`LIGHTER_*_<INSTANCE>` / `ARCUS_*_<INSTANCE>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum VenueKind {
+    #[default]
+    Lighter,
+    Arcus,
+}
+
+impl VenueKind {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "lighter" => Ok(Self::Lighter),
+            "arcus" => Ok(Self::Arcus),
+            other => bail!("unknown venue '{other}' (expected lighter or arcus)"),
+        }
+    }
+
+    /// The `DexConnectorBox::create` name.
+    fn dex_name(self) -> &'static str {
+        match self {
+            Self::Lighter => "lighter",
+            Self::Arcus => "arcus",
+        }
+    }
+}
+
+/// Symbol as a venue reports it → the holder's book key: upper-case, with
+/// Arcus' `-USD` market suffix removed (`BTC-USD` → `BTC`). Lighter already
+/// reports bare symbols.
+fn book_symbol(venue_symbol: &str) -> String {
+    let up = venue_symbol.trim().to_ascii_uppercase();
+    match up.strip_suffix("-USD") {
+        Some(base) if !base.is_empty() => base.to_string(),
+        _ => up,
+    }
+}
+
+/// `HEDGE_FILL_WAIT_SECS` = comma list of the waits (s) before each position
+/// re-read after an IOC, e.g. `2,4` (default) or `3,6,10` for a venue whose
+/// order ack is asynchronous (Arcus answers 202 before the engine fills).
+fn parse_fill_waits(spec: &str) -> Result<Vec<u64>> {
+    let waits = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|_| anyhow!("HEDGE_FILL_WAIT_SECS entry '{s}' is not a whole number"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if waits.is_empty() || waits.contains(&0) {
+        bail!("HEDGE_FILL_WAIT_SECS needs one or more waits > 0");
+    }
+    if waits.iter().sum::<u64>() > 60 {
+        bail!("HEDGE_FILL_WAIT_SECS totals more than 60 s");
+    }
+    Ok(waits)
 }
 
 #[derive(Debug, Clone)]
@@ -197,10 +326,19 @@ struct Config {
     /// Hedged markets, primary first (`HEDGE_SYMBOLS`, or the legacy
     /// `HEDGE_SYMBOL` + `HEDGE_MMR_PCT` pair as a one-symbol list).
     symbols: Vec<SymbolCfg>,
-    /// Lighter env suffix of the long leg (credentials + endpoints).
+    /// Exchange of the long leg (`HEDGE_LONG_VENUE`, default lighter).
+    long_venue: VenueKind,
+    /// Exchange of the short leg (`HEDGE_SHORT_VENUE`, default lighter).
+    short_venue: VenueKind,
+    /// Env suffix of the long leg (credentials + endpoints).
     long_instance: String,
-    /// Lighter env suffix of the short leg.
+    /// Env suffix of the short leg.
     short_instance: String,
+    /// `HEDGE_ARCUS_LIVE_CONFIRM`: must equal `ARCUS_LIVE_CONFIRM_TOKEN`
+    /// when a leg is on Arcus and the bot is live.
+    arcus_live_confirm: String,
+    /// Waits (s) before each position re-read after an IOC.
+    fill_wait_secs: Vec<u64>,
     /// Per-leg notional built on a bare ARM (USD); single-symbol only.
     target_notional_usd: f64,
     /// Hard cap on the per-leg notional any ARM may request, per symbol (USD).
@@ -245,17 +383,33 @@ impl Config {
             .filter(|v| !v.trim().is_empty())
         {
             Some(spec) => parse_symbols(&spec)?,
-            None => vec![SymbolCfg {
-                symbol: env_string("HEDGE_SYMBOL", "BTC").to_ascii_uppercase(),
-                mmr_pct: env_f64("HEDGE_MMR_PCT", 1.2),
-            }],
+            None => {
+                let mmr = env_f64("HEDGE_MMR_PCT", 1.2);
+                vec![SymbolCfg {
+                    symbol: env_string("HEDGE_SYMBOL", "BTC").to_ascii_uppercase(),
+                    mmr_pct: mmr,
+                    short_mmr_pct: mmr,
+                }]
+            }
         };
         let cfg = Self {
             dry_run: env_bool("HEDGE_DRY_RUN", true),
             live_confirm: env_string("HEDGE_LIVE_CONFIRM", ""),
             symbols,
+            long_venue: VenueKind::parse(&env_string("HEDGE_LONG_VENUE", "lighter"))
+                .context("HEDGE_LONG_VENUE")?,
+            short_venue: VenueKind::parse(&env_string("HEDGE_SHORT_VENUE", "lighter"))
+                .context("HEDGE_SHORT_VENUE")?,
             long_instance: env_string("HEDGE_LONG_INSTANCE", "rh"),
             short_instance: env_string("HEDGE_SHORT_INSTANCE", "core"),
+            arcus_live_confirm: env_string("HEDGE_ARCUS_LIVE_CONFIRM", ""),
+            fill_wait_secs: match std::env::var("HEDGE_FILL_WAIT_SECS")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+            {
+                Some(spec) => parse_fill_waits(&spec)?,
+                None => DEFAULT_FILL_WAIT_SECS.to_vec(),
+            },
             target_notional_usd: env_f64("HEDGE_TARGET_NOTIONAL_USD", 20_000.0),
             max_notional_usd: env_f64("HEDGE_MAX_NOTIONAL_USD", 30_000.0),
             clip_usd: env_f64("HEDGE_CLIP_USD", 10_000.0),
@@ -293,11 +447,15 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self
-            .long_instance
-            .eq_ignore_ascii_case(&self.short_instance)
+        if self.long_venue == self.short_venue
+            && self
+                .long_instance
+                .eq_ignore_ascii_case(&self.short_instance)
         {
-            bail!("HEDGE_LONG_INSTANCE and HEDGE_SHORT_INSTANCE must differ (two accounts, two venues)");
+            bail!("the two legs name the same venue and instance (HEDGE_*_VENUE / HEDGE_*_INSTANCE): two accounts, two venues");
+        }
+        if self.fill_wait_secs.is_empty() || self.fill_wait_secs.contains(&0) {
+            bail!("HEDGE_FILL_WAIT_SECS needs one or more waits > 0");
         }
         if self.symbols.is_empty() {
             bail!("no hedged symbol configured");
@@ -306,7 +464,7 @@ impl Config {
         // HEDGE_MMR_PCT pair is built directly and must pass the same bar
         // (a NaN MMR makes every headroom comparison false while holding).
         for c in &self.symbols {
-            if c.symbol.is_empty() || !positive(c.mmr_pct) {
+            if c.symbol.is_empty() || !positive(c.mmr_pct) || !positive(c.short_mmr_pct) {
                 bail!(
                     "symbol '{}': empty name or MMR_PCT <= 0 / non-finite (HEDGE_SYMBOLS or HEDGE_MMR_PCT)",
                     c.symbol
@@ -343,7 +501,25 @@ impl Config {
                  (the bot-strategy#1046 G0 readout is the gate)"
             );
         }
+        if !self.dry_run && self.uses_arcus() && self.arcus_live_confirm != ARCUS_LIVE_CONFIRM_TOKEN
+        {
+            bail!(
+                "a live leg on Arcus needs HEDGE_ARCUS_LIVE_CONFIRM={ARCUS_LIVE_CONFIRM_TOKEN} \
+                 (bot-strategy#1080: the Arcus execution path is gated separately)"
+            );
+        }
         Ok(())
+    }
+
+    fn uses_arcus(&self) -> bool {
+        self.long_venue == VenueKind::Arcus || self.short_venue == VenueKind::Arcus
+    }
+
+    fn venue(&self, leg: Leg) -> VenueKind {
+        match leg {
+            Leg::Long => self.long_venue,
+            Leg::Short => self.short_venue,
+        }
     }
 
     fn primary(&self) -> &str {
@@ -370,12 +546,24 @@ impl Config {
             ("liq_guard", format!("{:.3}", self.liq_guard_pct)),
             ("max_lev", format!("{:.2}", self.max_leverage)),
         ];
+        // Fields added after 7b1849e are hashed only when they differ from
+        // the default, so the running RH-long / Core-short Lighter deployment
+        // keeps its fingerprint (bot-strategy#1080).
+        if self.long_venue != VenueKind::Lighter {
+            fields.push(("long_venue", self.long_venue.dex_name().to_string()));
+        }
+        if self.short_venue != VenueKind::Lighter {
+            fields.push(("short_venue", self.short_venue.dex_name().to_string()));
+        }
+        if self.symbols.len() == 1 && self.symbols[0].short_mmr_pct != self.symbols[0].mmr_pct {
+            fields.push(("short_mmr", format!("{:.3}", self.symbols[0].short_mmr_pct)));
+        }
         if self.symbols.len() > 1 {
             fields.push((
                 "symbols",
                 self.symbols
                     .iter()
-                    .map(|c| format!("{}:{:.3}", c.symbol, c.mmr_pct))
+                    .map(|c| c.spec(3))
                     .collect::<Vec<_>>()
                     .join(","),
             ));
@@ -946,8 +1134,8 @@ impl Snapshot {
             .map(|c| {
                 let b = self.book(&c.symbol);
                 match leg {
-                    Leg::Long => (b.long * self.long.mark(&c.symbol), c.mmr_pct),
-                    Leg::Short => (b.short * self.short.mark(&c.symbol), c.mmr_pct),
+                    Leg::Long => (b.long * self.long.mark(&c.symbol), c.mmr(Leg::Long)),
+                    Leg::Short => (b.short * self.short.mark(&c.symbol), c.mmr(Leg::Short)),
                 }
             })
             .collect()
@@ -967,6 +1155,7 @@ impl Snapshot {
 
 struct Venue {
     name: &'static str,
+    kind: VenueKind,
     instance: String,
     dex: Arc<DexConnectorBox>,
 }
@@ -999,7 +1188,7 @@ impl Venue {
         let mut out = std::collections::BTreeMap::new();
         for p in positions {
             let q = p.size.to_f64().unwrap_or(0.0).abs() * if p.sign < 0 { -1.0 } else { 1.0 };
-            *out.entry(p.symbol.to_ascii_uppercase()).or_insert(0.0) += q;
+            *out.entry(book_symbol(&p.symbol)).or_insert(0.0) += q;
         }
         Ok(out)
     }
@@ -1206,6 +1395,7 @@ impl Engine {
                 venue.name
             );
             let instance = venue.instance.clone();
+            let exchange = venue.kind.dex_name();
             let signed = if order.qty > 0.0 { qty } else { -qty };
             let b = self.state.book_mut(symbol);
             match order.leg {
@@ -1216,6 +1406,7 @@ impl Engine {
                 "fill",
                 serde_json::json!({
                 "symbol": symbol, "leg": format!("{:?}", order.leg), "venue": instance,
+                "exchange": exchange,
                 "side": format!("{side}"), "qty": qty, "reduce_only": reduce_only,
                 "price": mark, "dry_run": true }),
             );
@@ -1229,10 +1420,12 @@ impl Engine {
             .create_order_taker_ioc(symbol, size, side, self.cfg.taker_slippage_bps, reduce_only)
             .await
             .map_err(|e| anyhow!("{} IOC {side} {symbol} {size}: {e:?}", venue.name))?;
-        // IOC is final on ack; read twice so a not-yet-visible fill is not
-        // mistaken for none (re-requesting it is the one way to overshoot).
+        // IOC is final on ack; read more than once so a not-yet-visible fill
+        // is not mistaken for none (re-requesting it is the one way to
+        // overshoot). Arcus acks asynchronously (202), so its deployments
+        // set longer `HEDGE_FILL_WAIT_SECS`.
         let mut filled = 0.0;
-        for wait in [2u64, 4] {
+        for &wait in &self.cfg.fill_wait_secs {
             tokio::time::sleep(Duration::from_secs(wait)).await;
             let after = venue.signed_qty(symbol).await?;
             filled = (after - before).abs();
@@ -1248,6 +1441,7 @@ impl Engine {
             "fill",
             serde_json::json!({
             "symbol": symbol, "leg": format!("{:?}", order.leg), "venue": venue.instance,
+            "exchange": venue.kind.dex_name(),
             "side": format!("{side}"), "req": qty, "filled": filled, "reduce_only": reduce_only,
             "limit": resp.ordered_price.to_string(), "order_id": resp.order_id, "mark": mark }),
         );
@@ -1780,12 +1974,14 @@ fn status_value(
         }
     };
     let leg = |name: &str, instance: &str, which: Leg| {
+        let exchange = cfg.venue(which).dex_name();
         let (qty, vs) = match which {
             Leg::Long => (pb.long, &snap.long),
             Leg::Short => (pb.short, &snap.short),
         };
         serde_json::json!({
             "instance": instance,
+            "exchange": exchange,
             "side": name,
             "qty": qty,
             "notional_usd": snap.gross(cfg, which),
@@ -1825,6 +2021,7 @@ fn status_value(
                 "mark_short": snap.short.mark(&c.symbol),
                 "basis_bps": basis(&c.symbol),
                 "mmr_pct": c.mmr_pct,
+                "short_mmr_pct": c.short_mmr_pct,
             }),
         );
     }
@@ -1892,34 +2089,47 @@ async fn main() -> Result<()> {
     init_logger();
     let cfg = Config::from_env()?;
     log::info!(
-        "[CONFIG] bot={BOT} dry_run={} symbols={} long={} short={} target=${:.0} max=${:.0} clip=${:.0} slip={}bps net_tol=${:.0} liq_guard={}% max_lev={}x fp={}",
+        "[CONFIG] bot={BOT} dry_run={} symbols={} long={}:{} short={}:{} target=${:.0} max=${:.0} clip=${:.0} slip={}bps net_tol=${:.0} liq_guard={}% max_lev={}x fill_waits={:?} fp={}",
         cfg.dry_run,
         cfg.symbols
             .iter()
-            .map(|c| format!("{}:{}", c.symbol, c.mmr_pct))
+            .map(|c| c.spec(3))
             .collect::<Vec<_>>()
             .join(","),
-        cfg.long_instance, cfg.short_instance, cfg.target_notional_usd,
+        cfg.long_venue.dex_name(), cfg.long_instance,
+        cfg.short_venue.dex_name(), cfg.short_instance, cfg.target_notional_usd,
         cfg.max_notional_usd, cfg.clip_usd, cfg.taker_slippage_bps, cfg.net_tolerance_usd,
-        cfg.liq_guard_pct, cfg.max_leverage, cfg.fingerprint()
+        cfg.liq_guard_pct, cfg.max_leverage, cfg.fill_wait_secs, cfg.fingerprint()
     );
     let symbols = cfg.symbol_names();
     let long_dex = DexConnectorBox::create(
-        "lighter",
+        cfg.long_venue.dex_name(),
         cfg.dry_run,
         &symbols,
         Some(cfg.long_instance.as_str()),
     )
     .await
-    .with_context(|| format!("init long-leg Lighter connector ({})", cfg.long_instance))?;
+    .with_context(|| {
+        format!(
+            "init long-leg {} connector ({})",
+            cfg.long_venue.dex_name(),
+            cfg.long_instance
+        )
+    })?;
     let short_dex = DexConnectorBox::create(
-        "lighter",
+        cfg.short_venue.dex_name(),
         cfg.dry_run,
         &symbols,
         Some(cfg.short_instance.as_str()),
     )
     .await
-    .with_context(|| format!("init short-leg Lighter connector ({})", cfg.short_instance))?;
+    .with_context(|| {
+        format!(
+            "init short-leg {} connector ({})",
+            cfg.short_venue.dex_name(),
+            cfg.short_instance
+        )
+    })?;
     long_dex.start().await.context("start long-leg connector")?;
     short_dex
         .start()
@@ -1928,11 +2138,13 @@ async fn main() -> Result<()> {
 
     let long = Venue {
         name: "long",
+        kind: cfg.long_venue,
         instance: cfg.long_instance.clone(),
         dex: Arc::new(long_dex),
     };
     let short = Venue {
         name: "short",
+        kind: cfg.short_venue,
         instance: cfg.short_instance.clone(),
         dex: Arc::new(short_dex),
     };
@@ -2290,9 +2502,14 @@ mod tests {
             symbols: vec![SymbolCfg {
                 symbol: "BTC".into(),
                 mmr_pct: 1.2,
+                short_mmr_pct: 1.2,
             }],
+            long_venue: VenueKind::Lighter,
+            short_venue: VenueKind::Lighter,
             long_instance: "rh".into(),
             short_instance: "core".into(),
+            arcus_live_confirm: String::new(),
+            fill_wait_secs: DEFAULT_FILL_WAIT_SECS.to_vec(),
             target_notional_usd: 20_000.0,
             max_notional_usd: 30_000.0,
             clip_usd: 10_000.0,
@@ -2830,5 +3047,169 @@ mod tests {
     #[test]
     fn utc_day_key_formats_the_date() {
         assert_eq!(utc_day_key(1_789_812_142), "2026-09-19");
+    }
+
+    // ------------------------------------------------ bot-strategy#1080: Arcus leg
+
+    fn arcus_short_cfg() -> Config {
+        let mut c = cfg_for_test();
+        c.short_venue = VenueKind::Arcus;
+        c.short_instance = "arcus".into();
+        c
+    }
+
+    #[test]
+    fn venue_parses_with_lighter_as_the_default() {
+        assert_eq!(VenueKind::parse("").unwrap(), VenueKind::Lighter);
+        assert_eq!(VenueKind::parse(" Lighter ").unwrap(), VenueKind::Lighter);
+        assert_eq!(VenueKind::parse("ARCUS").unwrap(), VenueKind::Arcus);
+        assert!(VenueKind::parse("core").is_err());
+        assert_eq!(VenueKind::Arcus.dex_name(), "arcus");
+        assert_eq!(VenueKind::default(), VenueKind::Lighter);
+    }
+
+    #[test]
+    fn default_venues_keep_the_multi_symbol_fingerprint() {
+        // The running Tokyo env (HEDGE_SYMBOLS with one MMR each, both legs
+        // Lighter) must hash exactly the field list 7b1849e hashed.
+        let c = multi_cfg();
+        let before = config_fingerprint(&[
+            ("symbol", "BTC".to_string()),
+            ("long", "rh".to_string()),
+            ("short", "core".to_string()),
+            ("target", "20000.00".to_string()),
+            ("max_notional", "30000.00".to_string()),
+            ("clip", "10000.00".to_string()),
+            ("slip_bps", "3".to_string()),
+            ("net_tol", "500.00".to_string()),
+            ("mmr", "1.200".to_string()),
+            ("liq_guard", "8.000".to_string()),
+            ("max_lev", "5.00".to_string()),
+            ("symbols", "BTC:1.200,META:3.000,AMZN:6.000".to_string()),
+        ]);
+        assert_eq!(c.fingerprint(), before);
+        // Fill waits are operational, not a strategy parameter.
+        let mut w = multi_cfg();
+        w.fill_wait_secs = vec![3, 6, 10];
+        assert_eq!(w.fingerprint(), before);
+    }
+
+    #[test]
+    fn a_non_default_venue_or_per_leg_mmr_changes_the_fingerprint() {
+        let base = cfg_for_test().fingerprint();
+        assert_ne!(arcus_short_cfg().fingerprint(), base);
+        let mut long_arcus = cfg_for_test();
+        long_arcus.long_venue = VenueKind::Arcus;
+        assert_ne!(long_arcus.fingerprint(), base);
+        assert_ne!(long_arcus.fingerprint(), arcus_short_cfg().fingerprint());
+        let mut split = cfg_for_test();
+        split.symbols[0].short_mmr_pct = 1.667;
+        assert_ne!(split.fingerprint(), base);
+        let mut multi_split = multi_cfg();
+        multi_split.symbols[0].short_mmr_pct = 1.667;
+        assert_ne!(multi_split.fingerprint(), multi_cfg().fingerprint());
+    }
+
+    #[test]
+    fn the_same_instance_is_fine_on_two_different_venues() {
+        let mut c = arcus_short_cfg();
+        c.short_instance = "rh".into();
+        assert!(
+            c.validate().is_ok(),
+            "arcus:rh vs lighter:rh are two accounts"
+        );
+        c.short_venue = VenueKind::Lighter;
+        assert!(c.validate().is_err(), "lighter:rh twice is one account");
+    }
+
+    #[test]
+    fn a_live_arcus_leg_needs_its_own_token() {
+        let mut c = arcus_short_cfg();
+        assert!(c.validate().is_ok(), "DRY_RUN needs no token");
+        c.dry_run = false;
+        c.live_confirm = LIVE_CONFIRM_TOKEN.into();
+        assert!(
+            c.validate().is_err(),
+            "G0 token alone must not go live on Arcus"
+        );
+        c.arcus_live_confirm = "1046-G0-PASSED".into();
+        assert!(c.validate().is_err());
+        c.arcus_live_confirm = ARCUS_LIVE_CONFIRM_TOKEN.into();
+        assert!(c.validate().is_ok());
+        // A Lighter-only live deployment is unaffected by the new gate.
+        let mut l = cfg_for_test();
+        l.dry_run = false;
+        l.live_confirm = LIVE_CONFIRM_TOKEN.into();
+        assert!(l.validate().is_ok());
+        // The Arcus token never substitutes for the G0 one.
+        c.live_confirm = String::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn symbols_parse_a_per_leg_mmr_pair() {
+        let s = parse_symbols("BTC:1.2/1.667, meta:3/6.667 ,AMZN:6").unwrap();
+        assert_eq!(
+            s.iter()
+                .map(|c| (c.symbol.as_str(), c.mmr_pct, c.short_mmr_pct))
+                .collect::<Vec<_>>(),
+            vec![
+                ("BTC", 1.2, 1.667),
+                ("META", 3.0, 6.667),
+                ("AMZN", 6.0, 6.0)
+            ]
+        );
+        assert_eq!(s[0].spec(3), "BTC:1.200/1.667");
+        assert_eq!(s[2].spec(3), "AMZN:6.000");
+        assert!(parse_symbols("BTC:1.2/").is_err());
+        assert!(parse_symbols("BTC:1.2/0").is_err());
+        assert!(parse_symbols("BTC:/1.2").is_err());
+        assert!(parse_symbols("BTC:1.2/x").is_err());
+        let mut c = cfg_for_test();
+        c.symbols[0].short_mmr_pct = f64::NAN;
+        assert!(c.validate().is_err(), "NaN short MMR");
+    }
+
+    #[test]
+    fn each_leg_guard_uses_its_own_mmr() {
+        let mut c = cfg_for_test();
+        c.symbols = parse_symbols("BTC:1.2/1.667").unwrap();
+        let mut snap = Snapshot::default();
+        snap.long.qty.insert("BTC".into(), 0.5);
+        snap.long.mark.insert("BTC".into(), 80_000.0);
+        snap.short.qty.insert("BTC".into(), -0.5);
+        snap.short.mark.insert("BTC".into(), 80_000.0);
+        assert_eq!(snap.legs(&c, Leg::Long), vec![(40_000.0, 1.2)]);
+        assert_eq!(snap.legs(&c, Leg::Short), vec![(40_000.0, 1.667)]);
+        // $4k equity: long headroom (4000 − 480) / 40000 = 8.8 %, short
+        // (4000 − 666.8) / 40000 = 8.333 %: an 8.5 % guard trips only the
+        // Arcus-side account.
+        let long_h = liq_headroom_pct(4_000.0, &snap.legs(&c, Leg::Long)).unwrap();
+        let short_h = liq_headroom_pct(4_000.0, &snap.legs(&c, Leg::Short)).unwrap();
+        assert!((long_h - 8.8).abs() < 1e-9, "{long_h}");
+        assert!((short_h - 8.333).abs() < 1e-9, "{short_h}");
+    }
+
+    #[test]
+    fn venue_symbols_map_to_book_keys() {
+        assert_eq!(book_symbol("BTC-USD"), "BTC");
+        assert_eq!(book_symbol("meta-usd"), "META");
+        assert_eq!(book_symbol("BTC"), "BTC");
+        assert_eq!(book_symbol(" eth "), "ETH");
+        assert_eq!(book_symbol("-USD"), "-USD", "no empty key");
+        assert_eq!(book_symbol("SOL-USDC"), "SOL-USDC", "only the -USD suffix");
+    }
+
+    #[test]
+    fn fill_waits_parse_and_validate() {
+        assert_eq!(parse_fill_waits("2,4").unwrap(), vec![2, 4]);
+        assert_eq!(parse_fill_waits(" 3, 6 ,10 ").unwrap(), vec![3, 6, 10]);
+        assert!(parse_fill_waits("").is_err());
+        assert!(parse_fill_waits("0,4").is_err());
+        assert!(parse_fill_waits("2,x").is_err());
+        assert!(parse_fill_waits("30,31").is_err(), "over 60 s");
+        let mut c = cfg_for_test();
+        c.fill_wait_secs = vec![];
+        assert!(c.validate().is_err());
     }
 }
