@@ -1035,6 +1035,11 @@ rollback](arcus-spot-state-rollback.md). The state tooling is offline and has
 no restore operation; starting the live-tick service remains an explicitly
 approved action because one tick can submit a swap.
 
+> **Removed 2026-09-27:** the Arcus bot was stopped 2026-09-25 and the host
+> (`i-0cb942c2950be020f`) terminated 2026-09-27, so `deploy-arcus-spot-executor.yml`,
+> `deploy-arcus-spot-live-tick.yml` and `deploy-arcus-live-tick-event-archive.yml`
+> were deleted. The description below is historical.
+
 `.github/workflows/deploy-arcus-spot-executor.yml` is the aarch64 build and
 install path for `arcus-spot-execute-once`. It runs automatically when Arcus
 executor/runtime source, Cargo inputs, the build script, or the workflow itself
