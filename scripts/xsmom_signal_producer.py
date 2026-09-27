@@ -170,10 +170,19 @@ def universe_mode_from_config(path: str) -> str:
     block = re.search(r"^universe:\s*$(.*?)^[a-z_]+:", text, re.M | re.S)
     if not block:
         raise SystemExit(f"{path}: no universe: block")
-    m = re.search(r"^\s+mode:\s*([A-Za-z_]+)\s*(?:#.*)?$", block.group(1), re.M)
-    mode = m.group(1) if m else "fixed"
+    # Any `mode:` key in the block, whatever its value looks like, so a
+    # spelling this regex does not expect fails loudly instead of silently
+    # reading as the default.
+    lines = re.findall(r"^\s+mode\s*:(.*)$", block.group(1), re.M)
+    if not lines:
+        return "fixed"
+    if len(lines) > 1:
+        raise SystemExit(f"{path}: universe.mode is set {len(lines)} times")
+    raw = lines[0]
+    m = re.fullmatch(r"\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s#'\"]+))\s*(?:#.*)?", raw)
+    mode = next((g for g in m.groups() if g is not None), None) if m else None
     if mode not in ("fixed", "venue_listed"):
-        raise SystemExit(f"{path}: universe.mode {mode!r} is not fixed or venue_listed")
+        raise SystemExit(f"{path}: universe.mode {raw.strip()!r} is not fixed or venue_listed")
     return mode
 
 

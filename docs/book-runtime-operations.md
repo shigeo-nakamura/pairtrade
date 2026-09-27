@@ -182,7 +182,12 @@ minus `trading_hours`, which the producer's own screen still applies):
   listing newer than the process.
 - **At the decision.** The full `signal.rs` validation still runs (hash,
   freshness, caps, neutrality, and a symbol-shape check — ASCII letters,
-  digits, `_`). Then every symbol is admitted if it was not already:
+  digits, `_`). Then every symbol is checked against the venue's current
+  listing — including ones already subscribed (the seed, held legs,
+  earlier admissions), since a market can be delisted, hidden or turned
+  reduce-only after it was subscribed — and admitted if it was not
+  already. The connector memoises the listing for 30 s, so this is one
+  `orderBookDetails` read per decision, not one per symbol:
   - the venue **refuses** one (not listed, inactive, hidden, reduce-only):
     the **whole signal is rejected** — `rejected:unlisted_symbol`,
     previous book held — the same fail-closed rule as `unknown_symbol` in

@@ -270,6 +270,24 @@ impl SymbolFeed for ConnectorSymbolFeed {
     async fn admit(&self, symbol: &str) -> std::result::Result<LotMeta, AdmitError> {
         admit_via_connector(&self.connector, self.paper.as_deref(), symbol).await
     }
+
+    /// `subscribe_symbols` re-checks the (connector-memoised, 30 s)
+    /// listing on every call, already-subscribed symbols included, and
+    /// subscribes nothing twice.
+    async fn revalidate(&self, symbol: &str) -> std::result::Result<(), AdmitError> {
+        subscribe_one(&self.connector, symbol).await
+    }
+}
+
+async fn subscribe_one(
+    connector: &Arc<dyn DexConnector + Send + Sync>,
+    symbol: &str,
+) -> std::result::Result<(), AdmitError> {
+    match connector.subscribe_symbols(&[symbol.to_string()]).await {
+        Ok(()) => Ok(()),
+        Err(DexError::Permanent(m)) => Err(AdmitError::Refused(m)),
+        Err(e) => Err(AdmitError::Unavailable(format!("subscribe: {e:?}"))),
+    }
 }
 
 async fn admit_via_connector(
@@ -277,11 +295,7 @@ async fn admit_via_connector(
     paper: Option<&PaperExecutor>,
     symbol: &str,
 ) -> std::result::Result<LotMeta, AdmitError> {
-    match connector.subscribe_symbols(&[symbol.to_string()]).await {
-        Ok(()) => {}
-        Err(DexError::Permanent(m)) => return Err(AdmitError::Refused(m)),
-        Err(e) => return Err(AdmitError::Unavailable(format!("subscribe: {e:?}"))),
-    }
+    subscribe_one(connector, symbol).await?;
     let lot = fetch_lot(connector, symbol)
         .await
         .ok_or_else(|| AdmitError::Unavailable(format!("no lot metadata for {symbol} yet")))?;

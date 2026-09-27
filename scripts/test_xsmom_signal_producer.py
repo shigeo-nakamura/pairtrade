@@ -155,6 +155,31 @@ class ProducerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 xp.universe_mode_from_config(odd)
 
+    def test_universe_mode_accepts_yaml_quoting_and_refuses_the_unrecognised(self):
+        """Codex on pairtrade#354: `mode: "venue_listed"` is the same YAML
+        value as the bare word and must not read as `fixed`; anything the
+        parser cannot recognise is an error, never the default."""
+        def mode_of(line):
+            with tempfile.TemporaryDirectory() as d:
+                cfg = os.path.join(d, "c.yaml")
+                with open(cfg, "w") as f:
+                    f.write(f"universe:\n{line}  symbols:\n    - LIT\nschedule:\n  kind: daily\n")
+                return xp.universe_mode_from_config(cfg)
+        for line, want in [
+            ('  mode: venue_listed\n', "venue_listed"),
+            ('  mode: "venue_listed"\n', "venue_listed"),
+            ("  mode: 'venue_listed'  # dynamic\n", "venue_listed"),
+            ('  mode: "fixed"\n', "fixed"),
+            ("  mode:   fixed\n", "fixed"),
+            ("", "fixed"),
+        ]:
+            self.assertEqual(mode_of(line), want, line)
+        for line in ['  mode: "venue listed"\n', "  mode: venue-listed\n", "  mode:\n",
+                     '  mode: "venue_listed\n', "  mode: VENUE_LISTED\n",
+                     "  mode: fixed\n  mode: venue_listed\n"]:
+            with self.assertRaises(SystemExit, msg=line):
+                mode_of(line)
+
     def test_caps_come_from_the_deployed_config(self):
         """bot-strategy#937: the shadow carries surviving legs at drifted
         notional, so its rows are not dollar-neutral by construction. The

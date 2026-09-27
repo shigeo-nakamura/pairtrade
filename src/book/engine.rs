@@ -99,6 +99,11 @@ impl SignalSource for DirSignalSource {
 #[async_trait::async_trait]
 pub trait SymbolFeed: Send + Sync {
     async fn admit(&self, symbol: &str) -> std::result::Result<LotMeta, AdmitError>;
+    /// Re-check that an already tracked `symbol` is still listed and open
+    /// for trading (no lot fetch). Asked for every signal symbol at the
+    /// decision, so implementations must answer from a short-lived
+    /// listing cache rather than a request each.
+    async fn revalidate(&self, symbol: &str) -> std::result::Result<(), AdmitError>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -358,15 +363,29 @@ impl BookEngine {
 
     /// Admit every symbol of `symbols` that is not tracked yet
     /// (`venue_listed`): subscribe its feed and load its lot metadata.
-    /// Returns the ones that could not be admitted, refusals first. A
-    /// symbol whose last attempt failed recently is not retried until its
-    /// backoff has passed; its recorded failure is returned instead.
-    async fn admit(&mut self, now: i64, symbols: &[String]) -> Vec<(String, AdmitError)> {
+    /// With `revalidate`, a symbol that *is* tracked (the seed, a held
+    /// leg, one admitted earlier) is re-checked against the venue's
+    /// current listing too: a market delisted, hidden or turned
+    /// reduce-only since must still reject the signal (bot-strategy#941,
+    /// Codex on #354). The connector memoises the listing, so this is not
+    /// a request per symbol per tick.
+    ///
+    /// Returns the symbols that failed, refusals first. A symbol whose
+    /// last attempt failed recently is not retried until its backoff has
+    /// passed; its recorded failure is returned instead.
+    async fn admit(
+        &mut self,
+        now: i64,
+        symbols: &[String],
+        revalidate: bool,
+    ) -> Vec<(String, AdmitError)> {
         let tracked = self.tracked_symbols();
         let mut failed = Vec::new();
-        let mut todo = Vec::new();
+        // (symbol, already tracked => only re-check the listing)
+        let mut todo: Vec<(String, bool)> = Vec::new();
         for s in symbols {
-            if tracked.contains(s) {
+            let is_tracked = tracked.contains(s);
+            if is_tracked && !revalidate {
                 continue;
             }
             if let Some((at, err)) = self.admission_failures.get(s) {
@@ -379,51 +398,62 @@ impl BookEngine {
                     continue;
                 }
             }
-            todo.push(s.clone());
+            todo.push((s.clone(), is_tracked));
         }
-        let results: Vec<(String, std::result::Result<LotMeta, AdmitError>)> =
-            match &self.symbol_feed {
-                Some(feed) => {
-                    // Concurrent: this runs inside `tick`, so one venue
-                    // round-trip per symbol in sequence would hold the
-                    // runtime's select! loop for their sum.
-                    let mut set = tokio::task::JoinSet::new();
-                    for s in todo {
-                        let feed = Arc::clone(feed);
-                        set.spawn(async move {
-                            let r = feed.admit(&s).await;
-                            (s, r)
-                        });
-                    }
-                    let mut out = Vec::new();
-                    while let Some(res) = set.join_next().await {
-                        match res {
-                            Ok(r) => out.push(r),
-                            Err(e) => log::error!("[UNIVERSE] admission task panicked: {e}"),
-                        }
-                    }
-                    out
+        type Outcome = std::result::Result<Option<LotMeta>, AdmitError>;
+        let results: Vec<(String, Outcome)> = match &self.symbol_feed {
+            Some(feed) => {
+                // Concurrent: this runs inside `tick`, so one venue
+                // round-trip per symbol in sequence would hold the
+                // runtime's select! loop for their sum.
+                let mut set = tokio::task::JoinSet::new();
+                for (s, recheck) in todo {
+                    let feed = Arc::clone(feed);
+                    set.spawn(async move {
+                        let r = if recheck {
+                            feed.revalidate(&s).await.map(|()| None)
+                        } else {
+                            feed.admit(&s).await.map(Some)
+                        };
+                        (s, r)
+                    });
                 }
-                None => {
-                    let mut out = Vec::new();
-                    for s in todo {
-                        let r = self
-                            .exec
+                let mut out = Vec::new();
+                while let Some(res) = set.join_next().await {
+                    match res {
+                        Ok(r) => out.push(r),
+                        Err(e) => log::error!("[UNIVERSE] admission task panicked: {e}"),
+                    }
+                }
+                out
+            }
+            None => {
+                let mut out = Vec::new();
+                for (s, recheck) in todo {
+                    let r = if recheck {
+                        Ok(None)
+                    } else {
+                        self.exec
                             .lot_meta(&s)
                             .await
-                            .map_err(|e| AdmitError::Refused(e.to_string()));
-                        out.push((s, r));
-                    }
-                    out
+                            .map(Some)
+                            .map_err(|e| AdmitError::Refused(e.to_string()))
+                    };
+                    out.push((s, r));
                 }
-            };
+                out
+            }
+        };
         for (s, r) in results {
             match r {
-                Ok(lot) => {
+                Ok(Some(lot)) => {
                     log::info!("[UNIVERSE] admitted {s} (venue_listed)");
                     self.lots.insert(s.clone(), lot);
                     self.admission_failures.remove(&s);
                     self.admitted.insert(s);
+                }
+                Ok(None) => {
+                    self.admission_failures.remove(&s);
                 }
                 Err(e) => {
                     log::warn!("[UNIVERSE] {s} not admitted: {e:?}");
@@ -464,7 +494,7 @@ impl BookEngine {
             .into_iter()
             .filter(|s| crate::book::config::is_plain_symbol(s))
             .collect();
-        let _ = self.admit(now, &symbols).await;
+        let _ = self.admit(now, &symbols, false).await;
     }
 
     async fn lot_for(&mut self, symbol: &str) -> Option<LotMeta> {
@@ -1350,7 +1380,9 @@ impl BookEngine {
         // unknown symbol does in `fixed` mode; one that cannot be admitted
         // *yet* rejects this tick and is retried inside the window.
         let symbols: Vec<String> = sig.weights.keys().cloned().collect();
-        if let Some((symbol, err)) = self.admit(now, &symbols).await.into_iter().next() {
+        // Every symbol, tracked ones included: being subscribed does not
+        // make a market still listed.
+        if let Some((symbol, err)) = self.admit(now, &symbols, true).await.into_iter().next() {
             let r = match err {
                 AdmitError::Refused(reason) => SignalReject::UnlistedSymbol { symbol, reason },
                 AdmitError::Unavailable(reason) => {
@@ -4378,7 +4410,12 @@ mod tests {
         listed: Vec<(&'static str, f64)>,
         unavailable_first: Mutex<Vec<&'static str>>,
         calls: Mutex<Vec<String>>,
+        /// Markets the venue has since delisted / closed.
+        delisted: Mutex<Vec<&'static str>>,
+        rechecks: Mutex<Vec<String>>,
     }
+
+    const SEED: [&str; 4] = ["BTC", "ETH", "SOL", "DOT"];
 
     #[async_trait]
     impl SymbolFeed for FakeVenue {
@@ -4391,7 +4428,11 @@ mod tests {
                     return Err(AdmitError::Unavailable("listing read failed".into()));
                 }
             }
-            let Some((_, px)) = self.listed.iter().find(|(s, _)| *s == symbol) else {
+            let Some((_, px)) = self
+                .listed
+                .iter()
+                .find(|(s, _)| *s == symbol && !self.delisted.lock().unwrap().contains(s))
+            else {
                 return Err(AdmitError::Refused(format!("{symbol}: not listed")));
             };
             let lot = LotMeta {
@@ -4401,6 +4442,15 @@ mod tests {
             self.exec.set_lot(symbol, lot).await;
             self.exec.set_price(symbol, *px).await;
             Ok(lot)
+        }
+
+        async fn revalidate(&self, symbol: &str) -> std::result::Result<(), AdmitError> {
+            self.rechecks.lock().unwrap().push(symbol.to_string());
+            let known = SEED.contains(&symbol) || self.listed.iter().any(|(s, _)| *s == symbol);
+            if !known || self.delisted.lock().unwrap().contains(&symbol) {
+                return Err(AdmitError::Refused(format!("{symbol}: status=inactive")));
+            }
+            Ok(())
         }
     }
 
@@ -4418,6 +4468,8 @@ mod tests {
             listed,
             unavailable_first: Mutex::new(unavailable_first),
             calls: Mutex::new(Vec::new()),
+            delisted: Mutex::new(Vec::new()),
+            rechecks: Mutex::new(Vec::new()),
         });
         engine.set_symbol_feed(venue.clone());
         (engine, venue, cfg)
@@ -4456,6 +4508,63 @@ mod tests {
         assert!(engine.state.positions["BTC"].qty > 0.0);
         // Admitted once; the decision did not ask again.
         assert_eq!(venue.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_already_tracked_symbol_that_was_delisted_still_rejects_the_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec![]).await;
+        let d1 = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d1, &[("BTC", 0.5), ("ARB", -0.5)]);
+        engine.tick(d1.timestamp()).await.unwrap();
+        assert_eq!(
+            engine.state.last_decision.as_ref().unwrap().outcome,
+            DecisionOutcome::Applied
+        );
+        assert!(engine.admitted_symbols().contains("ARB"));
+        // Every symbol was checked at the decision, the seed's BTC too.
+        assert!(venue.rechecks.lock().unwrap().contains(&"BTC".to_string()));
+
+        // ARB (admitted and held) is delisted before the next decision:
+        // being tracked must not let it through.
+        venue.delisted.lock().unwrap().push("ARB");
+        let d2 = ts("2026-09-11T00:30:00Z");
+        write_signal(
+            dir.path(),
+            "2026-09-11",
+            d2,
+            &[("BTC", 0.25), ("ARB", -0.25)],
+        );
+        let before = engine.state.signed_qty();
+        engine.tick(d2.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.key, "2026-09-11");
+        assert_eq!(rec.outcome, DecisionOutcome::Rejected);
+        assert!(
+            rec.reject_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unlisted_symbol") && r.contains("ARB")),
+            "{:?}",
+            rec.reject_reason
+        );
+        assert_eq!(engine.state.signed_qty(), before, "nothing traded");
+
+        // Same for a seed symbol the venue has closed.
+        venue.delisted.lock().unwrap().push("ETH");
+        let d3 = ts("2026-09-16T00:30:00Z");
+        write_signal(
+            dir.path(),
+            "2026-09-16",
+            d3,
+            &[("BTC", 0.25), ("ETH", -0.25)],
+        );
+        engine.tick(d3.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_eq!(rec.key, "2026-09-16");
+        assert_eq!(rec.outcome, DecisionOutcome::Rejected, "{rec:?}");
+        assert!(rec.reject_reason.as_deref().unwrap().contains("ETH"));
+        assert_eq!(engine.signal_status, "rejected:unlisted_symbol");
     }
 
     #[tokio::test]
