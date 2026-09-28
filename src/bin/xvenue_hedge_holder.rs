@@ -339,8 +339,9 @@ struct Config {
     arcus_live_confirm: String,
     /// Waits (s) before each position re-read after an IOC.
     fill_wait_secs: Vec<u64>,
-    /// Seconds after which an uncertain IOC that is no longer open is
-    /// released (`HEDGE_UNCERTAIN_GRACE_SECS`, default 60).
+    /// Seconds an uncertain order may stay unsettled before the bot halts
+    /// for the operator (`HEDGE_UNCERTAIN_GRACE_SECS`, default 60). It is
+    /// never released on time alone — only on terminal evidence or RISK_ACK.
     uncertain_grace_secs: u64,
     /// Arcus-leg roll (bot-strategy#1080), default off. See `RollCfg`.
     roll: RollCfg,
@@ -783,6 +784,10 @@ fn migrate_legacy(mut state: State, primary: &str) -> State {
 struct UncertainOrder {
     leg: Leg,
     exchange: String,
+    /// Connector instance (account) the order was sent on; checked before
+    /// reconciling so a venue/instance change never reads another account.
+    #[serde(default)]
+    instance: String,
     order_id: Option<String>,
     /// Requested size (base units).
     qty: f64,
@@ -1082,8 +1087,50 @@ fn settle_decision(
 /// `grace_secs` to finish it (an IOC lives milliseconds on the matching
 /// engine; what is slow is only its visibility) and it is no longer open.
 /// With no order id the whole symbol must show no open order.
-fn uncertain_released(sent_at: u64, now: u64, grace_secs: u64, still_open: bool) -> bool {
-    !still_open && now.saturating_sub(sent_at) >= grace_secs
+/// What to do with an uncertain order this tick.
+#[derive(Debug, Clone, PartialEq)]
+enum UncertainAction {
+    /// Terminal evidence seen: release the symbol.
+    Release,
+    /// Still unknown, within the grace window: keep the symbol blocked.
+    Keep,
+    /// Cannot be settled automatically: keep it blocked AND halt; only the
+    /// operator (after checking the venue) clears it with RISK_ACK.
+    Escalate(String),
+}
+
+/// An uncertain order is released ONLY on terminal evidence (its own
+/// fills / cancel agreeing with the position on Arcus; on Lighter, whose
+/// IOC is final on ack, a known order id that is no longer open). Time alone
+/// never releases it: absence from the open orders proves nothing while the
+/// venue's fill feed may lag. An order sent on another venue / instance than
+/// the leg is configured for now cannot be checked here at all.
+fn uncertain_action(
+    u: &UncertainOrder,
+    current_exchange: &str,
+    current_instance: &str,
+    terminal_evidence: bool,
+    now: u64,
+    grace_secs: u64,
+) -> UncertainAction {
+    let other_account = u.exchange != current_exchange
+        || (!u.instance.is_empty() && u.instance != current_instance);
+    if other_account {
+        return UncertainAction::Escalate(format!(
+            "uncertain order was sent on {}/{} but the leg is now {current_exchange}/{current_instance} — check that account by hand, then RISK_ACK",
+            u.exchange, u.instance
+        ));
+    }
+    if terminal_evidence {
+        return UncertainAction::Release;
+    }
+    if now.saturating_sub(u.sent_at) >= grace_secs {
+        return UncertainAction::Escalate(format!(
+            "uncertain order {:?} still unsettled after {grace_secs}s — check the venue by hand, then RISK_ACK",
+            u.order_id
+        ));
+    }
+    UncertainAction::Keep
 }
 
 /// The tick's plan without the symbols that have an uncertain order: no
@@ -1964,6 +2011,7 @@ impl Engine {
         let u = UncertainOrder {
             leg,
             exchange: exchange.dex_name().to_string(),
+            instance: self.venue(leg).instance.clone(),
             order_id,
             qty,
             before_qty,
@@ -2430,52 +2478,82 @@ impl Engine {
             .map(|(s, u)| (s.clone(), u.clone()))
             .collect();
         for (sym, u) in pending {
-            let dex = self.venue(u.leg).dex.clone();
-            let Ok(open_orders) = dex.get_open_orders(&sym).await else {
-                continue;
+            let (cur_exchange, cur_instance) = {
+                let v = self.venue(u.leg);
+                (v.kind.dex_name().to_string(), v.instance.clone())
             };
-            let still_open = match &u.order_id {
-                Some(id) => open_orders.orders.iter().any(|o| &o.order_id == id),
-                None => !open_orders.orders.is_empty(),
-            };
-            let Ok(after) = self.venue(u.leg).signed_qty(&sym).await else {
-                continue;
-            };
-            let delta = (after - u.before_qty).abs();
-            // Fast path: the order's own fills / cancel prove it terminal.
-            let mut released = false;
-            if let (Some(id), "arcus") = (&u.order_id, u.exchange.as_str()) {
-                if let Some(v) = self.arcus_order_view(u.leg, &sym, id).await {
-                    if let Settle::Terminal(_) = settle_decision(
-                        u.qty,
-                        v.open,
-                        v.canceled,
-                        v.filled,
-                        delta,
-                        self.size_tol(&sym),
-                    ) {
-                        self.forget_arcus_activity(u.leg, &sym, id, &v.trades).await;
-                        released = true;
+            // Never read another account's orders / fills / position as if
+            // they were this order's evidence.
+            let same_account =
+                u.exchange == cur_exchange && (u.instance.is_empty() || u.instance == cur_instance);
+            let mut terminal = false;
+            let mut delta = f64::NAN;
+            if same_account {
+                let dex = self.venue(u.leg).dex.clone();
+                let Ok(open_orders) = dex.get_open_orders(&sym).await else {
+                    continue;
+                };
+                let Ok(after) = self.venue(u.leg).signed_qty(&sym).await else {
+                    continue;
+                };
+                delta = (after - u.before_qty).abs();
+                match (&u.order_id, u.exchange.as_str()) {
+                    // Arcus: the order's own fills / cancel must settle it.
+                    (Some(id), "arcus") => {
+                        if let Some(v) = self.arcus_order_view(u.leg, &sym, id).await {
+                            if let Settle::Terminal(_) = settle_decision(
+                                u.qty,
+                                v.open,
+                                v.canceled,
+                                v.filled,
+                                delta,
+                                self.size_tol(&sym),
+                            ) {
+                                self.forget_arcus_activity(u.leg, &sym, id, &v.trades).await;
+                                terminal = true;
+                            }
+                        }
                     }
+                    // Lighter IOC is final on ack: a known order that is no
+                    // longer open is terminal and the position read is final.
+                    (Some(id), _) => {
+                        terminal = !open_orders.orders.iter().any(|o| &o.order_id == id);
+                    }
+                    // No order id (an ambiguous submission): no evidence.
+                    (None, _) => {}
                 }
             }
-            if !released
-                && uncertain_released(u.sent_at, now, self.cfg.uncertain_grace_secs, still_open)
-            {
-                released = true;
-            }
-            if released {
-                log::warn!(
-                    "[UNCERTAIN] {sym} {:?} order {:?} reconciled: position moved {delta} of {} requested",
-                    u.leg, u.order_id, u.qty
-                );
-                self.event(
-                    "uncertain_resolved",
-                    serde_json::json!({ "symbol": sym, "order": u, "position_delta": delta }),
-                );
-                self.state.uncertain.remove(&sym);
-                released_now.insert(sym);
-                self.persist();
+            match uncertain_action(
+                &u,
+                &cur_exchange,
+                &cur_instance,
+                terminal,
+                now,
+                self.cfg.uncertain_grace_secs,
+            ) {
+                UncertainAction::Release => {
+                    log::warn!(
+                        "[UNCERTAIN] {sym} {:?} order {:?} reconciled: position moved {delta} of {} requested",
+                        u.leg, u.order_id, u.qty
+                    );
+                    self.event(
+                        "uncertain_resolved",
+                        serde_json::json!({ "symbol": sym, "order": u, "position_delta": delta }),
+                    );
+                    self.state.uncertain.remove(&sym);
+                    released_now.insert(sym);
+                    self.persist();
+                }
+                UncertainAction::Keep => {}
+                UncertainAction::Escalate(why) => {
+                    if !self.state.halted {
+                        self.event(
+                            "uncertain_escalated",
+                            serde_json::json!({ "symbol": sym, "order": u, "reason": why }),
+                        );
+                    }
+                    self.halt(format!("{sym}: {why}"));
+                }
             }
         }
         released_now
@@ -2521,6 +2599,17 @@ impl Engine {
             log::warn!("[RISK_ACK] halt cleared ({:?})", self.state.halt_reason);
             self.state.halted = false;
             self.state.halt_reason = None;
+            // The operator has checked the venue by hand: unresolvable
+            // uncertain orders are cleared with the halt, and every book is
+            // replanned from the real positions on the next tick.
+            if !self.state.uncertain.is_empty() {
+                log::warn!(
+                    "[RISK_ACK] clearing {} uncertain order(s) on operator acknowledgement: {:?}",
+                    self.state.uncertain.len(),
+                    self.state.uncertain.keys().collect::<Vec<_>>()
+                );
+                self.state.uncertain.clear();
+            }
             for b in self.state.books.values_mut() {
                 b.net_breach_ticks = 0;
             }
@@ -3522,6 +3611,7 @@ mod tests {
             UncertainOrder {
                 leg: Leg::Short,
                 exchange: "arcus".into(),
+                instance: "arcus".into(),
                 order_id: Some("o1".into()),
                 qty: 0.1,
                 before_qty: -0.4,
@@ -4612,11 +4702,63 @@ mod tests {
         );
     }
 
+    fn uncertain_btc(exchange: &str, instance: &str) -> UncertainOrder {
+        UncertainOrder {
+            leg: Leg::Short,
+            exchange: exchange.into(),
+            instance: instance.into(),
+            order_id: Some("o1".into()),
+            qty: 0.1,
+            before_qty: 0.0,
+            sent_at: 1_000,
+            reason: "t".into(),
+        }
+    }
+
     #[test]
-    fn uncertain_release_waits_for_the_grace_and_a_closed_order() {
-        assert!(!uncertain_released(1_000, 1_030, 60, false));
-        assert!(!uncertain_released(1_000, 1_100, 60, true));
-        assert!(uncertain_released(1_000, 1_060, 60, false));
+    fn uncertain_orders_release_only_on_terminal_evidence_never_on_time() {
+        let u = uncertain_btc("arcus", "arcus-a");
+        // evidence -> release
+        assert_eq!(
+            uncertain_action(&u, "arcus", "arcus-a", true, 1_010, 60),
+            UncertainAction::Release
+        );
+        // no evidence, within grace -> keep blocked
+        assert_eq!(
+            uncertain_action(&u, "arcus", "arcus-a", false, 1_030, 60),
+            UncertainAction::Keep
+        );
+        // no evidence past the grace -> NOT released: escalate (halt, operator)
+        assert!(matches!(
+            uncertain_action(&u, "arcus", "arcus-a", false, 1_060, 60),
+            UncertainAction::Escalate(_)
+        ));
+        assert!(matches!(
+            uncertain_action(&u, "arcus", "arcus-a", false, 99_999, 60),
+            UncertainAction::Escalate(_)
+        ));
+    }
+
+    #[test]
+    fn uncertain_order_on_another_venue_or_instance_is_never_read_as_evidence() {
+        let u = uncertain_btc("arcus", "arcus-old");
+        // leg now points at a different instance / venue: escalate at once,
+        // even with "evidence" (it would come from the wrong account)
+        assert!(matches!(
+            uncertain_action(&u, "arcus", "arcus-new", true, 1_001, 60),
+            UncertainAction::Escalate(_)
+        ));
+        assert!(matches!(
+            uncertain_action(&u, "lighter", "arcus-old", true, 1_001, 60),
+            UncertainAction::Escalate(_)
+        ));
+        // an entry persisted before the field existed (instance "") only
+        // checks the exchange
+        let legacy = uncertain_btc("arcus", "");
+        assert_eq!(
+            uncertain_action(&legacy, "arcus", "any", true, 1_001, 60),
+            UncertainAction::Release
+        );
     }
 
     #[test]
@@ -4627,18 +4769,9 @@ mod tests {
             settle_decision(0.1, false, false, 0.0, 0.0, 0.000005),
             Settle::Pending
         );
-        state.uncertain.insert(
-            "BTC".into(),
-            UncertainOrder {
-                leg: Leg::Short,
-                exchange: "arcus".into(),
-                order_id: Some("o1".into()),
-                qty: 0.1,
-                before_qty: 0.0,
-                sent_at: 1_000,
-                reason: "not terminal".into(),
-            },
-        );
+        state
+            .uncertain
+            .insert("BTC".into(), uncertain_btc("arcus", "arcus-a"));
         // Tick 2: the fill is now visible, the book looks lopsided and the
         // planner wants to send the same short again — it must not.
         let plan = vec![
@@ -4663,7 +4796,17 @@ mod tests {
         assert_eq!(kept[0].0, "META");
         // Released during THIS tick (the plan was built from the older
         // snapshot): still blocked until the next tick replans it.
-        assert!(uncertain_released(1_000, 1_090, 60, false));
+        assert_eq!(
+            uncertain_action(
+                &uncertain_btc("arcus", "arcus-a"),
+                "arcus",
+                "arcus-a",
+                true,
+                1_090,
+                60
+            ),
+            UncertainAction::Release
+        );
         state.uncertain.remove("BTC");
         let released: std::collections::BTreeSet<String> = ["BTC".to_string()].into();
         let kept = drop_uncertain(plan.clone(), &state.uncertain, &released);
@@ -4685,6 +4828,7 @@ mod tests {
             UncertainOrder {
                 leg: Leg::Long,
                 exchange: "lighter".into(),
+                instance: "rh".into(),
                 order_id: None,
                 qty: 0.2,
                 before_qty: 0.5,
