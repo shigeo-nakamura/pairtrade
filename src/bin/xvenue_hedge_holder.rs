@@ -972,6 +972,34 @@ fn roll_symbol_unsettled(
     uncertain.contains_key(sym) || released_now.contains(sym)
 }
 
+/// The book must still be within the net tolerance AFTER the close (before
+/// the re-open), in the direction the close moves it: closing short raises
+/// long − short by the clip, closing long lowers it.
+fn roll_post_close_net_ok(
+    net_qty: f64,
+    leg: Leg,
+    clip_qty: f64,
+    long_mark: f64,
+    tol_usd: f64,
+) -> bool {
+    let after = match leg {
+        Leg::Short => net_qty + clip_qty,
+        Leg::Long => net_qty - clip_qty,
+    };
+    (after * long_mark).abs() <= tol_usd
+}
+
+/// Close fill the roll cannot re-open itself (a positive fill below the
+/// venue minimum): the leg shrank all the same and the planner repairs it
+/// later, so it must be reserved.
+fn roll_unreopened_close(close_filled: f64, min_qty: f64) -> f64 {
+    if close_filled > 0.0 && roll_reopen(Leg::Short, close_filled, min_qty).is_none() {
+        close_filled
+    } else {
+        0.0
+    }
+}
+
 /// Mark the roll clip is sized at: the higher of the rolled leg's mark and
 /// the long mark the net guard uses, so clip × either mark ≤ the clip USD.
 fn roll_sizing_mark(leg_mark: f64, long_mark: f64) -> f64 {
@@ -2378,7 +2406,13 @@ impl Engine {
         let headroom = liq_headroom_pct(snap.equity(leg), &snap.legs(&self.cfg, leg));
         let gate = RollGate {
             book_on: self.state.book(sym).mode == Mode::On,
-            balanced: (held.net() * snap.long.mark(sym)).abs() <= self.cfg.net_tolerance_usd,
+            balanced: roll_post_close_net_ok(
+                held.net(),
+                leg,
+                clip_qty,
+                snap.long.mark(sym),
+                self.cfg.net_tolerance_usd,
+            ),
             halted: self.state.halted,
             kill,
             uncertain: roll_symbol_unsettled(&self.state.uncertain, released_now, sym),
@@ -2517,7 +2551,16 @@ impl Engine {
         let (mut open_filled, mut open_cost) = (0.0, 0.0);
         let mut outcome = "done";
         match roll_reopen(leg, close_filled, m.min_qty) {
-            None => outcome = "close_unfilled",
+            None => {
+                outcome = "close_unfilled";
+                // A sub-minimum partial close still shrank the leg; the
+                // planner repairs it later, outside the roll path: reserve it.
+                let unrepaired = roll_unreopened_close(close_filled, m.min_qty);
+                if unrepaired > 0.0 {
+                    outcome = "close_partial_below_min";
+                    self.roll_book(roll_repair_reservation(unrepaired * mark, slip));
+                }
+            }
             Some(reopen) => {
                 let reserved = roll_reserve(close_filled * mark, slip);
                 self.roll_book(reserved);
@@ -3128,7 +3171,9 @@ impl Engine {
             }
         }
         // The Arcus-leg roll runs only on a tick that sent nothing else.
-        if sent == 0 {
+        // Not on a tick that reconciled an order either: its snapshot (and
+        // so every roll gate) predates the late fill.
+        if sent == 0 && released_now.is_empty() {
             self.maybe_roll(now, &snap, kill, &released_now).await;
         }
         self.persist();
@@ -4584,6 +4629,28 @@ mod tests {
         // partial re-open: the unfilled part stays reserved, never negative
         assert!((roll_partial_remainder(0.05, 0.03) - 0.02).abs() < 1e-12);
         assert_eq!(roll_partial_remainder(0.05, 0.06), 0.0);
+    }
+
+    #[test]
+    fn a_sub_minimum_partial_close_is_reserved_for_its_repair() {
+        assert_eq!(roll_unreopened_close(0.00005, 0.0001), 0.00005);
+        assert_eq!(roll_unreopened_close(0.0, 0.0001), 0.0);
+        // re-openable closes are handled (and booked) by the re-open itself
+        assert_eq!(roll_unreopened_close(0.05, 0.0001), 0.0);
+    }
+
+    #[test]
+    fn roll_gates_on_the_net_exposure_after_the_close() {
+        // long-heavy by $400 (net +4 @100), $400 short close, $500 tol:
+        // the close would leave $800 of exposure -> refused
+        assert!(!roll_post_close_net_ok(4.0, Leg::Short, 4.0, 100.0, 500.0));
+        // short-heavy by $400: closing short moves it to 0 -> fine
+        assert!(roll_post_close_net_ok(-4.0, Leg::Short, 4.0, 100.0, 500.0));
+        // balanced book, clip within tolerance -> fine
+        assert!(roll_post_close_net_ok(0.0, Leg::Short, 4.0, 100.0, 500.0));
+        // long leg rolled: direction reverses
+        assert!(!roll_post_close_net_ok(-4.0, Leg::Long, 4.0, 100.0, 500.0));
+        assert!(roll_post_close_net_ok(4.0, Leg::Long, 4.0, 100.0, 500.0));
     }
 
     #[test]
