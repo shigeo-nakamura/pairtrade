@@ -447,9 +447,10 @@ impl Config {
                 let suffix = env_string("HEDGE_LONG_INSTANCE", "rh")
                     .to_uppercase()
                     .replace('-', "_");
-                std::env::var(format!("LIGHTER_ACCOUNT_INDEX_{suffix}"))
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
+                points_account_index(
+                    VenueKind::parse(&env_string("HEDGE_LONG_VENUE", "lighter")).ok(),
+                    std::env::var(format!("LIGHTER_ACCOUNT_INDEX_{suffix}")).ok(),
+                )
             },
             arm_path: dir.join("ARM"),
             disarm_path: dir.join("DISARM"),
@@ -1114,6 +1115,16 @@ fn settle_decision(
 /// `grace_secs` to finish it (an IOC lives milliseconds on the matching
 /// engine; what is slow is only its visibility) and it is no longer open.
 /// With no order id the whole symbol must show no open order.
+/// The Lighter account whose points rows feed the subsidy block: only when
+/// the LONG leg is on Lighter (an Arcus long must never be credited with a
+/// stray LIGHTER_ACCOUNT_INDEX_<instance>'s points).
+fn points_account_index(long_venue: Option<VenueKind>, raw: Option<String>) -> Option<u64> {
+    if long_venue != Some(VenueKind::Lighter) {
+        return None;
+    }
+    raw.and_then(|v| v.trim().parse().ok())
+}
+
 /// What to do with an uncertain order this tick.
 #[derive(Debug, Clone, PartialEq)]
 enum UncertainAction {
@@ -1158,6 +1169,20 @@ fn uncertain_action(
         ));
     }
     UncertainAction::Keep
+}
+
+/// The plan that may be sent this tick: nothing at all when an order was
+/// reconciled during the tick (the risk snapshot predates it), otherwise
+/// the plan without the symbols that still have an uncertain order.
+fn tick_plan_after_reconcile(
+    plan: Vec<(String, Vec<Order>)>,
+    uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
+    released_now: &std::collections::BTreeSet<String>,
+) -> Vec<(String, Vec<Order>)> {
+    if !released_now.is_empty() {
+        return Vec::new();
+    }
+    drop_uncertain(plan, uncertain, released_now)
 }
 
 /// The tick's plan without the symbols that have an uncertain order: no
@@ -2987,6 +3012,22 @@ impl Engine {
             }
         }
 
+        // Uncertain symbols go out of the plan BEFORE the leverage guard (an
+        // order that will never be sent must not trip it). And when any order
+        // was reconciled during this tick, every guard above ran on a
+        // snapshot that predates it (a late fill may have changed equity /
+        // gross / net): send nothing this tick; the next one re-reads.
+        for sym in self.state.uncertain.keys() {
+            log::warn!("[UNCERTAIN] {sym}: an order is still unreconciled — nothing sent on {sym}");
+        }
+        let mut plan = tick_plan_after_reconcile(plan, &self.state.uncertain, &released_now);
+        if !released_now.is_empty() {
+            log::info!(
+                "[UNCERTAIN] {:?} reconciled this tick — nothing sent until the next tick re-reads the venues",
+                released_now
+            );
+        }
+
         // Leverage guard over the whole tick BEFORE anything is sent: each
         // venue's gross notional after every growth order of every symbol
         // must stay within max_leverage × its equity. A pair whose second
@@ -3007,15 +3048,7 @@ impl Engine {
             }
         }
 
-        for sym in self.state.uncertain.keys() {
-            log::warn!("[UNCERTAIN] {sym}: an order is still unreconciled — nothing sent on {sym}");
-        }
-        for sym in &released_now {
-            log::info!(
-                "[UNCERTAIN] {sym}: just reconciled — replanned next tick from a fresh snapshot"
-            );
-        }
-        let plan = drop_uncertain(plan, &self.state.uncertain, &released_now);
+        let plan = plan;
 
         // Execute, symbol by symbol. The second order of a pair is cut to
         // what the first actually filled, so a partial on the thin RH book
@@ -4935,6 +4968,55 @@ mod tests {
         assert_eq!(kept[0].0, "META");
         // Next tick: nothing released now -> BTC plans again.
         assert_eq!(drop_uncertain(plan, &state.uncertain, &none).len(), 2);
+    }
+
+    #[test]
+    fn points_are_only_attributed_to_a_lighter_long_leg() {
+        assert_eq!(
+            points_account_index(Some(VenueKind::Lighter), Some(" 3209 ".into())),
+            Some(3209)
+        );
+        assert_eq!(
+            points_account_index(Some(VenueKind::Arcus), Some("3209".into())),
+            None
+        );
+        assert_eq!(points_account_index(None, Some("3209".into())), None);
+        assert_eq!(points_account_index(Some(VenueKind::Lighter), None), None);
+    }
+
+    #[test]
+    fn a_reconcile_during_the_tick_sends_nothing_that_tick() {
+        let plan = vec![
+            (
+                "BTC".to_string(),
+                vec![Order {
+                    leg: Leg::Short,
+                    qty: 0.1,
+                }],
+            ),
+            (
+                "META".to_string(),
+                vec![Order {
+                    leg: Leg::Long,
+                    qty: 1.0,
+                }],
+            ),
+        ];
+        let none = std::collections::BTreeSet::new();
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(
+            tick_plan_after_reconcile(plan.clone(), &empty, &none).len(),
+            2
+        );
+        // BTC reconciled this tick: META must not trade on the stale snapshot either
+        let released: std::collections::BTreeSet<String> = ["BTC".to_string()].into();
+        assert!(tick_plan_after_reconcile(plan.clone(), &empty, &released).is_empty());
+        // still uncertain: only that symbol is dropped (before the leverage guard)
+        let mut unc = std::collections::BTreeMap::new();
+        unc.insert("BTC".to_string(), uncertain_btc("arcus", "a"));
+        let kept = tick_plan_after_reconcile(plan, &unc, &none);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "META");
     }
 
     #[test]

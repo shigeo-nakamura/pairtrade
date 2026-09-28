@@ -411,6 +411,18 @@ impl fmt::Debug for ArcusConfig {
     }
 }
 
+/// Arcus subaccount index: 0-9 only (u8 parsing alone would accept up to
+/// 255 and defer the failure to the first account read or signed order).
+#[cfg(feature = "arcus-sdk")]
+fn parse_arcus_account_index(raw: &str) -> Result<u8, ConfigError> {
+    match raw.trim().parse::<u8>() {
+        Ok(v) if v <= 9 => Ok(v),
+        _ => Err(ConfigError::OtherError(format!(
+            "ARCUS_ACCOUNT_INDEX '{raw}' is not 0-9"
+        ))),
+    }
+}
+
 #[cfg(feature = "arcus-sdk")]
 pub async fn get_arcus_config_from_env(
     instance_id: Option<&str>,
@@ -422,9 +434,7 @@ pub async fn get_arcus_config_from_env(
         .unwrap_or_else(|| "wss://api.arcus.xyz/v1/ws".to_string());
     let address = suffixed_env("ARCUS_ADDRESS", instance_id);
     let account_index = match suffixed_env("ARCUS_ACCOUNT_INDEX", instance_id) {
-        Some(raw) => raw.trim().parse::<u8>().map_err(|_| {
-            ConfigError::OtherError(format!("ARCUS_ACCOUNT_INDEX '{raw}' is not 0-9"))
-        })?,
+        Some(raw) => parse_arcus_account_index(&raw)?,
         None => 0,
     };
     if !with_signer {
@@ -478,4 +488,19 @@ pub async fn get_arcus_config_from_env(
         api_key: suffixed_env("ARCUS_API_KEY", instance_id),
         api_private_key_hex: Some(private_key.trim().to_string()),
     })
+}
+
+#[cfg(all(test, feature = "arcus-sdk"))]
+mod arcus_config_tests {
+    use super::parse_arcus_account_index;
+
+    #[test]
+    fn arcus_account_index_is_0_to_9() {
+        assert_eq!(parse_arcus_account_index("0").unwrap(), 0);
+        assert_eq!(parse_arcus_account_index(" 9 ").unwrap(), 9);
+        assert!(parse_arcus_account_index("10").is_err());
+        assert!(parse_arcus_account_index("255").is_err());
+        assert!(parse_arcus_account_index("-1").is_err());
+        assert!(parse_arcus_account_index("x").is_err());
+    }
 }
