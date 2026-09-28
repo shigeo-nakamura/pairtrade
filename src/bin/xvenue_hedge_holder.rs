@@ -93,7 +93,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use debot::directional::{append_jsonl, config_fingerprint, load_json, persist_json, Sentinels};
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
-use dex_connector::{DexConnector, OrderSide};
+use dex_connector::{DexConnector, DexError, OrderSide};
 use env_logger::Builder;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -339,6 +339,9 @@ struct Config {
     arcus_live_confirm: String,
     /// Waits (s) before each position re-read after an IOC.
     fill_wait_secs: Vec<u64>,
+    /// Seconds after which an uncertain IOC that is no longer open is
+    /// released (`HEDGE_UNCERTAIN_GRACE_SECS`, default 60).
+    uncertain_grace_secs: u64,
     /// Per-leg notional built on a bare ARM (USD); single-symbol only.
     target_notional_usd: f64,
     /// Hard cap on the per-leg notional any ARM may request, per symbol (USD).
@@ -410,6 +413,7 @@ impl Config {
                 Some(spec) => parse_fill_waits(&spec)?,
                 None => DEFAULT_FILL_WAIT_SECS.to_vec(),
             },
+            uncertain_grace_secs: env_u64("HEDGE_UNCERTAIN_GRACE_SECS", 60),
             target_notional_usd: env_f64("HEDGE_TARGET_NOTIONAL_USD", 20_000.0),
             max_notional_usd: env_f64("HEDGE_MAX_NOTIONAL_USD", 30_000.0),
             clip_usd: env_f64("HEDGE_CLIP_USD", 10_000.0),
@@ -494,6 +498,9 @@ impl Config {
         }
         if self.tick_secs == 0 || self.net_breach_ticks == 0 {
             bail!("HEDGE_TICK_SECS and HEDGE_NET_BREACH_TICKS must be > 0");
+        }
+        if self.uncertain_grace_secs == 0 {
+            bail!("HEDGE_UNCERTAIN_GRACE_SECS must be > 0");
         }
         if !self.dry_run && self.live_confirm != LIVE_CONFIRM_TOKEN {
             bail!(
@@ -625,6 +632,13 @@ struct State {
     /// The mode this state was written in. A state armed under DRY_RUN
     /// must not carry its target into a live start (or vice versa).
     dry_run: Option<bool>,
+    /// IOCs whose outcome is not known yet, per symbol (bot-strategy#1080,
+    /// Codex on pairtrade#356). Arcus acks asynchronously (202): a fill can
+    /// become visible after the settle waits, so the order is recorded here
+    /// and NOTHING more is sent on that symbol until a later tick sees it
+    /// terminal — re-sending is the one way the book can overshoot.
+    #[serde(default)]
+    uncertain: std::collections::BTreeMap<String, UncertainOrder>,
     // Single-symbol state.json (before `books`): read once by
     // `migrate_legacy`, never written back.
     #[serde(default, rename = "mode", skip_serializing)]
@@ -694,12 +708,100 @@ fn migrate_legacy(mut state: State, primary: &str) -> State {
     state
 }
 
+/// An IOC whose terminal state was not confirmed within the settle waits,
+/// or whose submission the venue answered ambiguously
+/// (`DexError::ReconciliationRequired`, then without an order id).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct UncertainOrder {
+    leg: Leg,
+    exchange: String,
+    order_id: Option<String>,
+    /// Requested size (base units).
+    qty: f64,
+    /// The leg's signed venue position right before the order.
+    before_qty: f64,
+    sent_at: u64,
+    reason: String,
+}
+
+/// Outcome of one look at a just-sent IOC.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Settle {
+    /// Terminal; the size it filled.
+    Terminal(f64),
+    Pending,
+}
+
+/// Decides from one read whether an Arcus IOC is final: it must be out of
+/// the open orders, either completely filled or seen canceled (the IOC's
+/// unfilled rest), and the fills reported for it must agree with the
+/// position change. Anything short of that is `Pending` — a fill that is
+/// only partly visible must not size the paired leg.
+fn settle_decision(
+    sent: f64,
+    open: bool,
+    canceled: bool,
+    fills_sum: f64,
+    pos_delta: f64,
+    tol: f64,
+) -> Settle {
+    if open {
+        return Settle::Pending;
+    }
+    let complete = fills_sum >= sent - tol;
+    if !(complete || canceled) {
+        return Settle::Pending;
+    }
+    if (fills_sum - pos_delta).abs() > tol {
+        return Settle::Pending;
+    }
+    Settle::Terminal(fills_sum)
+}
+
+/// An uncertain IOC may be released once the venue has had
+/// `grace_secs` to finish it (an IOC lives milliseconds on the matching
+/// engine; what is slow is only its visibility) and it is no longer open.
+/// With no order id the whole symbol must show no open order.
+fn uncertain_released(sent_at: u64, now: u64, grace_secs: u64, still_open: bool) -> bool {
+    !still_open && now.saturating_sub(sent_at) >= grace_secs
+}
+
+/// The tick's plan without the symbols that have an uncertain order: no
+/// order of any kind goes out on them until it is reconciled.
+fn drop_uncertain(
+    plan: Vec<(String, Vec<Order>)>,
+    uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
+) -> Vec<(String, Vec<Order>)> {
+    plan.into_iter()
+        .filter(|(sym, _)| !uncertain.contains_key(sym))
+        .collect()
+}
+
 // --------------------------------------------------------------- planning
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leg {
     Long,
     Short,
+}
+
+impl Serialize for Leg {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Leg::Long => "Long",
+            Leg::Short => "Short",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Leg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        match String::deserialize(d)?.as_str() {
+            "Long" => Ok(Leg::Long),
+            "Short" => Ok(Leg::Short),
+            other => Err(serde::de::Error::custom(format!("unknown leg {other}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1415,24 +1517,71 @@ impl Engine {
         }
         let before = venue.signed_qty(symbol).await?;
         let size = decimal(qty, "qty")?.round_dp(self.meta(symbol).size_decimals);
-        let resp = venue
+        let exchange = venue.kind;
+        let resp = match venue
             .dex
             .create_order_taker_ioc(symbol, size, side, self.cfg.taker_slippage_bps, reduce_only)
             .await
-            .map_err(|e| anyhow!("{} IOC {side} {symbol} {size}: {e:?}", venue.name))?;
-        // IOC is final on ack; read more than once so a not-yet-visible fill
-        // is not mistaken for none (re-requesting it is the one way to
-        // overshoot). Arcus acks asynchronously (202), so its deployments
-        // set longer `HEDGE_FILL_WAIT_SECS`.
-        let mut filled = 0.0;
-        for &wait in &self.cfg.fill_wait_secs {
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            let after = venue.signed_qty(symbol).await?;
-            filled = (after - before).abs();
-            if filled > 0.0 {
-                break;
+        {
+            Ok(r) => r,
+            Err(DexError::ReconciliationRequired { detail, .. }) => {
+                // The venue may have taken it: never re-send before the
+                // position says what happened.
+                let reason = format!("submission ambiguous: {detail}");
+                self.mark_uncertain(symbol, order.leg, exchange, None, qty, before, &reason);
+                bail!(
+                    "{} IOC {side} {symbol} {size}: {reason}",
+                    self.venue(order.leg).name
+                );
             }
-        }
+            Err(e) => bail!("{} IOC {side} {symbol} {size}: {e:?}", venue.name),
+        };
+        let order_id = resp.order_id.clone();
+        let filled = if exchange == VenueKind::Arcus {
+            // Arcus acks with 202: the fill is final only once the order is
+            // out of the open orders AND its fills (or its cancel) are
+            // visible and agree with the position change.
+            match self
+                .settle_arcus(order.leg, symbol, &order_id, qty, before)
+                .await
+            {
+                Some(f) => f,
+                None => {
+                    let reason = format!(
+                        "not terminal after {:?}s (order {order_id})",
+                        self.cfg.fill_wait_secs
+                    );
+                    self.mark_uncertain(
+                        symbol,
+                        order.leg,
+                        exchange,
+                        Some(order_id.clone()),
+                        qty,
+                        before,
+                        &reason,
+                    );
+                    bail!(
+                        "{} IOC {side} {symbol} {size}: {reason}",
+                        self.venue(order.leg).name
+                    );
+                }
+            }
+        } else {
+            // Lighter IOC is final on ack; read more than once so a
+            // not-yet-visible fill is not mistaken for none (re-requesting
+            // it is the one way to overshoot).
+            let mut filled = 0.0;
+            for &wait in &self.cfg.fill_wait_secs {
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                let after = venue.signed_qty(symbol).await?;
+                filled = (after - before).abs();
+                if filled > 0.0 {
+                    break;
+                }
+            }
+            filled
+        };
+        let venue = self.venue(order.leg);
         log::info!(
             "[FILL] {} {side} {symbol} req={qty} filled={filled:.5} reduce_only={reduce_only} limit={} order_id={}",
             venue.name, resp.ordered_price, resp.order_id
@@ -1446,6 +1595,189 @@ impl Engine {
             "limit": resp.ordered_price.to_string(), "order_id": resp.order_id, "mark": mark }),
         );
         Ok(filled)
+    }
+
+    fn venue(&self, leg: Leg) -> &Venue {
+        match leg {
+            Leg::Long => &self.long,
+            Leg::Short => &self.short,
+        }
+    }
+
+    /// Half a size step: two sizes closer than this are the same order size.
+    fn size_tol(&self, symbol: &str) -> f64 {
+        0.5 * 10f64.powi(-(self.meta(symbol).size_decimals as i32))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mark_uncertain(
+        &mut self,
+        symbol: &str,
+        leg: Leg,
+        exchange: VenueKind,
+        order_id: Option<String>,
+        qty: f64,
+        before_qty: f64,
+        reason: &str,
+    ) {
+        log::error!(
+            "[UNCERTAIN] {symbol} {leg:?} ({}) {reason} — no order on {symbol} until reconciled",
+            exchange.dex_name()
+        );
+        let u = UncertainOrder {
+            leg,
+            exchange: exchange.dex_name().to_string(),
+            order_id,
+            qty,
+            before_qty,
+            sent_at: now_secs(),
+            reason: reason.to_string(),
+        };
+        self.event(
+            "uncertain",
+            serde_json::json!({ "symbol": symbol, "order": u }),
+        );
+        self.state.uncertain.insert(symbol.to_string(), u);
+        self.persist();
+    }
+
+    /// One read of an Arcus order's state: (open, canceled, fills sum,
+    /// trade ids of those fills). `None` when a read failed.
+    async fn arcus_order_view(
+        &self,
+        leg: Leg,
+        symbol: &str,
+        order_id: &str,
+    ) -> Option<(bool, bool, f64, Vec<String>)> {
+        let dex = &self.venue(leg).dex;
+        let open = dex
+            .get_open_orders(symbol)
+            .await
+            .ok()?
+            .orders
+            .iter()
+            .any(|o| o.order_id == order_id);
+        let canceled = dex
+            .get_canceled_orders(symbol)
+            .await
+            .ok()?
+            .orders
+            .iter()
+            .any(|o| o.order_id == order_id);
+        let mut sum = 0.0;
+        let mut trades = Vec::new();
+        for f in dex.get_filled_orders(symbol).await.ok()?.orders {
+            if f.order_id == order_id {
+                sum += f.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
+                trades.push(f.trade_id);
+            }
+        }
+        Some((open, canceled, sum, trades))
+    }
+
+    /// Settle an Arcus IOC within `HEDGE_FILL_WAIT_SECS`: `Some(filled)`
+    /// once terminal, `None` when it is still unknown after the last wait.
+    async fn settle_arcus(
+        &mut self,
+        leg: Leg,
+        symbol: &str,
+        order_id: &str,
+        qty: f64,
+        before: f64,
+    ) -> Option<f64> {
+        let tol = self.size_tol(symbol);
+        for &wait in &self.cfg.fill_wait_secs.clone() {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            let Some((open, canceled, sum, trades)) =
+                self.arcus_order_view(leg, symbol, order_id).await
+            else {
+                continue;
+            };
+            let Ok(after) = self.venue(leg).signed_qty(symbol).await else {
+                continue;
+            };
+            if let Settle::Terminal(f) =
+                settle_decision(qty, open, canceled, sum, (after - before).abs(), tol)
+            {
+                self.forget_arcus_activity(leg, symbol, order_id, &trades)
+                    .await;
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// Drop consumed fill / cancel records from the connector's pending
+    /// lists, so they are not re-read (and do not pile up) later.
+    async fn forget_arcus_activity(
+        &self,
+        leg: Leg,
+        symbol: &str,
+        order_id: &str,
+        trades: &[String],
+    ) {
+        let dex = &self.venue(leg).dex;
+        for t in trades {
+            let _ = dex.clear_filled_order(symbol, t).await;
+        }
+        let _ = dex.clear_canceled_order(symbol, order_id).await;
+    }
+
+    /// Re-check every uncertain order; release the ones that are now known
+    /// terminal. Runs before planning: while an entry remains, its symbol
+    /// gets no order at all.
+    async fn reconcile_uncertain(&mut self, now: u64) {
+        let pending: Vec<(String, UncertainOrder)> = self
+            .state
+            .uncertain
+            .iter()
+            .map(|(s, u)| (s.clone(), u.clone()))
+            .collect();
+        for (sym, u) in pending {
+            let dex = self.venue(u.leg).dex.clone();
+            let Ok(open_orders) = dex.get_open_orders(&sym).await else {
+                continue;
+            };
+            let still_open = match &u.order_id {
+                Some(id) => open_orders.orders.iter().any(|o| &o.order_id == id),
+                None => !open_orders.orders.is_empty(),
+            };
+            let Ok(after) = self.venue(u.leg).signed_qty(&sym).await else {
+                continue;
+            };
+            let delta = (after - u.before_qty).abs();
+            // Fast path: the order's own fills / cancel prove it terminal.
+            let mut released = false;
+            if let (Some(id), "arcus") = (&u.order_id, u.exchange.as_str()) {
+                if let Some((open, canceled, sum, trades)) =
+                    self.arcus_order_view(u.leg, &sym, id).await
+                {
+                    if let Settle::Terminal(_) =
+                        settle_decision(u.qty, open, canceled, sum, delta, self.size_tol(&sym))
+                    {
+                        self.forget_arcus_activity(u.leg, &sym, id, &trades).await;
+                        released = true;
+                    }
+                }
+            }
+            if !released
+                && uncertain_released(u.sent_at, now, self.cfg.uncertain_grace_secs, still_open)
+            {
+                released = true;
+            }
+            if released {
+                log::warn!(
+                    "[UNCERTAIN] {sym} {:?} order {:?} reconciled: position moved {delta} of {} requested",
+                    u.leg, u.order_id, u.qty
+                );
+                self.event(
+                    "uncertain_resolved",
+                    serde_json::json!({ "symbol": sym, "order": u, "position_delta": delta }),
+                );
+                self.state.uncertain.remove(&sym);
+                self.persist();
+            }
+        }
     }
 
     /// (ARM request, DISARM symbols). DISARM beats ARM when both are present.
@@ -1748,6 +2080,12 @@ impl Engine {
             self.halt(reason);
         }
 
+        // Orders whose outcome was unknown: re-check them first; a symbol
+        // that still has one gets no order this tick (below).
+        if !self.cfg.dry_run && !self.state.uncertain.is_empty() {
+            self.reconcile_uncertain(now).await;
+        }
+
         // Plan (at most one clip per leg per symbol per tick).
         let restricted = self.state.halted || kill;
         let mut plan: Vec<(String, Vec<Order>)> = Vec::new();
@@ -1792,6 +2130,11 @@ impl Engine {
                 }
             }
         }
+
+        for sym in self.state.uncertain.keys() {
+            log::warn!("[UNCERTAIN] {sym}: an order is still unreconciled — nothing sent on {sym}");
+        }
+        let plan = drop_uncertain(plan, &self.state.uncertain);
 
         // Execute, symbol by symbol. The second order of a pair is cut to
         // what the first actually filled, so a partial on the thin RH book
@@ -2031,6 +2374,7 @@ fn status_value(
         "mode": state.overall_mode(),
         "halted": state.halted,
         "halt_reason": state.halt_reason,
+        "uncertain_orders": state.uncertain,
         "kill_switch": kill,
         "symbols": cfg.symbol_names(),
         "target_qty": pbook.target_qty,
@@ -2510,6 +2854,7 @@ mod tests {
             short_instance: "core".into(),
             arcus_live_confirm: String::new(),
             fill_wait_secs: DEFAULT_FILL_WAIT_SECS.to_vec(),
+            uncertain_grace_secs: 60,
             target_notional_usd: 20_000.0,
             max_notional_usd: 30_000.0,
             clip_usd: 10_000.0,
@@ -3198,6 +3543,127 @@ mod tests {
         assert_eq!(book_symbol(" eth "), "ETH");
         assert_eq!(book_symbol("-USD"), "-USD", "no empty key");
         assert_eq!(book_symbol("SOL-USDC"), "SOL-USDC", "only the -USD suffix");
+    }
+
+    #[test]
+    fn arcus_settle_needs_terminal_evidence_that_agrees_with_the_position() {
+        let tol = 0.000005;
+        // still on the book
+        assert_eq!(
+            settle_decision(1.0, true, false, 1.0, 1.0, tol),
+            Settle::Pending
+        );
+        // a partial fill visible, the rest not yet canceled: must not size the pair
+        assert_eq!(
+            settle_decision(1.0, false, false, 0.3, 0.3, tol),
+            Settle::Pending
+        );
+        // partial, rest canceled, position agrees -> terminal at the partial
+        assert_eq!(
+            settle_decision(1.0, false, true, 0.3, 0.3, tol),
+            Settle::Terminal(0.3)
+        );
+        // fully filled
+        assert_eq!(
+            settle_decision(1.0, false, false, 1.0, 1.0, tol),
+            Settle::Terminal(1.0)
+        );
+        // fills seen but the position has not moved yet (or vice versa)
+        assert_eq!(
+            settle_decision(1.0, false, false, 1.0, 0.0, tol),
+            Settle::Pending
+        );
+        assert_eq!(
+            settle_decision(1.0, false, true, 0.0, 0.4, tol),
+            Settle::Pending
+        );
+        // zero fill, canceled, flat -> terminal 0
+        assert_eq!(
+            settle_decision(1.0, false, true, 0.0, 0.0, tol),
+            Settle::Terminal(0.0)
+        );
+        // not open, nothing visible yet -> pending (could be not placed yet)
+        assert_eq!(
+            settle_decision(1.0, false, false, 0.0, 0.0, tol),
+            Settle::Pending
+        );
+    }
+
+    #[test]
+    fn uncertain_release_waits_for_the_grace_and_a_closed_order() {
+        assert!(!uncertain_released(1_000, 1_030, 60, false));
+        assert!(!uncertain_released(1_000, 1_100, 60, true));
+        assert!(uncertain_released(1_000, 1_060, 60, false));
+    }
+
+    #[test]
+    fn a_late_fill_blocks_the_symbol_until_reconciled_and_never_resends() {
+        let mut state = State::default();
+        // Tick 1: the IOC is still pending after every wait -> uncertain.
+        assert_eq!(
+            settle_decision(0.1, false, false, 0.0, 0.0, 0.000005),
+            Settle::Pending
+        );
+        state.uncertain.insert(
+            "BTC".into(),
+            UncertainOrder {
+                leg: Leg::Short,
+                exchange: "arcus".into(),
+                order_id: Some("o1".into()),
+                qty: 0.1,
+                before_qty: 0.0,
+                sent_at: 1_000,
+                reason: "not terminal".into(),
+            },
+        );
+        // Tick 2: the fill is now visible, the book looks lopsided and the
+        // planner wants to send the same short again — it must not.
+        let plan = vec![
+            (
+                "BTC".to_string(),
+                vec![Order {
+                    leg: Leg::Short,
+                    qty: 0.1,
+                }],
+            ),
+            (
+                "META".to_string(),
+                vec![Order {
+                    leg: Leg::Long,
+                    qty: 1.0,
+                }],
+            ),
+        ];
+        let kept = drop_uncertain(plan.clone(), &state.uncertain);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "META");
+        // Later: out of the book and past the grace -> released, BTC plans again.
+        assert!(uncertain_released(1_000, 1_090, 60, false));
+        state.uncertain.remove("BTC");
+        assert_eq!(drop_uncertain(plan, &state.uncertain).len(), 2);
+    }
+
+    #[test]
+    fn uncertain_orders_persist_and_old_state_loads_without_them() {
+        let mut v = serde_json::to_value(State::default()).unwrap();
+        v.as_object_mut().unwrap().remove("uncertain");
+        let old: State = serde_json::from_value(v).unwrap();
+        assert!(old.uncertain.is_empty());
+        let mut st = State::default();
+        st.uncertain.insert(
+            "BTC".into(),
+            UncertainOrder {
+                leg: Leg::Long,
+                exchange: "lighter".into(),
+                order_id: None,
+                qty: 0.2,
+                before_qty: 0.5,
+                sent_at: 7,
+                reason: "submission ambiguous".into(),
+            },
+        );
+        let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(back.uncertain, st.uncertain);
     }
 
     #[test]
