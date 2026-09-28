@@ -961,8 +961,23 @@ fn roll_release_booking(
 /// evidence: its reservation is replaced by the worst case of a full fill
 /// at the current mark (± the price margin, fee and slippage bound).
 fn roll_risk_ack_booking(rs: &mut RollState, sym: &str, qty: f64, mark: f64, slippage_bps: u32) {
-    rs.in_flight.remove(sym);
-    roll_book_actual(rs, roll_reserve(qty * mark, slippage_bps));
+    // never less than what was reserved at send time: the order may have
+    // filled near its send-time limit, and a later (lower) mark or a stale
+    // snapshot must not shrink the booking
+    let kept = rs.in_flight.remove(sym).unwrap_or((0.0, 0.0));
+    let now = roll_reserve(qty * mark, slippage_bps);
+    roll_book_actual(rs, (kept.0.max(now.0), kept.1.max(now.1)));
+}
+
+/// Absolute IOC limit for a roll taker leg, bound to the mark its
+/// reservation was sized at: the connector must not re-anchor it to a
+/// displaced touch, so value and cost stay inside what was booked.
+fn roll_taker_limit(is_buy: bool, reserved_mark: f64) -> f64 {
+    if is_buy {
+        reserved_mark * (1.0 + ROLL_PRICE_MARGIN)
+    } else {
+        reserved_mark * (1.0 - ROLL_PRICE_MARGIN)
+    }
 }
 
 /// In-flight reservations with no uncertain entry behind them can only be
@@ -1933,6 +1948,9 @@ struct Engine {
     /// (filled, fees, filled value) of the last Arcus order settled from its
     /// own fills — the roll's cost accounting reads it.
     last_settle: Option<(f64, f64, f64)>,
+    /// Set by a roll taker leg: send `execute`'s IOC at this ABSOLUTE limit
+    /// (bound to the reserved mark) instead of re-anchoring to the touch.
+    roll_limit: Option<f64>,
 }
 
 impl Engine {
@@ -2079,6 +2097,14 @@ impl Engine {
     /// reports filled (position delta), which is what the book is
     /// re-planned from.
     async fn execute(&mut self, symbol: &str, order: &Order, mark: f64) -> Result<f64> {
+        // Roll accounting values slippage against THIS leg's venue mark (the
+        // planner passes the long mark; an Arcus leg must not book the venue
+        // basis as cost or credit).
+        let leg_mark = match order.leg {
+            Leg::Long => self.last_snapshot.long.mark(symbol),
+            Leg::Short => self.last_snapshot.short.mark(symbol),
+        };
+        let book_mark = if leg_mark > 0.0 { leg_mark } else { mark };
         let (venue, side, reduce_only) = match (order.leg, order.qty > 0.0) {
             (Leg::Long, true) => (&self.long, OrderSide::Long, false),
             (Leg::Long, false) => (&self.long, OrderSide::Short, true),
@@ -2107,7 +2133,14 @@ impl Engine {
                 "side": format!("{side}"), "qty": qty, "reduce_only": reduce_only,
                 "price": mark, "dry_run": true }),
             );
-            self.roll_book_execution(order.leg, order_is_buy(order), qty, 0.0, qty * mark, mark);
+            self.roll_book_execution(
+                order.leg,
+                order_is_buy(order),
+                qty,
+                0.0,
+                qty * book_mark,
+                book_mark,
+            );
             self.persist();
             return Ok(qty);
         }
@@ -2115,11 +2148,33 @@ impl Engine {
         let before = venue.signed_qty(symbol).await?;
         let size = decimal(qty, "qty")?.round_dp(self.meta(symbol).size_decimals);
         let exchange = venue.kind;
-        let resp = match venue
-            .dex
-            .create_order_taker_ioc(symbol, size, side, self.cfg.taker_slippage_bps, reduce_only)
-            .await
-        {
+        let sent = match self.roll_limit {
+            Some(limit) => {
+                venue
+                    .dex
+                    .create_order_taker_ioc_at(
+                        symbol,
+                        size,
+                        side,
+                        decimal(limit, "limit")?,
+                        reduce_only,
+                    )
+                    .await
+            }
+            None => {
+                venue
+                    .dex
+                    .create_order_taker_ioc(
+                        symbol,
+                        size,
+                        side,
+                        self.cfg.taker_slippage_bps,
+                        reduce_only,
+                    )
+                    .await
+            }
+        };
+        let resp = match sent {
             Ok(r) => r,
             Err(DexError::ReconciliationRequired { detail, .. }) => {
                 // The venue may have taken it: never re-send before the
@@ -2185,7 +2240,14 @@ impl Engine {
         // value and cost into the roll week — roll legs and the planner's
         // levelling / repairs / ARM builds alike.
         if let Some((_, fee, value)) = self.last_settle.filter(|_| exchange == VenueKind::Arcus) {
-            self.roll_book_execution(order.leg, order_is_buy(order), filled, fee, value, mark);
+            self.roll_book_execution(
+                order.leg,
+                order_is_buy(order),
+                filled,
+                fee,
+                value,
+                book_mark,
+            );
         }
         let venue = self.venue(order.leg);
         log::info!(
@@ -2400,7 +2462,10 @@ impl Engine {
         is_buy: bool,
     ) -> Result<(f64, f64, f64)> {
         self.last_settle = None;
-        let filled = self.execute(symbol, order, mark).await?;
+        self.roll_limit = Some(roll_taker_limit(is_buy, mark));
+        let res = self.execute(symbol, order, mark).await;
+        self.roll_limit = None;
+        let filled = res?;
         let (fee, value) = match self.last_settle.take() {
             Some((_, fee, value)) => (fee, value),
             None => (0.0, filled * mark),
@@ -2975,6 +3040,12 @@ impl Engine {
 
     async fn tick(&mut self) -> Result<()> {
         let now = now_secs();
+        // Roll the roll week over FIRST, before anything this tick can book
+        // an execution: otherwise fills after Sunday 00:00 land in the old
+        // week and the first idle tick wipes them.
+        if self.cfg.roll.enabled && roll_week_rollover(&mut self.state.roll, now) {
+            self.persist();
+        }
         let kill = self.sentinels.kill_switch_engaged();
         if self.state.halted && self.sentinels.take_risk_ack() {
             log::warn!("[RISK_ACK] halt cleared ({:?})", self.state.halt_reason);
@@ -3779,6 +3850,7 @@ async fn main() -> Result<()> {
         last_snapshot_at: None,
         feed_problem: None,
         last_settle: None,
+        roll_limit: None,
     };
     let tick = Duration::from_secs(engine.cfg.tick_secs);
     loop {
@@ -4954,10 +5026,25 @@ mod tests {
         rs.in_flight.insert("BTC".into(), r);
         roll_risk_ack_booking(&mut rs, "BTC", 0.05, 110.0, 3);
         assert!(rs.in_flight.is_empty());
+        let now = roll_reserve(0.05 * 110.0, 3);
         assert_eq!(
             (rs.week_volume_usd, rs.week_cost_usd),
-            roll_reserve(0.05 * 110.0, 3)
+            (r.0.max(now.0), r.1.max(now.1))
         );
+        // a small reservation and a risen market: the current-mark worst case wins
+        let small = roll_reserve(1.0, 3);
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), small);
+        roll_risk_ack_booking(&mut rs, "BTC", 0.05, 110.0, 3);
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), now);
+        // … and never LESS than the send-time reservation (market fell since)
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_risk_ack_booking(&mut rs, "BTC", 0.05, 50.0, 3);
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), r);
+        // roll taker limits are absolute, bound to the reserved mark
+        assert!((roll_taker_limit(true, 100.0) - 100.1).abs() < 1e-9);
+        assert!((roll_taker_limit(false, 100.0) - 99.9).abs() < 1e-9);
     }
 
     #[test]
