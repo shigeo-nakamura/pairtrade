@@ -961,6 +961,22 @@ where
     Err(first_blocked)
 }
 
+/// A symbol with an uncertain order, or one reconciled during this tick
+/// (its snapshot predates the release), is not rolled.
+fn roll_symbol_unsettled(
+    uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
+    released_now: &std::collections::BTreeSet<String>,
+    sym: &str,
+) -> bool {
+    uncertain.contains_key(sym) || released_now.contains(sym)
+}
+
+/// When a roll's close fails unconfirmed, the planner's later re-open
+/// (the repair) happens outside the roll path: reserve it like a re-open.
+fn roll_repair_reservation(clip_notional_usd: f64, slippage_bps: u32) -> (f64, f64) {
+    roll_reserve(clip_notional_usd, slippage_bps)
+}
+
 /// Worst-case Arcus taker fee (Base tier) used to pre-book a roll leg's
 /// cost before it is sent.
 const ROLL_RESERVE_FEE_BPS: f64 = 2.25;
@@ -2290,7 +2306,14 @@ impl Engine {
     /// configured notional floored to the size decimals and is NEVER raised
     /// to the venue minimum (that would exceed the clip / net-tolerance
     /// bound the config validated); a clip below the minimum blocks.
-    fn roll_gate(&self, sym: &str, leg: Leg, snap: &Snapshot, kill: bool) -> (f64, f64, RollGate) {
+    fn roll_gate(
+        &self,
+        sym: &str,
+        leg: Leg,
+        snap: &Snapshot,
+        kill: bool,
+        released_now: &std::collections::BTreeSet<String>,
+    ) -> (f64, f64, RollGate) {
         let mark = match leg {
             Leg::Long => snap.long.mark(sym),
             Leg::Short => snap.short.mark(sym),
@@ -2308,7 +2331,7 @@ impl Engine {
             balanced: (held.net() * snap.long.mark(sym)).abs() <= self.cfg.net_tolerance_usd,
             halted: self.state.halted,
             kill,
-            uncertain: self.state.uncertain.contains_key(sym),
+            uncertain: roll_symbol_unsettled(&self.state.uncertain, released_now, sym),
             feed_ok: self.feed_problem.is_none(),
             headroom_ok: headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
             leverage_ok: self.cfg.dry_run
@@ -2331,7 +2354,16 @@ impl Engine {
         self.persist();
     }
 
-    async fn maybe_roll(&mut self, now: u64, snap: &Snapshot, kill: bool) {
+    /// `released_now`: symbols whose uncertain order was reconciled during
+    /// THIS tick — `snap` predates that, so they are not rolled until the
+    /// next tick's fresh snapshot (same rule as the normal planner).
+    async fn maybe_roll(
+        &mut self,
+        now: u64,
+        snap: &Snapshot,
+        kill: bool,
+        released_now: &std::collections::BTreeSet<String>,
+    ) {
         if !self.cfg.roll.enabled {
             return;
         }
@@ -2360,7 +2392,7 @@ impl Engine {
             return;
         }
         let picked = pick_roll_symbol(&order, |sym| {
-            let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill);
+            let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill, released_now);
             let notional = clip_qty * mark;
             let round_trip_cost = 2.0 * roll_reserve(notional, self.cfg.taker_slippage_bps).1;
             roll_blocker(
@@ -2390,7 +2422,7 @@ impl Engine {
                 return;
             }
         };
-        let (mark, clip_qty, _) = self.roll_gate(&sym, leg, snap, kill);
+        let (mark, clip_qty, _) = self.roll_gate(&sym, leg, snap, kill, released_now);
         let m = self.meta(&sym);
         log::info!("[ROLL] {sym} {leg:?} clip {clip_qty} @ {mark:.2}");
         self.event(
@@ -2417,7 +2449,12 @@ impl Engine {
                 (f, c)
             }
             Err(e) => {
-                log::error!("[ROLL] {sym} close failed: {e:?} — its reservation stays booked");
+                log::error!("[ROLL] {sym} close failed: {e:?} — its reservation stays booked, and the repair is reserved too");
+                // The close may have filled without being confirmed; the
+                // normal planner then re-opens that leg once the order is
+                // reconciled, outside the roll path. Book that repair here
+                // (same worst case as a re-open) so it counts against the caps.
+                self.roll_book(roll_repair_reservation(clip_qty * mark, slip));
                 self.state.roll.week_count += 1;
                 self.event(
                     "roll_blocked",
@@ -3012,7 +3049,7 @@ impl Engine {
         }
         // The Arcus-leg roll runs only on a tick that sent nothing else.
         if sent == 0 {
-            self.maybe_roll(now, &snap, kill).await;
+            self.maybe_roll(now, &snap, kill, &released_now).await;
         }
         self.persist();
         self.write_status(now, kill, sent);
@@ -4430,6 +4467,26 @@ mod tests {
             roll_blocker(&off, &rs, now, &g, 800.0, 0.5),
             Some("disabled")
         );
+    }
+
+    #[test]
+    fn roll_skips_symbols_reconciled_this_tick_and_books_the_repair() {
+        let mut uncertain = std::collections::BTreeMap::new();
+        let mut released = std::collections::BTreeSet::new();
+        assert!(!roll_symbol_unsettled(&uncertain, &released, "BTC"));
+        released.insert("BTC".to_string());
+        assert!(roll_symbol_unsettled(&uncertain, &released, "BTC"));
+        released.clear();
+        uncertain.insert("BTC".to_string(), uncertain_btc("arcus", "a"));
+        assert!(roll_symbol_unsettled(&uncertain, &released, "BTC"));
+        assert!(!roll_symbol_unsettled(&uncertain, &released, "META"));
+        // failed close: the repair is reserved like a full re-open, so the
+        // two bookings cover the worst case of both legs
+        assert_eq!(
+            roll_repair_reservation(5_000.0, 3),
+            roll_reserve(5_000.0, 3)
+        );
+        assert!(roll_repair_reservation(5_000.0, 3).0 > 0.0);
     }
 
     #[test]
