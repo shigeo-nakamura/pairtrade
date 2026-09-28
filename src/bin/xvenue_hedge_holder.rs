@@ -2525,14 +2525,30 @@ impl Engine {
                 u.exchange == cur_exchange && (u.instance.is_empty() || u.instance == cur_instance);
             let mut terminal = false;
             let mut delta = f64::NAN;
-            if same_account {
+            // Evidence reads may fail independently of the tick snapshot; a
+            // failed read is simply "no evidence" — the grace / account
+            // escalation below must still run, or an unreadable endpoint
+            // would block the symbol for ever without the operator halt.
+            let evidence = if same_account {
                 let dex = self.venue(u.leg).dex.clone();
-                let Ok(open_orders) = dex.get_open_orders(&sym).await else {
-                    continue;
-                };
-                let Ok(after) = self.venue(u.leg).signed_qty(&sym).await else {
-                    continue;
-                };
+                match (
+                    dex.get_open_orders(&sym).await,
+                    self.venue(u.leg).signed_qty(&sym).await,
+                ) {
+                    (Ok(open_orders), Ok(after)) => Some((open_orders, after)),
+                    (open_orders, after) => {
+                        log::warn!(
+                            "[UNCERTAIN] {sym}: evidence read failed (open_orders ok={} position ok={})",
+                            open_orders.is_ok(),
+                            after.is_ok()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some((open_orders, after)) = evidence {
                 delta = (after - u.before_qty).abs();
                 match (&u.order_id, u.exchange.as_str()) {
                     // Arcus: the order's own fills / cancel must settle it.
