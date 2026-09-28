@@ -889,6 +889,8 @@ struct RollGate {
     feed_ok: bool,
     headroom_ok: bool,
     leverage_ok: bool,
+    /// The configured clip is at least the venue minimum (never enlarged).
+    clip_ok: bool,
     leg_holds_clip: bool,
 }
 
@@ -916,6 +918,7 @@ fn roll_blocker(
         (!g.balanced, "unbalanced"),
         (!g.headroom_ok, "liq_headroom"),
         (!g.leverage_ok, "leverage"),
+        (!g.clip_ok, "clip_below_venue_min"),
         (!g.leg_holds_clip, "leg_smaller_than_clip"),
         (
             rs.week_volume_usd + round_trip_usd > cfg.weekly_volume_usd,
@@ -924,6 +927,51 @@ fn roll_blocker(
         (rs.week_cost_usd >= cfg.weekly_cost_usd, "weekly_cost_cap"),
     ];
     checks.iter().find(|(hit, _)| *hit).map(|(_, why)| *why)
+}
+
+/// Round robin: the first symbol (in `order`) whose gates pass, else the
+/// first candidate's blocker. A blocked book must not starve the others.
+fn pick_roll_symbol<F>(
+    order: &[String],
+    mut blocker: F,
+) -> Result<String, Option<(String, &'static str)>>
+where
+    F: FnMut(&str) -> Option<&'static str>,
+{
+    let mut first_blocked = None;
+    for sym in order {
+        match blocker(sym) {
+            None => return Ok(sym.clone()),
+            Some(why) => {
+                first_blocked.get_or_insert((sym.clone(), why));
+            }
+        }
+    }
+    Err(first_blocked)
+}
+
+/// Worst-case Arcus taker fee (Base tier) used to pre-book a roll leg's
+/// cost before it is sent.
+const ROLL_RESERVE_FEE_BPS: f64 = 2.25;
+
+/// What a roll leg books against the weekly caps BEFORE it is sent: its
+/// full notional and a worst-case cost (fee + the IOC slippage bound).
+fn roll_reserve(notional_usd: f64, slippage_bps: u32) -> (f64, f64) {
+    (
+        notional_usd,
+        notional_usd * (ROLL_RESERVE_FEE_BPS + slippage_bps as f64) / 10_000.0,
+    )
+}
+
+/// Correction to apply once the leg's outcome is known: settled → replace
+/// the reservation with the actual (volume, cost); unknown (error /
+/// uncertain) → keep the reservation, so real but unconfirmed execution can
+/// never leave the weekly counters under the caps.
+fn roll_settle_reservation(reserved: (f64, f64), actual: Option<(f64, f64)>) -> (f64, f64) {
+    match actual {
+        Some((vol, cost)) => (vol - reserved.0, cost - reserved.1),
+        None => (0.0, 0.0),
+    }
 }
 
 /// The re-open of a roll: the same size the close actually filled, and
@@ -2171,6 +2219,51 @@ impl Engine {
     /// clip lopsided (within the net tolerance by config): the uncertain
     /// guard holds the symbol until reconciled, then the normal levelling
     /// grows the smaller leg back.
+    /// (mark, clip qty, gates) for rolling `sym` on `leg`. The clip is the
+    /// configured notional floored to the size decimals and is NEVER raised
+    /// to the venue minimum (that would exceed the clip / net-tolerance
+    /// bound the config validated); a clip below the minimum blocks.
+    fn roll_gate(&self, sym: &str, leg: Leg, snap: &Snapshot, kill: bool) -> (f64, f64, RollGate) {
+        let mark = match leg {
+            Leg::Long => snap.long.mark(sym),
+            Leg::Short => snap.short.mark(sym),
+        };
+        let m = self.meta(sym);
+        let clip_qty = qty_for_notional(self.cfg.roll.clip_usd, mark, m.size_decimals);
+        let held = snap.book(sym);
+        let leg_qty = match leg {
+            Leg::Long => held.long,
+            Leg::Short => held.short,
+        };
+        let headroom = liq_headroom_pct(snap.equity(leg), &snap.legs(&self.cfg, leg));
+        let gate = RollGate {
+            book_on: self.state.book(sym).mode == Mode::On,
+            balanced: (held.net() * snap.long.mark(sym)).abs() <= self.cfg.net_tolerance_usd,
+            halted: self.state.halted,
+            kill,
+            uncertain: self.state.uncertain.contains_key(sym),
+            feed_ok: self.feed_problem.is_none(),
+            headroom_ok: headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
+            leverage_ok: self.cfg.dry_run
+                || leverage_ok(
+                    snap.gross(&self.cfg, leg),
+                    snap.equity(leg),
+                    self.cfg.max_leverage,
+                ),
+            clip_ok: clip_qty > 0.0 && clip_qty >= m.min_qty,
+            leg_holds_clip: clip_qty > 0.0 && leg_qty >= clip_qty,
+        };
+        (mark, clip_qty, gate)
+    }
+
+    /// Add (volume, cost) to this week's roll counters and persist at once,
+    /// so a crash between send and settle cannot lose the booking.
+    fn roll_book(&mut self, (vol, cost): (f64, f64)) {
+        self.state.roll.week_volume_usd += vol;
+        self.state.roll.week_cost_usd += cost;
+        self.persist();
+    }
+
     async fn maybe_roll(&mut self, now: u64, snap: &Snapshot, kill: bool) {
         if !self.cfg.roll.enabled {
             return;
@@ -2181,7 +2274,8 @@ impl Engine {
         if roll_week_rollover(&mut self.state.roll, now) {
             self.persist();
         }
-        // Round robin over the armed books.
+        // Round robin over the armed books; a blocked book is skipped so it
+        // cannot starve the others.
         let syms: Vec<String> = self.cfg.symbol_names();
         let start = self
             .state
@@ -2191,63 +2285,43 @@ impl Engine {
             .and_then(|l| syms.iter().position(|s| s == l))
             .map(|i| i + 1)
             .unwrap_or(0);
-        let Some(sym) = (0..syms.len())
+        let order: Vec<String> = (0..syms.len())
             .map(|k| syms[(start + k) % syms.len()].clone())
-            .find(|s| self.state.book(s).mode == Mode::On)
-        else {
-            return;
-        };
-        let mark = match leg {
-            Leg::Long => snap.long.mark(&sym),
-            Leg::Short => snap.short.mark(&sym),
-        };
-        let m = self.meta(&sym);
-        let clip_qty =
-            qty_for_notional(self.cfg.roll.clip_usd, mark, m.size_decimals).max(m.min_qty);
-        let held = snap.book(&sym);
-        let leg_qty = match leg {
-            Leg::Long => held.long,
-            Leg::Short => held.short,
-        };
-        let headroom = liq_headroom_pct(snap.equity(leg), &snap.legs(&self.cfg, leg));
-        let gate = RollGate {
-            book_on: self.state.book(&sym).mode == Mode::On,
-            balanced: (held.net() * snap.long.mark(&sym)).abs() <= self.cfg.net_tolerance_usd,
-            halted: self.state.halted,
-            kill,
-            uncertain: self.state.uncertain.contains_key(&sym),
-            feed_ok: self.feed_problem.is_none(),
-            headroom_ok: headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
-            leverage_ok: self.cfg.dry_run
-                || leverage_ok(
-                    snap.gross(&self.cfg, leg),
-                    snap.equity(leg),
-                    self.cfg.max_leverage,
-                ),
-            leg_holds_clip: clip_qty > 0.0 && leg_qty >= clip_qty,
-        };
-        let blocked = roll_blocker(
-            &self.cfg.roll,
-            &self.state.roll,
-            now,
-            &gate,
-            2.0 * clip_qty * mark,
-        );
-        if let Some(why) = blocked {
-            let why = (why != "interval").then(|| why.to_string());
-            if self.state.roll.blocked_reason != why {
-                if let Some(w) = &why {
-                    log::info!("[ROLL] {sym} blocked: {w}");
-                    self.event(
-                        "roll_blocked",
-                        serde_json::json!({ "symbol": sym, "reason": w }),
-                    );
-                }
-                self.state.roll.blocked_reason = why;
-                self.persist();
-            }
+            .filter(|s| self.state.book(s).mode == Mode::On)
+            .collect();
+        if order.is_empty() {
             return;
         }
+        let picked = pick_roll_symbol(&order, |sym| {
+            let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill);
+            roll_blocker(
+                &self.cfg.roll,
+                &self.state.roll,
+                now,
+                &gate,
+                2.0 * clip_qty * mark,
+            )
+        });
+        let sym = match picked {
+            Ok(sym) => sym,
+            Err(first) => {
+                let why = first
+                    .as_ref()
+                    .filter(|(_, w)| *w != "interval")
+                    .map(|(s, w)| format!("{s}: {w}"));
+                if self.state.roll.blocked_reason != why {
+                    if let Some(w) = &why {
+                        log::info!("[ROLL] blocked: {w}");
+                        self.event("roll_blocked", serde_json::json!({ "reason": w }));
+                    }
+                    self.state.roll.blocked_reason = why;
+                    self.persist();
+                }
+                return;
+            }
+        };
+        let (mark, clip_qty, _) = self.roll_gate(&sym, leg, snap, kill);
+        let m = self.meta(&sym);
         log::info!("[ROLL] {sym} {leg:?} clip {clip_qty} @ {mark:.2}");
         self.event(
             "roll_start",
@@ -2261,10 +2335,20 @@ impl Engine {
             leg,
             qty: -clip_qty,
         };
+        // Each leg is booked against the weekly caps BEFORE it is sent (full
+        // notional + worst-case cost) and corrected to the actual once it
+        // settles; an unconfirmed leg keeps its reservation.
+        let slip = self.cfg.taker_slippage_bps;
+        let reserved = roll_reserve(clip_qty * mark, slip);
+        self.roll_book(reserved);
         let (close_filled, close_cost) = match self.roll_one(&sym, &close, mark).await {
-            Ok(v) => v,
+            Ok((f, c)) => {
+                self.roll_book(roll_settle_reservation(reserved, Some((f * mark, c))));
+                (f, c)
+            }
             Err(e) => {
-                log::error!("[ROLL] {sym} close failed: {e:?}");
+                log::error!("[ROLL] {sym} close failed: {e:?} — its reservation stays booked");
+                self.state.roll.week_count += 1;
                 self.event(
                     "roll_blocked",
                     serde_json::json!({ "symbol": sym, "reason": format!("close failed: {e}") }),
@@ -2278,8 +2362,11 @@ impl Engine {
         match roll_reopen(leg, close_filled, m.min_qty) {
             None => outcome = "close_unfilled",
             Some(reopen) => {
+                let reserved = roll_reserve(close_filled * mark, slip);
+                self.roll_book(reserved);
                 match self.roll_one(&sym, &reopen, mark).await {
                     Ok((f, c)) => {
+                        self.roll_book(roll_settle_reservation(reserved, Some((f * mark, c))));
                         open_filled = f;
                         open_cost = c;
                         if f + self.size_tol(&sym) < close_filled {
@@ -2287,15 +2374,13 @@ impl Engine {
                         }
                     }
                     Err(e) => {
-                        log::error!("[ROLL] {sym} re-open failed: {e:?} — levelling repairs it once reconciled");
+                        log::error!("[ROLL] {sym} re-open failed: {e:?} — reservation stays booked; levelling repairs it once reconciled");
                         outcome = "reopen_failed";
                     }
                 }
             }
         }
         let rs = &mut self.state.roll;
-        rs.week_volume_usd += (close_filled + open_filled) * mark;
-        rs.week_cost_usd += close_cost + open_cost;
         rs.week_count += 1;
         let (vol, cost) = (rs.week_volume_usd, rs.week_cost_usd);
         self.event(
@@ -4049,6 +4134,7 @@ mod tests {
             feed_ok: true,
             headroom_ok: true,
             leverage_ok: true,
+            clip_ok: true,
             leg_holds_clip: true,
         }
     }
@@ -4160,6 +4246,7 @@ mod tests {
             (Box::new(|g| g.balanced = false), "unbalanced"),
             (Box::new(|g| g.headroom_ok = false), "liq_headroom"),
             (Box::new(|g| g.leverage_ok = false), "leverage"),
+            (Box::new(|g| g.clip_ok = false), "clip_below_venue_min"),
             (
                 Box::new(|g| g.leg_holds_clip = false),
                 "leg_smaller_than_clip",
@@ -4191,6 +4278,33 @@ mod tests {
         let mut off = cfg.clone();
         off.enabled = false;
         assert_eq!(roll_blocker(&off, &rs, now, &g, 800.0), Some("disabled"));
+    }
+
+    #[test]
+    fn roll_round_robin_skips_blocked_books() {
+        let order: Vec<String> = ["BTC", "META", "AMZN"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // BTC is persistently blocked: META must still be rolled.
+        let picked = pick_roll_symbol(&order, |s| (s == "BTC").then_some("unbalanced"));
+        assert_eq!(picked, Ok("META".to_string()));
+        // Everyone blocked: the first candidate's reason is reported.
+        let none = pick_roll_symbol(&order, |_| Some("leverage"));
+        assert_eq!(none, Err(Some(("BTC".to_string(), "leverage"))));
+    }
+
+    #[test]
+    fn roll_reservation_is_kept_unless_the_leg_settles() {
+        let reserved = roll_reserve(5_000.0, 3);
+        assert_eq!(reserved.0, 5_000.0);
+        assert!((reserved.1 - 5_000.0 * 5.25 / 10_000.0).abs() < 1e-9);
+        // settled: replaced by the actual
+        let d = roll_settle_reservation(reserved, Some((4_000.0, 1.0)));
+        assert!((reserved.0 + d.0 - 4_000.0).abs() < 1e-9);
+        assert!((reserved.1 + d.1 - 1.0).abs() < 1e-9);
+        // unconfirmed (error / uncertain): the reservation stays booked
+        assert_eq!(roll_settle_reservation(reserved, None), (0.0, 0.0));
     }
 
     #[test]
