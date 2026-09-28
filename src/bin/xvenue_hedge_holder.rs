@@ -794,6 +794,10 @@ struct UncertainOrder {
     qty: f64,
     /// The leg's signed venue position right before the order.
     before_qty: f64,
+    /// Mark the order was sent against (roll accounting: slippage of the
+    /// fills booked when the order is released). 0 when unknown.
+    #[serde(default)]
+    mark: f64,
     sent_at: u64,
     reason: String,
 }
@@ -847,15 +851,19 @@ struct RollState {
     /// Day index (days since 1970-01-01) of the Sunday the current roll
     /// week started on.
     week: u64,
+    /// ACTUAL executed value / cost this week of every confirmed execution
+    /// on the rolled (Arcus) leg: roll legs AND the planner's levelling,
+    /// repairs and ARM builds — each books itself when it settles.
     week_volume_usd: f64,
     week_cost_usd: f64,
-    /// Repair reservations not yet consumed, per symbol (volume, cost):
-    /// uncertain / partial / sub-minimum closes and failed re-opens that the
-    /// planner still has to repair outside the roll path. They open EVERY
-    /// new week's counters until the book is seen settled and levelled, so a
-    /// repair landing after any number of Sundays is always booked.
+    /// Worst-case reservations (volume, cost) of roll legs sent but not yet
+    /// settled, per symbol. Set before a roll leg is sent and cleared when
+    /// it settles (its fills are booked where they settle); a leg that ends
+    /// uncertain keeps its reservation until the uncertain entry is released
+    /// (observed fills booked) or cleared by RISK_ACK (worst case booked).
+    /// Not part of the week counters: it survives rollovers on its own.
     #[serde(default)]
-    pending_repairs: std::collections::BTreeMap<String, (f64, f64)>,
+    in_flight: std::collections::BTreeMap<String, (f64, f64)>,
     week_count: u64,
     last_roll_at: Option<u64>,
     last_symbol: Option<String>,
@@ -875,17 +883,11 @@ fn roll_week(now: u64) -> u64 {
 fn roll_week_rollover(rs: &mut RollState, now: u64) -> bool {
     let week = roll_week(now);
     if rs.week != week {
-        // Outstanding repair reservations open the new week's counters and
-        // stay pending until consumed.
-        let (vol, cost) = rs
-            .pending_repairs
-            .values()
-            .fold((0.0, 0.0), |(v, c), (dv, dc)| (v + dv, c + dc));
+        // Actuals restart at zero; in-flight reservations (uncertain roll
+        // legs) are kept as they are until released.
         *rs = RollState {
             week,
-            week_volume_usd: vol,
-            week_cost_usd: cost,
-            pending_repairs: std::mem::take(&mut rs.pending_repairs),
+            in_flight: std::mem::take(&mut rs.in_flight),
             last_roll_at: rs.last_roll_at,
             last_symbol: rs.last_symbol.clone(),
             ..RollState::default()
@@ -895,23 +897,93 @@ fn roll_week_rollover(rs: &mut RollState, now: u64) -> bool {
     false
 }
 
-/// Drop the pending repairs whose book is now settled and levelled (no
-/// uncertain order, net within tolerance): the planner has made the repair,
-/// and its reservation stays counted in the week it was booked.
-fn roll_consume_repairs<F>(rs: &mut RollState, mut settled: F) -> Vec<String>
-where
-    F: FnMut(&str) -> bool,
-{
-    let done: Vec<String> = rs
-        .pending_repairs
+/// Sum of the in-flight reservations (volume, cost).
+fn roll_in_flight_total(rs: &RollState) -> (f64, f64) {
+    rs.in_flight
+        .values()
+        .fold((0.0, 0.0), |(v, c), (dv, dc)| (v + dv, c + dc))
+}
+
+/// Book a confirmed execution's actual (value, cost) into the week.
+fn roll_book_actual(rs: &mut RollState, (value, cost): (f64, f64)) {
+    rs.week_volume_usd += value;
+    rs.week_cost_usd += cost;
+}
+
+/// Booking of one settled execution on `leg`: `Some((value, cost))` when
+/// `leg` is the rolled (Arcus) leg — whoever sent it (roll, planner repair,
+/// levelling, ARM build) — `None` otherwise. Cost = fee + slippage vs the
+/// mark the order was sent against.
+fn roll_execution_booking(
+    rolled_leg: Option<Leg>,
+    leg: Leg,
+    is_buy: bool,
+    filled: f64,
+    fee: f64,
+    value: f64,
+    mark: f64,
+) -> Option<(f64, f64)> {
+    (rolled_leg == Some(leg) && filled > 0.0)
+        .then(|| (value, roll_cost(is_buy, filled, fee, value, mark)))
+}
+
+/// After a roll leg returned: an uncertain leg keeps its reservation (it
+/// is settled when the uncertain entry is released / cleared); any other
+/// outcome drops it — its fills were booked where they settled.
+fn roll_finish_in_flight(rs: &mut RollState, sym: &str, still_uncertain: bool) {
+    if !still_uncertain {
+        rs.in_flight.remove(sym);
+    }
+}
+
+/// An uncertain order on the rolled leg released on terminal evidence: its
+/// reservation is replaced by the fills actually observed. Slippage is taken
+/// as |value − filled × mark at send| (direction unknown here: the
+/// conservative absolute).
+fn roll_release_booking(
+    rs: &mut RollState,
+    sym: &str,
+    filled: f64,
+    fee: f64,
+    value: f64,
+    send_mark: f64,
+) {
+    rs.in_flight.remove(sym);
+    let slip = if send_mark > 0.0 {
+        (value - filled * send_mark).abs()
+    } else {
+        0.0
+    };
+    roll_book_actual(rs, (value, fee + slip));
+}
+
+/// An uncertain order on the rolled leg cleared by RISK_ACK without
+/// evidence: its reservation is replaced by the worst case of a full fill
+/// at the current mark (± the price margin, fee and slippage bound).
+fn roll_risk_ack_booking(rs: &mut RollState, sym: &str, qty: f64, mark: f64, slippage_bps: u32) {
+    rs.in_flight.remove(sym);
+    roll_book_actual(rs, roll_reserve(qty * mark, slippage_bps));
+}
+
+/// In-flight reservations with no uncertain entry behind them can only be
+/// left by a process that died between send and settle: book them (the leg
+/// may have filled) and drop them. Returns the symbols settled.
+fn roll_settle_stale_in_flight(
+    rs: &mut RollState,
+    uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
+) -> Vec<String> {
+    let stale: Vec<String> = rs
+        .in_flight
         .keys()
-        .filter(|s| settled(s))
+        .filter(|s| !uncertain.contains_key(*s))
         .cloned()
         .collect();
-    for s in &done {
-        rs.pending_repairs.remove(s);
+    for s in &stale {
+        if let Some(r) = rs.in_flight.remove(s) {
+            roll_book_actual(rs, r);
+        }
     }
-    done
+    stale
 }
 
 /// Largest move (fraction) of the rolled leg's mark between the gated
@@ -940,10 +1012,10 @@ struct RollGate {
     leg_holds_clip: bool,
 }
 
-/// Why the roll does not run now (`None`: go). `round_trip_usd` is the
-/// volume one roll adds (close + re-open) and `round_trip_cost_usd` its
-/// worst-case cost (the two leg reservations): the NEXT roll must fit under
-/// both weekly caps, not merely the spend so far.
+/// Why the roll does not run now (`None`: go). `round_trip_usd` /
+/// `round_trip_cost_usd` are the two leg reservations of the next roll
+/// (exactly what `roll_reserve` will book): actual week + in-flight +
+/// that projection must fit under both weekly caps.
 fn roll_blocker(
     cfg: &RollCfg,
     rs: &RollState,
@@ -958,6 +1030,7 @@ fn roll_blocker(
     if now < roll_next_at(rs, cfg.interval_secs) {
         return Some("interval");
     }
+    let (fly_v, fly_c) = roll_in_flight_total(rs);
     let checks = [
         (!g.book_on, "book_not_on"),
         (g.halted, "halted"),
@@ -970,11 +1043,11 @@ fn roll_blocker(
         (!g.clip_ok, "clip_below_venue_min"),
         (!g.leg_holds_clip, "leg_smaller_than_clip"),
         (
-            rs.week_volume_usd + round_trip_usd > cfg.weekly_volume_usd,
+            rs.week_volume_usd + fly_v + round_trip_usd > cfg.weekly_volume_usd,
             "weekly_volume_budget",
         ),
         (
-            rs.week_cost_usd + round_trip_cost_usd > cfg.weekly_cost_usd,
+            rs.week_cost_usd + fly_c + round_trip_cost_usd > cfg.weekly_cost_usd,
             "weekly_cost_cap",
         ),
     ];
@@ -1029,51 +1102,10 @@ fn roll_post_close_net_ok(
     (after * long_mark).abs() <= tol_usd
 }
 
-/// Bookings after a failed close: (correction to the close reservation,
-/// repair reservation). An uncertain close may have filled → keep the close
-/// reservation and reserve the repair; a failure before anything was
-/// accepted executed nothing → release the close reservation, no repair.
-fn roll_close_error_booking(
-    marked_uncertain: bool,
-    close_reserved: (f64, f64),
-    repair: (f64, f64),
-) -> ((f64, f64), (f64, f64)) {
-    if marked_uncertain {
-        ((0.0, 0.0), repair)
-    } else {
-        (
-            roll_settle_reservation(close_reserved, Some((0.0, 0.0))),
-            (0.0, 0.0),
-        )
-    }
-}
-
-/// Close fill the roll cannot re-open itself (a positive fill below the
-/// venue minimum): the leg shrank all the same and the planner repairs it
-/// later, so it must be reserved.
-fn roll_unreopened_close(close_filled: f64, min_qty: f64) -> f64 {
-    if close_filled > 0.0 && roll_reopen(Leg::Short, close_filled, min_qty).is_none() {
-        close_filled
-    } else {
-        0.0
-    }
-}
-
 /// Mark the roll clip is sized at: the higher of the rolled leg's mark and
 /// the long mark the net guard uses, so clip × either mark ≤ the clip USD.
 fn roll_sizing_mark(leg_mark: f64, long_mark: f64) -> f64 {
     leg_mark.max(long_mark)
-}
-
-/// Part of a re-open that did not fill (base units, never negative).
-fn roll_partial_remainder(close_filled: f64, reopen_filled: f64) -> f64 {
-    (close_filled - reopen_filled).max(0.0)
-}
-
-/// When a roll's close fails unconfirmed, the planner's later re-open
-/// (the repair) happens outside the roll path: reserve it like a re-open.
-fn roll_repair_reservation(clip_notional_usd: f64, slippage_bps: u32) -> (f64, f64) {
-    roll_reserve(clip_notional_usd, slippage_bps)
 }
 
 /// Worst-case Arcus taker fee (Base tier) used to pre-book a roll leg's
@@ -1099,17 +1131,6 @@ fn roll_price_ok(reserved_mark: f64, fresh_mark: f64) -> bool {
     reserved_mark > 0.0 && ((fresh_mark / reserved_mark) - 1.0).abs() <= ROLL_PRICE_MARGIN
 }
 
-/// Correction to apply once the leg's outcome is known: settled → replace
-/// the reservation with the actual (volume, cost); unknown (error /
-/// uncertain) → keep the reservation, so real but unconfirmed execution can
-/// never leave the weekly counters under the caps.
-fn roll_settle_reservation(reserved: (f64, f64), actual: Option<(f64, f64)>) -> (f64, f64) {
-    match actual {
-        Some((vol, cost)) => (vol - reserved.0, cost - reserved.1),
-        None => (0.0, 0.0),
-    }
-}
-
 /// The re-open of a roll: the same size the close actually filled, and
 /// nothing when the close did not fill (the book was never lopsided).
 fn roll_reopen(leg: Leg, close_filled: f64, min_qty: f64) -> Option<Order> {
@@ -1117,6 +1138,39 @@ fn roll_reopen(leg: Leg, close_filled: f64, min_qty: f64) -> Option<Order> {
         leg,
         qty: close_filled,
     })
+}
+
+/// Outcome of one roll leg. `error` is set when part of the leg failed
+/// after something may already have executed (the fills so far are real
+/// and kept); a leg that executed nothing and failed is an `Err` instead.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct RollLeg {
+    filled: f64,
+    cost: f64,
+    value: f64,
+    error: Option<String>,
+}
+
+/// A maker_first leg: the post-only fill is kept whatever happens to the
+/// taker remainder — a failed remainder never discards it.
+fn maker_first_leg(
+    maker: (f64, f64, f64),
+    rest: std::result::Result<(f64, f64, f64), String>,
+) -> RollLeg {
+    match rest {
+        Ok((f, c, v)) => RollLeg {
+            filled: maker.0 + f,
+            cost: maker.1 + c,
+            value: maker.2 + v,
+            error: None,
+        },
+        Err(e) => RollLeg {
+            filled: maker.0,
+            cost: maker.1,
+            value: maker.2,
+            error: Some(e),
+        },
+    }
 }
 
 /// After the post-only part of a maker_first roll leg.
@@ -1150,6 +1204,14 @@ fn maker_next(
     } else {
         MakerNext::Taker(rest)
     }
+}
+
+/// True when the order buys (long grows / short shrinks).
+fn order_is_buy(order: &Order) -> bool {
+    matches!(
+        (order.leg, order.qty > 0.0),
+        (Leg::Long, true) | (Leg::Short, false)
+    )
 }
 
 /// Roll cost of one execution: fees plus slippage against the mark at send
@@ -2045,9 +2107,11 @@ impl Engine {
                 "side": format!("{side}"), "qty": qty, "reduce_only": reduce_only,
                 "price": mark, "dry_run": true }),
             );
+            self.roll_book_execution(order.leg, order_is_buy(order), qty, 0.0, qty * mark, mark);
             self.persist();
             return Ok(qty);
         }
+        self.last_settle = None;
         let before = venue.signed_qty(symbol).await?;
         let size = decimal(qty, "qty")?.round_dp(self.meta(symbol).size_decimals);
         let exchange = venue.kind;
@@ -2061,7 +2125,9 @@ impl Engine {
                 // The venue may have taken it: never re-send before the
                 // position says what happened.
                 let reason = format!("submission ambiguous: {detail}");
-                self.mark_uncertain(symbol, order.leg, exchange, None, qty, before, &reason);
+                self.mark_uncertain(
+                    symbol, order.leg, exchange, None, qty, before, mark, &reason,
+                );
                 bail!(
                     "{} IOC {side} {symbol} {size}: {reason}",
                     self.venue(order.leg).name
@@ -2091,6 +2157,7 @@ impl Engine {
                         Some(order_id.clone()),
                         qty,
                         before,
+                        mark,
                         &reason,
                     );
                     bail!(
@@ -2114,6 +2181,12 @@ impl Engine {
             }
             filled
         };
+        // Every settled execution on the rolled (Arcus) leg books its actual
+        // value and cost into the roll week — roll legs and the planner's
+        // levelling / repairs / ARM builds alike.
+        if let Some((_, fee, value)) = self.last_settle.filter(|_| exchange == VenueKind::Arcus) {
+            self.roll_book_execution(order.leg, order_is_buy(order), filled, fee, value, mark);
+        }
         let venue = self.venue(order.leg);
         log::info!(
             "[FILL] {} {side} {symbol} req={qty} filled={filled:.5} reduce_only={reduce_only} limit={} order_id={}",
@@ -2151,6 +2224,7 @@ impl Engine {
         order_id: Option<String>,
         qty: f64,
         before_qty: f64,
+        mark: f64,
         reason: &str,
     ) {
         log::error!(
@@ -2164,6 +2238,7 @@ impl Engine {
             order_id,
             qty,
             before_qty,
+            mark,
             sent_at: now_secs(),
             reason: reason.to_string(),
         };
@@ -2261,56 +2336,60 @@ impl Engine {
     }
 
     /// One roll leg (reduce when `order.qty < 0`, re-open when > 0) on the
-    /// Arcus leg; returns (filled, cost USD, executed value USD). Terminal
-    /// before it returns:
-    /// the taker path settles through `execute`, the maker path confirms the
-    /// post-only order filled or canceled before any taker rest is sent.
-    async fn roll_one(
-        &mut self,
-        symbol: &str,
-        order: &Order,
-        mark: f64,
-    ) -> Result<(f64, f64, f64)> {
-        let is_buy = matches!(
-            (order.leg, order.qty > 0.0),
-            (Leg::Long, true) | (Leg::Short, false)
-        );
+    /// Arcus leg. Terminal before it returns: the taker path settles through
+    /// `execute`, the maker path confirms the post-only order filled or
+    /// canceled before any taker rest is sent. Fills are booked where they
+    /// settle (`execute` / `roll_maker`); the result only reports them.
+    /// `Err` = nothing executed; a partial post-only fill followed by a
+    /// failed remainder is `Ok` with `error` set (the fill is real).
+    async fn roll_one(&mut self, symbol: &str, order: &Order, mark: f64) -> Result<RollLeg> {
+        let is_buy = order_is_buy(order);
         let want = order.qty.abs();
         self.roll_price_guard(symbol, order.leg, mark).await?;
-        let mut filled = 0.0;
-        let mut cost = 0.0;
-        let mut value = 0.0;
         if self.cfg.roll.mode == RollMode::MakerFirst && !self.cfg.dry_run {
             let (maker_filled, maker_cost, maker_value, confirmed) =
                 self.roll_maker(symbol, order, mark, is_buy).await?;
-            filled += maker_filled;
-            cost += maker_cost;
-            value += maker_value;
-            match maker_next(
-                want,
-                maker_filled,
-                self.meta(symbol).min_qty,
-                confirmed,
-                self.size_tol(symbol),
-            ) {
-                MakerNext::Done(_) => return Ok((filled, cost, value)),
-                MakerNext::Uncertain => {
-                    bail!("post-only roll order not confirmed canceled — no taker rest")
-                }
-                MakerNext::Taker(rest) => {
-                    // the post-only half may have rested for the whole timeout
-                    self.roll_price_guard(symbol, order.leg, mark).await?;
-                    let taker = Order {
-                        leg: order.leg,
-                        qty: rest * order.qty.signum(),
-                    };
-                    let (f, c, v) = self.roll_taker(symbol, &taker, mark, is_buy).await?;
-                    return Ok((filled + f, cost + c, value + v));
-                }
-            }
+            let maker = (maker_filled, maker_cost, maker_value);
+            return Ok(
+                match maker_next(
+                    want,
+                    maker_filled,
+                    self.meta(symbol).min_qty,
+                    confirmed,
+                    self.size_tol(symbol),
+                ) {
+                    MakerNext::Done(_) => maker_first_leg(maker, Ok((0.0, 0.0, 0.0))),
+                    MakerNext::Uncertain => maker_first_leg(
+                        maker,
+                        Err("post-only roll order not confirmed canceled — no taker rest".into()),
+                    ),
+                    MakerNext::Taker(rest) => {
+                        // the post-only half may have rested for the whole timeout
+                        let rest_result = match self.roll_price_guard(symbol, order.leg, mark).await
+                        {
+                            Err(e) => Err(format!("{e:#}")),
+                            Ok(()) => {
+                                let taker = Order {
+                                    leg: order.leg,
+                                    qty: rest * order.qty.signum(),
+                                };
+                                self.roll_taker(symbol, &taker, mark, is_buy)
+                                    .await
+                                    .map_err(|e| format!("{e:#}"))
+                            }
+                        };
+                        maker_first_leg(maker, rest_result)
+                    }
+                },
+            );
         }
         let (f, c, v) = self.roll_taker(symbol, order, mark, is_buy).await?;
-        Ok((filled + f, cost + c, value + v))
+        Ok(RollLeg {
+            filled: f,
+            cost: c,
+            value: v,
+            error: None,
+        })
     }
 
     async fn roll_taker(
@@ -2361,6 +2440,15 @@ impl Engine {
         }
         .map(|l| l.price)
         .ok_or_else(|| anyhow!("roll book {symbol}: empty side"))?;
+        // The limit actually sent must be inside the margin the reservation
+        // covers, not just the ticker mark.
+        let passive_f = passive.to_f64().unwrap_or(0.0);
+        if !roll_price_ok(mark, passive_f) {
+            bail!(
+                "roll post-only {symbol}: passive touch {passive_f} vs reserved mark {mark} (> {} %) — not sent",
+                ROLL_PRICE_MARGIN * 100.0
+            );
+        }
         let before = self.venue(leg).signed_qty(symbol).await?;
         let size = decimal(want, "qty")?.round_dp(self.meta(symbol).size_decimals);
         let resp = match dex
@@ -2378,7 +2466,16 @@ impl Engine {
             Ok(r) => r,
             Err(DexError::ReconciliationRequired { detail, .. }) => {
                 let reason = format!("post-only roll submission ambiguous: {detail}");
-                self.mark_uncertain(symbol, leg, VenueKind::Arcus, None, want, before, &reason);
+                self.mark_uncertain(
+                    symbol,
+                    leg,
+                    VenueKind::Arcus,
+                    None,
+                    want,
+                    before,
+                    mark,
+                    &reason,
+                );
                 bail!("{reason}");
             }
             Err(e) => bail!("roll post-only {side} {symbol} {size}: {e:?}"),
@@ -2419,6 +2516,7 @@ impl Engine {
             ) {
                 self.forget_arcus_activity(leg, symbol, &id, &v.trades)
                     .await;
+                self.roll_book_execution(leg, is_buy, f, v.fee, v.value, mark);
                 self.event(
                     "roll_leg",
                     serde_json::json!({ "symbol": symbol, "leg": format!("{leg:?}"), "kind": "post_only",
@@ -2435,6 +2533,7 @@ impl Engine {
             Some(id),
             want,
             before,
+            mark,
             &reason,
         );
         Ok((0.0, 0.0, 0.0, false))
@@ -2502,26 +2601,23 @@ impl Engine {
         (mark, clip_qty, gate)
     }
 
-    /// Add (volume, cost) to this week's roll counters and persist at once,
-    /// so a crash between send and settle cannot lose the booking.
-    fn roll_book(&mut self, (vol, cost): (f64, f64)) {
-        self.state.roll.week_volume_usd += vol;
-        self.state.roll.week_cost_usd += cost;
-        self.persist();
-    }
-
-    /// Book a repair reservation: counted this week AND carried into the
-    /// next one at rollover (the planner's repair may land after Sunday).
-    fn roll_book_repair(&mut self, sym: &str, (vol, cost): (f64, f64)) {
-        let e = self
-            .state
-            .roll
-            .pending_repairs
-            .entry(sym.to_string())
-            .or_insert((0.0, 0.0));
-        e.0 += vol;
-        e.1 += cost;
-        self.roll_book((vol, cost));
+    /// Book one settled execution into the roll week when it is on the
+    /// rolled (Arcus) leg, and persist at once.
+    fn roll_book_execution(
+        &mut self,
+        leg: Leg,
+        is_buy: bool,
+        filled: f64,
+        fee: f64,
+        value: f64,
+        mark: f64,
+    ) {
+        if let Some(b) =
+            roll_execution_booking(self.cfg.roll_leg(), leg, is_buy, filled, fee, value, mark)
+        {
+            roll_book_actual(&mut self.state.roll, b);
+            self.persist();
+        }
     }
 
     /// Refuse to send a roll leg once the leg's mark has moved beyond the
@@ -2557,14 +2653,9 @@ impl Engine {
             self.persist();
         }
         {
-            let tol = self.cfg.net_tolerance_usd;
-            let uncertain = &self.state.uncertain;
-            let done = roll_consume_repairs(&mut self.state.roll, |sym| {
-                !uncertain.contains_key(sym)
-                    && (snap.book(sym).net() * snap.long.mark(sym)).abs() <= tol
-            });
-            if !done.is_empty() {
-                log::info!("[ROLL] repairs consumed (book levelled): {done:?}");
+            let stale = roll_settle_stale_in_flight(&mut self.state.roll, &self.state.uncertain);
+            if !stale.is_empty() {
+                log::warn!("[ROLL] in-flight reservations without an uncertain order (process restart mid-roll) booked: {stale:?}");
                 self.persist();
             }
         }
@@ -2588,15 +2679,15 @@ impl Engine {
         }
         let picked = pick_roll_symbol(&order, |sym| {
             let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill, released_now);
-            let notional = clip_qty * mark;
-            let round_trip_cost = 2.0 * roll_reserve(notional, self.cfg.taker_slippage_bps).1;
+            // exactly what the two legs will reserve
+            let (leg_v, leg_c) = roll_reserve(clip_qty * mark, self.cfg.taker_slippage_bps);
             roll_blocker(
                 &self.cfg.roll,
                 &self.state.roll,
                 now,
                 &gate,
-                2.0 * notional,
-                round_trip_cost,
+                2.0 * leg_v,
+                2.0 * leg_c,
             )
         });
         let sym = match picked {
@@ -2632,110 +2723,100 @@ impl Engine {
             leg,
             qty: -clip_qty,
         };
-        // Each leg is booked against the weekly caps BEFORE it is sent (full
-        // notional + worst-case cost) and corrected to the actual once it
-        // settles; an unconfirmed leg keeps its reservation.
+        // Each leg is reserved (worst case) before it is sent; its fills
+        // book themselves where they settle and the reservation is dropped,
+        // unless the leg ends uncertain (then it stays until released).
         let slip = self.cfg.taker_slippage_bps;
-        let reserved = roll_reserve(clip_qty * mark, slip);
-        self.roll_book(reserved);
-        let (close_filled, close_cost) = match self.roll_one(&sym, &close, mark).await {
-            Ok((f, c, v)) => {
-                self.roll_book(roll_settle_reservation(reserved, Some((v, c))));
-                (f, c)
-            }
-            Err(e) => {
-                let (close_fix, repair) = roll_close_error_booking(
-                    self.state.uncertain.contains_key(&sym),
-                    reserved,
-                    roll_repair_reservation(clip_qty * mark, slip),
-                );
-                if repair.0 > 0.0 {
-                    // Sent, outcome unknown: it may have filled. Keep the close
-                    // reservation and reserve the planner's later repair (a
-                    // re-open worst case), carried across the week boundary.
-                    log::error!(
-                        "[ROLL] {sym} close uncertain: {e:?} — close and repair reservations kept"
-                    );
-                    self.roll_book_repair(&sym, repair);
-                } else {
-                    // Failed before anything was accepted (book / position
-                    // read, plain rejection): nothing executed — release it.
-                    log::warn!(
-                        "[ROLL] {sym} close failed before execution: {e:?} — reservation released"
-                    );
-                    self.roll_book(close_fix);
-                }
-                self.state.roll.week_count += 1;
-                self.event(
-                    "roll_blocked",
-                    serde_json::json!({ "symbol": sym, "reason": format!("close failed: {e}") }),
-                );
-                self.persist();
-                return;
-            }
+        let close_leg = self
+            .roll_leg_send(&sym, &close, mark, clip_qty * mark, slip)
+            .await;
+        let close_filled = close_leg.as_ref().map(|l| l.filled).unwrap_or(0.0);
+        let close_cost = close_leg.as_ref().map(|l| l.cost).unwrap_or(0.0);
+        let close_err = match &close_leg {
+            Ok(l) => l.error.clone(),
+            Err(e) => Some(format!("{e:#}")),
         };
-        let (mut open_filled, mut open_cost) = (0.0, 0.0);
         let mut outcome = "done";
-        match roll_reopen(leg, close_filled, m.min_qty) {
-            None => {
-                outcome = "close_unfilled";
-                // A sub-minimum partial close still shrank the leg; the
-                // planner repairs it later, outside the roll path: reserve it.
-                let unrepaired = roll_unreopened_close(close_filled, m.min_qty);
-                if unrepaired > 0.0 {
-                    outcome = "close_partial_below_min";
-                    self.roll_book_repair(&sym, roll_repair_reservation(unrepaired * mark, slip));
-                }
+        let (mut open_filled, mut open_cost) = (0.0, 0.0);
+        if self.state.uncertain.contains_key(&sym) {
+            // the close's outcome is unknown: nothing more on this symbol
+            outcome = "close_uncertain";
+        } else {
+            if let Some(e) = &close_err {
+                log::warn!("[ROLL] {sym} close: {e} (filled {close_filled})");
+                outcome = "close_failed";
             }
-            Some(reopen) => {
-                let reserved = roll_reserve(close_filled * mark, slip);
-                self.roll_book(reserved);
-                match self.roll_one(&sym, &reopen, mark).await {
-                    Ok((f, c, v)) => {
-                        self.roll_book(roll_settle_reservation(reserved, Some((v, c))));
-                        open_filled = f;
-                        open_cost = c;
-                        if f + self.size_tol(&sym) < close_filled {
+            // re-open exactly what the close filled — a partial post-only
+            // fill before a failed remainder included
+            if let Some(reopen) = roll_reopen(leg, close_filled, m.min_qty) {
+                outcome = if close_err.is_some() {
+                    "close_partial"
+                } else {
+                    "done"
+                };
+                match self
+                    .roll_leg_send(&sym, &reopen, mark, close_filled * mark, slip)
+                    .await
+                {
+                    Ok(l) => {
+                        open_filled = l.filled;
+                        open_cost = l.cost;
+                        if let Some(e) = l.error {
+                            log::warn!("[ROLL] {sym} re-open: {e} (filled {})", l.filled);
+                        }
+                        if l.filled + self.size_tol(&sym) < close_filled {
                             outcome = "reopen_partial";
-                            // The planner re-grows the missing part next tick,
-                            // outside the roll path: keep it reserved.
-                            self.roll_book_repair(
-                                &sym,
-                                roll_repair_reservation(
-                                    roll_partial_remainder(close_filled, f) * mark,
-                                    slip,
-                                ),
-                            );
                         }
                     }
                     Err(e) => {
-                        log::error!("[ROLL] {sym} re-open failed: {e:?} — reservation stays booked (as a repair); levelling repairs it once reconciled");
-                        // The kept re-open reservation now stands for the
-                        // planner's repair: mark it so it survives rollover.
-                        let e = self
-                            .state
-                            .roll
-                            .pending_repairs
-                            .entry(sym.clone())
-                            .or_insert((0.0, 0.0));
-                        e.0 += reserved.0;
-                        e.1 += reserved.1;
+                        log::error!("[ROLL] {sym} re-open failed: {e:?} — levelling repairs it (booked when it settles)");
                         outcome = "reopen_failed";
                     }
                 }
+                if self.state.uncertain.contains_key(&sym) {
+                    outcome = "reopen_uncertain";
+                }
+            } else if close_filled > 0.0 {
+                // below the venue minimum: the planner repairs it later and
+                // that execution books itself when it settles
+                outcome = "close_partial_below_min";
             }
         }
         let rs = &mut self.state.roll;
         rs.week_count += 1;
         let (vol, cost) = (rs.week_volume_usd, rs.week_cost_usd);
+        let (fly_v, fly_c) = roll_in_flight_total(rs);
         self.event(
             "roll_done",
             serde_json::json!({ "symbol": sym, "leg": format!("{leg:?}"), "outcome": outcome,
-                "close_filled": close_filled, "reopen_filled": open_filled,
-                "cost_usd": close_cost + open_cost, "week_volume_usd": vol, "week_cost_usd": cost }),
+                "close_filled": close_filled, "reopen_filled": open_filled, "close_error": close_err,
+                "cost_usd": close_cost + open_cost, "week_volume_usd": vol, "week_cost_usd": cost,
+                "in_flight_volume_usd": fly_v, "in_flight_cost_usd": fly_c }),
         );
-        log::info!("[ROLL] {sym} {outcome}: close {close_filled} / reopen {open_filled}, cost ${:.2}, week ${vol:.0} / ${cost:.2}", close_cost + open_cost);
+        log::info!("[ROLL] {sym} {outcome}: close {close_filled} / reopen {open_filled}, cost ${:.2}, week ${vol:.0} / ${cost:.2} (+ in flight ${fly_v:.0} / ${fly_c:.2})", close_cost + open_cost);
         self.persist();
+    }
+
+    /// Reserve, send and finish one roll leg: the reservation is persisted
+    /// before the send and dropped afterwards unless the leg ended uncertain.
+    async fn roll_leg_send(
+        &mut self,
+        sym: &str,
+        order: &Order,
+        mark: f64,
+        notional_usd: f64,
+        slip: u32,
+    ) -> Result<RollLeg> {
+        self.state
+            .roll
+            .in_flight
+            .insert(sym.to_string(), roll_reserve(notional_usd, slip));
+        self.persist();
+        let result = self.roll_one(sym, order, mark).await;
+        let uncertain = self.state.uncertain.contains_key(sym);
+        roll_finish_in_flight(&mut self.state.roll, sym, uncertain);
+        self.persist();
+        result
     }
 
     /// Re-check every uncertain order; release the ones that are now known
@@ -2763,6 +2844,8 @@ impl Engine {
                 u.exchange == cur_exchange && (u.instance.is_empty() || u.instance == cur_instance);
             let mut terminal = false;
             let mut delta = f64::NAN;
+            // (filled, fee, value) of the order as last observed (Arcus)
+            let mut observed: Option<(f64, f64, f64)> = None;
             // Evidence reads may fail independently of the tick snapshot; a
             // failed read is simply "no evidence" — the grace / account
             // escalation below must still run, or an unreadable endpoint
@@ -2801,6 +2884,7 @@ impl Engine {
                                 self.size_tol(&sym),
                             ) {
                                 self.forget_arcus_activity(u.leg, &sym, id, &v.trades).await;
+                                observed = Some((v.filled, v.fee, v.value));
                                 terminal = true;
                             }
                         }
@@ -2831,6 +2915,12 @@ impl Engine {
                         "uncertain_resolved",
                         serde_json::json!({ "symbol": sym, "order": u, "position_delta": delta }),
                     );
+                    // roll accounting: the order's observed fills replace its
+                    // reservation (any execution on the rolled leg counts)
+                    if self.cfg.roll_leg() == Some(u.leg) {
+                        let (f, fee, value) = observed.unwrap_or((0.0, 0.0, 0.0));
+                        roll_release_booking(&mut self.state.roll, &sym, f, fee, value, u.mark);
+                    }
                     self.state.uncertain.remove(&sym);
                     released_now.insert(sym);
                     self.persist();
@@ -2899,7 +2989,25 @@ impl Engine {
                     self.state.uncertain.len(),
                     self.state.uncertain.keys().collect::<Vec<_>>()
                 );
-                self.state.uncertain.clear();
+                // roll accounting: no evidence was seen, so an uncertain
+                // order on the rolled leg is booked as a full fill at the
+                // current mark (worst case) in place of its reservation.
+                let rolled = self.cfg.roll_leg();
+                let slip = self.cfg.taker_slippage_bps;
+                let cleared: Vec<(String, UncertainOrder)> =
+                    std::mem::take(&mut self.state.uncertain)
+                        .into_iter()
+                        .collect();
+                for (sym, u) in cleared {
+                    if rolled == Some(u.leg) {
+                        let now_mark = match u.leg {
+                            Leg::Long => self.last_snapshot.long.mark(&sym),
+                            Leg::Short => self.last_snapshot.short.mark(&sym),
+                        };
+                        let m = if now_mark > 0.0 { now_mark } else { u.mark };
+                        roll_risk_ack_booking(&mut self.state.roll, &sym, u.qty, m, slip);
+                    }
+                }
             }
             for b in self.state.books.values_mut() {
                 b.net_breach_ticks = 0;
@@ -3486,6 +3594,8 @@ fn status_value(
             "week_volume_usd": state.roll.week_volume_usd,
             "week_cost_usd": state.roll.week_cost_usd,
             "week_count": state.roll.week_count,
+            "in_flight_volume_usd": roll_in_flight_total(&state.roll).0,
+            "in_flight_cost_usd": roll_in_flight_total(&state.roll).1,
             "weekly_volume_budget_usd": cfg.roll.weekly_volume_usd,
             "weekly_cost_cap_usd": cfg.roll.weekly_cost_usd,
             "last_roll_at": state.roll.last_roll_at,
@@ -3916,6 +4026,7 @@ mod tests {
                 order_id: Some("o1".into()),
                 qty: 0.1,
                 before_qty: -0.4,
+                mark: 0.0,
                 sent_at: 1,
                 reason: "t".into(),
             },
@@ -4660,27 +4771,19 @@ mod tests {
         assert_eq!(rs.last_roll_at, Some(1_791_071_000));
         assert!(rs.blocked_reason.is_none());
 
-        // Outstanding repair reservations open the new week (the repair may
-        // land after Sunday), and are carried once, not for ever.
+        // Actuals restart at zero; an in-flight reservation (an uncertain
+        // roll leg) survives every rollover until it is released.
         let mut rs = RollState {
             week: 20_723,
             week_volume_usd: 9_000.0,
             week_cost_usd: 3.0,
             ..RollState::default()
         };
-        rs.pending_repairs.insert("BTC".into(), (5_000.0, 2.6));
+        rs.in_flight.insert("BTC".into(), (5_005.0, 2.6));
         assert!(roll_week_rollover(&mut rs, 1_791_072_000));
-        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (5_000.0, 2.6));
-        // still unrepaired at the NEXT Sunday: carried again
-        assert!(roll_week_rollover(&mut rs, 1_791_072_000 + 7 * 86_400));
-        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (5_000.0, 2.6));
-        // consumed once the book is settled and levelled -> not carried
-        assert_eq!(
-            roll_consume_repairs(&mut rs, |s| s == "BTC"),
-            vec!["BTC".to_string()]
-        );
-        assert!(roll_week_rollover(&mut rs, 1_791_072_000 + 14 * 86_400));
         assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (0.0, 0.0));
+        assert!(roll_week_rollover(&mut rs, 1_791_072_000 + 7 * 86_400));
+        assert_eq!(roll_in_flight_total(&rs), (5_005.0, 2.6));
     }
 
     #[test]
@@ -4757,7 +4860,7 @@ mod tests {
     }
 
     #[test]
-    fn roll_skips_symbols_reconciled_this_tick_and_books_the_repair() {
+    fn roll_skips_symbols_reconciled_this_tick() {
         let mut uncertain = std::collections::BTreeMap::new();
         let mut released = std::collections::BTreeSet::new();
         assert!(!roll_symbol_unsettled(&uncertain, &released, "BTC"));
@@ -4767,17 +4870,10 @@ mod tests {
         uncertain.insert("BTC".to_string(), uncertain_btc("arcus", "a"));
         assert!(roll_symbol_unsettled(&uncertain, &released, "BTC"));
         assert!(!roll_symbol_unsettled(&uncertain, &released, "META"));
-        // failed close: the repair is reserved like a full re-open, so the
-        // two bookings cover the worst case of both legs
-        assert_eq!(
-            roll_repair_reservation(5_000.0, 3),
-            roll_reserve(5_000.0, 3)
-        );
-        assert!(roll_repair_reservation(5_000.0, 3).0 > 0.0);
     }
 
     #[test]
-    fn roll_clip_fits_the_net_tolerance_at_both_marks_and_partials_stay_reserved() {
+    fn roll_clip_fits_the_net_tolerance_at_both_marks() {
         // Arcus short marked 2 % below the long venue: sizing at the Arcus
         // mark alone would put clip × long mark over the clip USD.
         let (arcus, long) = (98.0, 100.0);
@@ -4788,9 +4884,6 @@ mod tests {
         assert!(q * long <= clip_usd && q * arcus <= clip_usd);
         // and when Arcus is the higher one, it is used
         assert_eq!(roll_sizing_mark(101.0, 100.0), 101.0);
-        // partial re-open: the unfilled part stays reserved, never negative
-        assert!((roll_partial_remainder(0.05, 0.03) - 0.02).abs() < 1e-12);
-        assert_eq!(roll_partial_remainder(0.05, 0.06), 0.0);
     }
 
     #[test]
@@ -4807,26 +4900,141 @@ mod tests {
     }
 
     #[test]
-    fn a_close_that_failed_before_execution_releases_its_reservation() {
-        let reserved = roll_reserve(5_000.0, 3);
-        let repair = roll_repair_reservation(5_000.0, 3);
-        // uncertain: keep the close reservation, reserve the repair
+    fn every_settled_execution_on_the_rolled_leg_books_its_actual_value() {
+        // a PLANNER repair (not a roll order) on the Arcus short leg: buy
+        // 0.05 @ 100.2 filled value 5.01 vs mark 100 → booked at its actual
+        // value, halted or not, whenever it happens
+        let b =
+            roll_execution_booking(Some(Leg::Short), Leg::Short, true, 0.05, 0.002, 5.01, 100.0)
+                .unwrap();
+        assert!((b.0 - 5.01).abs() < 1e-12);
+        assert!((b.1 - (0.002 + 0.01)).abs() < 1e-12);
+        let mut rs = RollState::default();
+        roll_book_actual(&mut rs, b);
+        assert!((rs.week_volume_usd - 5.01).abs() < 1e-12);
+        // the Lighter long leg is not the rolled leg: never booked
         assert_eq!(
-            roll_close_error_booking(true, reserved, repair),
-            ((0.0, 0.0), repair)
+            roll_execution_booking(Some(Leg::Short), Leg::Long, true, 0.05, 0.0, 5.0, 100.0),
+            None
         );
-        // pre-send failure: the close reservation is fully released, no repair
-        let (fix, rep) = roll_close_error_booking(false, reserved, repair);
-        assert!((reserved.0 + fix.0).abs() < 1e-9 && (reserved.1 + fix.1).abs() < 1e-9);
-        assert_eq!(rep, (0.0, 0.0));
+        // no roll leg configured / nothing filled: nothing booked
+        assert_eq!(
+            roll_execution_booking(None, Leg::Short, true, 0.05, 0.0, 5.0, 100.0),
+            None
+        );
+        assert_eq!(
+            roll_execution_booking(Some(Leg::Short), Leg::Short, true, 0.0, 0.0, 0.0, 100.0),
+            None
+        );
     }
 
     #[test]
-    fn a_sub_minimum_partial_close_is_reserved_for_its_repair() {
-        assert_eq!(roll_unreopened_close(0.00005, 0.0001), 0.00005);
-        assert_eq!(roll_unreopened_close(0.0, 0.0001), 0.0);
-        // re-openable closes are handled (and booked) by the re-open itself
-        assert_eq!(roll_unreopened_close(0.05, 0.0001), 0.0);
+    fn in_flight_reservations_follow_the_leg_and_are_never_double_counted() {
+        let r = roll_reserve(5_000.0, 3);
+        // settled leg: the reservation goes, the fill was booked at settle
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_book_actual(&mut rs, (4_990.0, 1.2));
+        roll_finish_in_flight(&mut rs, "BTC", false);
+        assert!(rs.in_flight.is_empty());
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (4_990.0, 1.2));
+        // uncertain leg: reservation kept, nothing booked yet …
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_finish_in_flight(&mut rs, "BTC", true);
+        assert_eq!(roll_in_flight_total(&rs), r);
+        assert_eq!(rs.week_volume_usd, 0.0);
+        // … released on evidence: observed fills replace it (once)
+        roll_release_booking(&mut rs, "BTC", 0.05, 0.002, 5.01, 100.0);
+        assert!(rs.in_flight.is_empty());
+        assert!((rs.week_volume_usd - 5.01).abs() < 1e-12);
+        assert!((rs.week_cost_usd - (0.002 + 0.01)).abs() < 1e-12);
+        // … or cleared by RISK_ACK without evidence: worst case at the current mark
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_risk_ack_booking(&mut rs, "BTC", 0.05, 110.0, 3);
+        assert!(rs.in_flight.is_empty());
+        assert_eq!(
+            (rs.week_volume_usd, rs.week_cost_usd),
+            roll_reserve(0.05 * 110.0, 3)
+        );
+    }
+
+    #[test]
+    fn stale_in_flight_after_a_restart_is_booked_not_lost() {
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), (5_005.0, 2.6));
+        rs.in_flight.insert("META".into(), (1_000.0, 0.5));
+        let mut unc = std::collections::BTreeMap::new();
+        unc.insert("META".to_string(), uncertain_btc("arcus", "a"));
+        // BTC has no uncertain order behind it: booked and dropped; META stays
+        assert_eq!(
+            roll_settle_stale_in_flight(&mut rs, &unc),
+            vec!["BTC".to_string()]
+        );
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (5_005.0, 2.6));
+        assert_eq!(roll_in_flight_total(&rs), (1_000.0, 0.5));
+    }
+
+    #[test]
+    fn the_next_roll_is_gated_on_actual_plus_in_flight_plus_its_inflated_reservations() {
+        let cfg = roll_cfg_on().roll; // 100k volume / 50 cost
+        let g = open_gate();
+        let (lv, lc) = roll_reserve(10_000.0, 3);
+        // exactly the raw two-leg notional left: the inflated reservation does not fit
+        let rs = RollState {
+            week_volume_usd: cfg.weekly_volume_usd - 20_000.0,
+            ..RollState::default()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 20_000, &g, 2.0 * lv, 2.0 * lc),
+            Some("weekly_volume_budget")
+        );
+        // in-flight reservations count too
+        let mut rs = RollState::default();
+        rs.in_flight
+            .insert("BTC".into(), (cfg.weekly_volume_usd - 1_000.0, 0.0));
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 20_000, &g, 2.0 * lv, 2.0 * lc),
+            Some("weekly_volume_budget")
+        );
+        let mut rs = RollState::default();
+        rs.in_flight
+            .insert("BTC".into(), (0.0, cfg.weekly_cost_usd - 1.0));
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 20_000, &g, 2.0 * lv, 2.0 * lc),
+            Some("weekly_cost_cap")
+        );
+        assert_eq!(
+            roll_blocker(&cfg, &RollState::default(), 20_000, &g, 2.0 * lv, 2.0 * lc),
+            None
+        );
+    }
+
+    #[test]
+    fn a_failed_taker_remainder_never_discards_the_post_only_fill() {
+        let leg = maker_first_leg((0.02, 0.001, 2.0), Err("price moved".into()));
+        assert_eq!(leg.filled, 0.02);
+        assert_eq!(leg.value, 2.0);
+        assert!(leg.error.is_some());
+        // the re-open is sized to that partial close
+        assert_eq!(
+            roll_reopen(Leg::Short, leg.filled, 0.0001),
+            Some(Order {
+                leg: Leg::Short,
+                qty: 0.02
+            })
+        );
+        let ok = maker_first_leg((0.02, 0.001, 2.0), Ok((0.03, 0.002, 3.0)));
+        assert_eq!((ok.filled, ok.value, ok.error), (0.05, 5.0, None));
+    }
+
+    #[test]
+    fn the_post_only_limit_sent_must_be_inside_the_reserved_margin() {
+        // the passive touch displaced 0.3 % from the reserved mark: not sent
+        assert!(!roll_price_ok(100.0, 99.7));
+        assert!(!roll_price_ok(100.0, 100.3));
+        assert!(roll_price_ok(100.0, 99.95));
     }
 
     #[test]
@@ -4858,19 +5066,13 @@ mod tests {
     }
 
     #[test]
-    fn roll_reservation_is_kept_unless_the_leg_settles() {
+    fn roll_reservation_covers_the_worst_allowed_price() {
         let reserved = roll_reserve(5_000.0, 3);
         let worst = 5_000.0 * (1.0 + ROLL_PRICE_MARGIN);
         assert!((reserved.0 - worst).abs() < 1e-9);
         assert!(
             (reserved.1 - (worst * 5.25 / 10_000.0 + 5_000.0 * ROLL_PRICE_MARGIN)).abs() < 1e-9
         );
-        // settled: replaced by the actual
-        let d = roll_settle_reservation(reserved, Some((4_000.0, 1.0)));
-        assert!((reserved.0 + d.0 - 4_000.0).abs() < 1e-9);
-        assert!((reserved.1 + d.1 - 1.0).abs() < 1e-9);
-        // unconfirmed (error / uncertain): the reservation stays booked
-        assert_eq!(roll_settle_reservation(reserved, None), (0.0, 0.0));
     }
 
     #[test]
@@ -5124,6 +5326,7 @@ mod tests {
             order_id: Some("o1".into()),
             qty: 0.1,
             before_qty: 0.0,
+            mark: 100.0,
             sent_at: 1_000,
             reason: "t".into(),
         }
@@ -5295,6 +5498,7 @@ mod tests {
                 order_id: None,
                 qty: 0.2,
                 before_qty: 0.5,
+                mark: 0.0,
                 sent_at: 7,
                 reason: "submission ambiguous".into(),
             },
