@@ -895,13 +895,16 @@ struct RollGate {
 }
 
 /// Why the roll does not run now (`None`: go). `round_trip_usd` is the
-/// volume one roll adds (close + re-open).
+/// volume one roll adds (close + re-open) and `round_trip_cost_usd` its
+/// worst-case cost (the two leg reservations): the NEXT roll must fit under
+/// both weekly caps, not merely the spend so far.
 fn roll_blocker(
     cfg: &RollCfg,
     rs: &RollState,
     now: u64,
     g: &RollGate,
     round_trip_usd: f64,
+    round_trip_cost_usd: f64,
 ) -> Option<&'static str> {
     if !cfg.enabled {
         return Some("disabled");
@@ -924,7 +927,10 @@ fn roll_blocker(
             rs.week_volume_usd + round_trip_usd > cfg.weekly_volume_usd,
             "weekly_volume_budget",
         ),
-        (rs.week_cost_usd >= cfg.weekly_cost_usd, "weekly_cost_cap"),
+        (
+            rs.week_cost_usd + round_trip_cost_usd > cfg.weekly_cost_usd,
+            "weekly_cost_cap",
+        ),
     ];
     checks.iter().find(|(hit, _)| *hit).map(|(_, why)| *why)
 }
@@ -2307,12 +2313,15 @@ impl Engine {
         }
         let picked = pick_roll_symbol(&order, |sym| {
             let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill);
+            let notional = clip_qty * mark;
+            let round_trip_cost = 2.0 * roll_reserve(notional, self.cfg.taker_slippage_bps).1;
             roll_blocker(
                 &self.cfg.roll,
                 &self.state.roll,
                 now,
                 &gate,
-                2.0 * clip_qty * mark,
+                2.0 * notional,
+                round_trip_cost,
             )
         });
         let sym = match picked {
@@ -4269,10 +4278,13 @@ mod tests {
         };
         let g = open_gate();
         assert_eq!(
-            roll_blocker(&cfg, &rs, 10_000 + 3_599, &g, 800.0),
+            roll_blocker(&cfg, &rs, 10_000 + 3_599, &g, 800.0, 0.5),
             Some("interval")
         );
-        assert_eq!(roll_blocker(&cfg, &rs, 10_000 + 3_600, &g, 800.0), None);
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 10_000 + 3_600, &g, 800.0, 0.5),
+            None
+        );
         let now = 20_000;
         let cases: Vec<(Box<dyn Fn(&mut RollGate)>, &str)> = vec![
             (Box::new(|g| g.book_on = false), "book_not_on"),
@@ -4292,7 +4304,7 @@ mod tests {
         for (f, want) in cases {
             let mut g = open_gate();
             f(&mut g);
-            assert_eq!(roll_blocker(&cfg, &rs, now, &g, 800.0), Some(want));
+            assert_eq!(roll_blocker(&cfg, &rs, now, &g, 800.0, 0.5), Some(want));
         }
         // weekly volume budget: the NEXT roll must fit
         let near = RollState {
@@ -4300,21 +4312,34 @@ mod tests {
             ..rs.clone()
         };
         assert_eq!(
-            roll_blocker(&cfg, &near, now, &g, 800.0),
+            roll_blocker(&cfg, &near, now, &g, 800.0, 0.5),
             Some("weekly_volume_budget")
         );
-        assert_eq!(roll_blocker(&cfg, &near, now, &g, 700.0), None);
+        assert_eq!(roll_blocker(&cfg, &near, now, &g, 700.0, 0.5), None);
+        // weekly cost cap: the NEXT roll's worst-case cost must fit too
+        let near_cost = RollState {
+            week_cost_usd: 49.6,
+            ..rs.clone()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &near_cost, now, &g, 800.0, 0.5),
+            Some("weekly_cost_cap")
+        );
+        assert_eq!(roll_blocker(&cfg, &near_cost, now, &g, 800.0, 0.3), None);
         let spent = RollState {
             week_cost_usd: 50.0,
             ..rs.clone()
         };
         assert_eq!(
-            roll_blocker(&cfg, &spent, now, &g, 800.0),
+            roll_blocker(&cfg, &spent, now, &g, 800.0, 0.5),
             Some("weekly_cost_cap")
         );
         let mut off = cfg.clone();
         off.enabled = false;
-        assert_eq!(roll_blocker(&off, &rs, now, &g, 800.0), Some("disabled"));
+        assert_eq!(
+            roll_blocker(&off, &rs, now, &g, 800.0, 0.5),
+            Some("disabled")
+        );
     }
 
     #[test]
