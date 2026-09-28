@@ -771,9 +771,10 @@ fn uncertain_released(sent_at: u64, now: u64, grace_secs: u64, still_open: bool)
 fn drop_uncertain(
     plan: Vec<(String, Vec<Order>)>,
     uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
+    released_this_tick: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, Vec<Order>)> {
     plan.into_iter()
-        .filter(|(sym, _)| !uncertain.contains_key(sym))
+        .filter(|(sym, _)| !uncertain.contains_key(sym) && !released_this_tick.contains(sym))
         .collect()
 }
 
@@ -1725,8 +1726,12 @@ impl Engine {
 
     /// Re-check every uncertain order; release the ones that are now known
     /// terminal. Runs before planning: while an entry remains, its symbol
-    /// gets no order at all.
-    async fn reconcile_uncertain(&mut self, now: u64) {
+    /// gets no order at all. Returns the symbols released in THIS call: the
+    /// tick's snapshot predates the release (a delayed fill may only have
+    /// become visible now), so those stay blocked until the next tick plans
+    /// them from a fresh snapshot.
+    async fn reconcile_uncertain(&mut self, now: u64) -> std::collections::BTreeSet<String> {
+        let mut released_now = std::collections::BTreeSet::new();
         let pending: Vec<(String, UncertainOrder)> = self
             .state
             .uncertain
@@ -1775,9 +1780,11 @@ impl Engine {
                     serde_json::json!({ "symbol": sym, "order": u, "position_delta": delta }),
                 );
                 self.state.uncertain.remove(&sym);
+                released_now.insert(sym);
                 self.persist();
             }
         }
+        released_now
     }
 
     /// (ARM request, DISARM symbols). DISARM beats ARM when both are present.
@@ -2082,9 +2089,11 @@ impl Engine {
 
         // Orders whose outcome was unknown: re-check them first; a symbol
         // that still has one gets no order this tick (below).
-        if !self.cfg.dry_run && !self.state.uncertain.is_empty() {
-            self.reconcile_uncertain(now).await;
-        }
+        let released_now = if !self.cfg.dry_run && !self.state.uncertain.is_empty() {
+            self.reconcile_uncertain(now).await
+        } else {
+            std::collections::BTreeSet::new()
+        };
 
         // Plan (at most one clip per leg per symbol per tick).
         let restricted = self.state.halted || kill;
@@ -2134,7 +2143,12 @@ impl Engine {
         for sym in self.state.uncertain.keys() {
             log::warn!("[UNCERTAIN] {sym}: an order is still unreconciled — nothing sent on {sym}");
         }
-        let plan = drop_uncertain(plan, &self.state.uncertain);
+        for sym in &released_now {
+            log::info!(
+                "[UNCERTAIN] {sym}: just reconciled — replanned next tick from a fresh snapshot"
+            );
+        }
+        let plan = drop_uncertain(plan, &self.state.uncertain, &released_now);
 
         // Execute, symbol by symbol. The second order of a pair is cut to
         // what the first actually filled, so a partial on the thin RH book
@@ -3634,13 +3648,20 @@ mod tests {
                 }],
             ),
         ];
-        let kept = drop_uncertain(plan.clone(), &state.uncertain);
+        let none = std::collections::BTreeSet::new();
+        let kept = drop_uncertain(plan.clone(), &state.uncertain, &none);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].0, "META");
-        // Later: out of the book and past the grace -> released, BTC plans again.
+        // Released during THIS tick (the plan was built from the older
+        // snapshot): still blocked until the next tick replans it.
         assert!(uncertain_released(1_000, 1_090, 60, false));
         state.uncertain.remove("BTC");
-        assert_eq!(drop_uncertain(plan, &state.uncertain).len(), 2);
+        let released: std::collections::BTreeSet<String> = ["BTC".to_string()].into();
+        let kept = drop_uncertain(plan.clone(), &state.uncertain, &released);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "META");
+        // Next tick: nothing released now -> BTC plans again.
+        assert_eq!(drop_uncertain(plan, &state.uncertain, &none).len(), 2);
     }
 
     #[test]
