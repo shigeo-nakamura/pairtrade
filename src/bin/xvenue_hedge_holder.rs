@@ -920,6 +920,19 @@ fn reconcile_state_mode(mut state: State, dry_run: bool) -> State {
             state.halt_reason = None;
         }
     }
+    // Uncertain orders are live venue orders: DRY_RUN never sends and never
+    // reconciles, so an entry carried into a dry-run process would block its
+    // symbol for good (and keep ARM from rebuilding the dry book). Drop them;
+    // the live venue positions are re-read when the process next runs live.
+    if dry_run && !state.uncertain.is_empty() {
+        for (sym, u) in &state.uncertain {
+            log::warn!(
+                "[STARTUP] dry_run: dropping live uncertain order on {sym} ({:?} {:?} qty {}) — check the venue by hand before going live again",
+                u.leg, u.order_id, u.qty
+            );
+        }
+        state.uncertain.clear();
+    }
     state.dry_run = Some(dry_run);
     state
 }
@@ -2796,6 +2809,30 @@ mod tests {
         let kept = reconcile_state_mode(legacy, false);
         assert_eq!(kept.book("BTC").mode, Mode::On);
         assert_eq!(kept.dry_run, Some(false));
+
+        // A live uncertain entry never survives into a dry-run process
+        // (nothing would reconcile it and it would block ARM for good) …
+        let mut live_state = State {
+            dry_run: Some(false),
+            ..Default::default()
+        };
+        live_state.uncertain.insert(
+            "BTC".into(),
+            UncertainOrder {
+                leg: Leg::Short,
+                exchange: "arcus".into(),
+                order_id: Some("o1".into()),
+                qty: 0.1,
+                before_qty: -0.4,
+                sent_at: 1,
+                reason: "t".into(),
+            },
+        );
+        assert!(reconcile_state_mode(live_state.clone(), true)
+            .uncertain
+            .is_empty());
+        // … but a live restart keeps it (it still has to be reconciled).
+        assert_eq!(reconcile_state_mode(live_state, false).uncertain.len(), 1);
     }
 
     #[test]
