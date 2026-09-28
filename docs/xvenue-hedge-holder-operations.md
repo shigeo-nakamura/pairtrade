@@ -296,6 +296,8 @@ Books are rolled round-robin.
 | `HEDGE_ROLL_CLIP_USD` | — | notional per roll; must be <= `HEDGE_CLIP_USD` and <= `HEDGE_NET_TOLERANCE_USD` |
 | `HEDGE_ROLL_WEEKLY_VOLUME_USD` | — | weekly volume budget (close + re-open) |
 | `HEDGE_ROLL_WEEKLY_COST_USD` | — | weekly cap on fees + slippage vs mark |
+
+**Roll accounting.** Each roll leg is booked against the weekly caps *before* it is sent. The booking uses the full notional at the worst price a send is allowed at: the gated mark ± 0.1 %. Just before every send, including the taker remainder after a post-only timeout, the leg's mark is re-read. If it has moved more than 0.1 %, nothing is sent. Once a leg settles, its booking is replaced by the actual executed value and cost. A leg that is uncertain, or a close that is partial or below the venue minimum, stays reserved as a **pending repair**, because the planner repairs it outside the roll path. Pending repairs are carried into every new week's counters until the book is seen settled and levelled. A close that failed before anything was sent releases its booking.
 | `HEDGE_ROLL_MODE` | `taker` | `taker`, or `maker_first` (see below) |
 | `HEDGE_ROLL_MAKER_TIMEOUT_SECS` | `20` | how long the post-only order rests before it is canceled |
 
