@@ -849,6 +849,14 @@ struct RollState {
     week: u64,
     week_volume_usd: f64,
     week_cost_usd: f64,
+    /// The part of the week's counters that reserves repairs the planner
+    /// has not necessarily made yet (uncertain / partial / sub-minimum
+    /// closes). Carried into the next week at rollover, because the repair
+    /// can land after Sunday and would otherwise be booked nowhere.
+    #[serde(default)]
+    week_repair_volume_usd: f64,
+    #[serde(default)]
+    week_repair_cost_usd: f64,
     week_count: u64,
     last_roll_at: Option<u64>,
     last_symbol: Option<String>,
@@ -868,8 +876,11 @@ fn roll_week(now: u64) -> u64 {
 fn roll_week_rollover(rs: &mut RollState, now: u64) -> bool {
     let week = roll_week(now);
     if rs.week != week {
+        // Outstanding repair reservations open the new week's counters.
         *rs = RollState {
             week,
+            week_volume_usd: rs.week_repair_volume_usd,
+            week_cost_usd: rs.week_repair_cost_usd,
             last_roll_at: rs.last_roll_at,
             last_symbol: rs.last_symbol.clone(),
             ..RollState::default()
@@ -987,6 +998,25 @@ fn roll_post_close_net_ok(
         Leg::Long => net_qty - clip_qty,
     };
     (after * long_mark).abs() <= tol_usd
+}
+
+/// Bookings after a failed close: (correction to the close reservation,
+/// repair reservation). An uncertain close may have filled → keep the close
+/// reservation and reserve the repair; a failure before anything was
+/// accepted executed nothing → release the close reservation, no repair.
+fn roll_close_error_booking(
+    marked_uncertain: bool,
+    close_reserved: (f64, f64),
+    repair: (f64, f64),
+) -> ((f64, f64), (f64, f64)) {
+    if marked_uncertain {
+        ((0.0, 0.0), repair)
+    } else {
+        (
+            roll_settle_reservation(close_reserved, Some((0.0, 0.0))),
+            (0.0, 0.0),
+        )
+    }
 }
 
 /// Close fill the roll cannot re-open itself (a positive fill below the
@@ -2438,6 +2468,14 @@ impl Engine {
         self.persist();
     }
 
+    /// Book a repair reservation: counted this week AND carried into the
+    /// next one at rollover (the planner's repair may land after Sunday).
+    fn roll_book_repair(&mut self, (vol, cost): (f64, f64)) {
+        self.state.roll.week_repair_volume_usd += vol;
+        self.state.roll.week_repair_cost_usd += cost;
+        self.roll_book((vol, cost));
+    }
+
     /// `released_now`: symbols whose uncertain order was reconciled during
     /// THIS tick — `snap` predates that, so they are not rolled until the
     /// next tick's fresh snapshot (same rule as the normal planner).
@@ -2533,12 +2571,27 @@ impl Engine {
                 (f, c)
             }
             Err(e) => {
-                log::error!("[ROLL] {sym} close failed: {e:?} — its reservation stays booked, and the repair is reserved too");
-                // The close may have filled without being confirmed; the
-                // normal planner then re-opens that leg once the order is
-                // reconciled, outside the roll path. Book that repair here
-                // (same worst case as a re-open) so it counts against the caps.
-                self.roll_book(roll_repair_reservation(clip_qty * mark, slip));
+                let (close_fix, repair) = roll_close_error_booking(
+                    self.state.uncertain.contains_key(&sym),
+                    reserved,
+                    roll_repair_reservation(clip_qty * mark, slip),
+                );
+                if repair.0 > 0.0 {
+                    // Sent, outcome unknown: it may have filled. Keep the close
+                    // reservation and reserve the planner's later repair (a
+                    // re-open worst case), carried across the week boundary.
+                    log::error!(
+                        "[ROLL] {sym} close uncertain: {e:?} — close and repair reservations kept"
+                    );
+                    self.roll_book_repair(repair);
+                } else {
+                    // Failed before anything was accepted (book / position
+                    // read, plain rejection): nothing executed — release it.
+                    log::warn!(
+                        "[ROLL] {sym} close failed before execution: {e:?} — reservation released"
+                    );
+                    self.roll_book(close_fix);
+                }
                 self.state.roll.week_count += 1;
                 self.event(
                     "roll_blocked",
@@ -2558,7 +2611,7 @@ impl Engine {
                 let unrepaired = roll_unreopened_close(close_filled, m.min_qty);
                 if unrepaired > 0.0 {
                     outcome = "close_partial_below_min";
-                    self.roll_book(roll_repair_reservation(unrepaired * mark, slip));
+                    self.roll_book_repair(roll_repair_reservation(unrepaired * mark, slip));
                 }
             }
             Some(reopen) => {
@@ -2573,14 +2626,18 @@ impl Engine {
                             outcome = "reopen_partial";
                             // The planner re-grows the missing part next tick,
                             // outside the roll path: keep it reserved.
-                            self.roll_book(roll_repair_reservation(
+                            self.roll_book_repair(roll_repair_reservation(
                                 roll_partial_remainder(close_filled, f) * mark,
                                 slip,
                             ));
                         }
                     }
                     Err(e) => {
-                        log::error!("[ROLL] {sym} re-open failed: {e:?} — reservation stays booked; levelling repairs it once reconciled");
+                        log::error!("[ROLL] {sym} re-open failed: {e:?} — reservation stays booked (as a repair); levelling repairs it once reconciled");
+                        // The kept re-open reservation now stands for the
+                        // planner's repair: mark it so it survives rollover.
+                        self.state.roll.week_repair_volume_usd += reserved.0;
+                        self.state.roll.week_repair_cost_usd += reserved.1;
                         outcome = "reopen_failed";
                     }
                 }
@@ -4509,6 +4566,7 @@ mod tests {
             last_roll_at: Some(1_791_071_000),
             last_symbol: Some("BTC".into()),
             blocked_reason: Some("weekly_cost_cap".into()),
+            ..RollState::default()
         };
         assert!(!roll_week_rollover(&mut rs, 1_791_071_999));
         assert_eq!(rs.week_count, 5);
@@ -4519,6 +4577,23 @@ mod tests {
         );
         assert_eq!(rs.last_roll_at, Some(1_791_071_000));
         assert!(rs.blocked_reason.is_none());
+
+        // Outstanding repair reservations open the new week (the repair may
+        // land after Sunday), and are carried once, not for ever.
+        let mut rs = RollState {
+            week: 20_723,
+            week_volume_usd: 9_000.0,
+            week_cost_usd: 3.0,
+            week_repair_volume_usd: 5_000.0,
+            week_repair_cost_usd: 2.6,
+            ..RollState::default()
+        };
+        assert!(roll_week_rollover(&mut rs, 1_791_072_000));
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (5_000.0, 2.6));
+        assert_eq!(
+            (rs.week_repair_volume_usd, rs.week_repair_cost_usd),
+            (0.0, 0.0)
+        );
     }
 
     #[test]
@@ -4629,6 +4704,21 @@ mod tests {
         // partial re-open: the unfilled part stays reserved, never negative
         assert!((roll_partial_remainder(0.05, 0.03) - 0.02).abs() < 1e-12);
         assert_eq!(roll_partial_remainder(0.05, 0.06), 0.0);
+    }
+
+    #[test]
+    fn a_close_that_failed_before_execution_releases_its_reservation() {
+        let reserved = roll_reserve(5_000.0, 3);
+        let repair = roll_repair_reservation(5_000.0, 3);
+        // uncertain: keep the close reservation, reserve the repair
+        assert_eq!(
+            roll_close_error_booking(true, reserved, repair),
+            ((0.0, 0.0), repair)
+        );
+        // pre-send failure: the close reservation is fully released, no repair
+        let (fix, rep) = roll_close_error_booking(false, reserved, repair);
+        assert!((reserved.0 + fix.0).abs() < 1e-9 && (reserved.1 + fix.1).abs() < 1e-9);
+        assert_eq!(rep, (0.0, 0.0));
     }
 
     #[test]
