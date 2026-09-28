@@ -971,6 +971,17 @@ fn roll_symbol_unsettled(
     uncertain.contains_key(sym) || released_now.contains(sym)
 }
 
+/// Mark the roll clip is sized at: the higher of the rolled leg's mark and
+/// the long mark the net guard uses, so clip × either mark ≤ the clip USD.
+fn roll_sizing_mark(leg_mark: f64, long_mark: f64) -> f64 {
+    leg_mark.max(long_mark)
+}
+
+/// Part of a re-open that did not fill (base units, never negative).
+fn roll_partial_remainder(close_filled: f64, reopen_filled: f64) -> f64 {
+    (close_filled - reopen_filled).max(0.0)
+}
+
 /// When a roll's close fails unconfirmed, the planner's later re-open
 /// (the repair) happens outside the roll path: reserve it like a re-open.
 fn roll_repair_reservation(clip_notional_usd: f64, slippage_bps: u32) -> (f64, f64) {
@@ -2128,10 +2139,16 @@ impl Engine {
     }
 
     /// One roll leg (reduce when `order.qty < 0`, re-open when > 0) on the
-    /// Arcus leg; returns (filled, cost USD). Terminal before it returns:
+    /// Arcus leg; returns (filled, cost USD, executed value USD). Terminal
+    /// before it returns:
     /// the taker path settles through `execute`, the maker path confirms the
     /// post-only order filled or canceled before any taker rest is sent.
-    async fn roll_one(&mut self, symbol: &str, order: &Order, mark: f64) -> Result<(f64, f64)> {
+    async fn roll_one(
+        &mut self,
+        symbol: &str,
+        order: &Order,
+        mark: f64,
+    ) -> Result<(f64, f64, f64)> {
         let is_buy = matches!(
             (order.leg, order.qty > 0.0),
             (Leg::Long, true) | (Leg::Short, false)
@@ -2139,11 +2156,13 @@ impl Engine {
         let want = order.qty.abs();
         let mut filled = 0.0;
         let mut cost = 0.0;
+        let mut value = 0.0;
         if self.cfg.roll.mode == RollMode::MakerFirst && !self.cfg.dry_run {
-            let (maker_filled, maker_cost, confirmed) =
+            let (maker_filled, maker_cost, maker_value, confirmed) =
                 self.roll_maker(symbol, order, mark, is_buy).await?;
             filled += maker_filled;
             cost += maker_cost;
+            value += maker_value;
             match maker_next(
                 want,
                 maker_filled,
@@ -2151,7 +2170,7 @@ impl Engine {
                 confirmed,
                 self.size_tol(symbol),
             ) {
-                MakerNext::Done(_) => return Ok((filled, cost)),
+                MakerNext::Done(_) => return Ok((filled, cost, value)),
                 MakerNext::Uncertain => {
                     bail!("post-only roll order not confirmed canceled — no taker rest")
                 }
@@ -2160,13 +2179,13 @@ impl Engine {
                         leg: order.leg,
                         qty: rest * order.qty.signum(),
                     };
-                    let (f, c) = self.roll_taker(symbol, &taker, mark, is_buy).await?;
-                    return Ok((filled + f, cost + c));
+                    let (f, c, v) = self.roll_taker(symbol, &taker, mark, is_buy).await?;
+                    return Ok((filled + f, cost + c, value + v));
                 }
             }
         }
-        let (f, c) = self.roll_taker(symbol, order, mark, is_buy).await?;
-        Ok((filled + f, cost + c))
+        let (f, c, v) = self.roll_taker(symbol, order, mark, is_buy).await?;
+        Ok((filled + f, cost + c, value + v))
     }
 
     async fn roll_taker(
@@ -2175,26 +2194,27 @@ impl Engine {
         order: &Order,
         mark: f64,
         is_buy: bool,
-    ) -> Result<(f64, f64)> {
+    ) -> Result<(f64, f64, f64)> {
         self.last_settle = None;
         let filled = self.execute(symbol, order, mark).await?;
         let (fee, value) = match self.last_settle.take() {
             Some((_, fee, value)) => (fee, value),
             None => (0.0, filled * mark),
         };
-        Ok((filled, roll_cost(is_buy, filled, fee, value, mark)))
+        Ok((filled, roll_cost(is_buy, filled, fee, value, mark), value))
     }
 
     /// The post-only half of a maker_first roll leg: ALO at the passive
     /// touch, held for `HEDGE_ROLL_MAKER_TIMEOUT_SECS`, then canceled and
-    /// the cancel confirmed. Returns (filled, cost, terminal confirmed).
+    /// the cancel confirmed. Returns (filled, cost, executed value, terminal
+    /// confirmed).
     async fn roll_maker(
         &mut self,
         symbol: &str,
         order: &Order,
         mark: f64,
         is_buy: bool,
-    ) -> Result<(f64, f64, bool)> {
+    ) -> Result<(f64, f64, f64, bool)> {
         let leg = order.leg;
         let reduce_only = order.qty < 0.0;
         let side = if is_buy {
@@ -2279,7 +2299,7 @@ impl Engine {
                     serde_json::json!({ "symbol": symbol, "leg": format!("{leg:?}"), "kind": "post_only",
                         "order_id": id, "req": want, "filled": f, "fee": v.fee }),
                 );
-                return Ok((f, roll_cost(is_buy, f, v.fee, v.value, mark), true));
+                return Ok((f, roll_cost(is_buy, f, v.fee, v.value, mark), v.value, true));
             }
         }
         let reason = format!("post-only roll order {id} not terminal after cancel");
@@ -2292,7 +2312,7 @@ impl Engine {
             before,
             &reason,
         );
-        Ok((0.0, 0.0, false))
+        Ok((0.0, 0.0, 0.0, false))
     }
 
     /// Roll one clip of the Arcus leg when due and every gate is open.
@@ -2319,7 +2339,12 @@ impl Engine {
             Leg::Short => snap.short.mark(sym),
         };
         let m = self.meta(sym);
-        let clip_qty = qty_for_notional(self.cfg.roll.clip_usd, mark, m.size_decimals);
+        // Size the clip at the HIGHER of the two venues' marks: the net
+        // guard values |long − short| at the long mark, so a clip sized at a
+        // cheaper Arcus mark could exceed the net tolerance it was validated
+        // against (the feed gate allows up to 2 % divergence).
+        let sizing_mark = roll_sizing_mark(mark, snap.long.mark(sym));
+        let clip_qty = qty_for_notional(self.cfg.roll.clip_usd, sizing_mark, m.size_decimals);
         let held = snap.book(sym);
         let leg_qty = match leg {
             Leg::Long => held.long,
@@ -2444,8 +2469,8 @@ impl Engine {
         let reserved = roll_reserve(clip_qty * mark, slip);
         self.roll_book(reserved);
         let (close_filled, close_cost) = match self.roll_one(&sym, &close, mark).await {
-            Ok((f, c)) => {
-                self.roll_book(roll_settle_reservation(reserved, Some((f * mark, c))));
+            Ok((f, c, v)) => {
+                self.roll_book(roll_settle_reservation(reserved, Some((v, c))));
                 (f, c)
             }
             Err(e) => {
@@ -2472,12 +2497,18 @@ impl Engine {
                 let reserved = roll_reserve(close_filled * mark, slip);
                 self.roll_book(reserved);
                 match self.roll_one(&sym, &reopen, mark).await {
-                    Ok((f, c)) => {
-                        self.roll_book(roll_settle_reservation(reserved, Some((f * mark, c))));
+                    Ok((f, c, v)) => {
+                        self.roll_book(roll_settle_reservation(reserved, Some((v, c))));
                         open_filled = f;
                         open_cost = c;
                         if f + self.size_tol(&sym) < close_filled {
                             outcome = "reopen_partial";
+                            // The planner re-grows the missing part next tick,
+                            // outside the roll path: keep it reserved.
+                            self.roll_book(roll_repair_reservation(
+                                roll_partial_remainder(close_filled, f) * mark,
+                                slip,
+                            ));
                         }
                     }
                     Err(e) => {
@@ -4503,6 +4534,23 @@ mod tests {
             roll_reserve(5_000.0, 3)
         );
         assert!(roll_repair_reservation(5_000.0, 3).0 > 0.0);
+    }
+
+    #[test]
+    fn roll_clip_fits_the_net_tolerance_at_both_marks_and_partials_stay_reserved() {
+        // Arcus short marked 2 % below the long venue: sizing at the Arcus
+        // mark alone would put clip × long mark over the clip USD.
+        let (arcus, long) = (98.0, 100.0);
+        let clip_usd = 5_000.0;
+        let naive = qty_for_notional(clip_usd, arcus, 4);
+        assert!(naive * long > clip_usd);
+        let q = qty_for_notional(clip_usd, roll_sizing_mark(arcus, long), 4);
+        assert!(q * long <= clip_usd && q * arcus <= clip_usd);
+        // and when Arcus is the higher one, it is used
+        assert_eq!(roll_sizing_mark(101.0, 100.0), 101.0);
+        // partial re-open: the unfilled part stays reserved, never negative
+        assert!((roll_partial_remainder(0.05, 0.03) - 0.02).abs() < 1e-12);
+        assert_eq!(roll_partial_remainder(0.05, 0.06), 0.0);
     }
 
     #[test]
