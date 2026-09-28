@@ -342,6 +342,8 @@ struct Config {
     /// Seconds after which an uncertain IOC that is no longer open is
     /// released (`HEDGE_UNCERTAIN_GRACE_SECS`, default 60).
     uncertain_grace_secs: u64,
+    /// Arcus-leg roll (bot-strategy#1080), default off. See `RollCfg`.
+    roll: RollCfg,
     /// Per-leg notional built on a bare ARM (USD); single-symbol only.
     target_notional_usd: f64,
     /// Hard cap on the per-leg notional any ARM may request, per symbol (USD).
@@ -414,6 +416,16 @@ impl Config {
                 None => DEFAULT_FILL_WAIT_SECS.to_vec(),
             },
             uncertain_grace_secs: env_u64("HEDGE_UNCERTAIN_GRACE_SECS", 60),
+            roll: RollCfg {
+                enabled: env_bool("HEDGE_ROLL_ENABLED", false),
+                interval_secs: env_u64("HEDGE_ROLL_INTERVAL_SECS", 3_600),
+                clip_usd: env_f64("HEDGE_ROLL_CLIP_USD", 0.0),
+                weekly_volume_usd: env_f64("HEDGE_ROLL_WEEKLY_VOLUME_USD", 0.0),
+                weekly_cost_usd: env_f64("HEDGE_ROLL_WEEKLY_COST_USD", 0.0),
+                mode: RollMode::parse(&env_string("HEDGE_ROLL_MODE", "taker"))
+                    .context("HEDGE_ROLL_MODE")?,
+                maker_timeout_secs: env_u64("HEDGE_ROLL_MAKER_TIMEOUT_SECS", 20),
+            },
             target_notional_usd: env_f64("HEDGE_TARGET_NOTIONAL_USD", 20_000.0),
             max_notional_usd: env_f64("HEDGE_MAX_NOTIONAL_USD", 30_000.0),
             clip_usd: env_f64("HEDGE_CLIP_USD", 10_000.0),
@@ -502,6 +514,32 @@ impl Config {
         if self.uncertain_grace_secs == 0 {
             bail!("HEDGE_UNCERTAIN_GRACE_SECS must be > 0");
         }
+        if self.roll.enabled {
+            if self.roll_leg().is_none() {
+                bail!("HEDGE_ROLL_ENABLED needs an Arcus leg (the Lighter leg is never rolled)");
+            }
+            if !positive(self.roll.clip_usd) {
+                bail!("HEDGE_ROLL_CLIP_USD must be > 0 when the roll is enabled");
+            }
+            if self.roll.clip_usd > self.clip_usd {
+                bail!("HEDGE_ROLL_CLIP_USD must be <= HEDGE_CLIP_USD");
+            }
+            // Between the close and the re-open the book is one roll clip
+            // lopsided; above the net tolerance that would count as a
+            // breach (and a slow re-open could halt the bot).
+            if self.roll.clip_usd > self.net_tolerance_usd {
+                bail!("HEDGE_ROLL_CLIP_USD must be <= HEDGE_NET_TOLERANCE_USD");
+            }
+            if !positive(self.roll.weekly_volume_usd) || !positive(self.roll.weekly_cost_usd) {
+                bail!("HEDGE_ROLL_WEEKLY_VOLUME_USD and HEDGE_ROLL_WEEKLY_COST_USD must be > 0 when the roll is enabled");
+            }
+            if self.roll.interval_secs < self.tick_secs {
+                bail!("HEDGE_ROLL_INTERVAL_SECS must be >= HEDGE_TICK_SECS");
+            }
+            if self.roll.mode == RollMode::MakerFirst && self.roll.maker_timeout_secs == 0 {
+                bail!("HEDGE_ROLL_MAKER_TIMEOUT_SECS must be > 0 for maker_first");
+            }
+        }
         if !self.dry_run && self.live_confirm != LIVE_CONFIRM_TOKEN {
             bail!(
                 "HEDGE_DRY_RUN=false needs HEDGE_LIVE_CONFIRM={LIVE_CONFIRM_TOKEN} \
@@ -520,6 +558,19 @@ impl Config {
 
     fn uses_arcus(&self) -> bool {
         self.long_venue == VenueKind::Arcus || self.short_venue == VenueKind::Arcus
+    }
+
+    /// The leg the roll trades: the Arcus leg (the short when both are
+    /// Arcus). `None` when no leg is on Arcus — the Lighter leg is never
+    /// rolled.
+    fn roll_leg(&self) -> Option<Leg> {
+        if self.short_venue == VenueKind::Arcus {
+            Some(Leg::Short)
+        } else if self.long_venue == VenueKind::Arcus {
+            Some(Leg::Long)
+        } else {
+            None
+        }
     }
 
     fn venue(&self, leg: Leg) -> VenueKind {
@@ -561,6 +612,20 @@ impl Config {
         }
         if self.short_venue != VenueKind::Lighter {
             fields.push(("short_venue", self.short_venue.dex_name().to_string()));
+        }
+        if self.roll.enabled {
+            fields.push((
+                "roll",
+                format!(
+                    "{}:{}:{:.2}:{:.2}:{:.2}:{}",
+                    self.roll.mode.as_str(),
+                    self.roll.interval_secs,
+                    self.roll.clip_usd,
+                    self.roll.weekly_volume_usd,
+                    self.roll.weekly_cost_usd,
+                    self.roll.maker_timeout_secs
+                ),
+            ));
         }
         if self.symbols.len() == 1 && self.symbols[0].short_mmr_pct != self.symbols[0].mmr_pct {
             fields.push(("short_mmr", format!("{:.3}", self.symbols[0].short_mmr_pct)));
@@ -639,6 +704,9 @@ struct State {
     /// terminal — re-sending is the one way the book can overshoot.
     #[serde(default)]
     uncertain: std::collections::BTreeMap<String, UncertainOrder>,
+    /// Arcus-leg roll counters (bot-strategy#1080).
+    #[serde(default)]
+    roll: RollState,
     // Single-symbol state.json (before `books`): read once by
     // `migrate_legacy`, never written back.
     #[serde(default, rename = "mode", skip_serializing)]
@@ -722,6 +790,204 @@ struct UncertainOrder {
     before_qty: f64,
     sent_at: u64,
     reason: String,
+}
+
+// ------------------------------------------------------------------- roll
+
+/// How a roll leg is executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RollMode {
+    /// Taker IOC (2.25 bp on Arcus Base tier).
+    #[default]
+    Taker,
+    /// Post-only (ALO) at the touch first; after the timeout the rest is
+    /// canceled, the cancel confirmed, and only then sent as a taker IOC.
+    MakerFirst,
+}
+
+impl RollMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "taker" => Ok(Self::Taker),
+            "maker_first" => Ok(Self::MakerFirst),
+            other => bail!("unknown roll mode '{other}' (taker | maker_first)"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Taker => "taker",
+            Self::MakerFirst => "maker_first",
+        }
+    }
+}
+
+/// Arcus-leg roll settings (`HEDGE_ROLL_*`). Off by default: enabling it is
+/// the owner's call once the Arcus points terms are known (#1075, #1080).
+#[derive(Debug, Clone, Default)]
+struct RollCfg {
+    enabled: bool,
+    interval_secs: u64,
+    clip_usd: f64,
+    weekly_volume_usd: f64,
+    weekly_cost_usd: f64,
+    mode: RollMode,
+    maker_timeout_secs: u64,
+}
+
+/// Roll bookkeeping in state.json (serde default: older states load).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct RollState {
+    /// Day index (days since 1970-01-01) of the Sunday the current roll
+    /// week started on.
+    week: u64,
+    week_volume_usd: f64,
+    week_cost_usd: f64,
+    week_count: u64,
+    last_roll_at: Option<u64>,
+    last_symbol: Option<String>,
+    blocked_reason: Option<String>,
+}
+
+/// Sunday-00:00-UTC week of `now`, as the day index of that Sunday. The
+/// Arcus points week is ASSUMED to run Sun 00:00 UTC (the points API's
+/// weekly history starts on Sunday 2026-09-13, see bot-strategy#1075).
+fn roll_week(now: u64) -> u64 {
+    let day = now / 86_400;
+    // 1970-01-01 was a Thursday: (day + 4) % 7 == 0 on Sundays.
+    day - (day + 4) % 7
+}
+
+/// Resets the weekly counters when a new roll week has started.
+fn roll_week_rollover(rs: &mut RollState, now: u64) -> bool {
+    let week = roll_week(now);
+    if rs.week != week {
+        *rs = RollState {
+            week,
+            last_roll_at: rs.last_roll_at,
+            last_symbol: rs.last_symbol.clone(),
+            ..RollState::default()
+        };
+        return true;
+    }
+    false
+}
+
+/// Next time a roll may run.
+fn roll_next_at(rs: &RollState, interval_secs: u64) -> u64 {
+    rs.last_roll_at.map(|t| t + interval_secs).unwrap_or(0)
+}
+
+/// Everything a roll must not run through, as read on this tick.
+#[derive(Debug, Clone, Copy)]
+struct RollGate {
+    book_on: bool,
+    balanced: bool,
+    halted: bool,
+    kill: bool,
+    uncertain: bool,
+    feed_ok: bool,
+    headroom_ok: bool,
+    leverage_ok: bool,
+    leg_holds_clip: bool,
+}
+
+/// Why the roll does not run now (`None`: go). `round_trip_usd` is the
+/// volume one roll adds (close + re-open).
+fn roll_blocker(
+    cfg: &RollCfg,
+    rs: &RollState,
+    now: u64,
+    g: &RollGate,
+    round_trip_usd: f64,
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return Some("disabled");
+    }
+    if now < roll_next_at(rs, cfg.interval_secs) {
+        return Some("interval");
+    }
+    let checks = [
+        (!g.book_on, "book_not_on"),
+        (g.halted, "halted"),
+        (g.kill, "kill_switch"),
+        (g.uncertain, "uncertain_order"),
+        (!g.feed_ok, "feed"),
+        (!g.balanced, "unbalanced"),
+        (!g.headroom_ok, "liq_headroom"),
+        (!g.leverage_ok, "leverage"),
+        (!g.leg_holds_clip, "leg_smaller_than_clip"),
+        (
+            rs.week_volume_usd + round_trip_usd > cfg.weekly_volume_usd,
+            "weekly_volume_budget",
+        ),
+        (rs.week_cost_usd >= cfg.weekly_cost_usd, "weekly_cost_cap"),
+    ];
+    checks.iter().find(|(hit, _)| *hit).map(|(_, why)| *why)
+}
+
+/// The re-open of a roll: the same size the close actually filled, and
+/// nothing when the close did not fill (the book was never lopsided).
+fn roll_reopen(leg: Leg, close_filled: f64, min_qty: f64) -> Option<Order> {
+    (close_filled >= min_qty && close_filled > 0.0).then_some(Order {
+        leg,
+        qty: close_filled,
+    })
+}
+
+/// After the post-only part of a maker_first roll leg.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MakerNext {
+    /// Done; total filled.
+    Done(f64),
+    /// Send this rest as a taker IOC.
+    Taker(f64),
+    /// The post-only order's cancel is not confirmed: sending the rest
+    /// could execute twice. Stop.
+    Uncertain,
+}
+
+fn maker_next(
+    want: f64,
+    maker_filled: f64,
+    min_qty: f64,
+    cancel_confirmed: bool,
+    tol: f64,
+) -> MakerNext {
+    if maker_filled >= want - tol {
+        return MakerNext::Done(maker_filled);
+    }
+    if !cancel_confirmed {
+        return MakerNext::Uncertain;
+    }
+    let rest = want - maker_filled;
+    if rest < min_qty {
+        MakerNext::Done(maker_filled)
+    } else {
+        MakerNext::Taker(rest)
+    }
+}
+
+/// Roll cost of one execution: fees plus slippage against the mark at send
+/// (paid above mark on a buy, received below it on a sell).
+fn roll_cost(is_buy: bool, filled: f64, fee: f64, value: f64, mark: f64) -> f64 {
+    let at_mark = filled * mark;
+    fee + if is_buy {
+        value - at_mark
+    } else {
+        at_mark - value
+    }
+}
+
+/// One read of an Arcus order: book presence, cancel, and its fills.
+#[derive(Debug, Clone, Default)]
+struct OrderView {
+    open: bool,
+    canceled: bool,
+    filled: f64,
+    fee: f64,
+    value: f64,
+    trades: Vec<String>,
 }
 
 /// Outcome of one look at a just-sent IOC.
@@ -1338,6 +1604,9 @@ struct Engine {
     /// Set while a venue is unreachable or the two marks disagree;
     /// reported in status (`hedge_holder.feed_problem`).
     feed_problem: Option<String>,
+    /// (filled, fees, filled value) of the last Arcus order settled from its
+    /// own fills — the roll's cost accounting reads it.
+    last_settle: Option<(f64, f64, f64)>,
 }
 
 impl Engine {
@@ -1641,14 +1910,8 @@ impl Engine {
         self.persist();
     }
 
-    /// One read of an Arcus order's state: (open, canceled, fills sum,
-    /// trade ids of those fills). `None` when a read failed.
-    async fn arcus_order_view(
-        &self,
-        leg: Leg,
-        symbol: &str,
-        order_id: &str,
-    ) -> Option<(bool, bool, f64, Vec<String>)> {
+    /// One read of an Arcus order's state. `None` when a read failed.
+    async fn arcus_order_view(&self, leg: Leg, symbol: &str, order_id: &str) -> Option<OrderView> {
         let dex = &self.venue(leg).dex;
         let open = dex
             .get_open_orders(symbol)
@@ -1664,15 +1927,20 @@ impl Engine {
             .orders
             .iter()
             .any(|o| o.order_id == order_id);
-        let mut sum = 0.0;
-        let mut trades = Vec::new();
+        let mut view = OrderView {
+            open,
+            canceled,
+            ..OrderView::default()
+        };
         for f in dex.get_filled_orders(symbol).await.ok()?.orders {
             if f.order_id == order_id {
-                sum += f.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
-                trades.push(f.trade_id);
+                view.filled += f.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
+                view.fee += f.filled_fee.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                view.value += f.filled_value.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
+                view.trades.push(f.trade_id);
             }
         }
-        Some((open, canceled, sum, trades))
+        Some(view)
     }
 
     /// Settle an Arcus IOC within `HEDGE_FILL_WAIT_SECS`: `Some(filled)`
@@ -1688,19 +1956,23 @@ impl Engine {
         let tol = self.size_tol(symbol);
         for &wait in &self.cfg.fill_wait_secs.clone() {
             tokio::time::sleep(Duration::from_secs(wait)).await;
-            let Some((open, canceled, sum, trades)) =
-                self.arcus_order_view(leg, symbol, order_id).await
-            else {
+            let Some(v) = self.arcus_order_view(leg, symbol, order_id).await else {
                 continue;
             };
             let Ok(after) = self.venue(leg).signed_qty(symbol).await else {
                 continue;
             };
-            if let Settle::Terminal(f) =
-                settle_decision(qty, open, canceled, sum, (after - before).abs(), tol)
-            {
-                self.forget_arcus_activity(leg, symbol, order_id, &trades)
+            if let Settle::Terminal(f) = settle_decision(
+                qty,
+                v.open,
+                v.canceled,
+                v.filled,
+                (after - before).abs(),
+                tol,
+            ) {
+                self.forget_arcus_activity(leg, symbol, order_id, &v.trades)
                     .await;
+                self.last_settle = Some((f, v.fee, v.value));
                 return Some(f);
             }
         }
@@ -1721,6 +1993,318 @@ impl Engine {
             let _ = dex.clear_filled_order(symbol, t).await;
         }
         let _ = dex.clear_canceled_order(symbol, order_id).await;
+    }
+
+    /// One roll leg (reduce when `order.qty < 0`, re-open when > 0) on the
+    /// Arcus leg; returns (filled, cost USD). Terminal before it returns:
+    /// the taker path settles through `execute`, the maker path confirms the
+    /// post-only order filled or canceled before any taker rest is sent.
+    async fn roll_one(&mut self, symbol: &str, order: &Order, mark: f64) -> Result<(f64, f64)> {
+        let is_buy = matches!(
+            (order.leg, order.qty > 0.0),
+            (Leg::Long, true) | (Leg::Short, false)
+        );
+        let want = order.qty.abs();
+        let mut filled = 0.0;
+        let mut cost = 0.0;
+        if self.cfg.roll.mode == RollMode::MakerFirst && !self.cfg.dry_run {
+            let (maker_filled, maker_cost, confirmed) =
+                self.roll_maker(symbol, order, mark, is_buy).await?;
+            filled += maker_filled;
+            cost += maker_cost;
+            match maker_next(
+                want,
+                maker_filled,
+                self.meta(symbol).min_qty,
+                confirmed,
+                self.size_tol(symbol),
+            ) {
+                MakerNext::Done(_) => return Ok((filled, cost)),
+                MakerNext::Uncertain => {
+                    bail!("post-only roll order not confirmed canceled — no taker rest")
+                }
+                MakerNext::Taker(rest) => {
+                    let taker = Order {
+                        leg: order.leg,
+                        qty: rest * order.qty.signum(),
+                    };
+                    let (f, c) = self.roll_taker(symbol, &taker, mark, is_buy).await?;
+                    return Ok((filled + f, cost + c));
+                }
+            }
+        }
+        let (f, c) = self.roll_taker(symbol, order, mark, is_buy).await?;
+        Ok((filled + f, cost + c))
+    }
+
+    async fn roll_taker(
+        &mut self,
+        symbol: &str,
+        order: &Order,
+        mark: f64,
+        is_buy: bool,
+    ) -> Result<(f64, f64)> {
+        self.last_settle = None;
+        let filled = self.execute(symbol, order, mark).await?;
+        let (fee, value) = match self.last_settle.take() {
+            Some((_, fee, value)) => (fee, value),
+            None => (0.0, filled * mark),
+        };
+        Ok((filled, roll_cost(is_buy, filled, fee, value, mark)))
+    }
+
+    /// The post-only half of a maker_first roll leg: ALO at the passive
+    /// touch, held for `HEDGE_ROLL_MAKER_TIMEOUT_SECS`, then canceled and
+    /// the cancel confirmed. Returns (filled, cost, terminal confirmed).
+    async fn roll_maker(
+        &mut self,
+        symbol: &str,
+        order: &Order,
+        mark: f64,
+        is_buy: bool,
+    ) -> Result<(f64, f64, bool)> {
+        let leg = order.leg;
+        let reduce_only = order.qty < 0.0;
+        let side = if is_buy {
+            OrderSide::Long
+        } else {
+            OrderSide::Short
+        };
+        let want = order.qty.abs();
+        let tol = self.size_tol(symbol);
+        let dex = self.venue(leg).dex.clone();
+        let book = dex
+            .get_order_book(symbol, 1)
+            .await
+            .map_err(|e| anyhow!("roll book {symbol}: {e:?}"))?;
+        let passive = if is_buy {
+            book.bids.first()
+        } else {
+            book.asks.first()
+        }
+        .map(|l| l.price)
+        .ok_or_else(|| anyhow!("roll book {symbol}: empty side"))?;
+        let before = self.venue(leg).signed_qty(symbol).await?;
+        let size = decimal(want, "qty")?.round_dp(self.meta(symbol).size_decimals);
+        let resp = match dex
+            .create_order(
+                symbol,
+                size,
+                side,
+                Some(passive),
+                Some(-2),
+                reduce_only,
+                None,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(DexError::ReconciliationRequired { detail, .. }) => {
+                let reason = format!("post-only roll submission ambiguous: {detail}");
+                self.mark_uncertain(symbol, leg, VenueKind::Arcus, None, want, before, &reason);
+                bail!("{reason}");
+            }
+            Err(e) => bail!("roll post-only {side} {symbol} {size}: {e:?}"),
+        };
+        let id = resp.order_id.clone();
+        let deadline = now_secs() + self.cfg.roll.maker_timeout_secs;
+        let mut last = OrderView::default();
+        while now_secs() < deadline {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Some(v) = self.arcus_order_view(leg, symbol, &id).await {
+                let done = !v.open && v.filled >= want - tol;
+                last = v;
+                if done {
+                    break;
+                }
+            }
+        }
+        if !(last.filled >= want - tol && !last.open) {
+            // Pull the rest and wait until the venue shows it gone: only a
+            // confirmed cancel lets the taker rest go out.
+            let _ = dex.cancel_order(symbol, &id).await;
+        }
+        for &wait in &self.cfg.fill_wait_secs.clone() {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+            let Some(v) = self.arcus_order_view(leg, symbol, &id).await else {
+                continue;
+            };
+            let Ok(after) = self.venue(leg).signed_qty(symbol).await else {
+                continue;
+            };
+            if let Settle::Terminal(f) = settle_decision(
+                want,
+                v.open,
+                v.canceled,
+                v.filled,
+                (after - before).abs(),
+                tol,
+            ) {
+                self.forget_arcus_activity(leg, symbol, &id, &v.trades)
+                    .await;
+                self.event(
+                    "roll_leg",
+                    serde_json::json!({ "symbol": symbol, "leg": format!("{leg:?}"), "kind": "post_only",
+                        "order_id": id, "req": want, "filled": f, "fee": v.fee }),
+                );
+                return Ok((f, roll_cost(is_buy, f, v.fee, v.value, mark), true));
+            }
+        }
+        let reason = format!("post-only roll order {id} not terminal after cancel");
+        self.mark_uncertain(
+            symbol,
+            leg,
+            VenueKind::Arcus,
+            Some(id),
+            want,
+            before,
+            &reason,
+        );
+        Ok((0.0, 0.0, false))
+    }
+
+    /// Roll one clip of the Arcus leg when due and every gate is open.
+    /// Called only on a tick that sent nothing else. Strictly sequential:
+    /// the re-open starts only after the close is terminal, sized to what
+    /// the close filled. A failed or uncertain re-open leaves the book one
+    /// clip lopsided (within the net tolerance by config): the uncertain
+    /// guard holds the symbol until reconciled, then the normal levelling
+    /// grows the smaller leg back.
+    async fn maybe_roll(&mut self, now: u64, snap: &Snapshot, kill: bool) {
+        if !self.cfg.roll.enabled {
+            return;
+        }
+        let Some(leg) = self.cfg.roll_leg() else {
+            return;
+        };
+        if roll_week_rollover(&mut self.state.roll, now) {
+            self.persist();
+        }
+        // Round robin over the armed books.
+        let syms: Vec<String> = self.cfg.symbol_names();
+        let start = self
+            .state
+            .roll
+            .last_symbol
+            .as_ref()
+            .and_then(|l| syms.iter().position(|s| s == l))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let Some(sym) = (0..syms.len())
+            .map(|k| syms[(start + k) % syms.len()].clone())
+            .find(|s| self.state.book(s).mode == Mode::On)
+        else {
+            return;
+        };
+        let mark = match leg {
+            Leg::Long => snap.long.mark(&sym),
+            Leg::Short => snap.short.mark(&sym),
+        };
+        let m = self.meta(&sym);
+        let clip_qty =
+            qty_for_notional(self.cfg.roll.clip_usd, mark, m.size_decimals).max(m.min_qty);
+        let held = snap.book(&sym);
+        let leg_qty = match leg {
+            Leg::Long => held.long,
+            Leg::Short => held.short,
+        };
+        let headroom = liq_headroom_pct(snap.equity(leg), &snap.legs(&self.cfg, leg));
+        let gate = RollGate {
+            book_on: self.state.book(&sym).mode == Mode::On,
+            balanced: (held.net() * snap.long.mark(&sym)).abs() <= self.cfg.net_tolerance_usd,
+            halted: self.state.halted,
+            kill,
+            uncertain: self.state.uncertain.contains_key(&sym),
+            feed_ok: self.feed_problem.is_none(),
+            headroom_ok: headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
+            leverage_ok: self.cfg.dry_run
+                || leverage_ok(
+                    snap.gross(&self.cfg, leg),
+                    snap.equity(leg),
+                    self.cfg.max_leverage,
+                ),
+            leg_holds_clip: clip_qty > 0.0 && leg_qty >= clip_qty,
+        };
+        let blocked = roll_blocker(
+            &self.cfg.roll,
+            &self.state.roll,
+            now,
+            &gate,
+            2.0 * clip_qty * mark,
+        );
+        if let Some(why) = blocked {
+            let why = (why != "interval").then(|| why.to_string());
+            if self.state.roll.blocked_reason != why {
+                if let Some(w) = &why {
+                    log::info!("[ROLL] {sym} blocked: {w}");
+                    self.event(
+                        "roll_blocked",
+                        serde_json::json!({ "symbol": sym, "reason": w }),
+                    );
+                }
+                self.state.roll.blocked_reason = why;
+                self.persist();
+            }
+            return;
+        }
+        log::info!("[ROLL] {sym} {leg:?} clip {clip_qty} @ {mark:.2}");
+        self.event(
+            "roll_start",
+            serde_json::json!({ "symbol": sym, "leg": format!("{leg:?}"), "clip_qty": clip_qty,
+                "mark": mark, "mode": self.cfg.roll.mode.as_str() }),
+        );
+        self.state.roll.last_roll_at = Some(now);
+        self.state.roll.last_symbol = Some(sym.clone());
+        self.state.roll.blocked_reason = None;
+        let close = Order {
+            leg,
+            qty: -clip_qty,
+        };
+        let (close_filled, close_cost) = match self.roll_one(&sym, &close, mark).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("[ROLL] {sym} close failed: {e:?}");
+                self.event(
+                    "roll_blocked",
+                    serde_json::json!({ "symbol": sym, "reason": format!("close failed: {e}") }),
+                );
+                self.persist();
+                return;
+            }
+        };
+        let (mut open_filled, mut open_cost) = (0.0, 0.0);
+        let mut outcome = "done";
+        match roll_reopen(leg, close_filled, m.min_qty) {
+            None => outcome = "close_unfilled",
+            Some(reopen) => {
+                match self.roll_one(&sym, &reopen, mark).await {
+                    Ok((f, c)) => {
+                        open_filled = f;
+                        open_cost = c;
+                        if f + self.size_tol(&sym) < close_filled {
+                            outcome = "reopen_partial";
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[ROLL] {sym} re-open failed: {e:?} — levelling repairs it once reconciled");
+                        outcome = "reopen_failed";
+                    }
+                }
+            }
+        }
+        let rs = &mut self.state.roll;
+        rs.week_volume_usd += (close_filled + open_filled) * mark;
+        rs.week_cost_usd += close_cost + open_cost;
+        rs.week_count += 1;
+        let (vol, cost) = (rs.week_volume_usd, rs.week_cost_usd);
+        self.event(
+            "roll_done",
+            serde_json::json!({ "symbol": sym, "leg": format!("{leg:?}"), "outcome": outcome,
+                "close_filled": close_filled, "reopen_filled": open_filled,
+                "cost_usd": close_cost + open_cost, "week_volume_usd": vol, "week_cost_usd": cost }),
+        );
+        log::info!("[ROLL] {sym} {outcome}: close {close_filled} / reopen {open_filled}, cost ${:.2}, week ${vol:.0} / ${cost:.2}", close_cost + open_cost);
+        self.persist();
     }
 
     /// Re-check every uncertain order; release the ones that are now known
@@ -1749,13 +2333,16 @@ impl Engine {
             // Fast path: the order's own fills / cancel prove it terminal.
             let mut released = false;
             if let (Some(id), "arcus") = (&u.order_id, u.exchange.as_str()) {
-                if let Some((open, canceled, sum, trades)) =
-                    self.arcus_order_view(u.leg, &sym, id).await
-                {
-                    if let Settle::Terminal(_) =
-                        settle_decision(u.qty, open, canceled, sum, delta, self.size_tol(&sym))
-                    {
-                        self.forget_arcus_activity(u.leg, &sym, id, &trades).await;
+                if let Some(v) = self.arcus_order_view(u.leg, &sym, id).await {
+                    if let Settle::Terminal(_) = settle_decision(
+                        u.qty,
+                        v.open,
+                        v.canceled,
+                        v.filled,
+                        delta,
+                        self.size_tol(&sym),
+                    ) {
+                        self.forget_arcus_activity(u.leg, &sym, id, &v.trades).await;
                         released = true;
                     }
                 }
@@ -2213,6 +2800,10 @@ impl Engine {
                 }
             }
         }
+        // The Arcus-leg roll runs only on a tick that sent nothing else.
+        if sent == 0 {
+            self.maybe_roll(now, &snap, kill).await;
+        }
         self.persist();
         self.write_status(now, kill, sent);
         Ok(())
@@ -2374,7 +2965,22 @@ fn status_value(
         "mode": state.overall_mode(),
         "halted": state.halted,
         "halt_reason": state.halt_reason,
-        "uncertain_orders": state.uncertain,
+                "uncertain_orders": state.uncertain,
+        "roll": {
+            "enabled": cfg.roll.enabled,
+            "mode": cfg.roll.mode.as_str(),
+            "leg": cfg.roll_leg().map(|l| format!("{l:?}")),
+            "clip_usd": cfg.roll.clip_usd,
+            "week_start_day": state.roll.week,
+            "week_volume_usd": state.roll.week_volume_usd,
+            "week_cost_usd": state.roll.week_cost_usd,
+            "week_count": state.roll.week_count,
+            "weekly_volume_budget_usd": cfg.roll.weekly_volume_usd,
+            "weekly_cost_cap_usd": cfg.roll.weekly_cost_usd,
+            "last_roll_at": state.roll.last_roll_at,
+            "next_roll_at": cfg.roll.enabled.then(|| roll_next_at(&state.roll, cfg.roll.interval_secs)),
+            "blocked_reason": state.roll.blocked_reason,
+        },
         "kill_switch": kill,
         "symbols": cfg.symbol_names(),
         "target_qty": pbook.target_qty,
@@ -2551,6 +3157,7 @@ async fn main() -> Result<()> {
         last_snapshot: Snapshot::default(),
         last_snapshot_at: None,
         feed_problem: None,
+        last_settle: None,
     };
     let tick = Duration::from_secs(engine.cfg.tick_secs);
     loop {
@@ -2855,6 +3462,7 @@ mod tests {
             arcus_live_confirm: String::new(),
             fill_wait_secs: DEFAULT_FILL_WAIT_SECS.to_vec(),
             uncertain_grace_secs: 60,
+            roll: RollCfg::default(),
             target_notional_usd: 20_000.0,
             max_notional_usd: 30_000.0,
             clip_usd: 10_000.0,
@@ -3401,6 +4009,231 @@ mod tests {
         c.short_venue = VenueKind::Arcus;
         c.short_instance = "arcus".into();
         c
+    }
+
+    fn roll_cfg_on() -> Config {
+        let mut c = arcus_short_cfg();
+        c.roll = RollCfg {
+            enabled: true,
+            interval_secs: 3_600,
+            clip_usd: 400.0,
+            weekly_volume_usd: 100_000.0,
+            weekly_cost_usd: 50.0,
+            mode: RollMode::Taker,
+            maker_timeout_secs: 20,
+        };
+        c
+    }
+
+    fn open_gate() -> RollGate {
+        RollGate {
+            book_on: true,
+            balanced: true,
+            halted: false,
+            kill: false,
+            uncertain: false,
+            feed_ok: true,
+            headroom_ok: true,
+            leverage_ok: true,
+            leg_holds_clip: true,
+        }
+    }
+
+    #[test]
+    fn roll_is_off_by_default_and_leaves_the_fingerprint_alone() {
+        let c = cfg_for_test();
+        assert!(!c.roll.enabled);
+        assert!(c.validate().is_ok());
+        let mut on = roll_cfg_on();
+        let off_fp = {
+            let mut o = on.clone();
+            o.roll.enabled = false;
+            o.fingerprint()
+        };
+        assert!(on.validate().is_ok());
+        assert_ne!(on.fingerprint(), off_fp);
+        on.roll.enabled = false;
+        assert_eq!(on.fingerprint(), off_fp);
+    }
+
+    #[test]
+    fn roll_config_is_validated_when_enabled() {
+        // the Lighter leg is never rolled: no Arcus leg -> refused
+        let mut c = cfg_for_test();
+        c.roll = roll_cfg_on().roll;
+        assert!(c.validate().unwrap_err().to_string().contains("Arcus leg"));
+        let bad: Vec<Box<dyn Fn(&mut Config)>> = vec![
+            Box::new(|c| c.roll.clip_usd = 0.0),
+            Box::new(|c| c.roll.clip_usd = c.clip_usd + 1.0),
+            Box::new(|c| c.roll.clip_usd = c.net_tolerance_usd + 1.0),
+            Box::new(|c| c.roll.weekly_volume_usd = 0.0),
+            Box::new(|c| c.roll.weekly_cost_usd = 0.0),
+            Box::new(|c| c.roll.interval_secs = c.tick_secs - 1),
+            Box::new(|c| {
+                c.roll.mode = RollMode::MakerFirst;
+                c.roll.maker_timeout_secs = 0
+            }),
+        ];
+        for (i, f) in bad.iter().enumerate() {
+            let mut c = roll_cfg_on();
+            f(&mut c);
+            assert!(c.validate().is_err(), "case {i} must be rejected");
+        }
+        assert_eq!(
+            RollMode::parse("maker_first").unwrap(),
+            RollMode::MakerFirst
+        );
+        assert!(RollMode::parse("both").is_err());
+    }
+
+    #[test]
+    fn only_the_arcus_leg_is_ever_rolled() {
+        assert_eq!(cfg_for_test().roll_leg(), None);
+        assert_eq!(arcus_short_cfg().roll_leg(), Some(Leg::Short));
+        let mut c = cfg_for_test();
+        c.long_venue = VenueKind::Arcus;
+        c.long_instance = "arcus".into();
+        assert_eq!(c.roll_leg(), Some(Leg::Long));
+    }
+
+    #[test]
+    fn roll_weeks_start_sunday_utc_and_reset_the_counters() {
+        // 2026-09-27 is a Sunday (day 20723)
+        assert_eq!(roll_week(1_790_467_200), 20_723);
+        assert_eq!(roll_week(1_790_467_200 + 6 * 86_400 + 86_399), 20_723);
+        assert_eq!(roll_week(1_790_467_199), 20_716); // Sat 09-26 -> week of 09-20
+        assert_eq!(roll_week(1_791_072_000), 20_730); // next Sunday
+        let mut rs = RollState {
+            week: 20_723,
+            week_volume_usd: 9_000.0,
+            week_cost_usd: 3.0,
+            week_count: 5,
+            last_roll_at: Some(1_791_071_000),
+            last_symbol: Some("BTC".into()),
+            blocked_reason: Some("weekly_cost_cap".into()),
+        };
+        assert!(!roll_week_rollover(&mut rs, 1_791_071_999));
+        assert_eq!(rs.week_count, 5);
+        assert!(roll_week_rollover(&mut rs, 1_791_072_000));
+        assert_eq!(
+            (rs.week, rs.week_volume_usd, rs.week_cost_usd, rs.week_count),
+            (20_730, 0.0, 0.0, 0)
+        );
+        assert_eq!(rs.last_roll_at, Some(1_791_071_000));
+        assert!(rs.blocked_reason.is_none());
+    }
+
+    #[test]
+    fn roll_gates_interval_every_blocker_and_the_weekly_caps() {
+        let cfg = roll_cfg_on().roll;
+        let rs = RollState {
+            last_roll_at: Some(10_000),
+            ..RollState::default()
+        };
+        let g = open_gate();
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 10_000 + 3_599, &g, 800.0),
+            Some("interval")
+        );
+        assert_eq!(roll_blocker(&cfg, &rs, 10_000 + 3_600, &g, 800.0), None);
+        let now = 20_000;
+        let cases: Vec<(Box<dyn Fn(&mut RollGate)>, &str)> = vec![
+            (Box::new(|g| g.book_on = false), "book_not_on"),
+            (Box::new(|g| g.halted = true), "halted"),
+            (Box::new(|g| g.kill = true), "kill_switch"),
+            (Box::new(|g| g.uncertain = true), "uncertain_order"),
+            (Box::new(|g| g.feed_ok = false), "feed"),
+            (Box::new(|g| g.balanced = false), "unbalanced"),
+            (Box::new(|g| g.headroom_ok = false), "liq_headroom"),
+            (Box::new(|g| g.leverage_ok = false), "leverage"),
+            (
+                Box::new(|g| g.leg_holds_clip = false),
+                "leg_smaller_than_clip",
+            ),
+        ];
+        for (f, want) in cases {
+            let mut g = open_gate();
+            f(&mut g);
+            assert_eq!(roll_blocker(&cfg, &rs, now, &g, 800.0), Some(want));
+        }
+        // weekly volume budget: the NEXT roll must fit
+        let near = RollState {
+            week_volume_usd: 99_300.0,
+            ..rs.clone()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &near, now, &g, 800.0),
+            Some("weekly_volume_budget")
+        );
+        assert_eq!(roll_blocker(&cfg, &near, now, &g, 700.0), None);
+        let spent = RollState {
+            week_cost_usd: 50.0,
+            ..rs.clone()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &spent, now, &g, 800.0),
+            Some("weekly_cost_cap")
+        );
+        let mut off = cfg.clone();
+        off.enabled = false;
+        assert_eq!(roll_blocker(&off, &rs, now, &g, 800.0), Some("disabled"));
+    }
+
+    #[test]
+    fn roll_reopens_only_what_the_close_filled() {
+        assert_eq!(
+            roll_reopen(Leg::Short, 0.004, 0.0001),
+            Some(Order {
+                leg: Leg::Short,
+                qty: 0.004
+            })
+        );
+        // close unfilled: nothing re-opened, the book was never lopsided
+        assert_eq!(roll_reopen(Leg::Short, 0.0, 0.0001), None);
+        assert_eq!(roll_reopen(Leg::Short, 0.00005, 0.0001), None);
+    }
+
+    #[test]
+    fn maker_first_sends_the_taker_rest_only_after_a_confirmed_cancel() {
+        let tol = 0.000005;
+        assert_eq!(
+            maker_next(0.01, 0.01, 0.0001, false, tol),
+            MakerNext::Done(0.01)
+        );
+        assert_eq!(
+            maker_next(0.01, 0.004, 0.0001, false, tol),
+            MakerNext::Uncertain
+        );
+        assert_eq!(
+            maker_next(0.01, 0.0, 0.0001, false, tol),
+            MakerNext::Uncertain
+        );
+        match maker_next(0.01, 0.004, 0.0001, true, tol) {
+            MakerNext::Taker(rest) => assert!((rest - 0.006).abs() < 1e-12),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            maker_next(0.01, 0.00995, 0.0001, true, tol),
+            MakerNext::Done(0.00995)
+        );
+    }
+
+    #[test]
+    fn roll_cost_is_fees_plus_slippage_against_the_mark() {
+        // buy 0.01 @ 100.1 vs mark 100: 0.001 slippage + 0.02 fee
+        assert!((roll_cost(true, 0.01, 0.02, 1.001, 100.0) - 0.021).abs() < 1e-12);
+        // sell 0.01 @ 99.9 vs mark 100
+        assert!((roll_cost(false, 0.01, 0.0, 0.999, 100.0) - 0.001).abs() < 1e-12);
+        // maker rebate / price improvement can make it negative
+        assert!(roll_cost(true, 0.01, -0.001, 0.999, 100.0) < 0.0);
+    }
+
+    #[test]
+    fn roll_state_loads_from_older_state_json() {
+        let mut v = serde_json::to_value(State::default()).unwrap();
+        v.as_object_mut().unwrap().remove("roll");
+        let st: State = serde_json::from_value(v).unwrap();
+        assert_eq!(st.roll, RollState::default());
     }
 
     #[test]

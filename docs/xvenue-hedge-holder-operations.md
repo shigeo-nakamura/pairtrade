@@ -265,3 +265,46 @@ the settle waits for the next readable tick.
 The unit does **not** close positions on stop; a delta-neutral book needs
 no supervision while the process is down, and the venue funding on both
 sides keeps netting. `DISARM` before stopping only if the book should go.
+
+## Arcus-leg roll (bot-strategy#1080) — default OFF
+
+Arcus points are reported (unofficially) at ~100 pt per $1M of **perps volume**, while the RH points come from **holding** (#1046). The roll therefore trades **only the Arcus leg**. The Lighter/RH leg is never rolled: holding earns RH points at ~$1–2/pt, versus ~$36–92/pt from volume, and Lighter's terms say artificial trading does not earn points.
+
+**Only enable it after** the owner's manual Arcus week has shown that volume earns points (#1075: the wallet's fills are reconciled against the weekly drop) and the official Arcus terms do not forbid it. Start with a small budget. Rolling a hedge leg is close to wash trading, which Arcus may filter or penalise.
+
+What one roll does, strictly sequentially and only on a tick that sent nothing else:
+1. A reduce-only close of `HEDGE_ROLL_CLIP_USD` on the Arcus leg, waited on until terminal (the Arcus settle above).
+2. A re-open on the same leg, sized to what the close actually filled. There is nothing to re-open if the close did not fill.
+
+The book is lopsided by at most one roll clip, and only between the two orders. There are never two orders on the account at once, so there is no self-trade. If the re-open fails or is uncertain, the uncertain guard holds the symbol until it is reconciled. The normal levelling then grows the short leg back, because the clip is at or below the net tolerance, so no breach is counted.
+
+A roll runs only when all of these hold:
+- the book is `On` and balanced within the tolerance
+- the bot is not halted and there is no KILL_SWITCH
+- the symbol has no uncertain order and the feed is healthy
+- the Arcus account headroom is at least `HEDGE_LIQ_GUARD_PCT` and it is within `HEDGE_MAX_LEVERAGE`
+- the Arcus leg holds at least one clip
+- the interval has elapsed
+- the weekly volume budget (including this roll's close and re-open) and the weekly cost cap are not exhausted
+
+Books are rolled round-robin.
+
+| env | default | meaning |
+|---|---|---|
+| `HEDGE_ROLL_ENABLED` | `false` | master switch; needs an Arcus leg |
+| `HEDGE_ROLL_INTERVAL_SECS` | `3600` | minimum time between rolls (>= tick) |
+| `HEDGE_ROLL_CLIP_USD` | — | notional per roll; must be <= `HEDGE_CLIP_USD` and <= `HEDGE_NET_TOLERANCE_USD` |
+| `HEDGE_ROLL_WEEKLY_VOLUME_USD` | — | weekly volume budget (close + re-open) |
+| `HEDGE_ROLL_WEEKLY_COST_USD` | — | weekly cap on fees + slippage vs mark |
+| `HEDGE_ROLL_MODE` | `taker` | `taker`, or `maker_first` (see below) |
+| `HEDGE_ROLL_MAKER_TIMEOUT_SECS` | `20` | how long the post-only order rests before it is canceled |
+
+`maker_first` works like this:
+1. A post-only (ALO) order is placed at the passive touch.
+2. After the timeout, the rest is canceled, and the cancel must be confirmed (the order is terminal).
+3. Only then is the remainder sent as a taker IOC. An unconfirmed cancel marks the order uncertain and stops the roll.
+
+The roll week runs **Sunday 00:00 UTC to Sunday 00:00 UTC**. This is an assumption: the Arcus points API's weekly history starts on Sunday 2026-09-13 (#1075).
+
+Status: `hedge_holder.roll` (`enabled`, `mode`, `leg`, week volume / cost / count, budgets, `last_roll_at`, `next_roll_at`, `blocked_reason`). Events: `roll_start`, `roll_leg`, `roll_done` (with `outcome`: done / close_unfilled / reopen_partial / reopen_failed), `roll_blocked`.
+
