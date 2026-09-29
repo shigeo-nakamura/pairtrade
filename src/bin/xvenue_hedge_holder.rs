@@ -1230,6 +1230,7 @@ fn roll_close_stage(
     close_uncertain: bool,
     close_filled: f64,
     min_qty: f64,
+    size_decimals: u32,
 ) -> std::result::Result<Order, &'static str> {
     if close_uncertain {
         return Err("close_uncertain");
@@ -1242,13 +1243,51 @@ fn roll_close_stage(
     }
     // filled, but below the venue minimum: it cannot be re-opened as one
     // order (the planner levels it later; that execution books itself)
-    if close_filled < min_qty {
+    // The re-open is the quantity that will actually be SUBMITTED: the fill
+    // floored to the order size decimals (execute rounds, which could round
+    // a finer-precision fill UP past what the close filled).
+    let qty = floor_to_decimals(close_filled, size_decimals);
+    if close_filled < min_qty || qty < min_qty || qty <= 0.0 {
         return Err("close_partial_below_min");
     }
-    Ok(Order {
-        leg,
-        qty: close_filled,
-    })
+    Ok(Order { leg, qty })
+}
+
+/// `q` floored to `decimals` places (never rounds up).
+fn floor_to_decimals(q: f64, decimals: u32) -> f64 {
+    let scale = 10f64.powi(decimals as i32);
+    // tiny epsilon so a value like 0.3 (0.29999…) is not floored a whole step
+    ((q * scale) + 1e-9).floor() / scale
+}
+
+/// Arcus-leg notionals AFTER the re-open, from FRESH positions and the
+/// FRESH mark of the rolled symbol (other symbols at their snapshot mark):
+/// the growth gates must judge the account as it is when the re-open goes
+/// out, not as it was at the start of the tick.
+fn reopen_legs_after<Q, M>(
+    symbols: &[SymbolCfg],
+    leg: Leg,
+    qty_of: Q,
+    mark_of: M,
+    sym: &str,
+    reopen_qty: f64,
+    fresh_mark: f64,
+) -> Vec<(f64, f64)>
+where
+    Q: Fn(&str) -> f64,
+    M: Fn(&str) -> f64,
+{
+    symbols
+        .iter()
+        .map(|c| {
+            let (qty, mark) = if c.symbol == sym {
+                (qty_of(&c.symbol).abs() + reopen_qty, fresh_mark)
+            } else {
+                (qty_of(&c.symbol).abs(), mark_of(&c.symbol))
+            };
+            (qty * mark, c.mmr(leg))
+        })
+        .collect()
 }
 
 /// A roll IOC the venue accepted that filled nothing although the price the
@@ -3047,6 +3086,7 @@ impl Engine {
             self.state.uncertain.contains_key(&sym),
             close_filled,
             m.min_qty,
+            m.size_decimals,
         ) {
             // close_partial_below_min: the planner repairs the shrunken leg
             // later and that execution books itself when it settles
@@ -3065,43 +3105,12 @@ impl Engine {
                 // planner makes no growth, so the gap is levelled here by a
                 // REDUCTION of the other leg.
                 let kill_now = self.sentinels.kill_switch_engaged();
-                let fresh_equity = if kill_now {
-                    None
-                } else if self.cfg.dry_run {
-                    // DRY_RUN never reads the venue account: the same simulated
-                    // equity the snapshot and the roll gate use.
-                    Some(self.cfg.dry_run_equity_usd)
-                } else {
-                    match self.venue(leg).equity().await {
-                        Ok(e) => Some(e),
-                        Err(e) => {
-                            log::warn!("[ROLL] {sym} re-open: fresh equity read failed: {e:#}");
-                            None
-                        }
-                    }
-                };
-                let gate = match (kill_now, fresh_equity) {
-                    (true, _) => roll_reopen_blocked(true, true, true),
-                    (false, None) => Some("reopen_failed"),
-                    (false, Some(eq)) => {
-                        let headroom = liq_headroom_pct(eq, &snap.legs(&self.cfg, leg));
-                        roll_reopen_blocked(
-                            false,
-                            headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
-                            self.cfg.dry_run
-                                || leverage_ok(
-                                    snap.gross(&self.cfg, leg),
-                                    eq,
-                                    self.cfg.max_leverage,
-                                ),
-                        )
-                    }
-                };
                 // one ticker read gives the fresh mark AND its tick; roll_one
                 // then skips its own guard read (the mark is that read)
-                let fresh = match gate {
-                    Some(_) => None,
-                    None => match self.venue(leg).dex.get_ticker(&sym, None).await {
+                let fresh = if kill_now {
+                    None
+                } else {
+                    match self.venue(leg).dex.get_ticker(&sym, None).await {
                         Ok(t) => {
                             let p = t.price.to_f64().unwrap_or(0.0);
                             (p > 0.0).then_some((p, t.min_tick))
@@ -3110,8 +3119,68 @@ impl Engine {
                             log::warn!("[ROLL] {sym} re-open: fresh mark read failed: {e:?}");
                             None
                         }
-                    },
+                    }
                 };
+                // FRESH equity and FRESH positions (live) — the snapshot's are
+                // from the start of the tick, before the close settled.
+                let fresh_account: Option<(f64, std::collections::BTreeMap<String, f64>)> =
+                    if kill_now || fresh.is_none() {
+                        None
+                    } else if self.cfg.dry_run {
+                        // DRY_RUN never reads the venue account: the simulated
+                        // equity and book the snapshot and the roll gate use.
+                        let dry: std::collections::BTreeMap<String, f64> = self
+                            .cfg
+                            .symbols
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.symbol.clone(),
+                                    roll_dry_leg_qty(&self.state.book(&c.symbol), leg),
+                                )
+                            })
+                            .collect();
+                        Some((self.cfg.dry_run_equity_usd, dry))
+                    } else {
+                        match (
+                            self.venue(leg).equity().await,
+                            self.venue(leg).positions().await,
+                        ) {
+                            (Ok(e), Ok(p)) => Some((e, p)),
+                            (e, p) => {
+                                log::warn!(
+                                    "[ROLL] {sym} re-open: fresh account read failed (equity ok={} positions ok={})",
+                                    e.is_ok(),
+                                    p.is_ok()
+                                );
+                                None
+                            }
+                        }
+                    };
+                let gate = match (kill_now, &fresh, &fresh_account) {
+                    (true, _, _) => roll_reopen_blocked(true, true, true),
+                    (false, Some((f, _)), Some((eq, pos))) => {
+                        let legs_after = reopen_legs_after(
+                            &self.cfg.symbols,
+                            leg,
+                            |s| pos.get(s).copied().unwrap_or(0.0),
+                            |s| snap.mark_of(leg, s),
+                            &sym,
+                            reopen.qty,
+                            *f,
+                        );
+                        let gross_after: f64 = legs_after.iter().map(|(n, _)| n).sum();
+                        let headroom = liq_headroom_pct(*eq, &legs_after);
+                        roll_reopen_blocked(
+                            false,
+                            headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
+                            self.cfg.dry_run
+                                || leverage_ok(gross_after, *eq, self.cfg.max_leverage),
+                        )
+                    }
+                    _ => Some("reopen_failed"),
+                };
+                let fresh = if gate.is_some() { None } else { fresh };
                 // price moved beyond the band, or the fresh reservation no
                 // longer fits the caps: the re-open is refused
                 let reopen_refused = match (gate, fresh) {
@@ -3120,7 +3189,7 @@ impl Engine {
                         &self.state.roll,
                         mark,
                         f,
-                        roll_reserve(close_filled * f, slip),
+                        roll_reserve(reopen.qty * f, slip),
                     ),
                     _ => None,
                 };
@@ -3195,7 +3264,7 @@ impl Engine {
                                 &sym,
                                 &reopen,
                                 fresh,
-                                close_filled * fresh,
+                                reopen.qty * fresh,
                                 slip,
                                 "reopen",
                                 Some(fresh_tick),
@@ -5256,7 +5325,7 @@ mod tests {
     #[test]
     fn roll_close_outcomes_match_what_happened() {
         let min = 0.0001;
-        let st = |sent, unc, filled| roll_close_stage(Leg::Short, sent, unc, filled, min);
+        let st = |sent, unc, filled| roll_close_stage(Leg::Short, sent, unc, filled, min, 4);
         assert_eq!(st(true, true, 0.05).unwrap_err(), "close_uncertain");
         assert_eq!(st(false, false, 0.0).unwrap_err(), "close_not_sent");
         assert_eq!(st(true, false, 0.0).unwrap_err(), "close_unfilled");
@@ -5268,8 +5337,40 @@ mod tests {
         let o = st(true, false, min).unwrap();
         assert_eq!((o.leg, o.qty), (Leg::Short, min));
         // filled enough: the re-open carries exactly the close fill, same leg
-        let o = roll_close_stage(Leg::Long, true, false, 0.05, min).unwrap();
+        let o = roll_close_stage(Leg::Long, true, false, 0.05, min, 4).unwrap();
         assert_eq!((o.leg, o.qty), (Leg::Long, 0.05));
+        // a finer-precision fill is re-opened FLOORED to the size decimals,
+        // never rounded up past what the close filled
+        let o = roll_close_stage(Leg::Short, true, false, 0.123456, min, 4).unwrap();
+        assert_eq!(o.qty, 0.1234);
+        assert!(o.qty <= 0.123456);
+        // floored below the minimum -> not re-openable
+        assert_eq!(
+            roll_close_stage(Leg::Short, true, false, 0.00019, 0.0002, 4).unwrap_err(),
+            "close_partial_below_min"
+        );
+        assert_eq!(floor_to_decimals(0.3, 1), 0.3);
+    }
+
+    #[test]
+    fn the_reopen_gates_use_fresh_positions_and_the_fresh_mark() {
+        let cfg = multi_cfg();
+        let syms = &cfg.symbols;
+        let sym = syms[0].symbol.clone();
+        // fresh position 0.2 (after the close) + re-open 0.05 at the FRESH mark 110
+        let legs = reopen_legs_after(
+            syms,
+            Leg::Short,
+            |s| if s == sym { -0.2 } else { 0.0 },
+            |_| 100.0,
+            &sym,
+            0.05,
+            110.0,
+        );
+        let n: f64 = legs.iter().map(|(n, _)| n).sum();
+        assert!((n - 0.25 * 110.0).abs() < 1e-9, "{n}");
+        // a stale-snapshot view (0.2 at 100) would understate the exposure
+        assert!(n > 0.2 * 100.0);
     }
 
     #[test]
