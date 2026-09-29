@@ -868,6 +868,12 @@ struct RollState {
     /// only `ROLL_REFUSAL_BACKOFF_SECS`, not a whole interval.
     #[serde(default)]
     retry_not_before: Option<u64>,
+    /// Consecutive roll attempts refused or rejected before anything was
+    /// sent (reset by a roll that sends, and by the week rollover). Each one
+    /// doubles the backoff; `ROLL_MAX_REFUSALS` in a row suspend the roll
+    /// until the next roll week.
+    #[serde(default)]
+    refusals: u32,
     last_symbol: Option<String>,
     blocked_reason: Option<String>,
 }
@@ -942,37 +948,78 @@ fn roll_reopen_fits(cfg: &RollCfg, rs: &RollState, reserve: (f64, f64)) -> bool 
         && rs.week_cost_usd + fly_c + reserve.1 <= cfg.weekly_cost_usd
 }
 
-/// Growth gate re-read right before the re-open (a growth order): an
-/// operator who engaged KILL_SWITCH, or a halt raised while the close was
-/// settling, stops it; the planner then levels (reductions still allowed).
-fn roll_reopen_blocked(kill: bool, halted: bool) -> Option<&'static str> {
+/// Growth gates re-read right before the re-open (a growth order): the
+/// KILL_SWITCH sentinel, and the Arcus leg's liquidation headroom and
+/// leverage from a FRESH equity read. (A halt cannot be raised between the
+/// close and the re-open — nothing in the roll path halts — so it is only
+/// checked at the gate.) `None` = send.
+fn roll_reopen_blocked(kill: bool, headroom_ok: bool, leverage_ok: bool) -> Option<&'static str> {
     if kill {
         Some("reopen_blocked_kill")
-    } else if halted {
-        Some("reopen_blocked_halt")
+    } else if !headroom_ok {
+        Some("reopen_blocked_headroom")
+    } else if !leverage_ok {
+        Some("reopen_blocked_leverage")
     } else {
         None
     }
 }
 
+/// With KILL_SWITCH engaged the re-open (growth) is never sent, and the
+/// planner does not repair a gap inside the net tolerance while restricted:
+/// the one-clip gap is closed by a REDUCTION of the other (non-rolled) leg
+/// instead — reduce-only, by exactly what the close filled. `None` when that
+/// cannot be one order (below the venue minimum) or the other leg holds less.
+fn roll_kill_levelling(close_filled: f64, other_leg_qty: f64, min_qty: f64) -> Option<f64> {
+    (close_filled > 0.0 && close_filled >= min_qty && other_leg_qty + 1e-12 >= close_filled)
+        .then_some(close_filled)
+}
+
 /// Does an absolute IOC limit reach the touch (buy ≥ best ask, sell ≤ best
 /// bid)? A roll IOC that cannot cross would be accepted, fill nothing and
 /// still spend the interval: refuse it before the send instead. A missing,
-/// one-sided or crossed book counts as not marketable.
-fn roll_limit_crosses(is_buy: bool, limit: f64, best_bid: f64, best_ask: f64) -> bool {
-    const TIE: f64 = 1e-9;
-    let usable = best_bid.is_finite()
-        && best_ask.is_finite()
-        && best_bid > 0.0
-        && best_ask >= best_bid
-        && limit.is_finite()
-        && limit > 0.0;
-    usable
-        && if is_buy {
-            limit >= best_ask * (1.0 - TIE)
-        } else {
-            limit <= best_bid * (1.0 + TIE)
+/// one-sided or crossed book counts as not marketable. Compared EXACTLY on
+/// the tick-rounded limit the venue will receive (`roll_limit_dec`) — no
+/// float tolerance, which could wave through a limit one tick short.
+fn roll_limit_crosses(
+    is_buy: bool,
+    limit: Decimal,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+) -> bool {
+    match (best_bid, best_ask) {
+        (Some(bid), Some(ask)) if bid > Decimal::ZERO && ask >= bid && limit > Decimal::ZERO => {
+            if is_buy {
+                limit >= ask
+            } else {
+                limit <= bid
+            }
         }
+        _ => false,
+    }
+}
+
+/// The absolute roll IOC limit exactly as the venue will receive it: mark
+/// × (1 ± `ROLL_PRICE_MARGIN`) computed in `Decimal` (from `Decimal::from_f64`,
+/// the shortest decimal of the f64 — never `from_f64_retain`, whose binary
+/// expansion `700 × 1.001 = 700.6999…` lands one tick short after the
+/// connector's inward rounding, pairtrade#315), then rounded INWARD to the
+/// market tick (buy down, sell up) the same way the connector's
+/// `create_order_taker_ioc_at` does. `None` for an unusable mark.
+fn roll_limit_dec(is_buy: bool, mark: f64, tick: Option<Decimal>) -> Option<Decimal> {
+    let m = Decimal::from_f64(mark).filter(|m| *m > Decimal::ZERO)?;
+    let margin = Decimal::from_f64(ROLL_PRICE_MARGIN)?;
+    let raw = if is_buy {
+        m * (Decimal::ONE + margin)
+    } else {
+        m * (Decimal::ONE - margin)
+    };
+    let rounded = match tick.filter(|t| *t > Decimal::ZERO) {
+        Some(t) if is_buy => (raw / t).floor() * t,
+        Some(t) => (raw / t).ceil() * t,
+        None => raw,
+    };
+    (rounded > Decimal::ZERO).then(|| rounded.normalize())
 }
 
 /// Booking of one settled execution on `leg`: `Some((value, cost))` when
@@ -1034,17 +1081,6 @@ fn roll_risk_ack_booking(rs: &mut RollState, sym: &str, qty: f64, mark: f64, sli
     roll_book_actual(rs, (kept.0.max(now.0), kept.1.max(now.1)));
 }
 
-/// Absolute IOC limit for a roll taker leg, bound to the mark its
-/// reservation was sized at: the connector must not re-anchor it to a
-/// displaced touch, so value and cost stay inside what was booked.
-fn roll_taker_limit(is_buy: bool, reserved_mark: f64) -> f64 {
-    if is_buy {
-        reserved_mark * (1.0 + ROLL_PRICE_MARGIN)
-    } else {
-        reserved_mark * (1.0 - ROLL_PRICE_MARGIN)
-    }
-}
-
 /// In-flight reservations with no uncertain entry behind them can only be
 /// left by a process that died between send and settle: book them (the leg
 /// may have filled) and drop them. Returns the symbols settled.
@@ -1077,19 +1113,41 @@ fn roll_next_at(rs: &RollState, interval_secs: u64) -> u64 {
     by_interval.max(rs.retry_not_before.unwrap_or(0))
 }
 
-/// Short wait after a roll refused before sending anything (no volume, no
-/// cost): retry soon, without hammering the venue every tick.
+/// First wait after a roll refused before sending anything (no volume, no
+/// cost); it doubles with each consecutive refusal up to
+/// `ROLL_REFUSAL_BACKOFF_MAX_SECS`, so a persistent reject (margin,
+/// reduce-only mode, market halt, auth) does not re-sign an order every minute.
 const ROLL_REFUSAL_BACKOFF_SECS: u64 = 60;
+const ROLL_REFUSAL_BACKOFF_MAX_SECS: u64 = 3_600;
+/// Consecutive refusals that suspend the roll until the next roll week.
+const ROLL_MAX_REFUSALS: u32 = 5;
+
+/// Backoff after the `n`-th consecutive refusal (n ≥ 1).
+fn roll_refusal_backoff(n: u32) -> u64 {
+    let shift = n.saturating_sub(1).min(16);
+    (ROLL_REFUSAL_BACKOFF_SECS << shift).min(ROLL_REFUSAL_BACKOFF_MAX_SECS)
+}
 
 /// Bookkeeping after a roll attempt: a roll that SENT something starts the
-/// interval; one refused before any send only backs off briefly.
-fn roll_after_attempt(rs: &mut RollState, now: u64, sent: bool) {
+/// interval and clears the refusal streak; one refused before any send backs
+/// off (doubling), and `ROLL_MAX_REFUSALS` in a row suspend the roll until the
+/// next roll week (returns true when this attempt suspended it).
+fn roll_after_attempt(rs: &mut RollState, now: u64, sent: bool) -> bool {
     if sent {
         rs.last_roll_at = Some(now);
         rs.retry_not_before = None;
+        rs.refusals = 0;
         rs.week_count += 1;
+        return false;
+    }
+    rs.refusals = rs.refusals.saturating_add(1);
+    if rs.refusals >= ROLL_MAX_REFUSALS {
+        // the rollover (a fresh RollState) lifts it
+        rs.retry_not_before = Some((roll_week(now) + 7) * 86_400);
+        true
     } else {
-        rs.retry_not_before = Some(now + ROLL_REFUSAL_BACKOFF_SECS);
+        rs.retry_not_before = Some(now + roll_refusal_backoff(rs.refusals));
+        false
     }
 }
 
@@ -1157,9 +1215,6 @@ fn roll_blocker(
     round_trip_usd: f64,
     round_trip_cost_usd: f64,
 ) -> Option<&'static str> {
-    if !cfg.enabled {
-        return Some("disabled");
-    }
     if now < roll_next_at(rs, cfg.interval_secs) {
         return Some("interval");
     }
@@ -1277,11 +1332,22 @@ struct RollLeg {
 /// settle), else 0 and filled × the leg's mark. Returned only for an order
 /// the venue accepted (DRY_RUN: simulated); failures before or at the send,
 /// and uncertain orders, are `Err`.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 struct ExecResult {
     filled: f64,
     fee: f64,
     value: f64,
+    order_id: String,
+}
+
+/// A ROLL leg's execution context: the only caller that sends an absolute
+/// limit and whose settle drops the roll's in-flight reservation and books
+/// at the leg's anchor mark. Explicit, so a future non-roll caller with a
+/// bounded price can never be mistaken for a roll leg.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RollCtx {
+    /// Tick-rounded absolute IOC limit (`roll_limit_dec`).
+    limit: Decimal,
 }
 
 /// True when the order buys (long grows / short shrinks).
@@ -1292,20 +1358,20 @@ fn order_is_buy(order: &Order) -> bool {
     )
 }
 
-/// Roll cost of one execution: fees plus slippage against the mark at send
-/// (paid above mark on a buy, received below it on a sell).
+/// Roll cost of one execution: the fee plus the ADVERSE slippage against the
+/// mark at send (paid above mark on a buy, received below it on a sell).
+/// Never negative: a fee reported debit-signed still raises it (Arcus
+/// reports it positive — testnet 2026-09-28: 0.038 on $84.5), and a price
+/// better than the (possibly stale) mark counts as zero slippage, never as a
+/// credit that would loosen the weekly cost cap.
 fn roll_cost(is_buy: bool, filled: f64, fee: f64, value: f64, mark: f64) -> f64 {
     let at_mark = filled * mark;
-    // Taker-only: every fee is PAID. Arcus reports it positive (testnet
-    // 2026-09-28: 0.038 on $84.5), so abs() is a no-op today — and a fee
-    // that ever came back debit-signed must still RAISE the booked cost,
-    // never loosen the weekly cost cap.
-    fee.abs()
-        + if is_buy {
-            value - at_mark
-        } else {
-            at_mark - value
-        }
+    let slip = if is_buy {
+        value - at_mark
+    } else {
+        at_mark - value
+    };
+    fee.abs() + slip.max(0.0)
 }
 
 /// One read of an Arcus order: book presence, cancel, and its fills.
@@ -1576,6 +1642,18 @@ fn reconcile_state_mode(mut state: State, dry_run: bool) -> State {
             state.halted = false;
             state.halt_reason = None;
         }
+    }
+    // Roll bookkeeping belongs to one mode: simulated DRY_RUN rolls must not
+    // eat the live week's budget (or delay the first live roll), nor live
+    // counters a DRY_RUN run.
+    if state.dry_run.is_some_and(|was| was != dry_run) && state.roll != RollState::default() {
+        log::warn!(
+            "[STARTUP] dry_run flip: resetting roll bookkeeping (was week vol ${:.0} / cost ${:.2}, {} in flight)",
+            state.roll.week_volume_usd,
+            state.roll.week_cost_usd,
+            state.roll.in_flight.len()
+        );
+        state.roll = RollState::default();
     }
     // Uncertain orders are live venue orders: DRY_RUN never sends and never
     // reconciles, so an entry carried into a dry-run process would block its
@@ -2159,30 +2237,30 @@ impl Engine {
         Ok(snap)
     }
 
-    /// One taker IOC on one leg of one symbol. `abs_limit`: send it at this
-    /// ABSOLUTE limit (a roll leg, bound to its reserved mark) instead of
-    /// the touch ± `HEDGE_TAKER_SLIPPAGE_BPS` the planner uses. Returns the
-    /// size the venue reports filled (position delta — what the book is
+    /// One taker IOC on one leg of one symbol. `roll`: a ROLL leg — sent at
+    /// its ABSOLUTE tick-rounded limit (bound to the reserved mark) instead of
+    /// the touch ± `HEDGE_TAKER_SLIPPAGE_BPS` the planner uses, booked at that
+    /// anchor mark, and settling the roll's in-flight reservation. Returns
+    /// the size the venue reports filled (position delta — what the book is
     /// re-planned from) with the fee / value of its own fills when read.
     async fn execute(
         &mut self,
         symbol: &str,
         order: &Order,
         mark: f64,
-        abs_limit: Option<f64>,
+        roll: Option<RollCtx>,
     ) -> Result<ExecResult> {
         // Roll accounting values slippage against THIS leg's venue mark (the
         // planner passes the long mark; an Arcus leg must not book the venue
-        // basis as cost or credit).
-        // A roll leg (it alone sends an absolute limit) books against the
-        // mark its reservation and limit were anchored at.
+        // basis as cost or credit). A roll leg books against the mark its
+        // reservation and limit were anchored at.
         let leg_mark = self.last_snapshot.mark_of(order.leg, symbol);
-        let book_mark = if abs_limit.is_some() || leg_mark <= 0.0 {
+        let book_mark = if roll.is_some() || leg_mark <= 0.0 {
             mark
         } else {
             leg_mark
         };
-        let roll_sym = abs_limit.is_some().then_some(symbol);
+        let roll_sym = roll.is_some().then_some(symbol);
         let (venue, side, reduce_only) = match (order.leg, order.qty > 0.0) {
             (Leg::Long, true) => (&self.long, OrderSide::Long, false),
             (Leg::Long, false) => (&self.long, OrderSide::Short, true),
@@ -2209,7 +2287,7 @@ impl Engine {
                 "symbol": symbol, "leg": format!("{:?}", order.leg), "venue": instance,
                 "exchange": exchange,
                 "side": format!("{side}"), "qty": qty, "reduce_only": reduce_only,
-                "price": mark, "dry_run": true }),
+                "price": mark, "dry_run": true, "roll": roll.is_some() }),
             );
             self.roll_book_execution(
                 roll_sym,
@@ -2225,13 +2303,13 @@ impl Engine {
                 filled: qty,
                 fee: 0.0,
                 value: qty * book_mark,
+                order_id: "dry_run".to_string(),
             });
         }
         let before = venue.signed_qty(symbol).await?;
         let size = decimal(qty, "qty")?.round_dp(self.meta(symbol).size_decimals);
-        let limit = abs_limit.map(|l| decimal(l, "limit")).transpose()?;
         let exchange = venue.kind;
-        let sent = match limit {
+        let sent = match roll.map(|r| r.limit) {
             Some(limit) => {
                 venue
                     .dex
@@ -2338,10 +2416,16 @@ impl Engine {
             "symbol": symbol, "leg": format!("{:?}", order.leg), "venue": venue.instance,
             "exchange": venue.kind.dex_name(),
             "side": format!("{side}"), "req": qty, "filled": filled, "reduce_only": reduce_only,
-            "limit": resp.ordered_price.to_string(), "order_id": resp.order_id, "mark": mark }),
+            "limit": resp.ordered_price.to_string(), "order_id": resp.order_id, "mark": mark,
+            "roll": roll.is_some() }),
         );
         let (fee, value) = fills.unwrap_or((0.0, filled * book_mark));
-        Ok(ExecResult { filled, fee, value })
+        Ok(ExecResult {
+            filled,
+            fee,
+            value,
+            order_id,
+        })
     }
 
     fn venue(&self, leg: Leg) -> &Venue {
@@ -2478,15 +2562,25 @@ impl Engine {
 
     /// One roll leg (reduce when `order.qty < 0`, re-open when > 0) on the
     /// Arcus leg: a taker IOC at an ABSOLUTE limit bound to the reserved
-    /// mark (`roll_taker_limit`), refused before the send if the leg's mark
-    /// has moved beyond the margin the reservation covers. Terminal before it
-    /// returns (it settles through `execute`, which also books its fills).
+    /// mark and rounded to the tick exactly as the venue will receive it
+    /// (`roll_limit_dec`), refused before the send if the leg's mark has moved
+    /// beyond the margin the reservation covers or that limit cannot reach
+    /// the touch. Terminal before it returns (it settles through `execute`,
+    /// which also books its fills); a settled leg emits `roll_leg`.
     /// `Err` = nothing executed, or the order became uncertain (the caller
     /// tells the two apart with `roll_leg_sent`).
-    async fn roll_one(&mut self, symbol: &str, order: &Order, mark: f64) -> Result<RollLeg> {
+    async fn roll_one(
+        &mut self,
+        symbol: &str,
+        order: &Order,
+        mark: f64,
+        kind: &'static str,
+    ) -> Result<RollLeg> {
         let is_buy = order_is_buy(order);
-        self.roll_price_guard(symbol, order.leg, mark).await?;
-        let limit = roll_taker_limit(is_buy, mark);
+        let tick = self.roll_price_guard(symbol, order.leg, mark).await?;
+        let limit = roll_limit_dec(is_buy, mark, tick).ok_or_else(|| {
+            anyhow!("roll IOC {symbol}: no usable limit from mark {mark} — not sent")
+        })?;
         // An IOC that cannot reach the touch would be accepted, fill nothing
         // and still spend the interval: refuse it before the send.
         let book = self
@@ -2495,23 +2589,25 @@ impl Engine {
             .get_order_book(symbol, 1)
             .await
             .map_err(|e| anyhow!("roll book {symbol}: {e:?}"))?;
-        let bid = book
-            .bids
-            .first()
-            .and_then(|l| l.price.to_f64())
-            .unwrap_or(0.0);
-        let ask = book
-            .asks
-            .first()
-            .and_then(|l| l.price.to_f64())
-            .unwrap_or(0.0);
+        let bid = book.bids.first().map(|l| l.price);
+        let ask = book.asks.first().map(|l| l.price);
         if !roll_limit_crosses(is_buy, limit, bid, ask) {
-            bail!("roll IOC {symbol}: limit {limit} does not reach the touch (bid {bid} / ask {ask}) — not sent");
+            bail!("roll IOC {symbol}: limit {limit} does not reach the touch (bid {bid:?} / ask {ask:?}) — not sent");
         }
-        let r = self.execute(symbol, order, mark, Some(limit)).await?;
+        let r = self
+            .execute(symbol, order, mark, Some(RollCtx { limit }))
+            .await?;
+        let cost = roll_cost(is_buy, r.filled, r.fee, r.value, mark);
+        self.event(
+            "roll_leg",
+            serde_json::json!({ "symbol": symbol, "leg": format!("{:?}", order.leg),
+                "kind": kind, "order_id": r.order_id, "req": order.qty.abs(),
+                "filled": r.filled, "fee": r.fee, "value": r.value, "mark": mark,
+                "limit": limit.to_string(), "cost_usd": cost }),
+        );
         Ok(RollLeg {
             filled: r.filled,
-            cost: roll_cost(is_buy, r.filled, r.fee, r.value, mark),
+            cost,
         })
     }
 
@@ -2609,15 +2705,27 @@ impl Engine {
 
     /// Refuse to send a roll leg once the leg's mark has moved beyond the
     /// margin its reservation covers (not an uncertain failure: nothing sent).
-    async fn roll_price_guard(&self, symbol: &str, leg: Leg, reserved_mark: f64) -> Result<()> {
-        let (fresh, _, _) = self.venue(leg).mark(symbol).await?;
+    /// Returns the venue's tick at that price (for the limit's rounding).
+    async fn roll_price_guard(
+        &self,
+        symbol: &str,
+        leg: Leg,
+        reserved_mark: f64,
+    ) -> Result<Option<Decimal>> {
+        let venue = self.venue(leg);
+        let t = venue
+            .dex
+            .get_ticker(symbol, None)
+            .await
+            .map_err(|e| anyhow!("{} get_ticker {symbol}: {e:?}", venue.name))?;
+        let fresh = t.price.to_f64().unwrap_or(0.0);
         if !roll_price_ok(reserved_mark, fresh) {
             bail!(
                 "roll price moved: {symbol} mark {fresh} vs reserved {reserved_mark} (> {} %) — not sent",
                 ROLL_PRICE_MARGIN * 100.0
             );
         }
-        Ok(())
+        Ok(t.min_tick)
     }
 
     /// Roll one clip of the Arcus leg when due and every gate is open.
@@ -2640,7 +2748,7 @@ impl Engine {
             return 0;
         };
         {
-            self.roll_rollover_now();
+            // (the week rollover already ran at the start of the tick)
             let stale = roll_settle_stale_in_flight(&mut self.state.roll, &self.state.uncertain);
             if !stale.is_empty() {
                 log::warn!("[ROLL] in-flight reservations without an uncertain order (process restart mid-roll) booked: {stale:?}");
@@ -2722,13 +2830,15 @@ impl Engine {
         // unless the leg ends uncertain (then it stays until released).
         let slip = self.cfg.taker_slippage_bps;
         let (close_leg, close_sent) = self
-            .roll_leg_send(&sym, &close, mark, clip_qty * mark, slip)
+            .roll_leg_send(&sym, &close, mark, clip_qty * mark, slip, "close")
             .await;
         let close_filled = close_leg.as_ref().map(|l| l.filled).unwrap_or(0.0);
         let close_cost = close_leg.as_ref().map(|l| l.cost).unwrap_or(0.0);
         let close_err = close_leg.as_ref().err().map(|e| format!("{e:#}"));
         let (mut open_filled, mut open_cost) = (0.0, 0.0);
         let mut reopen_sent = false;
+        // a KILL_SWITCH levelling reduction of the other leg (not a roll leg)
+        let mut levelling_sent = false;
         let mut outcome = "done";
         if let Some(e) = &close_err {
             log::warn!("[ROLL] {sym} close: {e}");
@@ -2747,12 +2857,43 @@ impl Engine {
                 let reopen = roll_reopen(leg, close_filled, m.min_qty)
                     .expect("roll_close_outcome None means re-openable");
                 // The re-open goes out only after the close settled (seconds
-                // later): re-anchor it on a FRESH mark, re-check the caps with
-                // its own reservation, and re-read the growth gates. Any
-                // refusal leaves the leg one clip short; the planner repairs
-                // it and that execution books itself.
-                let gate =
-                    roll_reopen_blocked(self.sentinels.kill_switch_engaged(), self.state.halted);
+                // later): re-read the growth gates (KILL_SWITCH; Arcus-leg
+                // headroom and leverage from a FRESH equity read), re-anchor it
+                // on a FRESH mark and re-check the caps with its own
+                // reservation. A refused re-open leaves the leg one clip short:
+                // the planner grows it back on the next unrestricted tick (that
+                // execution books itself) — except under KILL_SWITCH, where the
+                // planner makes no growth, so the gap is levelled here by a
+                // REDUCTION of the other leg.
+                let kill_now = self.sentinels.kill_switch_engaged();
+                let fresh_equity = if kill_now {
+                    None
+                } else {
+                    match self.venue(leg).equity().await {
+                        Ok(e) => Some(e),
+                        Err(e) => {
+                            log::warn!("[ROLL] {sym} re-open: fresh equity read failed: {e:#}");
+                            None
+                        }
+                    }
+                };
+                let gate = match (kill_now, fresh_equity) {
+                    (true, _) => roll_reopen_blocked(true, true, true),
+                    (false, None) => Some("reopen_failed"),
+                    (false, Some(eq)) => {
+                        let headroom = liq_headroom_pct(eq, &snap.legs(&self.cfg, leg));
+                        roll_reopen_blocked(
+                            false,
+                            headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
+                            self.cfg.dry_run
+                                || leverage_ok(
+                                    snap.gross(&self.cfg, leg),
+                                    eq,
+                                    self.cfg.max_leverage,
+                                ),
+                        )
+                    }
+                };
                 let fresh = match gate {
                     Some(_) => None,
                     None => match self.venue(leg).mark(&sym).await {
@@ -2765,9 +2906,44 @@ impl Engine {
                     },
                 };
                 match (gate, fresh) {
+                    (Some("reopen_blocked_kill"), _) => {
+                        outcome = "reopen_blocked_kill_unlevelled";
+                        let other = match leg {
+                            Leg::Long => Leg::Short,
+                            Leg::Short => Leg::Long,
+                        };
+                        let other_qty = match self.venue(other).signed_qty(&sym).await {
+                            Ok(q) => q.abs(),
+                            Err(e) => {
+                                log::error!("[ROLL] {sym} KILL_SWITCH: other-leg read failed: {e:#} — one clip stays unlevelled");
+                                0.0
+                            }
+                        };
+                        if let Some(q) = roll_kill_levelling(close_filled, other_qty, m.min_qty) {
+                            let reduce = Order {
+                                leg: other,
+                                qty: -q,
+                            };
+                            let other_mark = snap.mark_of(other, &sym);
+                            levelling_sent = true;
+                            match self.execute(&sym, &reduce, other_mark, None).await {
+                                Ok(r) if r.filled + self.size_tol(&sym) >= q => {
+                                    outcome = "reopen_blocked_kill_levelled";
+                                }
+                                Ok(r) => log::error!(
+                                    "[ROLL] {sym} KILL_SWITCH levelling filled {} of {q} — the rest stays unlevelled",
+                                    r.filled
+                                ),
+                                Err(e) => log::error!(
+                                    "[ROLL] {sym} KILL_SWITCH levelling failed: {e:#} — one clip stays unlevelled"
+                                ),
+                            }
+                        }
+                        log::warn!("[ROLL] {sym} re-open not sent (KILL_SWITCH): {outcome}");
+                    }
                     (Some(blocked), _) => {
                         log::warn!(
-                            "[ROLL] {sym} re-open not sent: {blocked} — levelling repairs it"
+                            "[ROLL] {sym} re-open not sent: {blocked} — the planner / guards take it from here"
                         );
                         outcome = blocked;
                     }
@@ -2779,7 +2955,14 @@ impl Engine {
                             outcome = "reopen_capped";
                         } else {
                             let (res, sent) = self
-                                .roll_leg_send(&sym, &reopen, fresh, close_filled * fresh, slip)
+                                .roll_leg_send(
+                                    &sym,
+                                    &reopen,
+                                    fresh,
+                                    close_filled * fresh,
+                                    slip,
+                                    "reopen",
+                                )
                                 .await;
                             reopen_sent = sent;
                             match res {
@@ -2803,16 +2986,32 @@ impl Engine {
                 }
             }
         }
-        let sent_orders = usize::from(close_sent) + usize::from(reopen_sent);
-        roll_after_attempt(&mut self.state.roll, now, sent_orders > 0);
-        if sent_orders == 0 {
+        let roll_orders = usize::from(close_sent) + usize::from(reopen_sent);
+        let sent_orders = roll_orders + usize::from(levelling_sent);
+        let suspended = roll_after_attempt(&mut self.state.roll, now, roll_orders > 0);
+        if roll_orders == 0 {
             // refused before any send, or rejected synchronously (price
             // moved, a read failed, the venue refused it): nothing executed;
-            // retry after a short backoff, and say why
-            self.state.roll.blocked_reason = Some(format!(
-                "{sym}: not sent: {}",
-                close_err.clone().unwrap_or_default()
-            ));
+            // back off (doubling; suspended after ROLL_MAX_REFUSALS), and say
+            // why — once per distinct reason, kept while the backoff runs
+            let refusals = self.state.roll.refusals;
+            let why = if suspended {
+                format!(
+                    "{sym}: suspended until the next roll week after {refusals} consecutive refusals: {}",
+                    close_err.clone().unwrap_or_default()
+                )
+            } else {
+                format!("{sym}: not sent: {}", close_err.clone().unwrap_or_default())
+            };
+            if self.state.roll.blocked_reason.as_deref() != Some(why.as_str()) {
+                log::warn!("[ROLL] blocked: {why}");
+                self.event(
+                    "roll_blocked",
+                    serde_json::json!({ "symbol": sym, "reason": why, "refusals": refusals,
+                        "retry_not_before": self.state.roll.retry_not_before, "suspended": suspended }),
+                );
+            }
+            self.state.roll.blocked_reason = Some(why);
         }
         let rs = &mut self.state.roll;
         let (vol, cost) = (rs.week_volume_usd, rs.week_cost_usd);
@@ -2840,6 +3039,7 @@ impl Engine {
         mark: f64,
         notional_usd: f64,
         slip: u32,
+        kind: &'static str,
     ) -> (Result<RollLeg>, bool) {
         let was_uncertain = self.state.uncertain.contains_key(sym);
         self.state
@@ -2847,7 +3047,7 @@ impl Engine {
             .in_flight
             .insert(sym.to_string(), roll_reserve(notional_usd, slip));
         self.persist();
-        let result = self.roll_one(sym, order, mark).await;
+        let result = self.roll_one(sym, order, mark, kind).await;
         let uncertain = self.state.uncertain.contains_key(sym);
         roll_finish_in_flight(&mut self.state.roll, sym, uncertain);
         self.persist();
@@ -3648,6 +3848,7 @@ fn status_value(
             "last_roll_at": state.roll.last_roll_at,
             "next_roll_at": cfg.roll.enabled.then(|| roll_next_at(&state.roll, cfg.roll.interval_secs)),
             "blocked_reason": state.roll.blocked_reason,
+            "consecutive_refusals": state.roll.refusals,
         },
         "kill_switch": kill,
         "symbols": cfg.symbol_names(),
@@ -4797,6 +4998,70 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_refusals_back_off_exponentially_then_suspend_until_next_week() {
+        assert_eq!(roll_refusal_backoff(1), 60);
+        assert_eq!(roll_refusal_backoff(2), 120);
+        assert_eq!(roll_refusal_backoff(3), 240);
+        assert_eq!(roll_refusal_backoff(7), 3_600); // capped
+        assert_eq!(roll_refusal_backoff(60), 3_600);
+        let now = 1_790_467_200 + 3 * 86_400; // a Wednesday
+        let mut rs = RollState {
+            week: roll_week(now),
+            ..RollState::default()
+        };
+        let mut t = now;
+        for n in 1..ROLL_MAX_REFUSALS {
+            assert!(!roll_after_attempt(&mut rs, t, false));
+            assert_eq!(rs.refusals, n);
+            assert_eq!(rs.retry_not_before, Some(t + roll_refusal_backoff(n)));
+            t += roll_refusal_backoff(n);
+        }
+        // the N-th consecutive refusal suspends until next Sunday 00:00 UTC
+        assert!(roll_after_attempt(&mut rs, t, false));
+        let next_week = (roll_week(now) + 7) * 86_400;
+        assert_eq!(rs.retry_not_before, Some(next_week));
+        assert_eq!(roll_next_at(&rs, 3_600), next_week);
+        // the rollover lifts it
+        assert!(roll_week_rollover(&mut rs, next_week));
+        assert_eq!((rs.refusals, rs.retry_not_before), (0, None));
+        // a roll that sends clears the streak
+        let mut rs = RollState::default();
+        roll_after_attempt(&mut rs, now, false);
+        roll_after_attempt(&mut rs, now + 60, false);
+        assert!(!roll_after_attempt(&mut rs, now + 200, true));
+        assert_eq!(rs.refusals, 0);
+    }
+
+    #[test]
+    fn kill_switch_levels_the_roll_gap_by_reducing_the_other_leg() {
+        // re-open blocked by KILL_SWITCH: reduce the other leg by what the
+        // close filled, reduce-only
+        assert_eq!(roll_kill_levelling(0.05, 0.47, 0.0001), Some(0.05));
+        // not one orderable order, or the other leg holds less: nothing
+        assert_eq!(roll_kill_levelling(0.00005, 0.47, 0.0001), None);
+        assert_eq!(roll_kill_levelling(0.05, 0.03, 0.0001), None);
+        assert_eq!(roll_kill_levelling(0.0, 0.47, 0.0001), None);
+    }
+
+    #[test]
+    fn a_dry_run_live_flip_resets_the_roll_bookkeeping() {
+        let mut st = State {
+            dry_run: Some(true),
+            ..State::default()
+        };
+        st.roll.week_volume_usd = 40_000.0;
+        st.roll.week_cost_usd = 12.0;
+        st.roll.last_roll_at = Some(1);
+        st.roll.refusals = 3;
+        st.roll.in_flight.insert("BTC".into(), (5_000.0, 2.6));
+        let live = reconcile_state_mode(st.clone(), false);
+        assert_eq!(live.roll, RollState::default());
+        // same mode: kept
+        let same = reconcile_state_mode(st, true);
+        assert_eq!(same.roll.week_volume_usd, 40_000.0);
+    }
+
+    #[test]
     fn mark_of_reads_the_legs_own_venue() {
         let mut s = Snapshot::default();
         s.long.mark.insert("BTC".into(), 100.0);
@@ -5021,12 +5286,6 @@ mod tests {
             roll_blocker(&cfg, &spent, now, &g, 800.0, 0.5),
             Some("weekly_cost_cap")
         );
-        let mut off = cfg.clone();
-        off.enabled = false;
-        assert_eq!(
-            roll_blocker(&off, &rs, now, &g, 800.0, 0.5),
-            Some("disabled")
-        );
     }
 
     #[test]
@@ -5128,8 +5387,14 @@ mod tests {
         roll_risk_ack_booking(&mut rs, "BTC", 0.05, 50.0, 3);
         assert_eq!((rs.week_volume_usd, rs.week_cost_usd), r);
         // roll taker limits are absolute, bound to the reserved mark
-        assert!((roll_taker_limit(true, 100.0) - 100.1).abs() < 1e-9);
-        assert!((roll_taker_limit(false, 100.0) - 99.9).abs() < 1e-9);
+        assert_eq!(
+            roll_limit_dec(true, 100.0, None),
+            Some(Decimal::new(1001, 1))
+        );
+        assert_eq!(
+            roll_limit_dec(false, 100.0, None),
+            Some(Decimal::new(999, 1))
+        );
     }
 
     #[test]
@@ -5190,10 +5455,11 @@ mod tests {
         assert!(!roll_price_ok(100.0, 100.3));
         assert!(roll_price_ok(100.0, 99.95));
         // and what IS sent is capped at the same margin, whatever the touch
-        let buy = roll_taker_limit(true, 100.0);
-        let sell = roll_taker_limit(false, 100.0);
-        assert!(buy <= 100.0 * (1.0 + ROLL_PRICE_MARGIN) + 1e-9 && buy > 100.0);
-        assert!(sell >= 100.0 * (1.0 - ROLL_PRICE_MARGIN) - 1e-9 && sell < 100.0);
+        let tick = Some(Decimal::new(1, 2));
+        let buy = roll_limit_dec(true, 100.0, tick).unwrap();
+        let sell = roll_limit_dec(false, 100.0, tick).unwrap();
+        assert!(buy <= Decimal::new(1001, 1) && buy > Decimal::new(100, 0));
+        assert!(sell >= Decimal::new(999, 1) && sell < Decimal::new(100, 0));
     }
 
     #[test]
@@ -5231,20 +5497,83 @@ mod tests {
         assert_eq!(none, Err(Some(("BTC".to_string(), "leverage"))));
     }
 
+    fn d(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
     #[test]
     fn a_roll_ioc_that_cannot_reach_the_touch_is_not_sent() {
-        // buy limit mark × 1.001 = 100.1 vs asks
-        assert!(roll_limit_crosses(true, 100.1, 99.9, 100.05));
-        assert!(!roll_limit_crosses(true, 100.1, 99.8, 100.3)); // wide / thin book
-                                                                // sell limit 99.9 vs bids
-        assert!(roll_limit_crosses(false, 99.9, 99.95, 100.1));
-        assert!(!roll_limit_crosses(false, 99.9, 99.7, 100.1));
-        // exact touch is marketable
-        assert!(roll_limit_crosses(true, 100.1, 99.9, 100.1));
+        let s = |v: &str| Some(d(v));
+        // buy limit 100.1 vs asks
+        assert!(roll_limit_crosses(true, d("100.1"), s("99.9"), s("100.05")));
+        // wide book
+        assert!(!roll_limit_crosses(true, d("100.1"), s("99.8"), s("100.3")));
+        // sell limit 99.9 vs bids
+        assert!(roll_limit_crosses(false, d("99.9"), s("99.95"), s("100.1")));
+        assert!(!roll_limit_crosses(false, d("99.9"), s("99.7"), s("100.1")));
+        // exact touch is marketable on both sides; one tick short is not
+        // (no tolerance)
+        assert!(roll_limit_crosses(true, d("100.1"), s("99.9"), s("100.1")));
+        assert!(roll_limit_crosses(false, d("99.9"), s("99.9"), s("100.1")));
+        assert!(!roll_limit_crosses(
+            false,
+            d("99.91"),
+            s("99.9"),
+            s("100.1")
+        ));
+        assert!(!roll_limit_crosses(
+            true,
+            d("700.69"),
+            s("700.0"),
+            s("700.70")
+        ));
         // no / one-sided / crossed book: not marketable
-        assert!(!roll_limit_crosses(true, 100.1, 0.0, 100.0));
-        assert!(!roll_limit_crosses(true, 100.1, 100.2, 100.0));
-        assert!(!roll_limit_crosses(true, f64::NAN, 99.9, 100.0));
+        assert!(!roll_limit_crosses(true, d("100.1"), None, s("100.0")));
+        assert!(!roll_limit_crosses(true, d("100.1"), s("0"), s("100.0")));
+        assert!(!roll_limit_crosses(
+            true,
+            d("100.1"),
+            s("100.2"),
+            s("100.0")
+        ));
+    }
+
+    #[test]
+    fn the_roll_limit_is_rounded_like_the_venue_and_survives_binary_inexact_marks() {
+        // the pairtrade#315 trap: 700.0 * 1.001 in f64 is 700.6999999999999,
+        // which the connector's inward (buy-down) tick rounding turns into
+        // 700.69 — one tick short of a 700.70 ask. Decimal arithmetic does not.
+        assert_eq!(700.0_f64 * 1.001, 700.6999999999999);
+        let tick = Some(d("0.01"));
+        let buy = roll_limit_dec(true, 700.0, tick).unwrap();
+        assert_eq!(buy, d("700.7"));
+        assert!(roll_limit_crosses(
+            true,
+            buy,
+            Some(d("700.0")),
+            Some(d("700.70"))
+        ));
+        // sell: 700 × 0.999 = 699.3 exactly, rounded UP (inward) to the tick
+        assert_eq!(roll_limit_dec(false, 700.0, tick).unwrap(), d("699.3"));
+        // binary-inexact marks: rounding is inward (buy never above mark ×
+        // 1.001, sell never below mark × 0.999) and lands on the tick
+        let buy = roll_limit_dec(true, 1700.1, tick).unwrap();
+        assert_eq!(buy, d("1701.8")); // 1701.8001 floored
+        let sell = roll_limit_dec(false, 1700.1, tick).unwrap();
+        assert_eq!(sell, d("1698.4")); // 1698.3999 ceiled to the tick
+        let buy = roll_limit_dec(true, 84537.8, Some(d("0.1"))).unwrap();
+        assert_eq!(buy, d("84622.3")); // 84622.3378 floored
+                                       // a binary-inexact mark whose limit lands exactly ON a tick: 0.3 is
+                                       // 0.29999999999999998889… in f64, so from_f64_retain would give
+                                       // 0.30029999… and floor it a whole tick short to 0.3002
+        assert_eq!(
+            roll_limit_dec(true, 0.3, Some(d("0.0001"))).unwrap(),
+            d("0.3003")
+        );
+        // no tick: the exact decimal
+        assert_eq!(roll_limit_dec(true, 100.0, None).unwrap(), d("100.1"));
+        assert!(roll_limit_dec(true, 0.0, tick).is_none());
+        assert!(roll_limit_dec(true, f64::NAN, tick).is_none());
     }
 
     #[test]
@@ -5273,14 +5602,18 @@ mod tests {
         rs.in_flight.insert("META".into(), (2_000.0, 1.0));
         assert!(!roll_reopen_fits(&cfg, &rs, roll_reserve(4_000.0, 3)));
         // growth gates re-read right before the re-open
-        assert_eq!(roll_reopen_blocked(false, false), None);
+        assert_eq!(roll_reopen_blocked(false, true, true), None);
         assert_eq!(
-            roll_reopen_blocked(true, false),
+            roll_reopen_blocked(true, true, true),
             Some("reopen_blocked_kill")
         );
         assert_eq!(
-            roll_reopen_blocked(false, true),
-            Some("reopen_blocked_halt")
+            roll_reopen_blocked(false, false, true),
+            Some("reopen_blocked_headroom")
+        );
+        assert_eq!(
+            roll_reopen_blocked(false, true, false),
+            Some("reopen_blocked_leverage")
         );
     }
 
@@ -5369,8 +5702,12 @@ mod tests {
         assert!((roll_cost(true, 0.01, 0.02, 1.001, 100.0) - 0.021).abs() < 1e-12);
         // sell 0.01 @ 99.9 vs mark 100
         assert!((roll_cost(false, 0.01, 0.0, 0.999, 100.0) - 0.001).abs() < 1e-12);
-        // maker rebate / price improvement can make it negative
-        assert!(roll_cost(true, 0.01, -0.001, 0.999, 100.0) < 0.0);
+        // price improvement never credits the cap: a buy BELOW mark and a sell
+        // ABOVE mark book the fee only (never a negative cost)
+        assert!((roll_cost(true, 0.01, 0.001, 0.999, 100.0) - 0.001).abs() < 1e-12);
+        assert!((roll_cost(false, 0.01, 0.001, 1.001, 100.0) - 0.001).abs() < 1e-12);
+        assert_eq!(roll_cost(true, 0.01, 0.0, 0.5, 100.0), 0.0);
+        assert!(roll_cost(true, 0.01, -0.001, 0.999, 100.0) >= 0.0);
     }
 
     #[test]
