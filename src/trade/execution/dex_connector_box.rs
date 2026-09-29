@@ -45,6 +45,16 @@ lazy_static! {
 /// fallback is disabled") kept tripping the old `contains("429")` check
 /// whenever the millisecond age happened to contain the digits 429, spamming
 /// false "HTTP 429" alert emails.
+/// The first batch row whose error is a rate limit (`RateLimited` or an
+/// HTTP 429 in the text), the same two cases `report_rate_limit` acts on.
+fn first_rate_limited_row(rows: &[dex_connector::BatchOrderResult]) -> Option<&DexError> {
+    rows.iter().find_map(|row| match row {
+        Err(err @ DexError::RateLimited { .. }) => Some(err),
+        Err(err) if mentions_http_429(&err.to_string()) => Some(err),
+        _ => None,
+    })
+}
+
 fn mentions_http_429(text: &str) -> bool {
     if text.contains("Too Many Requests") {
         return true;
@@ -101,6 +111,26 @@ impl DexConnectorBox {
         if mentions_http_429(&err_text) {
             let context = format!("{} ({})", operation, detail);
             notify_rate_limit(&context, &err_text);
+        }
+    }
+
+    /// Batch forwards: the whole call can fail, or single rows can (a row's
+    /// error is its own `Result`). Report the outer error, or else the first
+    /// rate-limited row, skipping ordinary row failures before it (Codex P2);
+    /// the notifiers dedupe per engagement, so one report is enough.
+    fn report_batch_rate_limit(
+        &self,
+        operation: &str,
+        detail: &str,
+        result: &Result<Vec<dex_connector::BatchOrderResult>, DexError>,
+    ) {
+        match result {
+            Err(err) => self.report_rate_limit(operation, detail, err),
+            Ok(rows) => {
+                if let Some(err) = first_rate_limited_row(rows) {
+                    self.report_rate_limit(operation, detail, err);
+                }
+            }
         }
     }
 
@@ -739,13 +769,76 @@ impl DexConnector for DexConnectorBox {
     async fn subscribe_symbols(&self, symbols: &[String]) -> Result<(), DexError> {
         self.inner.subscribe_symbols(symbols).await
     }
+
+    async fn schedule_cancel(&self, timeout_secs: Option<u64>) -> Result<(), DexError> {
+        let result = self.inner.schedule_cancel(timeout_secs).await;
+        if let Err(ref err) = result {
+            let detail = timeout_secs.map_or_else(|| "disarm".to_string(), |s| format!("{s}s"));
+            self.report_rate_limit("schedule_cancel", &detail, err);
+        }
+        result
+    }
+
+    async fn create_orders_batch(
+        &self,
+        orders: Vec<dex_connector::BatchOrderRequest>,
+    ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
+        let detail = format!("rows={}", orders.len());
+        let result = self.inner.create_orders_batch(orders).await;
+        self.report_batch_rate_limit("create_orders_batch", &detail, &result);
+        result
+    }
+
+    async fn modify_orders_batch(
+        &self,
+        modifies: Vec<dex_connector::BatchModifyRequest>,
+    ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
+        let detail = format!("rows={}", modifies.len());
+        let result = self.inner.modify_orders_batch(modifies).await;
+        self.report_batch_rate_limit("modify_orders_batch", &detail, &result);
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::mentions_http_429;
     #[cfg(feature = "arcus-sdk")]
     use super::DexConnectorBox;
+    use super::{first_rate_limited_row, mentions_http_429, DexError};
+
+    #[test]
+    fn batch_rate_limit_is_found_behind_ordinary_row_errors() {
+        let ok = || {
+            Ok(dex_connector::CreateOrderResponse {
+                order_id: "o1".to_string(),
+                exchange_order_id: None,
+                ordered_price: rust_decimal::Decimal::ONE,
+                ordered_size: rust_decimal::Decimal::ONE,
+                client_order_id: None,
+            })
+        };
+        let rows: Vec<dex_connector::BatchOrderResult> = vec![
+            ok(),
+            Err(DexError::ServerResponse(
+                "post-only would cross".to_string(),
+            )),
+            Err(DexError::RateLimited { until_unix: 42 }),
+        ];
+        assert!(matches!(
+            first_rate_limited_row(&rows),
+            Some(DexError::RateLimited { until_unix: 42 })
+        ));
+        let http = vec![
+            Err(DexError::ServerResponse("bad size".to_string())),
+            Err(DexError::ServerResponse(
+                "HTTP 429 Too Many Requests".to_string(),
+            )),
+        ];
+        assert!(first_rate_limited_row(&http).is_some());
+        let plain: Vec<dex_connector::BatchOrderResult> =
+            vec![ok(), Err(DexError::ServerResponse("bad size".to_string()))];
+        assert!(first_rate_limited_row(&plain).is_none());
+    }
 
     // Regression: the stale-WS-price transient error must never be reported
     // as a rate limit, no matter what the millisecond age happens to be.
