@@ -36,9 +36,9 @@ use ledger::{
     Ledger, PendingMarkout,
 };
 use logic::{
-    book_stale, dms_armed, flatten_reason, flatten_steps, may_disarm_dms, plan_quotes,
-    quote_action, shock, shutdown_steps, tick_plan, QSide, QuoteAction, QuoteParams, QuoteTarget,
-    Resting, ShutdownStep, Step, TickInputs, TickPlan,
+    dms_armed, flatten_reason, flatten_steps, may_disarm_dms, plan_inputs, plan_quotes,
+    quote_action, shock, shutdown_steps, tick_plan, PlanState, QSide, QuoteAction, QuoteParams,
+    QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -124,6 +124,13 @@ struct Runtime {
     last_summary_ms: u64,
     last_book_warn_ms: u64,
     sim_seq: u64,
+    /// Process start (ms): the per-run part of simulated ids.
+    run_id: u64,
+    /// DRY_RUN: set when a paper fill could not be booked; the sim stops
+    /// for the rest of this run rather than silently dropping executions.
+    sim_halted: Option<String>,
+    /// Live: the startup position read succeeded and is in the ledger.
+    startup_reconciled: bool,
     halt: Option<Halt>,
 }
 
@@ -202,41 +209,50 @@ impl Runtime {
     // ---------------------------------------------------------------- paper
 
     fn on_print(&mut self, p: tape::Print) {
-        if !self.cfg.dry_run {
+        if !self.cfg.dry_run || self.sim_halted.is_some() {
             return;
         }
         let now = now_ms();
         self.newest_print_ts_us = self.newest_print_ts_us.max(p.ts_us);
         for side in [QSide::Bid, QSide::Ask] {
-            let Some((vq, _)) = self.virt.get_mut(&side) else {
+            let Some((vq, orig)) = self.virt.get(&side).cloned() else {
                 continue;
             };
-            let filled = sim::apply_trade(vq, p.ts_us, p.px, p.qty, p.taker);
-            if filled.is_zero() {
-                continue;
-            }
-            let px = vq.px;
-            let done = vq.remaining.is_zero();
-            if done {
-                self.virt.remove(&side);
-            }
-            self.sim_seq += 1;
-            let fee = self.fee(filled * px, true);
-            let fill = FillIn {
-                trade_id: format!("sim-{}-{}", self.sim_seq, p.trade_id),
-                buy: side == QSide::Bid,
-                qty: filled,
-                px,
-                fee,
-                maker: true,
-                order_id: format!("sim-{}", side.as_str()),
-            };
-            // A print cannot be replayed, so a paper fill whose row fails to
-            // write is lost (logged); live fills are retried instead.
-            if let Err(e) = self.book(fill, now) {
-                log::error!("[ARCUS_VOL] paper fill not recorded: {e}");
+            // The quote only changes once its fill is durably booked.
+            let result = sim::try_fill(&vq, p.ts_us, p.px, p.qty, p.taker, |filled| {
+                self.sim_seq += 1;
+                let fill = FillIn {
+                    trade_id: sim::sim_id(self.run_id, self.sim_seq, &p.trade_id),
+                    buy: side == QSide::Bid,
+                    qty: filled,
+                    px: vq.px,
+                    fee: self.fee(filled * vq.px, true),
+                    maker: true,
+                    order_id: format!("sim-{}", side.as_str()),
+                };
+                self.book(fill, now).map(|_| ())
+            });
+            match result {
+                Ok(None) => {}
+                Ok(Some(next)) if next.remaining.is_zero() => {
+                    self.virt.remove(&side);
+                }
+                Ok(Some(next)) => {
+                    self.virt.insert(side, (next, orig));
+                }
+                Err(e) => {
+                    self.halt_sim(format!("paper fill could not be recorded: {e}"));
+                    return;
+                }
             }
         }
+    }
+
+    /// Stop the paper sim for the rest of this run (sticky, loud).
+    fn halt_sim(&mut self, reason: String) {
+        log::error!("[ARCUS_VOL] PAPER SIM HALTED for this run: {reason}");
+        self.virt.clear();
+        self.sim_halted = Some(reason);
     }
 
     fn paper_quote(&mut self, side: QSide, action: QuoteAction) {
@@ -265,6 +281,9 @@ impl Runtime {
         // A paper flatten needs a touch to price at; without a book it waits
         // for the next tick (live flattens price off the connector instead).
         let Some(book) = &self.book else { return };
+        if self.sim_halted.is_some() {
+            return;
+        }
         let (bid, ask) = (book.bid, book.ask);
         for step in flatten_steps(
             self.ledger.position.qty,
@@ -281,7 +300,7 @@ impl Runtime {
                     let fee = self.fee(qty * px, false);
                     self.sim_seq += 1;
                     let fill = FillIn {
-                        trade_id: format!("sim-{}-ioc", self.sim_seq),
+                        trade_id: sim::sim_id(self.run_id, self.sim_seq, "ioc"),
                         buy,
                         qty,
                         px,
@@ -290,7 +309,8 @@ impl Runtime {
                         order_id: "sim-ioc".to_string(),
                     };
                     if let Err(e) = self.book(fill, now) {
-                        log::error!("[ARCUS_VOL] paper flatten not recorded: {e}");
+                        self.halt_sim(format!("paper flatten could not be recorded: {e}"));
+                        return;
                     }
                 }
             }
@@ -412,14 +432,15 @@ impl Runtime {
 
     /// Adopt the venue position when it disagrees with the ledger for two
     /// polls in a row (a single disagreement is usually a fill in flight).
-    async fn live_position_check(&mut self, now: u64, force: bool) {
+    /// Returns whether the venue position could be read.
+    async fn live_position_check(&mut self, now: u64, force: bool) -> bool {
         let Some((venue, entry)) = self.venue_qty().await else {
-            return;
+            return false;
         };
         let ours = self.ledger.position.qty;
         if (venue - ours).abs() <= Decimal::new(1, 8) {
             self.position_mismatch_since_ms = None;
-            return;
+            return true;
         }
         let persisted = self
             .position_mismatch_since_ms
@@ -442,6 +463,26 @@ impl Runtime {
             self.position_mismatch_since_ms = None;
         } else if self.position_mismatch_since_ms.is_none() {
             self.position_mismatch_since_ms = Some(now);
+        }
+        true
+    }
+
+    /// Startup position read (live): until it succeeds no new quote goes
+    /// out (Codex P1, pairtrade#361); a non-zero position is flattened first.
+    async fn startup_reconcile(&mut self) {
+        if !self.live_position_check(now_ms(), true).await {
+            log::warn!("[ARCUS_VOL] startup position read failed; no quoting until it succeeds");
+            return;
+        }
+        self.startup_reconciled = true;
+        self.startup_flatten = !self.ledger.position.qty.is_zero();
+        if self.startup_flatten {
+            log::warn!(
+                "[ARCUS_VOL] startup inventory {} → flatten before quoting",
+                self.ledger.position.qty
+            );
+        } else {
+            log::info!("[ARCUS_VOL] startup position reconciled: flat");
         }
     }
 
@@ -546,6 +587,16 @@ impl Runtime {
         }
     }
 
+    /// DMS armed right now (fresh clock), for the check just before a send.
+    fn dms_armed_now(&self) -> bool {
+        dms_armed(
+            self.dms_last_ok_ms,
+            self.dms_last_failed,
+            now_ms(),
+            self.cfg.dms_secs,
+        )
+    }
+
     async fn live_quotes(&mut self, plan: Vec<(QSide, QuoteAction)>) {
         let market = self.cfg.market.clone();
         let mut places: Vec<QuoteTarget> = Vec::new();
@@ -566,6 +617,12 @@ impl Runtime {
                     }
                 }
             }
+        }
+        // Cancels above always go; a new place/modify only while the DMS is
+        // still armed at send time (Codex P1, pairtrade#361).
+        if (!modifies.is_empty() || !places.is_empty()) && !self.dms_armed_now() {
+            log::warn!("[ARCUS_VOL] DMS no longer armed at send time; skipping new quotes");
+            return;
         }
         if !modifies.is_empty() {
             let reqs = modifies
@@ -730,6 +787,9 @@ impl Runtime {
                     }
                 }
             }
+            if !self.startup_reconciled {
+                self.startup_reconcile().await;
+            }
             if self.need_reconcile {
                 self.live_full_reconcile(now).await;
                 self.finish_tick(now, mid);
@@ -744,6 +804,9 @@ impl Runtime {
                 self.last_position_ms = now;
             }
         }
+        // Every awaited call of the tick is done: decide on a fresh clock
+        // (Codex P1, pairtrade#361).
+        let now = now_ms();
         if let Some(m) = mid {
             for (fill_id, h, bps) in due_markouts(&mut self.pending_markouts, now, m) {
                 let row = json!({"kind": "markout", "ts_ms": now, "fill_id": fill_id,
@@ -775,7 +838,11 @@ impl Runtime {
                 log::error!("[ARCUS_VOL] cannot write HALT: {e}");
             }
         }
-        self.halt = risk.halt;
+        self.halt = risk.halt.or_else(|| {
+            self.sim_halted
+                .as_ref()
+                .map(|r| Halt::Sticky(format!("paper sim: {r}")))
+        });
 
         // Startup / halt / kill / max-hold flatten need no book; only the
         // cap check uses the mid (Codex P1, pairtrade#361).
@@ -794,11 +861,6 @@ impl Runtime {
             halt_label.as_deref(),
             startup,
         );
-        let stale = book_stale(
-            self.book.as_ref().and_then(|b| b.ts_ms),
-            now,
-            self.cfg.book_stale_secs,
-        );
         if shock(
             &self.mid_hist,
             now,
@@ -815,21 +877,21 @@ impl Runtime {
         }
         // Safety actions are never gated by a 429 backoff; only new
         // placement / modification is (Codex P1, pairtrade#361).
-        let plan = tick_plan(&TickInputs {
+        let state = PlanState {
+            dry_run: self.cfg.dry_run,
             has_book: mid.is_some(),
             halted: self.halt.is_some(),
-            stale,
-            shock_or_cooldown: now < self.cooldown_until_ms,
-            backoff: now < self.backoff_until_ms,
-            dms_armed: self.cfg.dry_run
-                || dms_armed(
-                    self.dms_last_ok_ms,
-                    self.dms_last_failed,
-                    now,
-                    self.cfg.dms_secs,
-                ),
+            book_ts_ms: self.book.as_ref().and_then(|b| b.ts_ms),
+            book_stale_secs: self.cfg.book_stale_secs,
+            cooldown_until_ms: self.cooldown_until_ms,
+            backoff_until_ms: self.backoff_until_ms,
+            dms_last_ok_ms: self.dms_last_ok_ms,
+            dms_last_failed: self.dms_last_failed,
+            dms_secs: self.cfg.dms_secs,
+            startup_reconciled: self.startup_reconciled,
             flatten,
-        });
+        };
+        let plan = tick_plan(&plan_inputs(&state, now));
         match plan {
             TickPlan::Flatten(reason) => {
                 log::info!(
@@ -1117,6 +1179,9 @@ async fn main() -> Result<()> {
         last_summary_ms: 0,
         last_book_warn_ms: 0,
         sim_seq: 0,
+        run_id: now_ms(),
+        sim_halted: None,
+        startup_reconciled: false,
         halt: None,
         cfg,
     };
@@ -1135,14 +1200,7 @@ async fn main() -> Result<()> {
             .cancel_all_orders(Some(market))
             .await
             .context("startup cancel_all")?;
-        rt.live_position_check(now_ms(), true).await;
-        rt.startup_flatten = !rt.ledger.position.qty.is_zero();
-        if rt.startup_flatten {
-            log::warn!(
-                "[ARCUS_VOL] startup inventory {} → flatten before quoting",
-                rt.ledger.position.qty
-            );
-        }
+        rt.startup_reconcile().await;
     }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())

@@ -40,6 +40,35 @@ pub fn placement_ts_us(book_ts_ms: Option<u64>, newest_print_ts_us: u64) -> u64 
     book_us.max(newest_print_ts_us.saturating_add(1))
 }
 
+/// Simulated order/fill id: `run_id` (the process start, ms) keeps ids
+/// unique across restarts even though `seq` starts again at 1, so a paper
+/// fill after a restart never collides with a booked id (Codex P2,
+/// pairtrade#361).
+pub fn sim_id(run_id: u64, seq: u64, tag: &str) -> String {
+    format!("sim-{run_id}-{seq}-{tag}")
+}
+
+/// Apply a print to a COPY of `q` and hand the fill to `book`; the updated
+/// quote is returned only when booking succeeded, so a fill that could not
+/// be recorded is never consumed (Codex P2, pairtrade#361). `Ok(None)` =
+/// the print did not touch the quote.
+pub fn try_fill<E>(
+    q: &VirtualQuote,
+    ts_us: u64,
+    px: Decimal,
+    qty: Decimal,
+    taker: OrderSide,
+    book: impl FnOnce(Decimal) -> Result<(), E>,
+) -> Result<Option<VirtualQuote>, E> {
+    let mut next = q.clone();
+    let filled = apply_trade(&mut next, ts_us, px, qty, taker);
+    if filled.is_zero() {
+        return Ok(None);
+    }
+    book(filled)?;
+    Ok(Some(next))
+}
+
 /// Join the back of the queue at `px` on `side` of the book.
 pub fn join(
     side: QSide,
@@ -224,6 +253,56 @@ mod tests {
         assert_eq!(placement_ts_us(Some(2_000), 1_500_000), 2_000_000);
         assert_eq!(placement_ts_us(Some(1_000), 1_500_000), 1_500_001);
         assert_eq!(placement_ts_us(None, 7), 8);
+    }
+
+    #[test]
+    fn sim_ids_never_collide_across_restarts() {
+        let mut ledger = crate::ledger::Ledger::new("dry_run", "2026-09-30");
+        let first_run = sim_id(1_790_700_000_000, 1, "ioc");
+        let fill = crate::ledger::FillIn {
+            trade_id: first_run.clone(),
+            buy: true,
+            qty: d("0.1"),
+            px: d("83642.9"),
+            fee: Decimal::ZERO,
+            maker: false,
+            order_id: "sim-ioc".to_string(),
+        };
+        crate::ledger::book_fill(&mut ledger, &fill, 1, |_| Ok(())).unwrap();
+        // Restart: seq starts at 1 again, the run id differs.
+        let second_run = sim_id(1_790_700_060_000, 1, "ioc");
+        assert_ne!(first_run, second_run);
+        assert!(!ledger.has_booked(&second_run));
+    }
+
+    #[test]
+    fn a_fill_that_fails_to_book_does_not_consume_the_quote() {
+        let q = join(QSide::Bid, d("83642.9"), d("0.12"), &levels(), 0);
+        let err: Result<Option<VirtualQuote>, &str> =
+            try_fill(&q, 10, d("83642.9"), d("0.35"), OrderSide::Short, |_| {
+                Err("disk")
+            });
+        assert!(err.is_err());
+        // Original untouched: same queue and size.
+        assert_eq!(q.queue_ahead, d("0.3"));
+        assert_eq!(q.remaining, d("0.12"));
+        let mut booked = Decimal::ZERO;
+        let ok = try_fill(&q, 10, d("83642.9"), d("0.35"), OrderSide::Short, |f| {
+            booked = f;
+            Ok::<(), &str>(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(booked, d("0.05"));
+        assert_eq!(ok.remaining, d("0.07"));
+        assert_eq!(ok.queue_ahead, Decimal::ZERO);
+        // A print that does not touch us books nothing.
+        assert_eq!(
+            try_fill(&q, 10, d("83643.0"), d("1"), OrderSide::Short, |_| Err(
+                "unused"
+            )),
+            Ok(None)
+        );
     }
 
     #[test]

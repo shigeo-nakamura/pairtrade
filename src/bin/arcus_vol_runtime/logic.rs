@@ -245,6 +245,9 @@ pub struct TickInputs {
     /// Live: the dead man's switch is armed and its refresh is succeeding
     /// (always true in DRY_RUN). No new quote without it.
     pub dms_armed: bool,
+    /// Live: the startup position read succeeded and is in the ledger
+    /// (always true in DRY_RUN). No new quote before it.
+    pub startup_reconciled: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -278,6 +281,11 @@ pub fn tick_plan(i: &TickInputs) -> TickPlan {
     if i.shock_or_cooldown {
         return TickPlan::PullQuotes("shock");
     }
+    if !i.startup_reconciled {
+        // Quoting on an unknown position could stack onto inventory we do
+        // not know about (Codex P1, pairtrade#361); main retries the read.
+        return TickPlan::PullQuotes("unreconciled");
+    }
     if !i.dms_armed {
         // No resting quote without a dead man's switch behind it (Codex P1,
         // pairtrade#361); main keeps trying to arm it every tick.
@@ -287,6 +295,39 @@ pub fn tick_plan(i: &TickInputs) -> TickPlan {
         return TickPlan::Wait;
     }
     TickPlan::Quote
+}
+
+/// Everything the tick plan depends on, gathered after the tick's IO.
+#[derive(Debug, Clone, Default)]
+pub struct PlanState {
+    pub dry_run: bool,
+    pub has_book: bool,
+    pub halted: bool,
+    pub book_ts_ms: Option<u64>,
+    pub book_stale_secs: u64,
+    pub cooldown_until_ms: u64,
+    pub backoff_until_ms: u64,
+    pub dms_last_ok_ms: Option<u64>,
+    pub dms_last_failed: bool,
+    pub dms_secs: u64,
+    pub startup_reconciled: bool,
+    pub flatten: Option<FlattenReason>,
+}
+
+/// The tick plan's inputs at `now_ms`, which the caller reads AFTER every
+/// awaited call of the tick (Codex P1, pairtrade#361): a DMS arm or a book
+/// that was fresh when the tick began can be stale by the time it decides.
+pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
+    TickInputs {
+        has_book: s.has_book,
+        halted: s.halted,
+        stale: book_stale(s.book_ts_ms, now_ms, s.book_stale_secs),
+        shock_or_cooldown: now_ms < s.cooldown_until_ms,
+        backoff: now_ms < s.backoff_until_ms,
+        dms_armed: s.dry_run || dms_armed(s.dms_last_ok_ms, s.dms_last_failed, now_ms, s.dms_secs),
+        startup_reconciled: s.dry_run || s.startup_reconciled,
+        flatten: s.flatten.clone(),
+    }
 }
 
 /// The DMS counts as armed when the last successful arm/refresh is younger
@@ -482,6 +523,7 @@ mod tests {
         let armed = TickInputs {
             has_book: true,
             dms_armed: true,
+            startup_reconciled: true,
             ..TickInputs::default()
         };
         assert_eq!(tick_plan(&armed), TickPlan::Quote);
@@ -500,6 +542,78 @@ mod tests {
         assert!(!dms_armed(Some(1_000), false, 31_000, 30));
         assert!(!dms_armed(Some(1_000), true, 2_000, 30));
         assert!(!dms_armed(None, false, 2_000, 30));
+    }
+
+    fn live_state() -> PlanState {
+        PlanState {
+            dry_run: false,
+            has_book: true,
+            book_ts_ms: Some(1_000),
+            book_stale_secs: 5,
+            dms_last_ok_ms: Some(1_000),
+            dms_secs: 30,
+            startup_reconciled: true,
+            ..PlanState::default()
+        }
+    }
+
+    #[test]
+    fn a_dms_arm_fresh_at_tick_start_but_stale_at_plan_time_blocks_quoting() {
+        let s = PlanState {
+            book_ts_ms: Some(30_000),
+            ..live_state()
+        };
+        // Tick started at 30.9 s: armed (29.9 s old).
+        assert_eq!(tick_plan(&plan_inputs(&s, 30_900)), TickPlan::Quote);
+        // IO took long; at plan time the arm is 30 s old → no quoting.
+        assert_eq!(
+            tick_plan(&plan_inputs(&s, 31_000)),
+            TickPlan::PullQuotes("dms_unarmed")
+        );
+        // Same for the book: fresh at start, stale at plan time.
+        let b = PlanState {
+            dms_last_ok_ms: Some(10_000),
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&b, 6_000)), TickPlan::Quote);
+        assert_eq!(
+            tick_plan(&plan_inputs(&b, 6_001)),
+            TickPlan::PullQuotes("stale_book")
+        );
+        // DRY_RUN needs neither a DMS nor a startup read.
+        let dry = PlanState {
+            dry_run: true,
+            dms_last_ok_ms: None,
+            startup_reconciled: false,
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&dry, 2_000)), TickPlan::Quote);
+    }
+
+    #[test]
+    fn no_live_quoting_until_the_startup_position_is_reconciled() {
+        let s = PlanState {
+            startup_reconciled: false,
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&s, 2_000)),
+            TickPlan::PullQuotes("unreconciled")
+        );
+        // Safety still runs.
+        let f = PlanState {
+            flatten: Some(FlattenReason::Halt("kill_switch".into())),
+            ..s
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&f, 2_000)),
+            TickPlan::Flatten(FlattenReason::Halt("kill_switch".into()))
+        );
+        let ok = PlanState {
+            startup_reconciled: true,
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&ok, 2_000)), TickPlan::Quote);
     }
 
     #[test]
@@ -604,6 +718,7 @@ mod tests {
             has_book: true,
             backoff: true,
             dms_armed: true,
+            startup_reconciled: true,
             ..TickInputs::default()
         };
         // Nothing unsafe: wait out the backoff.
