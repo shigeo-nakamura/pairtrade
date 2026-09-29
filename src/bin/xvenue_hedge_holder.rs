@@ -423,8 +423,10 @@ impl Config {
                 clip_usd: env_f64("HEDGE_ROLL_CLIP_USD", 0.0),
                 weekly_volume_usd: env_f64("HEDGE_ROLL_WEEKLY_VOLUME_USD", 0.0),
                 weekly_cost_usd: env_f64("HEDGE_ROLL_WEEKLY_COST_USD", 0.0),
-                mode: RollMode::parse(&env_string("HEDGE_ROLL_MODE", "taker"))
-                    .context("HEDGE_ROLL_MODE")?,
+                mode: roll_mode_from_env(
+                    &env_string("HEDGE_ROLL_MODE", "taker"),
+                    env_bool("HEDGE_ROLL_ENABLED", false),
+                )?,
                 maker_timeout_secs: env_u64("HEDGE_ROLL_MAKER_TIMEOUT_SECS", 20),
             },
             target_notional_usd: env_f64("HEDGE_TARGET_NOTIONAL_USD", 20_000.0),
@@ -565,6 +567,17 @@ impl Config {
     /// The leg the roll trades: the Arcus leg (the short when both are
     /// Arcus). `None` when no leg is on Arcus — the Lighter leg is never
     /// rolled.
+    /// The leg whose executions book into the roll week: the roll leg, but
+    /// only while the roll is enabled (disabled, the roll counters stay
+    /// untouched — nothing books, nothing grows).
+    fn roll_accounting_leg(&self) -> Option<Leg> {
+        if self.roll.enabled {
+            self.roll_leg()
+        } else {
+            None
+        }
+    }
+
     fn roll_leg(&self) -> Option<Leg> {
         if self.short_venue == VenueKind::Arcus {
             Some(Leg::Short)
@@ -709,6 +722,13 @@ struct State {
     /// Arcus-leg roll counters (bot-strategy#1080).
     #[serde(default)]
     roll: RollState,
+    /// Roll post-only (ALO) orders from just before `create_order` until
+    /// they are settled or handed to `uncertain`, per symbol. An ALO rests
+    /// for 40 days on Arcus: a process that dies while one rests must find
+    /// it again on restart (`startup_roll_reconcile`) instead of leaving a
+    /// live order nobody knows about.
+    #[serde(default)]
+    pending_post_only: std::collections::BTreeMap<String, PendingPostOnly>,
     // Single-symbol state.json (before `books`): read once by
     // `migrate_legacy`, never written back.
     #[serde(default, rename = "mode", skip_serializing)]
@@ -832,6 +852,20 @@ impl RollMode {
     }
 }
 
+/// `HEDGE_ROLL_MODE`: strict only when the roll is enabled. With the roll
+/// off, a bad or future value must not keep the (delta-neutral) holder
+/// from starting — it is logged and ignored.
+fn roll_mode_from_env(raw: &str, roll_enabled: bool) -> Result<RollMode> {
+    match RollMode::parse(raw) {
+        Ok(m) => Ok(m),
+        Err(e) if roll_enabled => Err(e.context("HEDGE_ROLL_MODE")),
+        Err(e) => {
+            log::warn!("[CONFIG] HEDGE_ROLL_MODE ignored (roll disabled): {e}");
+            Ok(RollMode::Taker)
+        }
+    }
+}
+
 /// Arcus-leg roll settings (`HEDGE_ROLL_*`). Off by default: enabling it is
 /// the owner's call once the Arcus points terms are known (#1075, #1080).
 #[derive(Debug, Clone, Default)]
@@ -864,8 +898,15 @@ struct RollState {
     /// Not part of the week counters: it survives rollovers on its own.
     #[serde(default)]
     in_flight: std::collections::BTreeMap<String, (f64, f64)>,
+    /// Rolls that sent at least one order this week (refusals before any
+    /// send — price moved, book read failed — are not rolls).
     week_count: u64,
+    /// When the last roll actually SENT an order; the interval counts from here.
     last_roll_at: Option<u64>,
+    /// After a roll refused before sending anything, the next attempt waits
+    /// only `ROLL_REFUSAL_BACKOFF_SECS`, not a whole interval.
+    #[serde(default)]
+    retry_not_before: Option<u64>,
     last_symbol: Option<String>,
     blocked_reason: Option<String>,
 }
@@ -1008,7 +1049,52 @@ const ROLL_PRICE_MARGIN: f64 = 0.001;
 
 /// Next time a roll may run.
 fn roll_next_at(rs: &RollState, interval_secs: u64) -> u64 {
-    rs.last_roll_at.map(|t| t + interval_secs).unwrap_or(0)
+    let by_interval = rs.last_roll_at.map(|t| t + interval_secs).unwrap_or(0);
+    by_interval.max(rs.retry_not_before.unwrap_or(0))
+}
+
+/// Short wait after a roll refused before sending anything (no volume, no
+/// cost): retry soon, without hammering the venue every tick.
+const ROLL_REFUSAL_BACKOFF_SECS: u64 = 60;
+
+/// Bookkeeping after a roll attempt: a roll that SENT something starts the
+/// interval; one refused before any send only backs off briefly.
+fn roll_after_attempt(rs: &mut RollState, now: u64, sent: bool) {
+    if sent {
+        rs.last_roll_at = Some(now);
+        rs.retry_not_before = None;
+        rs.week_count += 1;
+    } else {
+        rs.retry_not_before = Some(now + ROLL_REFUSAL_BACKOFF_SECS);
+    }
+}
+
+/// `roll_done` outcome of the close stage, or `None` when the close filled
+/// enough to re-open (the re-open decides the final outcome).
+fn roll_close_outcome(
+    close_sent: bool,
+    close_uncertain: bool,
+    close_error: bool,
+    close_filled: f64,
+    min_qty: f64,
+) -> Option<&'static str> {
+    if close_uncertain {
+        return Some("close_uncertain");
+    }
+    if !close_sent {
+        return Some("close_not_sent");
+    }
+    if close_filled <= 0.0 {
+        return Some(if close_error {
+            "close_failed"
+        } else {
+            "close_unfilled"
+        });
+    }
+    if roll_reopen(Leg::Short, close_filled, min_qty).is_none() {
+        return Some("close_partial_below_min");
+    }
+    None
 }
 
 /// Everything a roll must not run through, as read on this tick.
@@ -1088,16 +1174,6 @@ where
         }
     }
     Err(first_blocked)
-}
-
-/// A symbol with an uncertain order, or one reconciled during this tick
-/// (its snapshot predates the release), is not rolled.
-fn roll_symbol_unsettled(
-    uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
-    released_now: &std::collections::BTreeSet<String>,
-    sym: &str,
-) -> bool {
-    uncertain.contains_key(sym) || released_now.contains(sym)
 }
 
 /// The book must still be within the net tolerance AFTER the close (before
@@ -1249,6 +1325,58 @@ struct OrderView {
     fee: f64,
     value: f64,
     trades: Vec<String>,
+}
+
+/// A roll post-only order between "about to send" and settled/uncertain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingPostOnly {
+    leg: Leg,
+    /// `None` until `create_order` returned (a crash in between is covered).
+    order_id: Option<String>,
+    qty: f64,
+    before_qty: f64,
+    mark: f64,
+    sent_at: u64,
+}
+
+/// What startup does about a symbol's roll post-only state on the Arcus leg.
+#[derive(Debug, Clone, PartialEq)]
+enum StartupRollAction {
+    /// Our pending ALO is still resting: cancel it, then treat it as
+    /// uncertain (it may have filled partly) so the normal evidence /
+    /// escalation settles it before anything else trades the symbol.
+    CancelThenUncertain { order_id: String },
+    /// Pending but not (visibly) resting — it may have filled while the
+    /// process was down, or never reached the venue: uncertain, no cancel.
+    PendingUncertain,
+    /// A resting order this bot has no record of (it only ever sends IOCs
+    /// and roll ALOs): anomalous — block the symbol as uncertain and shout;
+    /// it is not cancelled automatically (it may be the operator's).
+    UnknownResting { order_id: String, qty: f64 },
+}
+
+/// Decide the startup action for one symbol from its pending roll ALO (if
+/// any) and the ids / sizes resting on the Arcus leg for it.
+fn startup_roll_action(
+    pending: Option<&PendingPostOnly>,
+    open: &[(String, f64)],
+) -> Option<StartupRollAction> {
+    match pending {
+        Some(p) => match &p.order_id {
+            Some(id) if open.iter().any(|(o, _)| o == id) => {
+                Some(StartupRollAction::CancelThenUncertain {
+                    order_id: id.clone(),
+                })
+            }
+            _ => Some(StartupRollAction::PendingUncertain),
+        },
+        None => open
+            .first()
+            .map(|(id, q)| StartupRollAction::UnknownResting {
+                order_id: id.clone(),
+                qty: *q,
+            }),
+    }
 }
 
 /// Outcome of one look at a just-sent IOC.
@@ -1951,6 +2079,9 @@ struct Engine {
     /// Set by a roll taker leg: send `execute`'s IOC at this ABSOLUTE limit
     /// (bound to the reserved mark) instead of re-anchoring to the touch.
     roll_limit: Option<f64>,
+    /// Orders actually submitted since the roll last reset it: tells a roll
+    /// that sent something from one refused before any send.
+    roll_sends: u32,
 }
 
 impl Engine {
@@ -2133,6 +2264,7 @@ impl Engine {
                 "side": format!("{side}"), "qty": qty, "reduce_only": reduce_only,
                 "price": mark, "dry_run": true }),
             );
+            self.roll_sends += 1;
             self.roll_book_execution(
                 order.leg,
                 order_is_buy(order),
@@ -2148,6 +2280,7 @@ impl Engine {
         let before = venue.signed_qty(symbol).await?;
         let size = decimal(qty, "qty")?.round_dp(self.meta(symbol).size_decimals);
         let exchange = venue.kind;
+        self.roll_sends += 1;
         let sent = match self.roll_limit {
             Some(limit) => {
                 venue
@@ -2181,7 +2314,7 @@ impl Engine {
                 // position says what happened.
                 let reason = format!("submission ambiguous: {detail}");
                 self.mark_uncertain(
-                    symbol, order.leg, exchange, None, qty, before, mark, &reason,
+                    symbol, order.leg, exchange, None, qty, before, book_mark, &reason,
                 );
                 bail!(
                     "{} IOC {side} {symbol} {size}: {reason}",
@@ -2212,7 +2345,7 @@ impl Engine {
                         Some(order_id.clone()),
                         qty,
                         before,
-                        mark,
+                        book_mark,
                         &reason,
                     );
                     bail!(
@@ -2516,7 +2649,22 @@ impl Engine {
         }
         let before = self.venue(leg).signed_qty(symbol).await?;
         let size = decimal(want, "qty")?.round_dp(self.meta(symbol).size_decimals);
-        let resp = match dex
+        // Recorded BEFORE the send: a crash between send and ack must be
+        // found again on restart (the ALO would rest for 40 days).
+        self.state.pending_post_only.insert(
+            symbol.to_string(),
+            PendingPostOnly {
+                leg,
+                order_id: None,
+                qty: want,
+                before_qty: before,
+                mark,
+                sent_at: now_secs(),
+            },
+        );
+        self.persist();
+        self.roll_sends += 1;
+        let sent = dex
             .create_order(
                 symbol,
                 size,
@@ -2526,10 +2674,25 @@ impl Engine {
                 reduce_only,
                 None,
             )
-            .await
-        {
+            .await;
+        if !matches!(sent, Err(DexError::ReconciliationRequired { .. })) {
+            match &sent {
+                Ok(r) => {
+                    if let Some(p) = self.state.pending_post_only.get_mut(symbol) {
+                        p.order_id = Some(r.order_id.clone());
+                    }
+                }
+                // definitively not accepted: nothing rests
+                Err(_) => {
+                    self.state.pending_post_only.remove(symbol);
+                }
+            }
+            self.persist();
+        }
+        let resp = match sent {
             Ok(r) => r,
             Err(DexError::ReconciliationRequired { detail, .. }) => {
+                self.state.pending_post_only.remove(symbol);
                 let reason = format!("post-only roll submission ambiguous: {detail}");
                 self.mark_uncertain(
                     symbol,
@@ -2547,18 +2710,19 @@ impl Engine {
         };
         let id = resp.order_id.clone();
         let deadline = now_secs() + self.cfg.roll.maker_timeout_secs;
-        let mut last = OrderView::default();
+        // While it rests, only its book presence matters: one open-orders
+        // read per poll (not the full three-read view).
+        let mut still_open = true;
         while now_secs() < deadline {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Some(v) = self.arcus_order_view(leg, symbol, &id).await {
-                let done = !v.open && v.filled >= want - tol;
-                last = v;
-                if done {
+            if let Ok(oo) = dex.get_open_orders(symbol).await {
+                if !oo.orders.iter().any(|o| o.order_id == id) {
+                    still_open = false;
                     break;
                 }
             }
         }
-        if !(last.filled >= want - tol && !last.open) {
+        if still_open {
             // Pull the rest and wait until the venue shows it gone: only a
             // confirmed cancel lets the taker rest go out.
             let _ = dex.cancel_order(symbol, &id).await;
@@ -2581,6 +2745,7 @@ impl Engine {
             ) {
                 self.forget_arcus_activity(leg, symbol, &id, &v.trades)
                     .await;
+                self.state.pending_post_only.remove(symbol);
                 self.roll_book_execution(leg, is_buy, f, v.fee, v.value, mark);
                 self.event(
                     "roll_leg",
@@ -2590,6 +2755,7 @@ impl Engine {
                 return Ok((f, roll_cost(is_buy, f, v.fee, v.value, mark), v.value, true));
             }
         }
+        self.state.pending_post_only.remove(symbol);
         let reason = format!("post-only roll order {id} not terminal after cancel");
         self.mark_uncertain(
             symbol,
@@ -2615,14 +2781,7 @@ impl Engine {
     /// configured notional floored to the size decimals and is NEVER raised
     /// to the venue minimum (that would exceed the clip / net-tolerance
     /// bound the config validated); a clip below the minimum blocks.
-    fn roll_gate(
-        &self,
-        sym: &str,
-        leg: Leg,
-        snap: &Snapshot,
-        kill: bool,
-        released_now: &std::collections::BTreeSet<String>,
-    ) -> (f64, f64, RollGate) {
+    fn roll_gate(&self, sym: &str, leg: Leg, snap: &Snapshot, kill: bool) -> (f64, f64, RollGate) {
         let mark = match leg {
             Leg::Long => snap.long.mark(sym),
             Leg::Short => snap.short.mark(sym),
@@ -2651,7 +2810,7 @@ impl Engine {
             ),
             halted: self.state.halted,
             kill,
-            uncertain: roll_symbol_unsettled(&self.state.uncertain, released_now, sym),
+            uncertain: self.state.uncertain.contains_key(sym),
             feed_ok: self.feed_problem.is_none(),
             headroom_ok: headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
             leverage_ok: self.cfg.dry_run
@@ -2677,9 +2836,15 @@ impl Engine {
         value: f64,
         mark: f64,
     ) {
-        if let Some(b) =
-            roll_execution_booking(self.cfg.roll_leg(), leg, is_buy, filled, fee, value, mark)
-        {
+        if let Some(b) = roll_execution_booking(
+            self.cfg.roll_accounting_leg(),
+            leg,
+            is_buy,
+            filled,
+            fee,
+            value,
+            mark,
+        ) {
             roll_book_actual(&mut self.state.roll, b);
             self.persist();
         }
@@ -2698,25 +2863,16 @@ impl Engine {
         Ok(())
     }
 
-    /// `released_now`: symbols whose uncertain order was reconciled during
-    /// THIS tick — `snap` predates that, so they are not rolled until the
-    /// next tick's fresh snapshot (same rule as the normal planner).
-    async fn maybe_roll(
-        &mut self,
-        now: u64,
-        snap: &Snapshot,
-        kill: bool,
-        released_now: &std::collections::BTreeSet<String>,
-    ) {
+    /// Runs only on a tick that sent nothing and reconciled nothing (the
+    /// caller guarantees it), so `snap` is fresh for every symbol; the week
+    /// rollover already ran at the start of the tick.
+    async fn maybe_roll(&mut self, now: u64, snap: &Snapshot, kill: bool) {
         if !self.cfg.roll.enabled {
             return;
         }
         let Some(leg) = self.cfg.roll_leg() else {
             return;
         };
-        if roll_week_rollover(&mut self.state.roll, now) {
-            self.persist();
-        }
         {
             let stale = roll_settle_stale_in_flight(&mut self.state.roll, &self.state.uncertain);
             if !stale.is_empty() {
@@ -2743,7 +2899,7 @@ impl Engine {
             return;
         }
         let picked = pick_roll_symbol(&order, |sym| {
-            let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill, released_now);
+            let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill);
             // exactly what the two legs will reserve
             let (leg_v, leg_c) = roll_reserve(clip_qty * mark, self.cfg.taker_slippage_bps);
             roll_blocker(
@@ -2758,6 +2914,11 @@ impl Engine {
         let sym = match picked {
             Ok(sym) => sym,
             Err(first) => {
+                // an interval wait after a refusal keeps the refusal's reason
+                let backing_off = self.state.roll.retry_not_before.is_some_and(|t| now < t);
+                if backing_off && first.as_ref().is_some_and(|(_, w)| *w == "interval") {
+                    return;
+                }
                 let why = first
                     .as_ref()
                     .filter(|(_, w)| *w != "interval")
@@ -2773,7 +2934,7 @@ impl Engine {
                 return;
             }
         };
-        let (mark, clip_qty, _) = self.roll_gate(&sym, leg, snap, kill, released_now);
+        let (mark, clip_qty, _) = self.roll_gate(&sym, leg, snap, kill);
         let m = self.meta(&sym);
         log::info!("[ROLL] {sym} {leg:?} clip {clip_qty} @ {mark:.2}");
         self.event(
@@ -2781,9 +2942,9 @@ impl Engine {
             serde_json::json!({ "symbol": sym, "leg": format!("{leg:?}"), "clip_qty": clip_qty,
                 "mark": mark, "mode": self.cfg.roll.mode.as_str() }),
         );
-        self.state.roll.last_roll_at = Some(now);
         self.state.roll.last_symbol = Some(sym.clone());
         self.state.roll.blocked_reason = None;
+        self.roll_sends = 0;
         let close = Order {
             leg,
             qty: -clip_qty,
@@ -2801,24 +2962,30 @@ impl Engine {
             Ok(l) => l.error.clone(),
             Err(e) => Some(format!("{e:#}")),
         };
-        let mut outcome = "done";
+        let close_sent = self.roll_sends > 0;
         let (mut open_filled, mut open_cost) = (0.0, 0.0);
-        if self.state.uncertain.contains_key(&sym) {
-            // the close's outcome is unknown: nothing more on this symbol
-            outcome = "close_uncertain";
-        } else {
-            if let Some(e) = &close_err {
-                log::warn!("[ROLL] {sym} close: {e} (filled {close_filled})");
-                outcome = "close_failed";
-            }
-            // re-open exactly what the close filled — a partial post-only
-            // fill before a failed remainder included
-            if let Some(reopen) = roll_reopen(leg, close_filled, m.min_qty) {
-                outcome = if close_err.is_some() {
-                    "close_partial"
-                } else {
-                    "done"
-                };
+        let mut outcome = "done";
+        if let Some(e) = &close_err {
+            log::warn!("[ROLL] {sym} close: {e} (filled {close_filled})");
+        }
+        match roll_close_outcome(
+            close_sent,
+            self.state.uncertain.contains_key(&sym),
+            close_err.is_some(),
+            close_filled,
+            m.min_qty,
+        ) {
+            // close_partial_below_min: the planner repairs the shrunken leg
+            // later and that execution books itself when it settles
+            Some(o) => outcome = o,
+            None => {
+                // re-open exactly what the close filled — a partial post-only
+                // fill before a failed remainder included
+                let reopen = roll_reopen(leg, close_filled, m.min_qty)
+                    .expect("roll_close_outcome None means re-openable");
+                if close_err.is_some() {
+                    outcome = "close_partial";
+                }
                 match self
                     .roll_leg_send(&sym, &reopen, mark, close_filled * mark, slip)
                     .await
@@ -2841,14 +3008,19 @@ impl Engine {
                 if self.state.uncertain.contains_key(&sym) {
                     outcome = "reopen_uncertain";
                 }
-            } else if close_filled > 0.0 {
-                // below the venue minimum: the planner repairs it later and
-                // that execution books itself when it settles
-                outcome = "close_partial_below_min";
             }
         }
+        let sent_any = self.roll_sends > 0;
+        roll_after_attempt(&mut self.state.roll, now, sent_any);
+        if !sent_any {
+            // refused before any send (price moved, book / position read):
+            // nothing executed; retry after a short backoff, and say why
+            self.state.roll.blocked_reason = Some(format!(
+                "{sym}: not sent: {}",
+                close_err.clone().unwrap_or_default()
+            ));
+        }
         let rs = &mut self.state.roll;
-        rs.week_count += 1;
         let (vol, cost) = (rs.week_volume_usd, rs.week_cost_usd);
         let (fly_v, fly_c) = roll_in_flight_total(rs);
         self.event(
@@ -2882,6 +3054,107 @@ impl Engine {
         roll_finish_in_flight(&mut self.state.roll, sym, uncertain);
         self.persist();
         result
+    }
+
+    /// Startup (live, with an Arcus leg): find roll post-only orders a
+    /// previous process left behind, and any resting order this bot has no
+    /// record of. Ours still resting are cancelled; every such symbol is
+    /// made uncertain, so the usual evidence / escalation settles it before
+    /// anything else trades it. A read failure on a symbol with a pending
+    /// record is treated as uncertain too (conservative).
+    async fn startup_roll_reconcile(&mut self) {
+        if self.cfg.dry_run {
+            return;
+        }
+        let Some(leg) = self.cfg.roll_leg() else {
+            return;
+        };
+        for sym in self.cfg.symbol_names() {
+            let pending = self.state.pending_post_only.get(&sym).cloned();
+            let dex = self.venue(leg).dex.clone();
+            let open: Vec<(String, f64)> = match dex.get_open_orders(&sym).await {
+                Ok(r) => r
+                    .orders
+                    .iter()
+                    .map(|o| (o.order_id.clone(), o.size.to_f64().unwrap_or(0.0).abs()))
+                    .collect(),
+                Err(e) => {
+                    if pending.is_none() {
+                        log::warn!("[STARTUP] {sym}: open orders unreadable ({e:?}) — resting-order check skipped");
+                        continue;
+                    }
+                    log::error!("[STARTUP] {sym}: open orders unreadable ({e:?}) with a pending roll post-only — treating it as uncertain");
+                    Vec::new()
+                }
+            };
+            let Some(action) = startup_roll_action(pending.as_ref(), &open) else {
+                continue;
+            };
+            if self.state.uncertain.contains_key(&sym) {
+                // already blocked and reconciled by the uncertain machinery;
+                // still pull our own resting order if it is there
+                if let StartupRollAction::CancelThenUncertain { order_id } = &action {
+                    let _ = dex.cancel_order(&sym, order_id).await;
+                }
+                self.state.pending_post_only.remove(&sym);
+                self.persist();
+                continue;
+            }
+            match action {
+                StartupRollAction::CancelThenUncertain { order_id } => {
+                    let p = pending.expect("CancelThenUncertain comes from a pending record");
+                    log::error!("[STARTUP] {sym}: roll post-only {order_id} left resting by the previous process — cancelling");
+                    if let Err(e) = dex.cancel_order(&sym, &order_id).await {
+                        log::error!("[STARTUP] {sym}: cancel {order_id} failed: {e:?}");
+                    }
+                    self.mark_uncertain(
+                        &sym,
+                        leg,
+                        VenueKind::Arcus,
+                        Some(order_id),
+                        p.qty,
+                        p.before_qty,
+                        p.mark,
+                        "roll post-only left resting at restart (cancelled)",
+                    );
+                }
+                StartupRollAction::PendingUncertain => {
+                    let p = pending.expect("PendingUncertain comes from a pending record");
+                    self.mark_uncertain(
+                        &sym,
+                        leg,
+                        VenueKind::Arcus,
+                        p.order_id,
+                        p.qty,
+                        p.before_qty,
+                        p.mark,
+                        "roll post-only pending at restart, not resting (it may have filled)",
+                    );
+                }
+                StartupRollAction::UnknownResting { order_id, qty } => {
+                    log::error!("[STARTUP] {sym}: UNKNOWN resting order {order_id} (qty {qty}) on the Arcus leg — symbol blocked as uncertain; check it by hand");
+                    let before = self.venue(leg).signed_qty(&sym).await.unwrap_or(0.0);
+                    let mark = self
+                        .venue(leg)
+                        .mark(&sym)
+                        .await
+                        .map(|(m, _, _)| m)
+                        .unwrap_or(0.0);
+                    self.mark_uncertain(
+                        &sym,
+                        leg,
+                        VenueKind::Arcus,
+                        Some(order_id),
+                        qty,
+                        before,
+                        mark,
+                        "unknown resting order at startup",
+                    );
+                }
+            }
+            self.state.pending_post_only.remove(&sym);
+            self.persist();
+        }
     }
 
     /// Re-check every uncertain order; release the ones that are now known
@@ -2982,7 +3255,7 @@ impl Engine {
                     );
                     // roll accounting: the order's observed fills replace its
                     // reservation (any execution on the rolled leg counts)
-                    if self.cfg.roll_leg() == Some(u.leg) {
+                    if self.cfg.roll_accounting_leg() == Some(u.leg) {
                         let (f, fee, value) = observed.unwrap_or((0.0, 0.0, 0.0));
                         roll_release_booking(&mut self.state.roll, &sym, f, fee, value, u.mark);
                     }
@@ -3063,7 +3336,7 @@ impl Engine {
                 // roll accounting: no evidence was seen, so an uncertain
                 // order on the rolled leg is booked as a full fill at the
                 // current mark (worst case) in place of its reservation.
-                let rolled = self.cfg.roll_leg();
+                let rolled = self.cfg.roll_accounting_leg();
                 let slip = self.cfg.taker_slippage_bps;
                 let cleared: Vec<(String, UncertainOrder)> =
                     std::mem::take(&mut self.state.uncertain)
@@ -3492,7 +3765,7 @@ impl Engine {
         // Not on a tick that reconciled an order either: its snapshot (and
         // so every roll gate) predates the late fill.
         if sent == 0 && released_now.is_empty() {
-            self.maybe_roll(now, &snap, kill, &released_now).await;
+            self.maybe_roll(now, &snap, kill).await;
         }
         self.persist();
         self.write_status(now, kill, sent);
@@ -3851,7 +4124,9 @@ async fn main() -> Result<()> {
         feed_problem: None,
         last_settle: None,
         roll_limit: None,
+        roll_sends: 0,
     };
+    engine.startup_roll_reconcile().await;
     let tick = Duration::from_secs(engine.cfg.tick_secs);
     loop {
         if let Err(e) = engine.tick().await {
@@ -4730,6 +5005,146 @@ mod tests {
         c
     }
 
+    #[test]
+    fn roll_mode_is_strict_only_when_the_roll_is_enabled() {
+        assert_eq!(
+            roll_mode_from_env("maker_first", true).unwrap(),
+            RollMode::MakerFirst
+        );
+        assert!(roll_mode_from_env("maker", true).is_err());
+        // roll off: a typo / future value never keeps the holder from starting
+        assert_eq!(roll_mode_from_env("maker", false).unwrap(), RollMode::Taker);
+        assert_eq!(
+            roll_mode_from_env("maker_first", false).unwrap(),
+            RollMode::MakerFirst
+        );
+    }
+
+    #[test]
+    fn roll_accounting_is_inert_while_the_roll_is_disabled() {
+        let off = arcus_short_cfg();
+        assert!(!off.roll.enabled);
+        assert_eq!(off.roll_leg(), Some(Leg::Short));
+        assert_eq!(off.roll_accounting_leg(), None);
+        // nothing books with the roll off, even on the Arcus leg
+        assert_eq!(
+            roll_execution_booking(
+                off.roll_accounting_leg(),
+                Leg::Short,
+                false,
+                0.1,
+                0.02,
+                10.0,
+                100.0
+            ),
+            None
+        );
+        let on = roll_cfg_on();
+        assert_eq!(on.roll_accounting_leg(), Some(Leg::Short));
+        assert!(roll_execution_booking(
+            on.roll_accounting_leg(),
+            Leg::Short,
+            false,
+            0.1,
+            0.02,
+            10.0,
+            100.0
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn roll_close_outcomes_match_what_happened() {
+        let min = 0.0001;
+        assert_eq!(
+            roll_close_outcome(true, true, false, 0.05, min),
+            Some("close_uncertain")
+        );
+        assert_eq!(
+            roll_close_outcome(false, false, true, 0.0, min),
+            Some("close_not_sent")
+        );
+        assert_eq!(
+            roll_close_outcome(true, false, false, 0.0, min),
+            Some("close_unfilled")
+        );
+        assert_eq!(
+            roll_close_outcome(true, false, true, 0.0, min),
+            Some("close_failed")
+        );
+        assert_eq!(
+            roll_close_outcome(true, false, false, 0.00005, min),
+            Some("close_partial_below_min")
+        );
+        // filled enough: the re-open decides the outcome
+        assert_eq!(roll_close_outcome(true, false, false, 0.05, min), None);
+        assert_eq!(roll_close_outcome(true, false, true, 0.05, min), None);
+    }
+
+    #[test]
+    fn a_refused_roll_backs_off_briefly_and_a_sent_one_starts_the_interval() {
+        let interval = 3_600;
+        let mut rs = RollState::default();
+        // refused before any send: no interval spent, no roll counted
+        roll_after_attempt(&mut rs, 10_000, false);
+        assert_eq!(rs.last_roll_at, None);
+        assert_eq!(rs.week_count, 0);
+        assert_eq!(
+            roll_next_at(&rs, interval),
+            10_000 + ROLL_REFUSAL_BACKOFF_SECS
+        );
+        // sent: the interval starts and the backoff is cleared
+        roll_after_attempt(&mut rs, 10_100, true);
+        assert_eq!(rs.last_roll_at, Some(10_100));
+        assert_eq!(rs.retry_not_before, None);
+        assert_eq!(rs.week_count, 1);
+        assert_eq!(roll_next_at(&rs, interval), 10_100 + interval);
+    }
+
+    #[test]
+    fn startup_finds_orphaned_roll_orders_and_unknown_resting_ones() {
+        let p = |id: Option<&str>| PendingPostOnly {
+            leg: Leg::Short,
+            order_id: id.map(|s| s.to_string()),
+            qty: 0.05,
+            before_qty: -0.5,
+            mark: 100.0,
+            sent_at: 1,
+        };
+        let open = vec![("o1".to_string(), 0.05)];
+        // ours, still resting -> cancel, then uncertain
+        assert_eq!(
+            startup_roll_action(Some(&p(Some("o1"))), &open),
+            Some(StartupRollAction::CancelThenUncertain {
+                order_id: "o1".into()
+            })
+        );
+        // ours, gone (may have filled) or never acked -> uncertain, no cancel
+        assert_eq!(
+            startup_roll_action(Some(&p(Some("o1"))), &[]),
+            Some(StartupRollAction::PendingUncertain)
+        );
+        assert_eq!(
+            startup_roll_action(Some(&p(None)), &open),
+            Some(StartupRollAction::PendingUncertain)
+        );
+        // nothing pending but something rests -> unknown, blocked (not cancelled)
+        assert_eq!(
+            startup_roll_action(None, &open),
+            Some(StartupRollAction::UnknownResting {
+                order_id: "o1".into(),
+                qty: 0.05
+            })
+        );
+        // clean
+        assert_eq!(startup_roll_action(None, &[]), None);
+        // older state.json (no pending map) still loads
+        let mut v = serde_json::to_value(State::default()).unwrap();
+        v.as_object_mut().unwrap().remove("pending_post_only");
+        let st: State = serde_json::from_value(v).unwrap();
+        assert!(st.pending_post_only.is_empty());
+    }
+
     fn roll_cfg_on() -> Config {
         let mut c = arcus_short_cfg();
         c.roll = RollCfg {
@@ -4929,19 +5344,6 @@ mod tests {
             roll_blocker(&off, &rs, now, &g, 800.0, 0.5),
             Some("disabled")
         );
-    }
-
-    #[test]
-    fn roll_skips_symbols_reconciled_this_tick() {
-        let mut uncertain = std::collections::BTreeMap::new();
-        let mut released = std::collections::BTreeSet::new();
-        assert!(!roll_symbol_unsettled(&uncertain, &released, "BTC"));
-        released.insert("BTC".to_string());
-        assert!(roll_symbol_unsettled(&uncertain, &released, "BTC"));
-        released.clear();
-        uncertain.insert("BTC".to_string(), uncertain_btc("arcus", "a"));
-        assert!(roll_symbol_unsettled(&uncertain, &released, "BTC"));
-        assert!(!roll_symbol_unsettled(&uncertain, &released, "META"));
     }
 
     #[test]
