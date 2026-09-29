@@ -104,6 +104,25 @@ impl DexConnectorBox {
         }
     }
 
+    /// Batch forwards: the whole call can fail, or single rows can (a row's
+    /// error is its own `Result`). Report the outer error, or else the first
+    /// failed row; the notifiers dedupe per engagement, so one is enough.
+    fn report_batch_rate_limit(
+        &self,
+        operation: &str,
+        detail: &str,
+        result: &Result<Vec<dex_connector::BatchOrderResult>, DexError>,
+    ) {
+        match result {
+            Err(err) => self.report_rate_limit(operation, detail, err),
+            Ok(rows) => {
+                if let Some(Err(err)) = rows.iter().find(|row| row.is_err()) {
+                    self.report_rate_limit(operation, detail, err);
+                }
+            }
+        }
+    }
+
     // instance_id is only read from the lighter-sdk arm; extended-sdk-only
     // builds (Tokyo, bot-strategy#123) don't consume it.
     #[cfg_attr(not(feature = "lighter-sdk"), allow(unused_variables))]
@@ -741,21 +760,32 @@ impl DexConnector for DexConnectorBox {
     }
 
     async fn schedule_cancel(&self, timeout_secs: Option<u64>) -> Result<(), DexError> {
-        self.inner.schedule_cancel(timeout_secs).await
+        let result = self.inner.schedule_cancel(timeout_secs).await;
+        if let Err(ref err) = result {
+            let detail = timeout_secs.map_or_else(|| "disarm".to_string(), |s| format!("{s}s"));
+            self.report_rate_limit("schedule_cancel", &detail, err);
+        }
+        result
     }
 
     async fn create_orders_batch(
         &self,
         orders: Vec<dex_connector::BatchOrderRequest>,
     ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
-        self.inner.create_orders_batch(orders).await
+        let detail = format!("rows={}", orders.len());
+        let result = self.inner.create_orders_batch(orders).await;
+        self.report_batch_rate_limit("create_orders_batch", &detail, &result);
+        result
     }
 
     async fn modify_orders_batch(
         &self,
         modifies: Vec<dex_connector::BatchModifyRequest>,
     ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
-        self.inner.modify_orders_batch(modifies).await
+        let detail = format!("rows={}", modifies.len());
+        let result = self.inner.modify_orders_batch(modifies).await;
+        self.report_batch_rate_limit("modify_orders_batch", &detail, &result);
+        result
     }
 }
 
