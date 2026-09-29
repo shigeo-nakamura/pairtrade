@@ -204,7 +204,7 @@ swap the short leg while the RH long stays open:
 |---|---|---|
 | `net exposure ...` | legs unequal by > `HEDGE_NET_TOLERANCE_USD` for `HEDGE_NET_BREACH_TICKS` ticks (an IOC keeps failing on one venue) | check the failing venue / book; while halted the bot only *reduces* the larger leg; `RISK_ACK` |
 | `leverage: ...` | a growth order this tick would exceed `HEDGE_MAX_LEVERAGE` × that venue's equity; nothing was sent (checked before the first leg) — also what fires after a liquidation | deposit, `RISK_ACK`, re-`ARM` |
-| `growth headroom: ...` | a growth order this tick fits `HEDGE_MAX_LEVERAGE` but would leave that venue's liquidation headroom (over every hedged book, after all of the tick's growth) under `HEDGE_LIQ_GUARD_PCT` — e.g. a high-MMR symbol on thin equity; nothing grew (checked before the first leg). While halted the next ticks only reduce, so a lopsided book (a refused roll re-open's repair) is levelled **down** | deposit, `RISK_ACK`, re-`ARM` |
+| `growth headroom: ...` | (**only while `HEDGE_ROLL_ENABLED=true`**) a growth order this tick fits `HEDGE_MAX_LEVERAGE` but would leave that venue's liquidation headroom (over every hedged book, after all of the tick's growth) under `HEDGE_LIQ_GUARD_PCT` — e.g. a high-MMR symbol on thin equity; nothing grew (checked before the first leg). While halted the next ticks only reduce, so a lopsided book (a refused roll re-open's repair) is levelled **down** | deposit, `RISK_ACK`, re-`ARM` |
 | `liq_guard: ...` | a venue's account headroom (over every hedged book) fell under `HEDGE_LIQ_GUARD_PCT`; **every armed book was closed** | rebalance collateral, `RISK_ACK`, re-`ARM` |
 
 A halt never leaves the book lopsided on purpose: the tick loop keeps

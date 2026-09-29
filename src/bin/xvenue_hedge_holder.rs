@@ -72,8 +72,9 @@
 //!    money, and the guard fires well before the venue would.
 //! 3. **Leverage guard**: growth is refused (halt `leverage`) when a leg's
 //!    notional after the order would exceed `HEDGE_MAX_LEVERAGE` × equity,
-//!    or (halt `growth headroom`) when it would leave that venue's
-//!    liquidation headroom under `HEDGE_LIQ_GUARD_PCT`.
+//!    or — only while the Arcus-leg roll is enabled — (halt `growth
+//!    headroom`) when it would leave that venue's liquidation headroom
+//!    under `HEDGE_LIQ_GUARD_PCT`.
 //!    Checked for the whole tick's orders before the first is sent.
 //!
 //! `Off` never trades: whatever the venues hold in `Off` (an operator's
@@ -1849,6 +1850,13 @@ fn legs_after_growth(
 /// Growth guard on liquidation headroom: after the tick's growth, the
 /// venue's headroom must stay at or above `liq_guard_pct` (the bound the
 /// roll's re-open is gated on). Nothing held after growth = ok.
+/// The post-growth headroom halt is part of the roll feature (it repairs a
+/// refused re-open by levelling down): it applies only while the roll is
+/// enabled, so a default-off deployment keeps its pre-roll planner.
+fn growth_headroom_guard_applies(roll_enabled: bool, growth_usd: f64) -> bool {
+    roll_enabled && growth_usd > 0.0
+}
+
 fn growth_headroom_ok(equity_usd: f64, legs_after: &[(f64, f64)], liq_guard_pct: f64) -> bool {
     liq_headroom_pct(equity_usd, legs_after).is_none_or(|h| h >= liq_guard_pct)
 }
@@ -3059,6 +3067,10 @@ impl Engine {
                 let kill_now = self.sentinels.kill_switch_engaged();
                 let fresh_equity = if kill_now {
                     None
+                } else if self.cfg.dry_run {
+                    // DRY_RUN never reads the venue account: the same simulated
+                    // equity the snapshot and the roll gate use.
+                    Some(self.cfg.dry_run_equity_usd)
                 } else {
                     match self.venue(leg).equity().await {
                         Ok(e) => Some(e),
@@ -3841,8 +3853,10 @@ impl Engine {
                 // drop the growth — the halt restricts the next tick to
                 // reductions, so a lopsided book (a refused roll re-open's
                 // repair) is levelled DOWN instead of left one leg short.
+                // Only while the roll is enabled: with the roll off the
+                // planner behaves exactly as before the roll feature.
                 let legs_after = legs_after_growth(&plan, &snap, &self.cfg, leg);
-                if add > 0.0
+                if growth_headroom_guard_applies(self.cfg.roll.enabled, add)
                     && !growth_headroom_ok(snap.equity(leg), &legs_after, self.cfg.liq_guard_pct)
                 {
                     self.halt(format!(
@@ -6639,6 +6653,10 @@ mod tests {
         assert!(growth_headroom_ok(3_200.0, &after_l, cfg.liq_guard_pct));
         // nothing held after growth: ok
         assert!(growth_headroom_ok(0.0, &[], cfg.liq_guard_pct));
+        // roll off: the guard never applies (pre-roll planner unchanged)
+        assert!(!growth_headroom_guard_applies(false, 5_000.0));
+        assert!(growth_headroom_guard_applies(true, 5_000.0));
+        assert!(!growth_headroom_guard_applies(true, 0.0));
     }
 
     #[test]
