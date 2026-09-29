@@ -153,7 +153,8 @@ Differences from Core to keep in mind:
 1. Create a **testnet** API key (testnet.arcus.xyz/api-keys) and fund it
    with **Testnet Deposit**.
 2. Run the dex-connector ignored smoke tests first (they place a post-only
-   order, cancel it, arm/disarm the dead man's switch, then IOC + close):
+   order, cancel it, arm/disarm the dead man's switch, then IOC + close —
+   connector-level; the holder's roll itself only sends IOCs):
    `ARCUS_TESTNET_ADDRESS=0x… ARCUS_TESTNET_API_PRIVATE_KEY_HEX=… cargo test --features arcus-sdk -- --ignored arcus`
    in dex-connector.
 3. Then run the holder in DRY_RUN against testnet, with the short leg on
@@ -296,32 +297,24 @@ Books are rolled round-robin.
 | `HEDGE_ROLL_CLIP_USD` | — | notional per roll; must be <= `HEDGE_CLIP_USD` and <= `HEDGE_NET_TOLERANCE_USD` |
 | `HEDGE_ROLL_WEEKLY_VOLUME_USD` | — | weekly volume budget (close + re-open) |
 | `HEDGE_ROLL_WEEKLY_COST_USD` | — | weekly cap on fees + slippage vs mark |
-| `HEDGE_ROLL_MODE` | `taker` | `taker` (absolute-limit IOC) or `maker_first` (post-only ALO at the passive touch, cancel-confirmed taker remainder). Validated only when the roll is enabled: with the roll off a bad value is logged and ignored |
-| `HEDGE_ROLL_MAKER_TIMEOUT_SECS` | `20` | how long a `maker_first` post-only order rests before it is cancelled |
+| `HEDGE_ROLL_MODE` | unset | leftover of the removed `maker_first` mode: the roll is **taker-only**. Unset / `taker` are accepted; any other value is a config error while the roll is enabled and is only logged while it is off |
 
-**Roll accounting (ground truth).** The weekly caps bound **all** execution on the rolled Arcus leg during the roll week. That includes roll legs and also the planner's levelling, repairs and ARM builds. Every execution on that leg books its **actual** executed value and cost (fee + slippage vs the mark it was sent against) into the week at the moment it is confirmed, so a repair is booked whenever it happens, at its real price. A roll leg is additionally **reserved** before it is sent: notional × (1 + 0.1 %), plus fee, slippage bound and that margin as cost. The reservation is dropped once the leg returns, because its fills were already booked where they settled. A leg that ends **uncertain** keeps its reservation (`in_flight`, kept across Sundays) until the uncertain entry is released on evidence, when its observed fills are booked, or cleared by `RISK_ACK`, when the larger of its send-time reservation and a full fill at the current mark is booked as the worst case. The next roll runs only if actual week + in-flight + its own two reservations fit under both caps. Before every send, the leg's mark (and, for post-only, the passive limit actually sent) must be within 0.1 % of the reserved mark. A post-only close that partly filled keeps that fill even if the taker remainder fails, and the re-open is sized to it. Reservations left in flight by a process that died mid-roll are booked at the next roll pass. Counters reset every Sunday 00:00 UTC (at the start of the tick, before anything can book). Roll IOCs are sent at an **absolute** limit bound to the reserved mark (not re-anchored to the touch), and every booking uses the Arcus leg's own mark. With the roll disabled none of this books anything.
+**Roll accounting (ground truth).** The weekly caps bound **all** execution on the rolled Arcus leg during the roll week. That includes roll legs and also the planner's levelling, repairs and ARM builds. Every execution on that leg books its **actual** executed value and cost (fee + slippage vs the mark it was sent against) into the week at the moment it is confirmed, so a repair is booked whenever it happens, at its real price. A roll leg is additionally **reserved** before it is sent: notional × (1 + 0.1 %), plus fee, slippage bound and that margin as cost. The reservation is dropped once the leg returns, because its fills were already booked where they settled. A leg that ends **uncertain** keeps its reservation (`in_flight`, kept across Sundays) until the uncertain entry is released on evidence, when its observed fills are booked, or cleared by `RISK_ACK`, when the larger of its send-time reservation and a full fill at the current mark is booked as the worst case. The next roll runs only if actual week + in-flight + its own two reservations fit under both caps. Before every send, the leg's fresh mark must be within 0.1 % of the reserved mark, else nothing is sent. Reservations left in flight by a process that died mid-roll are booked at the next roll pass. Counters reset every Sunday 00:00 UTC (at the start of the tick, before anything can book). Roll IOCs are sent at an **absolute** limit bound to the reserved mark (not re-anchored to the touch), and every booking uses the Arcus leg's own mark. With the roll disabled none of this books anything.
 
-`maker_first` works like this:
-1. A post-only (ALO) order is placed at the passive touch.
-2. After the timeout, the rest is canceled, and the cancel must be confirmed (the order is terminal).
-3. Only then is the remainder sent as a taker IOC. An unconfirmed cancel marks the order uncertain and stops the roll.
+**Taker-only.** Both roll legs are IOCs (Arcus taker fee, Base tier 2.25 bp), sent at an absolute limit within 0.1 % of the reserved mark. An IOC never rests on the book, so a restart can never leave a roll order behind (the post-only `maker_first` mode and its restart reconciliation were removed, bot-strategy#1080). A roll blocks the tick for at most two IOC settles (≈ 2 × the sum of `HEDGE_FILL_WAIT_SECS`).
 
 The roll week runs **Sunday 00:00 UTC to Sunday 00:00 UTC**. This is an assumption: the Arcus points API's weekly history starts on Sunday 2026-09-13 (#1075).
 
-Status: `hedge_holder.roll` (`enabled`, `mode`, `leg`, week volume / cost / count, budgets, `last_roll_at`, `next_roll_at`, `blocked_reason`). Events: `roll_start`, `roll_leg`, `roll_done`, `roll_blocked`. `roll_done.outcome` is one of:
+Status: `hedge_holder.roll` (`enabled`, `mode` = `taker`, `leg`, week volume / cost / count, budgets, `last_roll_at`, `next_roll_at`, `blocked_reason`). Events: `roll_start`, `roll_leg`, `roll_done`, `roll_blocked`. `roll_done.outcome` is one of:
 
 | outcome | meaning |
 |---|---|
 | `done` | close and re-open both filled the clip |
-| `close_not_sent` | refused before any order went out (price moved beyond the margin, book / position read failed): no volume, no cost; the next attempt waits only 60 s, not a whole interval |
-| `close_unfilled` | the close was sent and filled nothing (e.g. the touch sat outside the price margin) |
-| `close_failed` | the close was sent, filled nothing and errored |
+| `close_not_sent` | nothing executed: refused before the send (price moved beyond the margin, a read failed) or rejected synchronously by the venue. No volume, no cost; the next attempt waits only 60 s, not a whole interval |
+| `close_unfilled` | the close was accepted and filled nothing (e.g. the touch sat outside the price margin) |
 | `close_partial_below_min` | the close filled less than the venue minimum: nothing to re-open; the planner levels it later (booked when it settles) |
-| `close_partial` | a post-only close filled partly and its taker remainder failed: the re-open is sized to the partial |
 | `close_uncertain` / `reopen_uncertain` | an order's outcome is unknown: the symbol is blocked until the uncertain machinery settles it (**needs attention if it escalates**) |
 | `reopen_partial` / `reopen_failed` | the re-open filled less than the close / failed: the planner levels the gap next tick |
 
-`week_count` counts only rolls that sent at least one order; `last_roll_at` is when a roll last sent one (the interval counts from there). With the roll **disabled**, nothing books into the roll counters.
-
-**Restart safety (post-only).** A `maker_first` ALO rests on Arcus for up to 40 days. Each one is recorded in `state.json` (`pending_post_only`) *before* it is sent and cleared when it settles. On a live start the holder checks the Arcus leg's open orders for every configured symbol: its own pending ALO still resting is **cancelled** and the symbol made uncertain; a pending one no longer resting (it may have filled while the process was down) is made uncertain; and any resting order the bot has no record of is **not** cancelled but blocks the symbol as uncertain and is logged loudly (`[STARTUP] … UNKNOWN resting order`) — check it by hand, then RISK_ACK.
+A roll leg counts as **sent** only once the venue accepted it (it settled) or it became uncertain (it reached the venue and may have filled). `week_count` counts only rolls that sent at least one order; `last_roll_at` is when a roll last sent one (the interval counts from there). `orders_this_tick` in status includes roll orders. With the roll **disabled**, nothing books into the roll counters and nothing about the roll runs at startup: a default-off deployment behaves exactly as before the roll existed.
 
