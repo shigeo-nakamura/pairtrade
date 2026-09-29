@@ -71,7 +71,10 @@
 //!    so a lopsided liquidation is the one way this book can lose real
 //!    money, and the guard fires well before the venue would.
 //! 3. **Leverage guard**: growth is refused (halt `leverage`) when a leg's
-//!    notional after the order would exceed `HEDGE_MAX_LEVERAGE` × equity.
+//!    notional after the order would exceed `HEDGE_MAX_LEVERAGE` × equity,
+//!    or — only while the Arcus-leg roll is enabled — (halt `growth
+//!    headroom`) when it would leave that venue's liquidation headroom
+//!    under `HEDGE_LIQ_GUARD_PCT`.
 //!    Checked for the whole tick's orders before the first is sent.
 //!
 //! `Off` never trades: whatever the venues hold in `Off` (an operator's
@@ -343,6 +346,8 @@ struct Config {
     /// for the operator (`HEDGE_UNCERTAIN_GRACE_SECS`, default 60). It is
     /// never released on time alone — only on terminal evidence or RISK_ACK.
     uncertain_grace_secs: u64,
+    /// Arcus-leg roll (bot-strategy#1080), default off. See `RollCfg`.
+    roll: RollCfg,
     /// Per-leg notional built on a bare ARM (USD); single-symbol only.
     target_notional_usd: f64,
     /// Hard cap on the per-leg notional any ARM may request, per symbol (USD).
@@ -396,6 +401,10 @@ impl Config {
                 }]
             }
         };
+        check_roll_mode(
+            &env_string("HEDGE_ROLL_MODE", ""),
+            env_bool("HEDGE_ROLL_ENABLED", false),
+        )?;
         let cfg = Self {
             dry_run: env_bool("HEDGE_DRY_RUN", true),
             live_confirm: env_string("HEDGE_LIVE_CONFIRM", ""),
@@ -415,6 +424,13 @@ impl Config {
                 None => DEFAULT_FILL_WAIT_SECS.to_vec(),
             },
             uncertain_grace_secs: env_u64("HEDGE_UNCERTAIN_GRACE_SECS", 60),
+            roll: RollCfg {
+                enabled: env_bool("HEDGE_ROLL_ENABLED", false),
+                interval_secs: env_u64("HEDGE_ROLL_INTERVAL_SECS", 3_600),
+                clip_usd: env_f64("HEDGE_ROLL_CLIP_USD", 0.0),
+                weekly_volume_usd: env_f64("HEDGE_ROLL_WEEKLY_VOLUME_USD", 0.0),
+                weekly_cost_usd: env_f64("HEDGE_ROLL_WEEKLY_COST_USD", 0.0),
+            },
             target_notional_usd: env_f64("HEDGE_TARGET_NOTIONAL_USD", 20_000.0),
             max_notional_usd: env_f64("HEDGE_MAX_NOTIONAL_USD", 30_000.0),
             clip_usd: env_f64("HEDGE_CLIP_USD", 10_000.0),
@@ -504,6 +520,29 @@ impl Config {
         if self.uncertain_grace_secs == 0 {
             bail!("HEDGE_UNCERTAIN_GRACE_SECS must be > 0");
         }
+        if self.roll.enabled {
+            if self.roll_leg().is_none() {
+                bail!("HEDGE_ROLL_ENABLED needs an Arcus leg (the Lighter leg is never rolled)");
+            }
+            if !positive(self.roll.clip_usd) {
+                bail!("HEDGE_ROLL_CLIP_USD must be > 0 when the roll is enabled");
+            }
+            if self.roll.clip_usd > self.clip_usd {
+                bail!("HEDGE_ROLL_CLIP_USD must be <= HEDGE_CLIP_USD");
+            }
+            // Between the close and the re-open the book is one roll clip
+            // lopsided; above the net tolerance that would count as a
+            // breach (and a slow re-open could halt the bot).
+            if self.roll.clip_usd > self.net_tolerance_usd {
+                bail!("HEDGE_ROLL_CLIP_USD must be <= HEDGE_NET_TOLERANCE_USD");
+            }
+            if !positive(self.roll.weekly_volume_usd) || !positive(self.roll.weekly_cost_usd) {
+                bail!("HEDGE_ROLL_WEEKLY_VOLUME_USD and HEDGE_ROLL_WEEKLY_COST_USD must be > 0 when the roll is enabled");
+            }
+            if self.roll.interval_secs < self.tick_secs {
+                bail!("HEDGE_ROLL_INTERVAL_SECS must be >= HEDGE_TICK_SECS");
+            }
+        }
         if !self.dry_run && self.live_confirm != LIVE_CONFIRM_TOKEN {
             bail!(
                 "HEDGE_DRY_RUN=false needs HEDGE_LIVE_CONFIRM={LIVE_CONFIRM_TOKEN} \
@@ -522,6 +561,30 @@ impl Config {
 
     fn uses_arcus(&self) -> bool {
         self.long_venue == VenueKind::Arcus || self.short_venue == VenueKind::Arcus
+    }
+
+    /// The leg whose executions book into the roll week: the roll leg, but
+    /// only while the roll is enabled (disabled, the roll counters stay
+    /// untouched — nothing books, nothing grows).
+    fn roll_accounting_leg(&self) -> Option<Leg> {
+        if self.roll.enabled {
+            self.roll_leg()
+        } else {
+            None
+        }
+    }
+
+    /// The leg the roll trades: the Arcus leg (the short when both are
+    /// Arcus). `None` when no leg is on Arcus — the Lighter leg is never
+    /// rolled.
+    fn roll_leg(&self) -> Option<Leg> {
+        if self.short_venue == VenueKind::Arcus {
+            Some(Leg::Short)
+        } else if self.long_venue == VenueKind::Arcus {
+            Some(Leg::Long)
+        } else {
+            None
+        }
     }
 
     fn venue(&self, leg: Leg) -> VenueKind {
@@ -563,6 +626,18 @@ impl Config {
         }
         if self.short_venue != VenueKind::Lighter {
             fields.push(("short_venue", self.short_venue.dex_name().to_string()));
+        }
+        if self.roll.enabled {
+            fields.push((
+                "roll",
+                format!(
+                    "{}:{:.2}:{:.2}:{:.2}",
+                    self.roll.interval_secs,
+                    self.roll.clip_usd,
+                    self.roll.weekly_volume_usd,
+                    self.roll.weekly_cost_usd,
+                ),
+            ));
         }
         if self.symbols.len() == 1 && self.symbols[0].short_mmr_pct != self.symbols[0].mmr_pct {
             fields.push(("short_mmr", format!("{:.3}", self.symbols[0].short_mmr_pct)));
@@ -641,6 +716,9 @@ struct State {
     /// terminal — re-sending is the one way the book can overshoot.
     #[serde(default)]
     uncertain: std::collections::BTreeMap<String, UncertainOrder>,
+    /// Arcus-leg roll counters (bot-strategy#1080).
+    #[serde(default)]
+    roll: RollState,
     // Single-symbol state.json (before `books`): read once by
     // `migrate_legacy`, never written back.
     #[serde(default, rename = "mode", skip_serializing)]
@@ -726,8 +804,751 @@ struct UncertainOrder {
     qty: f64,
     /// The leg's signed venue position right before the order.
     before_qty: f64,
+    /// Mark the order was sent against (roll accounting: slippage of the
+    /// fills booked when the order is released). 0 when unknown.
+    #[serde(default)]
+    mark: f64,
     sent_at: u64,
     reason: String,
+    /// A ROLL leg (its in-flight reservation is settled when this entry is
+    /// released / cleared); planner orders never touch roll reservations.
+    #[serde(default)]
+    roll: bool,
+}
+
+// ------------------------------------------------------------------- roll
+
+/// `HEDGE_ROLL_MODE` is a leftover of the removed `maker_first` mode: the
+/// roll is taker-only (IOC legs never rest, so nothing can be orphaned on
+/// a restart). Unset / `taker` are fine; any other value is a config error
+/// while the roll is enabled (it would silently change what the operator
+/// asked for) and is only logged while the roll is off, so it can never
+/// keep the delta-neutral holder from starting.
+fn check_roll_mode(raw: &str, roll_enabled: bool) -> Result<()> {
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "taker" {
+        return Ok(());
+    }
+    if roll_enabled {
+        bail!("HEDGE_ROLL_MODE={raw}: maker_first was removed (bot-strategy#1080) — the roll is taker-only; unset HEDGE_ROLL_MODE");
+    }
+    log::warn!("[CONFIG] HEDGE_ROLL_MODE={raw} ignored (roll disabled; the roll is taker-only)");
+    Ok(())
+}
+
+/// Arcus-leg roll settings (`HEDGE_ROLL_*`). Off by default: enabling it is
+/// the owner's call once the Arcus points terms are known (#1075, #1080).
+#[derive(Debug, Clone, Default)]
+struct RollCfg {
+    enabled: bool,
+    interval_secs: u64,
+    clip_usd: f64,
+    weekly_volume_usd: f64,
+    weekly_cost_usd: f64,
+}
+
+/// Roll bookkeeping in state.json (serde default: older states load).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct RollState {
+    /// Day index (days since 1970-01-01) of the Sunday the current roll
+    /// week started on.
+    week: u64,
+    /// ACTUAL executed value / cost this week of every confirmed execution
+    /// on the rolled (Arcus) leg: roll legs AND the planner's levelling,
+    /// repairs and ARM builds — each books itself when it settles.
+    week_volume_usd: f64,
+    week_cost_usd: f64,
+    /// Worst-case reservations (volume, cost) of roll legs sent but not yet
+    /// settled, per symbol. Set before a roll leg is sent and cleared when
+    /// it settles (its fills are booked where they settle); a leg that ends
+    /// uncertain keeps its reservation until the uncertain entry is released
+    /// (observed fills booked) or cleared by RISK_ACK (worst case booked).
+    /// Not part of the week counters: it survives rollovers on its own.
+    #[serde(default)]
+    in_flight: std::collections::BTreeMap<String, (f64, f64)>,
+    /// Rolls that sent at least one order this week (refusals before any
+    /// send — price moved, book read failed — are not rolls).
+    week_count: u64,
+    /// When the last roll actually SENT an order; the interval counts from here.
+    last_roll_at: Option<u64>,
+    /// Per-SYMBOL refusal streaks: consecutive roll attempts on that symbol
+    /// refused or rejected before anything was sent (reset by a roll of that
+    /// symbol that sends, and by the week rollover). Each one doubles that
+    /// symbol's backoff; `ROLL_MAX_REFUSALS` in a row suspend THAT symbol
+    /// until the next roll week — the other books keep rolling.
+    #[serde(default)]
+    backoff: std::collections::BTreeMap<String, RollBackoff>,
+    last_symbol: Option<String>,
+    blocked_reason: Option<String>,
+}
+
+/// One symbol's refusal streak.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+struct RollBackoff {
+    refusals: u32,
+    /// No roll of this symbol before this time.
+    retry_not_before: u64,
+}
+
+/// Sunday-00:00-UTC week of `now`, as the day index of that Sunday. The
+/// Arcus points week is ASSUMED to run Sun 00:00 UTC (the points API's
+/// weekly history starts on Sunday 2026-09-13, see bot-strategy#1075).
+fn roll_week(now: u64) -> u64 {
+    let day = now / 86_400;
+    // 1970-01-01 was a Thursday: (day + 4) % 7 == 0 on Sundays.
+    day - (day + 4) % 7
+}
+
+/// Resets the weekly counters when a new roll week has started.
+fn roll_week_rollover(rs: &mut RollState, now: u64) -> bool {
+    let week = roll_week(now);
+    if rs.week != week {
+        // Actuals restart at zero; in-flight reservations (uncertain roll
+        // legs) are kept as they are until released.
+        *rs = RollState {
+            week,
+            in_flight: std::mem::take(&mut rs.in_flight),
+            last_roll_at: rs.last_roll_at,
+            last_symbol: rs.last_symbol.clone(),
+            ..RollState::default()
+        };
+        return true;
+    }
+    false
+}
+
+/// Sum of the in-flight reservations (volume, cost).
+fn roll_in_flight_total(rs: &RollState) -> (f64, f64) {
+    rs.in_flight
+        .values()
+        .fold((0.0, 0.0), |(v, c), (dv, dc)| (v + dv, c + dc))
+}
+
+/// THE booking entry point: a confirmed execution's actual (value, cost)
+/// goes into the week of the BOOKING time (rollover first), so a roll that
+/// started before Sunday 00:00 UTC and settles after it lands in the new
+/// week, not in the old one the next tick's rollover would wipe.
+fn roll_book_actual(rs: &mut RollState, now: u64, (value, cost): (f64, f64)) {
+    roll_week_rollover(rs, now);
+    rs.week_volume_usd += value;
+    rs.week_cost_usd += cost;
+}
+
+/// One settled ROLL leg, as a single state mutation: its in-flight
+/// reservation is dropped and its actual fills (if any) booked together, so
+/// a crash between two persists can never leave both on disk (the restart
+/// would book the stale reservation on top of the actual).
+fn roll_settle_leg(rs: &mut RollState, sym: &str, now: u64, booking: Option<(f64, f64)>) {
+    rs.in_flight.remove(sym);
+    match booking {
+        Some(b) => roll_book_actual(rs, now, b),
+        None => {
+            roll_week_rollover(rs, now);
+        }
+    }
+}
+
+/// THE cap check: week actuals + in-flight reservations + `reserve` must fit
+/// under both weekly caps. `None` = fits, else the cap it would break.
+fn roll_fits(cfg: &RollCfg, rs: &RollState, reserve: (f64, f64)) -> Option<&'static str> {
+    let (fly_v, fly_c) = roll_in_flight_total(rs);
+    if rs.week_volume_usd + fly_v + reserve.0 > cfg.weekly_volume_usd {
+        Some("weekly_volume_budget")
+    } else if rs.week_cost_usd + fly_c + reserve.1 > cfg.weekly_cost_usd {
+        Some("weekly_cost_cap")
+    } else {
+        None
+    }
+}
+
+/// Growth gates re-read right before the re-open (a growth order): the
+/// KILL_SWITCH sentinel, and the Arcus leg's liquidation headroom and
+/// leverage from a FRESH equity read. (A halt cannot be raised between the
+/// close and the re-open — nothing in the roll path halts — so it is only
+/// checked at the gate.) `None` = send.
+fn roll_reopen_blocked(kill: bool, headroom_ok: bool, leverage_ok: bool) -> Option<&'static str> {
+    if kill {
+        Some("reopen_blocked_kill")
+    } else if !headroom_ok {
+        Some("reopen_blocked_headroom")
+    } else if !leverage_ok {
+        Some("reopen_blocked_leverage")
+    } else {
+        None
+    }
+}
+
+/// With KILL_SWITCH engaged the re-open (growth) is never sent, and the
+/// planner does not repair a gap inside the net tolerance while restricted:
+/// the one-clip gap is closed by a REDUCTION of the other (non-rolled) leg
+/// instead — reduce-only, by exactly what the close filled. `None` when that
+/// cannot be one order (below the venue minimum) or the other leg holds less.
+fn roll_kill_levelling(
+    close_filled: f64,
+    other_leg_qty: f64,
+    min_qty: f64,
+    size_decimals: u32,
+) -> Option<f64> {
+    // floored to the submitted precision: execute rounds, which could round a
+    // finer-precision fill UP and close more of the other leg than was removed
+    let q = floor_to_decimals(close_filled, size_decimals);
+    (q > 0.0 && q >= min_qty && other_leg_qty + 1e-12 >= q).then_some(q)
+}
+
+/// Does an absolute IOC limit reach the touch (buy ≥ best ask, sell ≤ best
+/// bid)? A roll IOC that cannot cross would be accepted, fill nothing and
+/// still spend the interval: refuse it before the send instead. A missing,
+/// one-sided or crossed book counts as not marketable. Compared EXACTLY on
+/// the tick-rounded limit the venue will receive (`roll_limit_dec`) — no
+/// float tolerance, which could wave through a limit one tick short.
+fn roll_limit_crosses(
+    is_buy: bool,
+    limit: Decimal,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+) -> bool {
+    match (best_bid, best_ask) {
+        (Some(bid), Some(ask)) if bid > Decimal::ZERO && ask >= bid && limit > Decimal::ZERO => {
+            if is_buy {
+                limit >= ask
+            } else {
+                limit <= bid
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The absolute roll IOC limit exactly as the venue will receive it: mark
+/// × (1 ± `ROLL_PRICE_MARGIN`) computed in `Decimal` (from `Decimal::from_f64`,
+/// the shortest decimal of the f64 — never `from_f64_retain`, whose binary
+/// expansion `700 × 1.001 = 700.6999…` lands one tick short after the
+/// connector's inward rounding, pairtrade#315), then rounded INWARD to the
+/// market tick (buy down, sell up) the same way the connector's
+/// `create_order_taker_ioc_at` does. `None` for an unusable mark.
+fn roll_limit_dec(is_buy: bool, mark: f64, tick: Option<Decimal>) -> Option<Decimal> {
+    let m = Decimal::from_f64(mark).filter(|m| *m > Decimal::ZERO)?;
+    let margin = Decimal::from_f64(ROLL_PRICE_MARGIN)?;
+    let raw = if is_buy {
+        m * (Decimal::ONE + margin)
+    } else {
+        m * (Decimal::ONE - margin)
+    };
+    let rounded = match tick.filter(|t| *t > Decimal::ZERO) {
+        Some(t) if is_buy => (raw / t).floor() * t,
+        Some(t) => (raw / t).ceil() * t,
+        None => raw,
+    };
+    (rounded > Decimal::ZERO).then(|| rounded.normalize())
+}
+
+/// Booking of one settled execution on `leg`: `Some((value, cost))` when
+/// `leg` is the rolled (Arcus) leg — whoever sent it (roll, planner repair,
+/// levelling, ARM build) — `None` otherwise. Cost = fee + slippage vs the
+/// mark the order was sent against.
+fn roll_execution_booking(
+    rolled_leg: Option<Leg>,
+    leg: Leg,
+    is_buy: bool,
+    filled: f64,
+    fee: f64,
+    value: f64,
+    mark: f64,
+) -> Option<(f64, f64)> {
+    (rolled_leg == Some(leg) && filled > 0.0)
+        .then(|| (value, roll_cost(is_buy, filled, fee, value, mark)))
+}
+
+/// After a roll leg returned WITHOUT settling (`Err`): a leg that became
+/// uncertain keeps its reservation (settled when the uncertain entry is
+/// released / cleared); one that executed nothing drops it. (A settled leg
+/// already dropped it in the same mutation that booked it, `roll_settle_leg`.)
+/// Returns whether the state changed (the caller persists only then).
+fn roll_finish_in_flight(
+    rs: &mut RollState,
+    sym: &str,
+    settled: bool,
+    still_uncertain: bool,
+) -> bool {
+    !settled && !still_uncertain && rs.in_flight.remove(sym).is_some()
+}
+
+/// Reserve a roll leg's worst case, immediately before its send.
+fn roll_reserve_for_send(rs: &mut RollState, sym: &str, reserve: (f64, f64)) {
+    rs.in_flight.insert(sym.to_string(), reserve);
+}
+
+/// An uncertain order on the rolled leg released on terminal evidence: its
+/// reservation is replaced by the fills actually observed. Slippage is taken
+/// as |value − filled × mark at send| (direction unknown here: the
+/// conservative absolute).
+#[allow(clippy::too_many_arguments)]
+fn roll_release_booking(
+    rs: &mut RollState,
+    now: u64,
+    sym: &str,
+    roll_order: bool,
+    filled: f64,
+    fee: f64,
+    value: f64,
+    send_mark: f64,
+) {
+    // only a ROLL order's release settles the symbol's roll reservation; a
+    // planner order must never consume (and so lose) a stale one
+    if roll_order {
+        rs.in_flight.remove(sym);
+    }
+    let slip = if send_mark > 0.0 {
+        (value - filled * send_mark).abs()
+    } else {
+        0.0
+    };
+    roll_book_actual(rs, now, (value, fee.abs() + slip));
+}
+
+/// An uncertain order on the rolled leg cleared by RISK_ACK without
+/// evidence: its reservation is replaced by the worst case of a full fill
+/// at the current mark (± the price margin, fee and slippage bound).
+#[allow(clippy::too_many_arguments)]
+fn roll_risk_ack_booking(
+    rs: &mut RollState,
+    now: u64,
+    sym: &str,
+    roll_order: bool,
+    qty: f64,
+    mark: f64,
+    slippage_bps: u32,
+) {
+    // a ROLL order: never less than what was reserved at send time (it may
+    // have filled near its send-time limit, and a later lower mark or a
+    // stale snapshot must not shrink the booking). A planner order leaves
+    // any roll reservation alone and books its own worst case.
+    let kept = if roll_order {
+        rs.in_flight.remove(sym).unwrap_or((0.0, 0.0))
+    } else {
+        (0.0, 0.0)
+    };
+    let worst = roll_reserve(qty * mark, slippage_bps);
+    roll_book_actual(rs, now, (kept.0.max(worst.0), kept.1.max(worst.1)));
+}
+
+/// In-flight reservations with no uncertain entry behind them can only be
+/// left by a process that died between send and settle: book them (the leg
+/// may have filled) and drop them. Returns the symbols settled.
+fn roll_settle_stale_in_flight(
+    rs: &mut RollState,
+    now: u64,
+    uncertain: &std::collections::BTreeMap<String, UncertainOrder>,
+) -> Vec<String> {
+    // only a ROLL uncertain entry holds a reservation: an unrelated planner
+    // uncertain order on the symbol does not keep a stale one alive
+    let stale: Vec<String> = rs
+        .in_flight
+        .keys()
+        .filter(|s| !uncertain.get(*s).is_some_and(|u| u.roll))
+        .cloned()
+        .collect();
+    for s in &stale {
+        if let Some(r) = rs.in_flight.remove(s) {
+            roll_book_actual(rs, now, r);
+        }
+    }
+    stale
+}
+
+/// With the roll disabled nothing settles or books reservations (the stale
+/// sweep and the release bookings are roll-only), so a reservation carried
+/// in from an earlier roll-enabled run would sit in `in_flight` for good
+/// and show as phantom in-flight volume. Dropped at startup, unbooked (the
+/// disabled roll books nothing). Returns the symbols dropped.
+fn roll_drop_in_flight_when_disabled(rs: &mut RollState, enabled: bool) -> Vec<String> {
+    if enabled {
+        return Vec::new();
+    }
+    std::mem::take(&mut rs.in_flight).into_keys().collect()
+}
+
+/// Largest move (fraction) of the rolled leg's mark between the gated
+/// snapshot and each send; reservations are sized for it and a send is
+/// refused beyond it, so executed value can never outrun what was booked.
+const ROLL_PRICE_MARGIN: f64 = 0.001;
+
+/// Next time a roll may run (the interval counts from the last roll that
+/// actually sent; refusals back off per symbol, see `roll_symbol_backed_off`).
+fn roll_next_at(rs: &RollState, interval_secs: u64) -> u64 {
+    rs.last_roll_at.map(|t| t + interval_secs).unwrap_or(0)
+}
+
+/// True while `sym` is backing off after refusals (or suspended).
+fn roll_symbol_backed_off(rs: &RollState, sym: &str, now: u64) -> bool {
+    rs.backoff
+        .get(sym)
+        .is_some_and(|b| now < b.retry_not_before)
+}
+
+/// First wait after a roll refused before sending anything (no volume, no
+/// cost); it doubles with each consecutive refusal up to
+/// `ROLL_REFUSAL_BACKOFF_MAX_SECS`, so a persistent reject (margin,
+/// reduce-only mode, market halt, auth) does not re-sign an order every minute.
+const ROLL_REFUSAL_BACKOFF_SECS: u64 = 60;
+const ROLL_REFUSAL_BACKOFF_MAX_SECS: u64 = 3_600;
+/// Consecutive refusals that suspend the roll until the next roll week.
+const ROLL_MAX_REFUSALS: u32 = 5;
+
+/// Backoff after the `n`-th consecutive refusal (n ≥ 1).
+fn roll_refusal_backoff(n: u32) -> u64 {
+    let shift = n.saturating_sub(1).min(16);
+    (ROLL_REFUSAL_BACKOFF_SECS << shift).min(ROLL_REFUSAL_BACKOFF_MAX_SECS)
+}
+
+/// Bookkeeping after a roll attempt on `sym`: a roll that SENT something
+/// starts the (global) interval and clears THAT symbol's refusal streak; one
+/// refused before any send backs that symbol off (doubling), and
+/// `ROLL_MAX_REFUSALS` in a row suspend that symbol until the next roll week
+/// (returns true when this attempt suspended it). Other symbols are not
+/// affected: an equity book refused off-hours never stops the BTC roll.
+fn roll_after_attempt(rs: &mut RollState, sym: &str, now: u64, sent: bool) -> bool {
+    if sent {
+        rs.last_roll_at = Some(now);
+        rs.backoff.remove(sym);
+        rs.week_count += 1;
+        return false;
+    }
+    let b = rs.backoff.entry(sym.to_string()).or_default();
+    b.refusals = b.refusals.saturating_add(1);
+    if b.refusals >= ROLL_MAX_REFUSALS {
+        // the rollover (a fresh RollState) lifts it
+        b.retry_not_before = (roll_week(now) + 7) * 86_400;
+        true
+    } else {
+        b.retry_not_before = now + roll_refusal_backoff(b.refusals);
+        false
+    }
+}
+
+/// The close stage's result: `Ok(re-open order)` — exactly what the close
+/// filled, on the same leg — when it filled enough to re-open (the re-open
+/// decides the final outcome), else `Err(roll_done outcome)`. Taker-only: a
+/// close that reached the venue either settled (filled ≥ 0) or became
+/// uncertain; one that did not reach it was refused before the send.
+fn roll_close_stage(
+    leg: Leg,
+    close_sent: bool,
+    close_uncertain: bool,
+    close_filled: f64,
+    min_qty: f64,
+    size_decimals: u32,
+) -> std::result::Result<Order, &'static str> {
+    if close_uncertain {
+        return Err("close_uncertain");
+    }
+    if !close_sent {
+        return Err("close_not_sent");
+    }
+    if close_filled <= 0.0 {
+        return Err("close_unfilled");
+    }
+    // filled, but below the venue minimum: it cannot be re-opened as one
+    // order (the planner levels it later; that execution books itself)
+    // The re-open is the quantity that will actually be SUBMITTED: the fill
+    // floored to the order size decimals (execute rounds, which could round
+    // a finer-precision fill UP past what the close filled).
+    let qty = floor_to_decimals(close_filled, size_decimals);
+    if close_filled < min_qty || qty < min_qty || qty <= 0.0 {
+        return Err("close_partial_below_min");
+    }
+    Ok(Order { leg, qty })
+}
+
+/// `q` floored to `decimals` places (never rounds up).
+fn floor_to_decimals(q: f64, decimals: u32) -> f64 {
+    let scale = 10f64.powi(decimals as i32);
+    // tiny epsilon so a value like 0.3 (0.29999…) is not floored a whole step
+    ((q * scale) + 1e-9).floor() / scale
+}
+
+/// Arcus-leg notionals AFTER the re-open, from FRESH positions and the
+/// FRESH mark of the rolled symbol (other symbols at their snapshot mark):
+/// the growth gates must judge the account as it is when the re-open goes
+/// out, not as it was at the start of the tick.
+fn reopen_legs_after<Q, M>(
+    symbols: &[SymbolCfg],
+    leg: Leg,
+    qty_of: Q,
+    mark_of: M,
+    sym: &str,
+    reopen_qty: f64,
+    fresh_mark: f64,
+) -> Vec<(f64, f64)>
+where
+    Q: Fn(&str) -> f64,
+    M: Fn(&str) -> f64,
+{
+    symbols
+        .iter()
+        .map(|c| {
+            let (qty, mark) = if c.symbol == sym {
+                (qty_of(&c.symbol).abs() + reopen_qty, fresh_mark)
+            } else {
+                (qty_of(&c.symbol).abs(), mark_of(&c.symbol))
+            };
+            (qty * mark, c.mmr(leg))
+        })
+        .collect()
+}
+
+/// A roll IOC the venue accepted that filled nothing although the price the
+/// connector ACTUALLY sent (`ordered_price`, after its own tick rounding —
+/// which can differ from ours at a tick-tier boundary) did not reach the
+/// pre-send touch: a send-time refusal (backoff, no interval, no week
+/// count), not a roll that ran. A zero fill at a limit that did reach the
+/// touch is a genuine `close_unfilled` (the book moved).
+fn roll_unfilled_is_refusal(
+    is_buy: bool,
+    filled: f64,
+    sent_price: Decimal,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+) -> bool {
+    filled <= 0.0 && !roll_limit_crosses(is_buy, sent_price, best_bid, best_ask)
+}
+
+/// A roll leg counts as SENT (it starts the interval and counts as a roll)
+/// only when the venue accepted it (it settled) or it became uncertain (it
+/// reached the venue and may have filled). A synchronous reject or any
+/// pre-send failure (price moved, a read failed) executed nothing: that is
+/// a refusal, which only backs off briefly.
+fn roll_leg_sent(settled: bool, became_uncertain: bool) -> bool {
+    settled || became_uncertain
+}
+
+/// Everything a roll must not run through, as read on this tick.
+#[derive(Debug, Clone, Copy)]
+struct RollGate {
+    /// This symbol is backing off after refusals (or suspended this week).
+    backed_off: bool,
+    /// Net within tolerance NOW and after the close (`roll_balanced`).
+    balanced: bool,
+    halted: bool,
+    kill: bool,
+    uncertain: bool,
+    feed_ok: bool,
+    headroom_ok: bool,
+    leverage_ok: bool,
+    /// The configured clip is at least the venue minimum (never enlarged).
+    clip_ok: bool,
+    leg_holds_clip: bool,
+}
+
+/// Why the roll does not run now (`None`: go). `round_trip_usd` /
+/// `round_trip_cost_usd` are the two leg reservations of the next roll
+/// (exactly what `roll_reserve` will book): actual week + in-flight +
+/// that projection must fit under both weekly caps.
+fn roll_blocker(
+    cfg: &RollCfg,
+    rs: &RollState,
+    now: u64,
+    g: &RollGate,
+    round_trip_usd: f64,
+    round_trip_cost_usd: f64,
+) -> Option<&'static str> {
+    if now < roll_next_at(rs, cfg.interval_secs) {
+        return Some("interval");
+    }
+    let checks = [
+        (g.backed_off, "refusal_backoff"),
+        (g.halted, "halted"),
+        (g.kill, "kill_switch"),
+        (g.uncertain, "uncertain_order"),
+        (!g.feed_ok, "feed"),
+        (!g.balanced, "unbalanced"),
+        (!g.headroom_ok, "liq_headroom"),
+        (!g.leverage_ok, "leverage"),
+        (!g.clip_ok, "clip_below_venue_min"),
+        (!g.leg_holds_clip, "leg_smaller_than_clip"),
+    ];
+    checks
+        .iter()
+        .find(|(hit, _)| *hit)
+        .map(|(_, why)| *why)
+        .or_else(|| roll_fits(cfg, rs, (round_trip_usd, round_trip_cost_usd)))
+}
+
+/// Round robin: the first symbol (in `order`) whose gates pass — with what
+/// the gate computed for it (so the winner is not recomputed) — else the
+/// first candidate's blocker. A blocked book must not starve the others.
+fn pick_roll_symbol<T, F>(
+    order: &[String],
+    mut gate: F,
+) -> Result<(String, T), Option<(String, &'static str)>>
+where
+    F: FnMut(&str) -> Result<T, &'static str>,
+{
+    let mut first_blocked = None;
+    for sym in order {
+        match gate(sym) {
+            Ok(v) => return Ok((sym.clone(), v)),
+            Err(why) => {
+                first_blocked.get_or_insert((sym.clone(), why));
+            }
+        }
+    }
+    Err(first_blocked)
+}
+
+/// The book must still be within the net tolerance AFTER the close (before
+/// the re-open), in the direction the close moves it: closing short raises
+/// long − short by the clip, closing long lowers it.
+fn roll_post_close_net_ok(
+    net_qty: f64,
+    leg: Leg,
+    clip_qty: f64,
+    long_mark: f64,
+    tol_usd: f64,
+) -> bool {
+    let after = match leg {
+        Leg::Short => net_qty + clip_qty,
+        Leg::Long => net_qty - clip_qty,
+    };
+    (after * long_mark).abs() <= tol_usd
+}
+
+/// The roll's balance gate: the book must be within the net tolerance NOW
+/// (a book already in breach is not rolled — the re-open would restore the
+/// breach) AND still within it after the close.
+fn roll_balanced(net_qty: f64, leg: Leg, clip_qty: f64, long_mark: f64, tol_usd: f64) -> bool {
+    (net_qty * long_mark).abs() <= tol_usd
+        && roll_post_close_net_ok(net_qty, leg, clip_qty, long_mark, tol_usd)
+}
+
+/// The simulated (DRY_RUN) quantity of `leg` in a book.
+fn roll_dry_leg_qty(b: &SymBook, leg: Leg) -> f64 {
+    match leg {
+        Leg::Long => b.dry_long_qty,
+        Leg::Short => b.dry_short_qty,
+    }
+}
+
+/// Whether the re-open may go out, decided on the FRESH mark read after
+/// the close settled: `None` = go, else the `roll_done` outcome. It is
+/// refused when the mark moved beyond the price margin from the gated mark
+/// (the re-open would trade outside the band the roll was approved for),
+/// or when its fresh reservation no longer fits the weekly caps. Either way
+/// the planner repairs the one-clip gap on a later tick — that execution is
+/// booked when it settles but, by design, is never blocked by the caps
+/// (they gate rolls only).
+fn roll_reopen_decision(
+    cfg: &RollCfg,
+    rs: &RollState,
+    gated_mark: f64,
+    fresh_mark: f64,
+    reserve: (f64, f64),
+) -> Option<&'static str> {
+    if !roll_price_ok(gated_mark, fresh_mark) {
+        return Some("reopen_price_moved");
+    }
+    roll_fits(cfg, rs, reserve).map(|_| "reopen_capped")
+}
+
+/// Mark the roll clip is sized at: the higher of the rolled leg's mark and
+/// the long mark the net guard uses, so clip × either mark ≤ the clip USD.
+fn roll_sizing_mark(leg_mark: f64, long_mark: f64) -> f64 {
+    leg_mark.max(long_mark)
+}
+
+/// Worst-case Arcus taker fee (Base tier) used to pre-book a roll leg's
+/// cost before it is sent.
+const ROLL_RESERVE_FEE_BPS: f64 = 2.25;
+
+/// What a roll leg books against the weekly caps BEFORE it is sent: its
+/// full notional and a worst-case cost (fee + the IOC slippage bound).
+fn roll_reserve(notional_usd: f64, slippage_bps: u32) -> (f64, f64) {
+    // valued at the worst price a send is allowed at (mark ± margin), and
+    // costed with the fee, the IOC slippage bound and that price move
+    let worst = notional_usd * (1.0 + ROLL_PRICE_MARGIN);
+    (
+        worst,
+        worst * (ROLL_RESERVE_FEE_BPS + slippage_bps as f64) / 10_000.0
+            + notional_usd * ROLL_PRICE_MARGIN,
+    )
+}
+
+/// A roll leg may only be sent while the leg's fresh mark is within
+/// `ROLL_PRICE_MARGIN` of the mark its reservation was sized at.
+fn roll_price_ok(reserved_mark: f64, fresh_mark: f64) -> bool {
+    reserved_mark > 0.0 && ((fresh_mark / reserved_mark) - 1.0).abs() <= ROLL_PRICE_MARGIN
+}
+
+/// Outcome of one settled roll leg (an `Err` executed nothing, or became
+/// uncertain — see `roll_leg_sent`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct RollLeg {
+    filled: f64,
+    cost: f64,
+}
+
+/// What one `execute` did: the size the venue reports filled, and the fee
+/// and filled value of the order's own fills when they were read (Arcus
+/// settle), else 0 and filled × the leg's mark. Returned only for an order
+/// the venue accepted (DRY_RUN: simulated); failures before or at the send,
+/// and uncertain orders, are `Err`.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct ExecResult {
+    filled: f64,
+    fee: f64,
+    value: f64,
+    order_id: String,
+    /// Limit the connector actually sent (after its own tick rounding).
+    ordered_price: Decimal,
+}
+
+/// A ROLL leg's execution context: the only caller that sends an absolute
+/// limit and whose settle drops the roll's in-flight reservation and books
+/// at the leg's anchor mark. Explicit, so a future non-roll caller with a
+/// bounded price can never be mistaken for a roll leg.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RollCtx {
+    /// Tick-rounded absolute IOC limit (`roll_limit_dec`).
+    limit: Decimal,
+}
+
+/// The venue side and reduce-only flag an order is sent with: the ONE
+/// mapping (the send, the roll limit's direction and the roll cost's sign
+/// all derive from it, so they cannot disagree).
+fn order_side(order: &Order) -> (OrderSide, bool) {
+    match (order.leg, order.qty > 0.0) {
+        (Leg::Long, true) => (OrderSide::Long, false),
+        (Leg::Long, false) => (OrderSide::Short, true),
+        (Leg::Short, true) => (OrderSide::Short, false),
+        (Leg::Short, false) => (OrderSide::Long, true),
+    }
+}
+
+/// Roll cost of one execution: the fee plus the ADVERSE slippage against the
+/// mark at send (paid above mark on a buy, received below it on a sell).
+/// Never negative: a fee reported debit-signed still raises it (Arcus
+/// reports it positive — testnet 2026-09-28: 0.038 on $84.5), and a price
+/// better than the (possibly stale) mark counts as zero slippage, never as a
+/// credit that would loosen the weekly cost cap.
+fn roll_cost(is_buy: bool, filled: f64, fee: f64, value: f64, mark: f64) -> f64 {
+    let at_mark = filled * mark;
+    let slip = if is_buy {
+        value - at_mark
+    } else {
+        at_mark - value
+    };
+    fee.abs() + slip.max(0.0)
+}
+
+/// One read of an Arcus order: book presence, cancel, and its fills.
+#[derive(Debug, Clone, Default)]
+struct OrderView {
+    open: bool,
+    canceled: bool,
+    filled: f64,
+    fee: f64,
+    value: f64,
+    trades: Vec<String>,
 }
 
 /// Outcome of one look at a just-sent IOC.
@@ -764,10 +1585,6 @@ fn settle_decision(
     Settle::Terminal(fills_sum)
 }
 
-/// An uncertain IOC may be released once the venue has had
-/// `grace_secs` to finish it (an IOC lives milliseconds on the matching
-/// engine; what is slow is only its visibility) and it is no longer open.
-/// With no order id the whole symbol must show no open order.
 /// The Lighter account whose points rows feed the subsidy block: only when
 /// the LONG leg is on Lighter (an Arcus long must never be credited with a
 /// stray LIGHTER_ACCOUNT_INDEX_<instance>'s points).
@@ -992,6 +1809,18 @@ fn reconcile_state_mode(mut state: State, dry_run: bool) -> State {
             state.halt_reason = None;
         }
     }
+    // Roll bookkeeping belongs to one mode: simulated DRY_RUN rolls must not
+    // eat the live week's budget (or delay the first live roll), nor live
+    // counters a DRY_RUN run.
+    if state.dry_run.is_some_and(|was| was != dry_run) && state.roll != RollState::default() {
+        log::warn!(
+            "[STARTUP] dry_run flip: resetting roll bookkeeping (was week vol ${:.0} / cost ${:.2}, {} in flight)",
+            state.roll.week_volume_usd,
+            state.roll.week_cost_usd,
+            state.roll.in_flight.len()
+        );
+        state.roll = RollState::default();
+    }
     // Uncertain orders are live venue orders: DRY_RUN never sends and never
     // reconciles, so an entry carried into a dry-run process would block its
     // symbol for good (and keep ARM from rebuilding the dry book). Drop them;
@@ -1039,6 +1868,43 @@ fn planned_growth_usd(plan: &[(String, Vec<Order>)], snap: &Snapshot, leg: Leg) 
                 }
         })
         .sum()
+}
+
+/// Per-symbol (notional, mmr) of one venue AFTER the tick's growth orders:
+/// the held notional plus each growth order's qty at that venue's mark.
+fn legs_after_growth(
+    plan: &[(String, Vec<Order>)],
+    snap: &Snapshot,
+    cfg: &Config,
+    leg: Leg,
+) -> Vec<(f64, f64)> {
+    let mut legs = snap.legs(cfg, leg);
+    for (c, l) in cfg.symbols.iter().zip(legs.iter_mut()) {
+        let mark = snap.mark_of(leg, &c.symbol);
+        let grow: f64 = plan
+            .iter()
+            .filter(|(sym, _)| *sym == c.symbol)
+            .flat_map(|(_, os)| os.iter())
+            .filter(|o| o.leg == leg && o.qty > 0.0)
+            .map(|o| o.qty)
+            .sum();
+        l.0 += grow * mark;
+    }
+    legs
+}
+
+/// Growth guard on liquidation headroom: after the tick's growth, the
+/// venue's headroom must stay at or above `liq_guard_pct` (the bound the
+/// roll's re-open is gated on). Nothing held after growth = ok.
+/// The post-growth headroom halt is part of the roll feature (it repairs a
+/// refused re-open by levelling down): it applies only while the roll is
+/// enabled, so a default-off deployment keeps its pre-roll planner.
+fn growth_headroom_guard_applies(roll_enabled: bool, growth_usd: f64) -> bool {
+    roll_enabled && growth_usd > 0.0
+}
+
+fn growth_headroom_ok(equity_usd: f64, legs_after: &[(f64, f64)], liq_guard_pct: f64) -> bool {
+    liq_headroom_pct(equity_usd, legs_after).is_none_or(|h| h >= liq_guard_pct)
 }
 
 /// The tick's plan with every growth order removed (reductions — DISARM
@@ -1339,6 +2205,14 @@ impl Snapshot {
             Leg::Short => self.short.equity_usd,
         }
     }
+
+    /// `sym`'s mark on `leg`'s own venue (0 when unknown).
+    fn mark_of(&self, leg: Leg, sym: &str) -> f64 {
+        match leg {
+            Leg::Long => self.long.mark(sym),
+            Leg::Short => self.short.mark(sym),
+        }
+    }
 }
 
 struct Venue {
@@ -1566,16 +2440,33 @@ impl Engine {
         Ok(snap)
     }
 
-    /// One taker IOC on one leg of one symbol; returns the size the venue
-    /// reports filled (position delta), which is what the book is
-    /// re-planned from.
-    async fn execute(&mut self, symbol: &str, order: &Order, mark: f64) -> Result<f64> {
-        let (venue, side, reduce_only) = match (order.leg, order.qty > 0.0) {
-            (Leg::Long, true) => (&self.long, OrderSide::Long, false),
-            (Leg::Long, false) => (&self.long, OrderSide::Short, true),
-            (Leg::Short, true) => (&self.short, OrderSide::Short, false),
-            (Leg::Short, false) => (&self.short, OrderSide::Long, true),
+    /// One taker IOC on one leg of one symbol. `roll`: a ROLL leg — sent at
+    /// its ABSOLUTE tick-rounded limit (bound to the reserved mark) instead of
+    /// the touch ± `HEDGE_TAKER_SLIPPAGE_BPS` the planner uses, booked at that
+    /// anchor mark, and settling the roll's in-flight reservation. Returns
+    /// the size the venue reports filled (position delta — what the book is
+    /// re-planned from) with the fee / value of its own fills when read.
+    async fn execute(
+        &mut self,
+        symbol: &str,
+        order: &Order,
+        mark: f64,
+        roll: Option<RollCtx>,
+    ) -> Result<ExecResult> {
+        // Roll accounting values slippage against THIS leg's venue mark (the
+        // planner passes the long mark; an Arcus leg must not book the venue
+        // basis as cost or credit). A roll leg books against the mark its
+        // reservation and limit were anchored at.
+        let leg_mark = self.last_snapshot.mark_of(order.leg, symbol);
+        let book_mark = if roll.is_some() || leg_mark <= 0.0 {
+            mark
+        } else {
+            leg_mark
         };
+        let roll_sym = roll.is_some().then_some(symbol);
+        let (side, reduce_only) = order_side(order);
+        let is_buy = side == OrderSide::Long;
+        let venue = self.venue(order.leg);
         let qty = order.qty.abs();
         if self.cfg.dry_run {
             log::info!(
@@ -1596,25 +2487,69 @@ impl Engine {
                 "symbol": symbol, "leg": format!("{:?}", order.leg), "venue": instance,
                 "exchange": exchange,
                 "side": format!("{side}"), "qty": qty, "reduce_only": reduce_only,
-                "price": mark, "dry_run": true }),
+                "price": mark, "dry_run": true, "roll": roll.is_some() }),
+            );
+            self.roll_book_execution(
+                roll_sym,
+                order.leg,
+                is_buy,
+                qty,
+                0.0,
+                qty * book_mark,
+                book_mark,
             );
             self.persist();
-            return Ok(qty);
+            return Ok(ExecResult {
+                filled: qty,
+                fee: 0.0,
+                value: qty * book_mark,
+                order_id: "dry_run".to_string(),
+                ordered_price: roll
+                    .map(|r| r.limit)
+                    .or_else(|| Decimal::from_f64(mark))
+                    .unwrap_or_default(),
+            });
         }
         let before = venue.signed_qty(symbol).await?;
         let size = decimal(qty, "qty")?.round_dp(self.meta(symbol).size_decimals);
         let exchange = venue.kind;
-        let resp = match venue
-            .dex
-            .create_order_taker_ioc(symbol, size, side, self.cfg.taker_slippage_bps, reduce_only)
-            .await
-        {
+        let sent = match roll.map(|r| r.limit) {
+            Some(limit) => {
+                venue
+                    .dex
+                    .create_order_taker_ioc_at(symbol, size, side, limit, reduce_only)
+                    .await
+            }
+            None => {
+                venue
+                    .dex
+                    .create_order_taker_ioc(
+                        symbol,
+                        size,
+                        side,
+                        self.cfg.taker_slippage_bps,
+                        reduce_only,
+                    )
+                    .await
+            }
+        };
+        let resp = match sent {
             Ok(r) => r,
             Err(DexError::ReconciliationRequired { detail, .. }) => {
                 // The venue may have taken it: never re-send before the
                 // position says what happened.
                 let reason = format!("submission ambiguous: {detail}");
-                self.mark_uncertain(symbol, order.leg, exchange, None, qty, before, &reason);
+                self.mark_uncertain(
+                    symbol,
+                    order.leg,
+                    exchange,
+                    None,
+                    qty,
+                    before,
+                    book_mark,
+                    roll.is_some(),
+                    &reason,
+                );
                 bail!(
                     "{} IOC {side} {symbol} {size}: {reason}",
                     self.venue(order.leg).name
@@ -1623,7 +2558,7 @@ impl Engine {
             Err(e) => bail!("{} IOC {side} {symbol} {size}: {e:?}", venue.name),
         };
         let order_id = resp.order_id.clone();
-        let filled = if exchange == VenueKind::Arcus {
+        let (filled, fills) = if exchange == VenueKind::Arcus {
             // Arcus acks with 202: the fill is final only once the order is
             // out of the open orders AND its fills (or its cancel) are
             // visible and agree with the position change.
@@ -1631,7 +2566,7 @@ impl Engine {
                 .settle_arcus(order.leg, symbol, &order_id, qty, before)
                 .await
             {
-                Some(f) => f,
+                Some((f, fee, value)) => (f, Some((fee, value))),
                 None => {
                     let reason = format!(
                         "not terminal after {:?}s (order {order_id})",
@@ -1644,6 +2579,8 @@ impl Engine {
                         Some(order_id.clone()),
                         qty,
                         before,
+                        book_mark,
+                        roll.is_some(),
                         &reason,
                     );
                     bail!(
@@ -1665,8 +2602,15 @@ impl Engine {
                     break;
                 }
             }
-            filled
+            (filled, None)
         };
+        // Every settled execution on the rolled (Arcus) leg books its actual
+        // value and cost into the roll week — roll legs and the planner's
+        // levelling / repairs / ARM builds alike.
+        if let Some((fee, value)) = fills {
+            self.roll_book_execution(roll_sym, order.leg, is_buy, filled, fee, value, book_mark);
+            self.persist();
+        }
         let venue = self.venue(order.leg);
         log::info!(
             "[FILL] {} {side} {symbol} req={qty} filled={filled:.5} reduce_only={reduce_only} limit={} order_id={}",
@@ -1678,9 +2622,17 @@ impl Engine {
             "symbol": symbol, "leg": format!("{:?}", order.leg), "venue": venue.instance,
             "exchange": venue.kind.dex_name(),
             "side": format!("{side}"), "req": qty, "filled": filled, "reduce_only": reduce_only,
-            "limit": resp.ordered_price.to_string(), "order_id": resp.order_id, "mark": mark }),
+            "limit": resp.ordered_price.to_string(), "order_id": resp.order_id, "mark": mark,
+            "roll": roll.is_some() }),
         );
-        Ok(filled)
+        let (fee, value) = fills.unwrap_or((0.0, filled * book_mark));
+        Ok(ExecResult {
+            filled,
+            fee,
+            value,
+            order_id,
+            ordered_price: resp.ordered_price,
+        })
     }
 
     fn venue(&self, leg: Leg) -> &Venue {
@@ -1704,6 +2656,8 @@ impl Engine {
         order_id: Option<String>,
         qty: f64,
         before_qty: f64,
+        mark: f64,
+        roll: bool,
         reason: &str,
     ) {
         log::error!(
@@ -1717,8 +2671,10 @@ impl Engine {
             order_id,
             qty,
             before_qty,
+            mark,
             sent_at: now_secs(),
             reason: reason.to_string(),
+            roll,
         };
         self.event(
             "uncertain",
@@ -1728,14 +2684,8 @@ impl Engine {
         self.persist();
     }
 
-    /// One read of an Arcus order's state: (open, canceled, fills sum,
-    /// trade ids of those fills). `None` when a read failed.
-    async fn arcus_order_view(
-        &self,
-        leg: Leg,
-        symbol: &str,
-        order_id: &str,
-    ) -> Option<(bool, bool, f64, Vec<String>)> {
+    /// One read of an Arcus order's state. `None` when a read failed.
+    async fn arcus_order_view(&self, leg: Leg, symbol: &str, order_id: &str) -> Option<OrderView> {
         let dex = &self.venue(leg).dex;
         let open = dex
             .get_open_orders(symbol)
@@ -1751,19 +2701,25 @@ impl Engine {
             .orders
             .iter()
             .any(|o| o.order_id == order_id);
-        let mut sum = 0.0;
-        let mut trades = Vec::new();
+        let mut view = OrderView {
+            open,
+            canceled,
+            ..OrderView::default()
+        };
         for f in dex.get_filled_orders(symbol).await.ok()?.orders {
             if f.order_id == order_id {
-                sum += f.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
-                trades.push(f.trade_id);
+                view.filled += f.filled_size.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
+                view.fee += f.filled_fee.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                view.value += f.filled_value.and_then(|d| d.to_f64()).unwrap_or(0.0).abs();
+                view.trades.push(f.trade_id);
             }
         }
-        Some((open, canceled, sum, trades))
+        Some(view)
     }
 
-    /// Settle an Arcus IOC within `HEDGE_FILL_WAIT_SECS`: `Some(filled)`
-    /// once terminal, `None` when it is still unknown after the last wait.
+    /// Settle an Arcus IOC within `HEDGE_FILL_WAIT_SECS`: `Some((filled,
+    /// fee, value))` once terminal, `None` when still unknown after the last
+    /// wait.
     async fn settle_arcus(
         &mut self,
         leg: Leg,
@@ -1771,24 +2727,27 @@ impl Engine {
         order_id: &str,
         qty: f64,
         before: f64,
-    ) -> Option<f64> {
+    ) -> Option<(f64, f64, f64)> {
         let tol = self.size_tol(symbol);
         for &wait in &self.cfg.fill_wait_secs.clone() {
             tokio::time::sleep(Duration::from_secs(wait)).await;
-            let Some((open, canceled, sum, trades)) =
-                self.arcus_order_view(leg, symbol, order_id).await
-            else {
+            let Some(v) = self.arcus_order_view(leg, symbol, order_id).await else {
                 continue;
             };
             let Ok(after) = self.venue(leg).signed_qty(symbol).await else {
                 continue;
             };
-            if let Settle::Terminal(f) =
-                settle_decision(qty, open, canceled, sum, (after - before).abs(), tol)
-            {
-                self.forget_arcus_activity(leg, symbol, order_id, &trades)
+            if let Settle::Terminal(f) = settle_decision(
+                qty,
+                v.open,
+                v.canceled,
+                v.filled,
+                (after - before).abs(),
+                tol,
+            ) {
+                self.forget_arcus_activity(leg, symbol, order_id, &v.trades)
                     .await;
-                return Some(f);
+                return Some((f, v.fee, v.value));
             }
         }
         None
@@ -1808,6 +2767,639 @@ impl Engine {
             let _ = dex.clear_filled_order(symbol, t).await;
         }
         let _ = dex.clear_canceled_order(symbol, order_id).await;
+    }
+
+    /// One roll leg (reduce when `order.qty < 0`, re-open when > 0) on the
+    /// Arcus leg: a taker IOC at an ABSOLUTE limit bound to the reserved
+    /// mark and rounded to the tick exactly as the venue will receive it
+    /// (`roll_limit_dec`), refused before the send if the leg's mark has moved
+    /// beyond the margin the reservation covers or that limit cannot reach
+    /// the touch. Terminal before it returns (it settles through `execute`,
+    /// which also books its fills); every roll IOC that reached the venue
+    /// emits `roll_leg` (settled, uncertain, or accepted-but-unmarketable).
+    /// `Err` = nothing executed, or the order became uncertain (the caller
+    /// tells the two apart with `roll_leg_sent`). `fresh_tick`: the caller has
+    /// just read the ticker and `mark` IS that fresh mark (the re-open), so
+    /// the price guard's own ticker read is skipped; carries its tick.
+    async fn roll_one(
+        &mut self,
+        symbol: &str,
+        order: &Order,
+        mark: f64,
+        kind: &'static str,
+        fresh_tick: Option<Option<Decimal>>,
+        reserve: (f64, f64),
+    ) -> Result<RollLeg> {
+        // buys = long grows / short shrinks, from the send's own mapping
+        let is_buy = order_side(order).0 == OrderSide::Long;
+        let tick = match fresh_tick {
+            Some(t) => t,
+            None => self.roll_price_guard(symbol, order.leg, mark).await?,
+        };
+        let limit = roll_limit_dec(is_buy, mark, tick).ok_or_else(|| {
+            anyhow!("roll IOC {symbol}: no usable limit from mark {mark} — not sent")
+        })?;
+        // An IOC that cannot reach the touch would be accepted, fill nothing
+        // and still spend the interval: refuse it before the send.
+        let book = self
+            .venue(order.leg)
+            .dex
+            .get_order_book(symbol, 1)
+            .await
+            .map_err(|e| anyhow!("roll book {symbol}: {e:?}"))?;
+        let bid = book.bids.first().map(|l| l.price);
+        let ask = book.asks.first().map(|l| l.price);
+        if !roll_limit_crosses(is_buy, limit, bid, ask) {
+            bail!("roll IOC {symbol}: limit {limit} does not reach the touch (bid {bid:?} / ask {ask:?}) — not sent");
+        }
+        // Reserve only now, every pre-send refusal above having passed: a
+        // crash before this point leaves no reservation for the restart to
+        // book as a phantom roll; one after it is booked conservatively.
+        roll_reserve_for_send(&mut self.state.roll, symbol, reserve);
+        self.persist();
+        let r = match self
+            .execute(symbol, order, mark, Some(RollCtx { limit }))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // It reached the venue and may fill: the per-leg record the
+                // #1075 reconciliation needs most (a roll gate never runs on
+                // an uncertain symbol, so a roll entry here is this send's).
+                if let Some(u) = self.state.uncertain.get(symbol).filter(|u| u.roll) {
+                    let oid = u.order_id.clone();
+                    self.event(
+                        "roll_leg",
+                        serde_json::json!({ "symbol": symbol, "leg": format!("{:?}", order.leg),
+                            "kind": kind, "status": "uncertain", "order_id": oid,
+                            "req": order.qty.abs(), "mark": mark, "limit": limit.to_string() }),
+                    );
+                }
+                return Err(e);
+            }
+        };
+        let cost = roll_cost(is_buy, r.filled, r.fee, r.value, mark);
+        let unmarketable = roll_unfilled_is_refusal(is_buy, r.filled, r.ordered_price, bid, ask);
+        self.event(
+            "roll_leg",
+            serde_json::json!({ "symbol": symbol, "leg": format!("{:?}", order.leg),
+                "kind": kind,
+                "status": if unmarketable { "sent_unmarketable" } else { "settled" },
+                "order_id": r.order_id, "req": order.qty.abs(),
+                "filled": r.filled, "fee": r.fee, "value": r.value, "mark": mark,
+                "limit": limit.to_string(), "sent_price": r.ordered_price.to_string(),
+                "cost_usd": cost }),
+        );
+        if unmarketable {
+            // The connector rounded our limit to a different tick (a tier
+            // boundary) and it did not reach the pre-send touch: nothing
+            // executed — a send-time refusal, not a roll that ran.
+            bail!(
+                "roll IOC {symbol}: sent at {} (ours {limit}) did not reach the touch (bid {bid:?} / ask {ask:?}) — refusal",
+                r.ordered_price
+            );
+        }
+        Ok(RollLeg {
+            filled: r.filled,
+            cost,
+        })
+    }
+
+    /// (mark, clip qty, gates) for rolling `sym` on `leg`. The clip is the
+    /// configured notional floored to the size decimals and is NEVER raised
+    /// to the venue minimum (that would exceed the clip / net-tolerance
+    /// bound the config validated); a clip below the minimum blocks.
+    fn roll_gate(
+        &self,
+        sym: &str,
+        leg: Leg,
+        snap: &Snapshot,
+        kill: bool,
+        now: u64,
+    ) -> (f64, f64, RollGate) {
+        let mark = snap.mark_of(leg, sym);
+        let m = self.meta(sym);
+        // Size the clip at the HIGHER of the two venues' marks: the net
+        // guard values |long − short| at the long mark, so a clip sized at a
+        // cheaper Arcus mark could exceed the net tolerance it was validated
+        // against (the feed gate allows up to 2 % divergence).
+        let sizing_mark = roll_sizing_mark(mark, snap.long.mark(sym));
+        let clip_qty = qty_for_notional(self.cfg.roll.clip_usd, sizing_mark, m.size_decimals);
+        let held = snap.book(sym);
+        let leg_qty = match leg {
+            Leg::Long => held.long,
+            Leg::Short => held.short,
+        };
+        let headroom = liq_headroom_pct(snap.equity(leg), &snap.legs(&self.cfg, leg));
+        // (only armed books reach here: maybe_roll pre-filters on Mode::On)
+        let gate = RollGate {
+            backed_off: roll_symbol_backed_off(&self.state.roll, sym, now),
+            balanced: roll_balanced(
+                held.net(),
+                leg,
+                clip_qty,
+                snap.long.mark(sym),
+                self.cfg.net_tolerance_usd,
+            ),
+            halted: self.state.halted,
+            kill,
+            uncertain: self.state.uncertain.contains_key(sym),
+            feed_ok: self.feed_problem.is_none(),
+            headroom_ok: headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
+            leverage_ok: self.cfg.dry_run
+                || leverage_ok(
+                    snap.gross(&self.cfg, leg),
+                    snap.equity(leg),
+                    self.cfg.max_leverage,
+                ),
+            clip_ok: clip_qty > 0.0 && clip_qty >= m.min_qty,
+            leg_holds_clip: clip_qty > 0.0 && leg_qty >= clip_qty,
+        };
+        (mark, clip_qty, gate)
+    }
+
+    /// Book one settled execution into the roll week (of the booking time)
+    /// when it is on the rolled (Arcus) leg. For a ROLL leg (`roll_sym`) the
+    /// booking and the drop of its in-flight reservation are one mutation.
+    /// Does NOT persist: `execute` persists once per settled execution.
+    #[allow(clippy::too_many_arguments)]
+    fn roll_book_execution(
+        &mut self,
+        roll_sym: Option<&str>,
+        leg: Leg,
+        is_buy: bool,
+        filled: f64,
+        fee: f64,
+        value: f64,
+        mark: f64,
+    ) {
+        let booking = roll_execution_booking(
+            self.cfg.roll_accounting_leg(),
+            leg,
+            is_buy,
+            filled,
+            fee,
+            value,
+            mark,
+        );
+        let now = now_secs();
+        match roll_sym {
+            Some(sym) => roll_settle_leg(&mut self.state.roll, sym, now, booking),
+            None => {
+                if let Some(b) = booking {
+                    roll_book_actual(&mut self.state.roll, now, b);
+                }
+            }
+        }
+    }
+
+    /// Refuse to send a roll leg once the leg's mark has moved beyond the
+    /// margin its reservation covers (not an uncertain failure: nothing sent).
+    /// Returns the venue's tick at that price (for the limit's rounding).
+    async fn roll_price_guard(
+        &self,
+        symbol: &str,
+        leg: Leg,
+        reserved_mark: f64,
+    ) -> Result<Option<Decimal>> {
+        let venue = self.venue(leg);
+        let t = venue
+            .dex
+            .get_ticker(symbol, None)
+            .await
+            .map_err(|e| anyhow!("{} get_ticker {symbol}: {e:?}", venue.name))?;
+        let fresh = t.price.to_f64().unwrap_or(0.0);
+        if !roll_price_ok(reserved_mark, fresh) {
+            bail!(
+                "roll price moved: {symbol} mark {fresh} vs reserved {reserved_mark} (> {} %) — not sent",
+                ROLL_PRICE_MARGIN * 100.0
+            );
+        }
+        Ok(t.min_tick)
+    }
+
+    /// Roll one clip of the Arcus leg when due and every gate is open.
+    /// Strictly sequential: the re-open starts only after the close is
+    /// terminal, sized to what the close filled. A failed or uncertain
+    /// re-open leaves the book one clip lopsided (within the net tolerance by
+    /// config): the uncertain guard holds the symbol until reconciled, then
+    /// the normal levelling grows the smaller leg back.
+    ///
+    /// Runs only on a tick that sent nothing and reconciled nothing (the
+    /// caller guarantees it), so `snap` is fresh for every symbol; every
+    /// booking rolls the week over to its own time (`roll_book_actual`). It
+    /// blocks the tick for at most three IOC settles — close, re-open, or
+    /// close + the KILL_SWITCH levelling IOC — (≈ 3 × the sum of
+    /// `HEDGE_FILL_WAIT_SECS`), plus the ticker / book / equity reads.
+    /// Returns the number of roll orders it sent (for `orders_this_tick`).
+    async fn maybe_roll(&mut self, now: u64, snap: &Snapshot, kill: bool) -> usize {
+        if !self.cfg.roll.enabled {
+            return 0;
+        }
+        let Some(leg) = self.cfg.roll_leg() else {
+            return 0;
+        };
+        // Round robin over the armed books; a blocked book is skipped so it
+        // cannot starve the others.
+        let syms: Vec<String> = self.cfg.symbol_names();
+        let start = self
+            .state
+            .roll
+            .last_symbol
+            .as_ref()
+            .and_then(|l| syms.iter().position(|s| s == l))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let order: Vec<String> = (0..syms.len())
+            .map(|k| syms[(start + k) % syms.len()].clone())
+            .filter(|s| self.state.book(s).mode == Mode::On)
+            .collect();
+        if order.is_empty() {
+            return 0;
+        }
+        let picked = pick_roll_symbol(&order, |sym| {
+            let (mark, clip_qty, gate) = self.roll_gate(sym, leg, snap, kill, now);
+            // exactly what the two legs will reserve
+            let (leg_v, leg_c) = roll_reserve(clip_qty * mark, self.cfg.taker_slippage_bps);
+            match roll_blocker(
+                &self.cfg.roll,
+                &self.state.roll,
+                now,
+                &gate,
+                2.0 * leg_v,
+                2.0 * leg_c,
+            ) {
+                None => Ok((mark, clip_qty)),
+                Some(why) => Err(why),
+            }
+        });
+        let (sym, (mark, clip_qty)) = match picked {
+            Ok(v) => v,
+            Err(first) => {
+                // a symbol backing off keeps its refusal's reason (set when it
+                // was refused) instead of overwriting it with "refusal_backoff"
+                if first.as_ref().is_some_and(|(_, w)| *w == "refusal_backoff") {
+                    return 0;
+                }
+                let why = first
+                    .as_ref()
+                    .filter(|(_, w)| *w != "interval")
+                    .map(|(s, w)| format!("{s}: {w}"));
+                if self.state.roll.blocked_reason != why {
+                    if let Some(w) = &why {
+                        log::info!("[ROLL] blocked: {w}");
+                        self.event("roll_blocked", serde_json::json!({ "reason": w }));
+                    }
+                    self.state.roll.blocked_reason = why;
+                    self.persist();
+                }
+                return 0;
+            }
+        };
+        let m = self.meta(&sym);
+        log::info!("[ROLL] {sym} {leg:?} clip {clip_qty} @ {mark:.2}");
+        self.event(
+            "roll_start",
+            serde_json::json!({ "symbol": sym, "leg": format!("{leg:?}"), "clip_qty": clip_qty,
+                "mark": mark }),
+        );
+        self.state.roll.last_symbol = Some(sym.clone());
+        self.state.roll.blocked_reason = None;
+        let close = Order {
+            leg,
+            qty: -clip_qty,
+        };
+        // Each leg is reserved (worst case) before it is sent; its fills
+        // book themselves where they settle and the reservation is dropped,
+        // unless the leg ends uncertain (then it stays until released).
+        let slip = self.cfg.taker_slippage_bps;
+        let (close_leg, close_sent) = self
+            .roll_leg_send(&sym, &close, mark, clip_qty * mark, slip, "close", None)
+            .await;
+        let close_filled = close_leg.as_ref().map(|l| l.filled).unwrap_or(0.0);
+        let close_cost = close_leg.as_ref().map(|l| l.cost).unwrap_or(0.0);
+        let close_err = close_leg.as_ref().err().map(|e| format!("{e:#}"));
+        let (mut open_filled, mut open_cost) = (0.0, 0.0);
+        let mut reopen_sent = false;
+        // a KILL_SWITCH levelling reduction of the other leg (not a roll leg)
+        let mut levelling_sent = false;
+        let mut outcome = "done";
+        if let Some(e) = &close_err {
+            log::warn!("[ROLL] {sym} close: {e}");
+        }
+        match roll_close_stage(
+            leg,
+            close_sent,
+            self.state.uncertain.contains_key(&sym),
+            close_filled,
+            m.min_qty,
+            m.size_decimals,
+        ) {
+            // close_partial_below_min: the planner repairs the shrunken leg
+            // later and that execution books itself when it settles
+            Err(o) => outcome = o,
+            // re-open exactly what the close filled
+            Ok(reopen) => {
+                // The re-open goes out only after the close settled (seconds
+                // later): re-read the growth gates (KILL_SWITCH; Arcus-leg
+                // headroom and leverage from a FRESH equity read) and re-anchor
+                // it on a FRESH mark — refused when that mark moved beyond the
+                // reservation margin from the gated one, or when its fresh
+                // reservation no longer fits the weekly caps.
+                // A refused re-open leaves the leg one clip short:
+                // the planner grows it back on the next unrestricted tick (that
+                // execution books itself) — except under KILL_SWITCH, where the
+                // planner makes no growth, so the gap is levelled here by a
+                // REDUCTION of the other leg.
+                let kill_now = self.sentinels.kill_switch_engaged();
+                // one ticker read gives the fresh mark AND its tick; roll_one
+                // then skips its own guard read (the mark is that read)
+                let fresh = if kill_now {
+                    None
+                } else {
+                    match self.venue(leg).dex.get_ticker(&sym, None).await {
+                        Ok(t) => {
+                            let p = t.price.to_f64().unwrap_or(0.0);
+                            (p > 0.0).then_some((p, t.min_tick))
+                        }
+                        Err(e) => {
+                            log::warn!("[ROLL] {sym} re-open: fresh mark read failed: {e:?}");
+                            None
+                        }
+                    }
+                };
+                // FRESH equity and FRESH positions (live) — the snapshot's are
+                // from the start of the tick, before the close settled.
+                let fresh_account: Option<(f64, std::collections::BTreeMap<String, f64>)> =
+                    if kill_now || fresh.is_none() {
+                        None
+                    } else if self.cfg.dry_run {
+                        // DRY_RUN never reads the venue account: the simulated
+                        // equity and book the snapshot and the roll gate use.
+                        let dry: std::collections::BTreeMap<String, f64> = self
+                            .cfg
+                            .symbols
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.symbol.clone(),
+                                    roll_dry_leg_qty(&self.state.book(&c.symbol), leg),
+                                )
+                            })
+                            .collect();
+                        Some((self.cfg.dry_run_equity_usd, dry))
+                    } else {
+                        match (
+                            self.venue(leg).equity().await,
+                            self.venue(leg).positions().await,
+                        ) {
+                            (Ok(e), Ok(p)) => Some((e, p)),
+                            (e, p) => {
+                                log::warn!(
+                                    "[ROLL] {sym} re-open: fresh account read failed (equity ok={} positions ok={})",
+                                    e.is_ok(),
+                                    p.is_ok()
+                                );
+                                None
+                            }
+                        }
+                    };
+                // FRESH marks for every OTHER held symbol too: the gates are
+                // account-wide, and a stale tick-start mark would understate a
+                // market that moved while the close settled.
+                let mut fresh_marks: Option<std::collections::BTreeMap<String, f64>> =
+                    fresh_account.as_ref().map(|_| Default::default());
+                if let (Some(marks), Some((_, pos))) = (fresh_marks.as_mut(), &fresh_account) {
+                    for (s, q) in pos {
+                        if *s == sym || q.abs() <= 0.0 {
+                            continue;
+                        }
+                        match self.venue(leg).dex.get_ticker(s, None).await {
+                            Ok(t) if t.price.to_f64().is_some_and(|p| p > 0.0) => {
+                                marks.insert(s.clone(), t.price.to_f64().unwrap_or(0.0));
+                            }
+                            other => {
+                                log::warn!(
+                                    "[ROLL] {sym} re-open: fresh {s} mark read failed ({})",
+                                    if other.is_ok() { "no price" } else { "error" }
+                                );
+                                fresh_marks = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let gate = match (kill_now, &fresh, &fresh_account, &fresh_marks) {
+                    (true, _, _, _) => roll_reopen_blocked(true, true, true),
+                    (false, Some((f, _)), Some((eq, pos)), Some(marks)) => {
+                        let legs_after = reopen_legs_after(
+                            &self.cfg.symbols,
+                            leg,
+                            |s| pos.get(s).copied().unwrap_or(0.0),
+                            |s| marks.get(s).copied().unwrap_or(0.0),
+                            &sym,
+                            reopen.qty,
+                            *f,
+                        );
+                        let gross_after: f64 = legs_after.iter().map(|(n, _)| n).sum();
+                        let headroom = liq_headroom_pct(*eq, &legs_after);
+                        roll_reopen_blocked(
+                            false,
+                            headroom.is_none_or(|h| h >= self.cfg.liq_guard_pct),
+                            self.cfg.dry_run
+                                || leverage_ok(gross_after, *eq, self.cfg.max_leverage),
+                        )
+                    }
+                    _ => Some("reopen_failed"),
+                };
+                let fresh = if gate.is_some() { None } else { fresh };
+                // price moved beyond the band, or the fresh reservation no
+                // longer fits the caps: the re-open is refused
+                let reopen_refused = match (gate, fresh) {
+                    (None, Some((f, _))) => roll_reopen_decision(
+                        &self.cfg.roll,
+                        &self.state.roll,
+                        mark,
+                        f,
+                        roll_reserve(reopen.qty * f, slip),
+                    ),
+                    _ => None,
+                };
+                match (gate, fresh) {
+                    (Some("reopen_blocked_kill"), _) => {
+                        outcome = "reopen_blocked_kill_unlevelled";
+                        let other = match leg {
+                            Leg::Long => Leg::Short,
+                            Leg::Short => Leg::Long,
+                        };
+                        // DRY_RUN rehearses on the simulated book, live on the venue
+                        let other_qty = if self.cfg.dry_run {
+                            roll_dry_leg_qty(&self.state.book(&sym), other)
+                        } else {
+                            match self.venue(other).signed_qty(&sym).await {
+                                Ok(q) => q.abs(),
+                                Err(e) => {
+                                    log::error!("[ROLL] {sym} KILL_SWITCH: other-leg read failed: {e:#} — one clip stays unlevelled");
+                                    0.0
+                                }
+                            }
+                        };
+                        if let Some(q) =
+                            roll_kill_levelling(close_filled, other_qty, m.min_qty, m.size_decimals)
+                        {
+                            let reduce = Order {
+                                leg: other,
+                                qty: -q,
+                            };
+                            let other_mark = snap.mark_of(other, &sym);
+                            let res = self.execute(&sym, &reduce, other_mark, None).await;
+                            // counted only once it reached the venue: accepted,
+                            // or it became uncertain (a pre-send failure or a
+                            // synchronous reject sent nothing)
+                            levelling_sent = roll_leg_sent(
+                                res.is_ok(),
+                                self.state
+                                    .uncertain
+                                    .get(&sym)
+                                    .is_some_and(|u| u.leg == other),
+                            );
+                            match res {
+                                Ok(r) if r.filled + self.size_tol(&sym) >= q => {
+                                    outcome = "reopen_blocked_kill_levelled";
+                                }
+                                Ok(r) => log::error!(
+                                    "[ROLL] {sym} KILL_SWITCH levelling filled {} of {q} — the rest stays unlevelled",
+                                    r.filled
+                                ),
+                                Err(e) => log::error!(
+                                    "[ROLL] {sym} KILL_SWITCH levelling failed: {e:#} — one clip stays unlevelled"
+                                ),
+                            }
+                        }
+                        log::warn!("[ROLL] {sym} re-open not sent (KILL_SWITCH): {outcome}");
+                    }
+                    (Some(blocked), _) => {
+                        log::warn!(
+                            "[ROLL] {sym} re-open not sent: {blocked} — the planner / guards take it from here"
+                        );
+                        outcome = blocked;
+                    }
+                    (None, None) => outcome = "reopen_failed",
+                    (None, Some((fresh, _))) if reopen_refused.is_some() => {
+                        let why = reopen_refused.unwrap_or("reopen_failed");
+                        log::warn!(
+                            "[ROLL] {sym} re-open not sent: {why} (gated mark {mark}, fresh {fresh}) — the planner repairs the gap"
+                        );
+                        outcome = why;
+                    }
+                    (None, Some((fresh, fresh_tick))) => {
+                        let (res, sent) = self
+                            .roll_leg_send(
+                                &sym,
+                                &reopen,
+                                fresh,
+                                reopen.qty * fresh,
+                                slip,
+                                "reopen",
+                                Some(fresh_tick),
+                            )
+                            .await;
+                        reopen_sent = sent;
+                        match res {
+                            Ok(l) => {
+                                open_filled = l.filled;
+                                open_cost = l.cost;
+                                if l.filled + self.size_tol(&sym) < close_filled {
+                                    outcome = "reopen_partial";
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("[ROLL] {sym} re-open failed: {e:?} — levelling repairs it (booked when it settles)");
+                                outcome = "reopen_failed";
+                            }
+                        }
+                        if self.state.uncertain.contains_key(&sym) {
+                            outcome = "reopen_uncertain";
+                        }
+                    }
+                }
+            }
+        }
+        let roll_orders = usize::from(close_sent) + usize::from(reopen_sent);
+        let sent_orders = roll_orders + usize::from(levelling_sent);
+        let suspended = roll_after_attempt(&mut self.state.roll, &sym, now, roll_orders > 0);
+        if roll_orders == 0 {
+            // refused before any send, or rejected synchronously (price
+            // moved, a read failed, the venue refused it): nothing executed;
+            // back THIS symbol off (doubling; suspended after
+            // ROLL_MAX_REFUSALS), and say why — once per distinct reason
+            let sb = self
+                .state
+                .roll
+                .backoff
+                .get(&sym)
+                .copied()
+                .unwrap_or_default();
+            let refusals = sb.refusals;
+            let why = if suspended {
+                format!(
+                    "{sym}: suspended until the next roll week after {refusals} consecutive refusals: {}",
+                    close_err.clone().unwrap_or_default()
+                )
+            } else {
+                format!("{sym}: not sent: {}", close_err.clone().unwrap_or_default())
+            };
+            if self.state.roll.blocked_reason.as_deref() != Some(why.as_str()) {
+                log::warn!("[ROLL] blocked: {why}");
+                self.event(
+                    "roll_blocked",
+                    serde_json::json!({ "symbol": sym, "reason": why, "refusals": refusals,
+                        "retry_not_before": sb.retry_not_before, "suspended": suspended }),
+                );
+            }
+            self.state.roll.blocked_reason = Some(why);
+        }
+        let rs = &mut self.state.roll;
+        let (vol, cost) = (rs.week_volume_usd, rs.week_cost_usd);
+        let (fly_v, fly_c) = roll_in_flight_total(rs);
+        self.event(
+            "roll_done",
+            serde_json::json!({ "symbol": sym, "leg": format!("{leg:?}"), "outcome": outcome,
+                "close_filled": close_filled, "reopen_filled": open_filled, "close_error": close_err,
+                "sent_orders": sent_orders,
+                "cost_usd": close_cost + open_cost, "week_volume_usd": vol, "week_cost_usd": cost,
+                "in_flight_volume_usd": fly_v, "in_flight_cost_usd": fly_c }),
+        );
+        log::info!("[ROLL] {sym} {outcome}: close {close_filled} / reopen {open_filled}, cost ${:.2}, week ${vol:.0} / ${cost:.2} (+ in flight ${fly_v:.0} / ${fly_c:.2})", close_cost + open_cost);
+        self.persist();
+        sent_orders
+    }
+
+    /// Reserve, send and finish one roll leg: the reservation is persisted
+    /// right before the send (`roll_one`, after every pre-send refusal) and
+    /// dropped afterwards unless the leg ended uncertain.
+    /// Returns the leg and whether it counts as SENT (`roll_leg_sent`).
+    async fn roll_leg_send(
+        &mut self,
+        sym: &str,
+        order: &Order,
+        mark: f64,
+        notional_usd: f64,
+        slip: u32,
+        kind: &'static str,
+        fresh_tick: Option<Option<Decimal>>,
+    ) -> (Result<RollLeg>, bool) {
+        let was_uncertain = self.state.uncertain.contains_key(sym);
+        let reserve = roll_reserve(notional_usd, slip);
+        let result = self
+            .roll_one(sym, order, mark, kind, fresh_tick, reserve)
+            .await;
+        let uncertain = self.state.uncertain.contains_key(sym);
+        if roll_finish_in_flight(&mut self.state.roll, sym, result.is_ok(), uncertain) {
+            self.persist();
+        }
+        let sent = roll_leg_sent(result.is_ok(), uncertain && !was_uncertain);
+        (result, sent)
     }
 
     /// Re-check every uncertain order; release the ones that are now known
@@ -1835,6 +3427,8 @@ impl Engine {
                 u.exchange == cur_exchange && (u.instance.is_empty() || u.instance == cur_instance);
             let mut terminal = false;
             let mut delta = f64::NAN;
+            // (filled, fee, value) of the order as last observed (Arcus)
+            let mut observed: Option<(f64, f64, f64)> = None;
             // Evidence reads may fail independently of the tick snapshot; a
             // failed read is simply "no evidence" — the grace / account
             // escalation below must still run, or an unreadable endpoint
@@ -1863,18 +3457,17 @@ impl Engine {
                 match (&u.order_id, u.exchange.as_str()) {
                     // Arcus: the order's own fills / cancel must settle it.
                     (Some(id), "arcus") => {
-                        if let Some((open, canceled, sum, trades)) =
-                            self.arcus_order_view(u.leg, &sym, id).await
-                        {
+                        if let Some(v) = self.arcus_order_view(u.leg, &sym, id).await {
                             if let Settle::Terminal(_) = settle_decision(
                                 u.qty,
-                                open,
-                                canceled,
-                                sum,
+                                v.open,
+                                v.canceled,
+                                v.filled,
                                 delta,
                                 self.size_tol(&sym),
                             ) {
-                                self.forget_arcus_activity(u.leg, &sym, id, &trades).await;
+                                self.forget_arcus_activity(u.leg, &sym, id, &v.trades).await;
+                                observed = Some((v.filled, v.fee, v.value));
                                 terminal = true;
                             }
                         }
@@ -1905,6 +3498,21 @@ impl Engine {
                         "uncertain_resolved",
                         serde_json::json!({ "symbol": sym, "order": u, "position_delta": delta }),
                     );
+                    // roll accounting: the order's observed fills replace its
+                    // reservation (any execution on the rolled leg counts)
+                    if self.cfg.roll_accounting_leg() == Some(u.leg) {
+                        let (f, fee, value) = observed.unwrap_or((0.0, 0.0, 0.0));
+                        roll_release_booking(
+                            &mut self.state.roll,
+                            now,
+                            &sym,
+                            u.roll,
+                            f,
+                            fee,
+                            value,
+                            u.mark,
+                        );
+                    }
                     self.state.uncertain.remove(&sym);
                     released_now.insert(sym);
                     self.persist();
@@ -1959,6 +3567,12 @@ impl Engine {
 
     async fn tick(&mut self) -> Result<()> {
         let now = now_secs();
+        // Roll the roll week over FIRST, before anything this tick can book
+        // an execution: otherwise fills after Sunday 00:00 land in the old
+        // week and the first idle tick wipes them.
+        if self.cfg.roll.enabled && roll_week_rollover(&mut self.state.roll, now) {
+            self.persist();
+        }
         let kill = self.sentinels.kill_switch_engaged();
         if self.state.halted && self.sentinels.take_risk_ack() {
             log::warn!("[RISK_ACK] halt cleared ({:?})", self.state.halt_reason);
@@ -1973,7 +3587,30 @@ impl Engine {
                     self.state.uncertain.len(),
                     self.state.uncertain.keys().collect::<Vec<_>>()
                 );
-                self.state.uncertain.clear();
+                // roll accounting: no evidence was seen, so an uncertain
+                // order on the rolled leg is booked as a full fill at the
+                // current mark (worst case) in place of its reservation.
+                let rolled = self.cfg.roll_accounting_leg();
+                let slip = self.cfg.taker_slippage_bps;
+                let cleared: Vec<(String, UncertainOrder)> =
+                    std::mem::take(&mut self.state.uncertain)
+                        .into_iter()
+                        .collect();
+                for (sym, u) in cleared {
+                    if rolled == Some(u.leg) {
+                        let now_mark = self.last_snapshot.mark_of(u.leg, &sym);
+                        let m = if now_mark > 0.0 { now_mark } else { u.mark };
+                        roll_risk_ack_booking(
+                            &mut self.state.roll,
+                            now,
+                            &sym,
+                            u.roll,
+                            u.qty,
+                            m,
+                            slip,
+                        );
+                    }
+                }
             }
             for b in self.state.books.values_mut() {
                 b.net_breach_ticks = 0;
@@ -2243,6 +3880,18 @@ impl Engine {
             std::collections::BTreeSet::new()
         };
 
+        // Roll reservations left by a process that died between send and
+        // settle: booked every tick, before planning (a planner order that
+        // later goes uncertain on the symbol must not keep one alive).
+        if self.cfg.roll.enabled {
+            let stale =
+                roll_settle_stale_in_flight(&mut self.state.roll, now, &self.state.uncertain);
+            if !stale.is_empty() {
+                log::warn!("[ROLL] in-flight reservations without an uncertain roll order (process restart mid-roll) booked: {stale:?}");
+                self.persist();
+            }
+        }
+
         // Plan (at most one clip per leg per symbol per tick).
         let restricted = self.state.halted || kill;
         let mut plan: Vec<(String, Vec<Order>)> = Vec::new();
@@ -2301,6 +3950,26 @@ impl Engine {
                     plan = drop_growth(plan);
                     break;
                 }
+                // Growth that fits the leverage cap can still take the venue
+                // below its liquidation-headroom floor (a high-MMR symbol,
+                // equity drawn down). Same handling as leverage: halt and
+                // drop the growth — the halt restricts the next tick to
+                // reductions, so a lopsided book (a refused roll re-open's
+                // repair) is levelled DOWN instead of left one leg short.
+                // Only while the roll is enabled: with the roll off the
+                // planner behaves exactly as before the roll feature.
+                let legs_after = legs_after_growth(&plan, &snap, &self.cfg, leg);
+                if growth_headroom_guard_applies(self.cfg.roll.enabled, add)
+                    && !growth_headroom_ok(snap.equity(leg), &legs_after, self.cfg.liq_guard_pct)
+                {
+                    self.halt(format!(
+                        "growth headroom: {leg:?} venue liq headroom {:.2}% after this tick's growth ${add:.0} < {}% — deposit, then RISK_ACK",
+                        liq_headroom_pct(snap.equity(leg), &legs_after).unwrap_or(f64::NAN),
+                        self.cfg.liq_guard_pct
+                    ));
+                    plan = drop_growth(plan);
+                    break;
+                }
             }
         }
 
@@ -2318,7 +3987,11 @@ impl Engine {
             while i < orders.len() {
                 let order = orders[i].clone();
                 sent += 1;
-                match self.execute(&sym, &order, mark).await {
+                match self
+                    .execute(&sym, &order, mark, None)
+                    .await
+                    .map(|r| r.filled)
+                {
                     Ok(filled) if filled < min_qty || filled <= 0.0 => {
                         log::warn!(
                             "[EXEC] {sym} {:?} {} unfilled (got {filled}) — no further orders this tick",
@@ -2383,8 +4056,15 @@ impl Engine {
                 }
             }
         }
+        // The Arcus-leg roll runs only on a tick that sent nothing else.
+        // Not on a tick that reconciled an order either: its snapshot (and
+        // so every roll gate) predates the late fill.
+        let mut orders_this_tick = sent;
+        if sent == 0 && released_now.is_empty() {
+            orders_this_tick += self.maybe_roll(now, &snap, kill).await;
+        }
         self.persist();
-        self.write_status(now, kill, sent);
+        self.write_status(now, kill, orders_this_tick);
         Ok(())
     }
 
@@ -2540,11 +4220,31 @@ fn status_value(
     }
     // Split from the top-level literal: one `json!` this deep trips the
     // macro recursion limit.
+    let (roll_fly_v, roll_fly_c) = roll_in_flight_total(&state.roll);
     let hedge_holder = serde_json::json!({
         "mode": state.overall_mode(),
         "halted": state.halted,
         "halt_reason": state.halt_reason,
         "uncertain_orders": state.uncertain,
+        "roll": {
+            "enabled": cfg.roll.enabled,
+            "mode": "taker",
+            "leg": cfg.roll_leg().map(|l| format!("{l:?}")),
+            "clip_usd": cfg.roll.clip_usd,
+            "week_start_day": state.roll.week,
+            "week_volume_usd": state.roll.week_volume_usd,
+            "week_cost_usd": state.roll.week_cost_usd,
+            "week_count": state.roll.week_count,
+            "in_flight_volume_usd": roll_fly_v,
+            "in_flight_cost_usd": roll_fly_c,
+            "weekly_volume_budget_usd": cfg.roll.weekly_volume_usd,
+            "weekly_cost_cap_usd": cfg.roll.weekly_cost_usd,
+            "last_roll_at": state.roll.last_roll_at,
+            "next_roll_at": cfg.roll.enabled.then(|| roll_next_at(&state.roll, cfg.roll.interval_secs)),
+            "blocked_reason": state.roll.blocked_reason,
+            // per symbol: consecutive refusals and when it may retry
+            "refusal_backoff": state.roll.backoff,
+        },
         "kill_switch": kill,
         "symbols": cfg.symbol_names(),
         "target_qty": pbook.target_qty,
@@ -2665,6 +4365,10 @@ async fn main() -> Result<()> {
     let mut state: State = load_json(&cfg.state_path)?.unwrap_or_default();
     state = migrate_legacy(state, cfg.primary());
     state = reconcile_state_mode(state, cfg.dry_run);
+    let dropped = roll_drop_in_flight_when_disabled(&mut state.roll, cfg.roll.enabled);
+    if !dropped.is_empty() {
+        log::warn!("[STARTUP] roll disabled: dropping in-flight roll reservations {dropped:?} (unbooked) — check those symbols' Arcus fills by hand if a roll was mid-flight");
+    }
     state.process_started_at = Some(now_secs());
     // Size metadata (decimals / venue minimum) per symbol. Only books the
     // bot manages must be quotable at startup: an Off symbol whose market
@@ -2968,8 +4672,10 @@ mod tests {
                 order_id: Some("o1".into()),
                 qty: 0.1,
                 before_qty: -0.4,
+                mark: 0.0,
                 sent_at: 1,
                 reason: "t".into(),
+                roll: false,
             },
         );
         assert!(reconcile_state_mode(live_state.clone(), true)
@@ -3050,6 +4756,7 @@ mod tests {
             arcus_live_confirm: String::new(),
             fill_wait_secs: DEFAULT_FILL_WAIT_SECS.to_vec(),
             uncertain_grace_secs: 60,
+            roll: RollCfg::default(),
             target_notional_usd: 20_000.0,
             max_notional_usd: 30_000.0,
             clip_usd: 10_000.0,
@@ -3599,6 +5306,944 @@ mod tests {
     }
 
     #[test]
+    fn roll_mode_is_taker_only_and_strict_only_when_the_roll_is_enabled() {
+        // unset / taker: fine either way
+        for v in ["", "  ", "taker", "TAKER"] {
+            assert!(check_roll_mode(v, true).is_ok(), "{v}");
+            assert!(check_roll_mode(v, false).is_ok(), "{v}");
+        }
+        // maker_first was removed: refused while the roll is enabled …
+        let err = check_roll_mode("maker_first", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("maker_first was removed"), "{err}");
+        assert!(check_roll_mode("maker", true).is_err());
+        // … but never keeps the holder from starting with the roll off
+        assert!(check_roll_mode("maker_first", false).is_ok());
+        assert!(check_roll_mode("maker", false).is_ok());
+    }
+
+    #[test]
+    fn roll_accounting_is_inert_while_the_roll_is_disabled() {
+        let off = arcus_short_cfg();
+        assert!(!off.roll.enabled);
+        assert_eq!(off.roll_leg(), Some(Leg::Short));
+        assert_eq!(off.roll_accounting_leg(), None);
+        // nothing books with the roll off, even on the Arcus leg
+        assert_eq!(
+            roll_execution_booking(
+                off.roll_accounting_leg(),
+                Leg::Short,
+                false,
+                0.1,
+                0.02,
+                10.0,
+                100.0
+            ),
+            None
+        );
+        let on = roll_cfg_on();
+        assert_eq!(on.roll_accounting_leg(), Some(Leg::Short));
+        assert!(roll_execution_booking(
+            on.roll_accounting_leg(),
+            Leg::Short,
+            false,
+            0.1,
+            0.02,
+            10.0,
+            100.0
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn roll_close_outcomes_match_what_happened() {
+        let min = 0.0001;
+        let st = |sent, unc, filled| roll_close_stage(Leg::Short, sent, unc, filled, min, 4);
+        assert_eq!(st(true, true, 0.05).unwrap_err(), "close_uncertain");
+        assert_eq!(st(false, false, 0.0).unwrap_err(), "close_not_sent");
+        assert_eq!(st(true, false, 0.0).unwrap_err(), "close_unfilled");
+        assert_eq!(
+            st(true, false, 0.00005).unwrap_err(),
+            "close_partial_below_min"
+        );
+        // exactly the minimum re-opens
+        let o = st(true, false, min).unwrap();
+        assert_eq!((o.leg, o.qty), (Leg::Short, min));
+        // filled enough: the re-open carries exactly the close fill, same leg
+        let o = roll_close_stage(Leg::Long, true, false, 0.05, min, 4).unwrap();
+        assert_eq!((o.leg, o.qty), (Leg::Long, 0.05));
+        // a finer-precision fill is re-opened FLOORED to the size decimals,
+        // never rounded up past what the close filled
+        let o = roll_close_stage(Leg::Short, true, false, 0.123456, min, 4).unwrap();
+        assert_eq!(o.qty, 0.1234);
+        assert!(o.qty <= 0.123456);
+        // floored below the minimum -> not re-openable
+        assert_eq!(
+            roll_close_stage(Leg::Short, true, false, 0.00019, 0.0002, 4).unwrap_err(),
+            "close_partial_below_min"
+        );
+        assert_eq!(floor_to_decimals(0.3, 1), 0.3);
+    }
+
+    #[test]
+    fn the_reopen_gates_use_fresh_positions_and_the_fresh_mark() {
+        let cfg = multi_cfg();
+        let syms = &cfg.symbols;
+        let sym = syms[0].symbol.clone();
+        // fresh position 0.2 (after the close) + re-open 0.05 at the FRESH mark 110
+        let legs = reopen_legs_after(
+            syms,
+            Leg::Short,
+            |s| if s == sym { -0.2 } else { 0.0 },
+            |_| 100.0,
+            &sym,
+            0.05,
+            110.0,
+        );
+        let n: f64 = legs.iter().map(|(n, _)| n).sum();
+        assert!((n - 0.25 * 110.0).abs() < 1e-9, "{n}");
+        // a stale-snapshot view (0.2 at 100) would understate the exposure
+        assert!(n > 0.2 * 100.0);
+    }
+
+    #[test]
+    fn a_roll_leg_counts_as_sent_only_once_accepted_or_uncertain() {
+        // settled (accepted by the venue) -> sent
+        assert!(roll_leg_sent(true, false));
+        // became uncertain (reached the venue, may have filled) -> sent
+        assert!(roll_leg_sent(false, true));
+        // pre-send refusal or synchronous reject -> NOT sent (60 s backoff)
+        assert!(!roll_leg_sent(false, false));
+        // so a refused roll takes the backoff, not the interval
+        let mut rs = RollState::default();
+        roll_after_attempt(&mut rs, "BTC", 10_000, roll_leg_sent(false, false));
+        assert_eq!(rs.last_roll_at, None);
+        assert_eq!(rs.week_count, 0);
+    }
+
+    #[test]
+    fn consecutive_refusals_back_off_exponentially_then_suspend_until_next_week() {
+        assert_eq!(roll_refusal_backoff(1), 60);
+        assert_eq!(roll_refusal_backoff(2), 120);
+        assert_eq!(roll_refusal_backoff(3), 240);
+        assert_eq!(roll_refusal_backoff(7), 3_600); // capped
+        assert_eq!(roll_refusal_backoff(60), 3_600);
+        let now = 1_790_467_200 + 3 * 86_400; // a Wednesday
+        let mut rs = RollState {
+            week: roll_week(now),
+            ..RollState::default()
+        };
+        let mut t = now;
+        for n in 1..ROLL_MAX_REFUSALS {
+            assert!(!roll_after_attempt(&mut rs, "META", t, false));
+            assert_eq!(
+                rs.backoff.get("META"),
+                Some(&RollBackoff {
+                    refusals: n,
+                    retry_not_before: t + roll_refusal_backoff(n)
+                })
+            );
+            assert!(roll_symbol_backed_off(&rs, "META", t));
+            t += roll_refusal_backoff(n);
+            assert!(!roll_symbol_backed_off(&rs, "META", t));
+        }
+        // the N-th consecutive refusal suspends META until next Sunday 00:00 UTC
+        assert!(roll_after_attempt(&mut rs, "META", t, false));
+        let next_week = (roll_week(now) + 7) * 86_400;
+        assert_eq!(rs.backoff["META"].retry_not_before, next_week);
+        assert!(roll_symbol_backed_off(&rs, "META", next_week - 1));
+        // ... and ONLY META: another symbol is neither backed off nor
+        // suspended, and the global interval is untouched
+        assert!(!roll_symbol_backed_off(&rs, "BTC", t));
+        assert_eq!(roll_next_at(&rs, 3_600), 0);
+        assert!(!roll_after_attempt(&mut rs, "BTC", t, true));
+        assert!(roll_symbol_backed_off(&rs, "META", t + 3_600));
+        // the rollover lifts it
+        assert!(roll_week_rollover(&mut rs, next_week));
+        assert!(rs.backoff.is_empty());
+        assert!(!roll_symbol_backed_off(&rs, "META", next_week));
+        // a roll that sends clears THAT symbol's streak only
+        let mut rs = RollState::default();
+        roll_after_attempt(&mut rs, "BTC", now, false);
+        roll_after_attempt(&mut rs, "BTC", now + 60, false);
+        roll_after_attempt(&mut rs, "META", now + 70, false);
+        assert!(!roll_after_attempt(&mut rs, "BTC", now + 200, true));
+        assert!(!rs.backoff.contains_key("BTC"));
+        assert_eq!(rs.backoff["META"].refusals, 1);
+    }
+
+    #[test]
+    fn a_backed_off_symbol_is_skipped_by_the_picker_not_blocking_the_others() {
+        let cfg = roll_cfg_on().roll;
+        let now = T0;
+        let mut rs = RollState::default();
+        for k in 0..ROLL_MAX_REFUSALS {
+            roll_after_attempt(&mut rs, "META", now + k as u64, false);
+        }
+        let order = vec!["META".to_string(), "BTC".to_string()];
+        let picked = pick_roll_symbol(&order, |sym| {
+            let g = RollGate {
+                backed_off: roll_symbol_backed_off(&rs, sym, now + 60),
+                ..open_gate()
+            };
+            match roll_blocker(&cfg, &rs, now + 60, &g, 800.0, 0.5) {
+                None => Ok(()),
+                Some(w) => Err(w),
+            }
+        });
+        assert_eq!(picked.map(|(s, _)| s), Ok("BTC".to_string()));
+    }
+
+    #[test]
+    fn kill_switch_levels_the_roll_gap_by_reducing_the_other_leg() {
+        // re-open blocked by KILL_SWITCH: reduce the other leg by what the
+        // close filled, reduce-only
+        assert_eq!(roll_kill_levelling(0.05, 0.47, 0.0001, 4), Some(0.05));
+        // not one orderable order, or the other leg holds less: nothing
+        assert_eq!(roll_kill_levelling(0.00005, 0.47, 0.0001, 4), None);
+        assert_eq!(roll_kill_levelling(0.05, 0.03, 0.0001, 4), None);
+        assert_eq!(roll_kill_levelling(0.0, 0.47, 0.0001, 4), None);
+        // a finer-precision fill is levelled FLOORED, never rounded up
+        assert_eq!(roll_kill_levelling(0.123456, 0.47, 0.0001, 4), Some(0.1234));
+    }
+
+    #[test]
+    fn a_dry_run_live_flip_resets_the_roll_bookkeeping() {
+        let mut st = State {
+            dry_run: Some(true),
+            ..State::default()
+        };
+        st.roll.week_volume_usd = 40_000.0;
+        st.roll.week_cost_usd = 12.0;
+        st.roll.last_roll_at = Some(1);
+        st.roll.backoff.insert(
+            "BTC".into(),
+            RollBackoff {
+                refusals: 3,
+                retry_not_before: 9,
+            },
+        );
+        st.roll.in_flight.insert("BTC".into(), (5_000.0, 2.6));
+        let live = reconcile_state_mode(st.clone(), false);
+        assert_eq!(live.roll, RollState::default());
+        // same mode: kept
+        let same = reconcile_state_mode(st, true);
+        assert_eq!(same.roll.week_volume_usd, 40_000.0);
+    }
+
+    #[test]
+    fn mark_of_reads_the_legs_own_venue() {
+        let mut s = Snapshot::default();
+        s.long.mark.insert("BTC".into(), 100.0);
+        s.short.mark.insert("BTC".into(), 98.0);
+        assert_eq!(s.mark_of(Leg::Long, "BTC"), 100.0);
+        assert_eq!(s.mark_of(Leg::Short, "BTC"), 98.0);
+        assert_eq!(s.mark_of(Leg::Short, "ETH"), 0.0);
+    }
+
+    #[test]
+    fn a_refused_roll_backs_off_briefly_and_a_sent_one_starts_the_interval() {
+        let interval = 3_600;
+        let mut rs = RollState::default();
+        // refused before any send: no interval spent, no roll counted; only
+        // that symbol backs off
+        roll_after_attempt(&mut rs, "BTC", 10_000, false);
+        assert_eq!(rs.last_roll_at, None);
+        assert_eq!(rs.week_count, 0);
+        assert_eq!(roll_next_at(&rs, interval), 0);
+        assert_eq!(
+            rs.backoff["BTC"].retry_not_before,
+            10_000 + ROLL_REFUSAL_BACKOFF_SECS
+        );
+        // sent: the interval starts and the backoff is cleared
+        roll_after_attempt(&mut rs, "BTC", 10_100, true);
+        assert_eq!(rs.last_roll_at, Some(10_100));
+        assert!(rs.backoff.is_empty());
+        assert_eq!(rs.week_count, 1);
+        assert_eq!(roll_next_at(&rs, interval), 10_100 + interval);
+    }
+
+    #[test]
+    fn state_json_written_with_the_removed_post_only_map_still_loads() {
+        // a state.json from the maker_first era (pending_post_only present)
+        let mut v = serde_json::to_value(State::default()).unwrap();
+        v.as_object_mut().unwrap().insert(
+            "pending_post_only".into(),
+            serde_json::json!({"BTC": {"leg": "Short", "order_id": "o1", "qty": 0.05,
+                "before_qty": -0.5, "mark": 100.0, "sent_at": 1}}),
+        );
+        let st: State = serde_json::from_value(v).unwrap();
+        assert!(st.uncertain.is_empty());
+    }
+
+    fn roll_cfg_on() -> Config {
+        let mut c = arcus_short_cfg();
+        c.roll = RollCfg {
+            enabled: true,
+            interval_secs: 3_600,
+            clip_usd: 400.0,
+            weekly_volume_usd: 100_000.0,
+            weekly_cost_usd: 50.0,
+        };
+        c
+    }
+
+    /// Any fixed booking time (bookings roll the week over to it).
+    const T0: u64 = 1_791_072_000 + 3_600;
+
+    fn open_gate() -> RollGate {
+        RollGate {
+            backed_off: false,
+            balanced: true,
+            halted: false,
+            kill: false,
+            uncertain: false,
+            feed_ok: true,
+            headroom_ok: true,
+            leverage_ok: true,
+            clip_ok: true,
+            leg_holds_clip: true,
+        }
+    }
+
+    #[test]
+    fn roll_is_off_by_default_and_leaves_the_fingerprint_alone() {
+        let c = cfg_for_test();
+        assert!(!c.roll.enabled);
+        assert!(c.validate().is_ok());
+        let mut on = roll_cfg_on();
+        let off_fp = {
+            let mut o = on.clone();
+            o.roll.enabled = false;
+            o.fingerprint()
+        };
+        assert!(on.validate().is_ok());
+        assert_ne!(on.fingerprint(), off_fp);
+        on.roll.enabled = false;
+        assert_eq!(on.fingerprint(), off_fp);
+    }
+
+    #[test]
+    fn roll_config_is_validated_when_enabled() {
+        // the Lighter leg is never rolled: no Arcus leg -> refused
+        let mut c = cfg_for_test();
+        c.roll = roll_cfg_on().roll;
+        assert!(c.validate().unwrap_err().to_string().contains("Arcus leg"));
+        let bad: Vec<Box<dyn Fn(&mut Config)>> = vec![
+            Box::new(|c| c.roll.clip_usd = 0.0),
+            Box::new(|c| c.roll.clip_usd = c.clip_usd + 1.0),
+            Box::new(|c| c.roll.clip_usd = c.net_tolerance_usd + 1.0),
+            Box::new(|c| c.roll.weekly_volume_usd = 0.0),
+            Box::new(|c| c.roll.weekly_cost_usd = 0.0),
+            Box::new(|c| c.roll.interval_secs = c.tick_secs - 1),
+        ];
+        for (i, f) in bad.iter().enumerate() {
+            let mut c = roll_cfg_on();
+            f(&mut c);
+            assert!(c.validate().is_err(), "case {i} must be rejected");
+        }
+    }
+
+    #[test]
+    fn only_the_arcus_leg_is_ever_rolled() {
+        assert_eq!(cfg_for_test().roll_leg(), None);
+        assert_eq!(arcus_short_cfg().roll_leg(), Some(Leg::Short));
+        let mut c = cfg_for_test();
+        c.long_venue = VenueKind::Arcus;
+        c.long_instance = "arcus".into();
+        assert_eq!(c.roll_leg(), Some(Leg::Long));
+    }
+
+    #[test]
+    fn roll_weeks_start_sunday_utc_and_reset_the_counters() {
+        // 2026-09-27 is a Sunday (day 20723)
+        assert_eq!(roll_week(1_790_467_200), 20_723);
+        assert_eq!(roll_week(1_790_467_200 + 6 * 86_400 + 86_399), 20_723);
+        assert_eq!(roll_week(1_790_467_199), 20_716); // Sat 09-26 -> week of 09-20
+        assert_eq!(roll_week(1_791_072_000), 20_730); // next Sunday
+        let mut rs = RollState {
+            week: 20_723,
+            week_volume_usd: 9_000.0,
+            week_cost_usd: 3.0,
+            week_count: 5,
+            last_roll_at: Some(1_791_071_000),
+            last_symbol: Some("BTC".into()),
+            blocked_reason: Some("weekly_cost_cap".into()),
+            ..RollState::default()
+        };
+        assert!(!roll_week_rollover(&mut rs, 1_791_071_999));
+        assert_eq!(rs.week_count, 5);
+        assert!(roll_week_rollover(&mut rs, 1_791_072_000));
+        assert_eq!(
+            (rs.week, rs.week_volume_usd, rs.week_cost_usd, rs.week_count),
+            (20_730, 0.0, 0.0, 0)
+        );
+        assert_eq!(rs.last_roll_at, Some(1_791_071_000));
+        assert!(rs.blocked_reason.is_none());
+
+        // Actuals restart at zero; an in-flight reservation (an uncertain
+        // roll leg) survives every rollover until it is released.
+        let mut rs = RollState {
+            week: 20_723,
+            week_volume_usd: 9_000.0,
+            week_cost_usd: 3.0,
+            ..RollState::default()
+        };
+        rs.in_flight.insert("BTC".into(), (5_005.0, 2.6));
+        assert!(roll_week_rollover(&mut rs, 1_791_072_000));
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (0.0, 0.0));
+        assert!(roll_week_rollover(&mut rs, 1_791_072_000 + 7 * 86_400));
+        assert_eq!(roll_in_flight_total(&rs), (5_005.0, 2.6));
+    }
+
+    #[test]
+    fn roll_gates_interval_every_blocker_and_the_weekly_caps() {
+        let cfg = roll_cfg_on().roll;
+        let rs = RollState {
+            last_roll_at: Some(10_000),
+            ..RollState::default()
+        };
+        let g = open_gate();
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 10_000 + 3_599, &g, 800.0, 0.5),
+            Some("interval")
+        );
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 10_000 + 3_600, &g, 800.0, 0.5),
+            None
+        );
+        let now = 20_000;
+        let cases: Vec<(Box<dyn Fn(&mut RollGate)>, &str)> = vec![
+            (Box::new(|g| g.backed_off = true), "refusal_backoff"),
+            (Box::new(|g| g.halted = true), "halted"),
+            (Box::new(|g| g.kill = true), "kill_switch"),
+            (Box::new(|g| g.uncertain = true), "uncertain_order"),
+            (Box::new(|g| g.feed_ok = false), "feed"),
+            (Box::new(|g| g.balanced = false), "unbalanced"),
+            (Box::new(|g| g.headroom_ok = false), "liq_headroom"),
+            (Box::new(|g| g.leverage_ok = false), "leverage"),
+            (Box::new(|g| g.clip_ok = false), "clip_below_venue_min"),
+            (
+                Box::new(|g| g.leg_holds_clip = false),
+                "leg_smaller_than_clip",
+            ),
+        ];
+        for (f, want) in cases {
+            let mut g = open_gate();
+            f(&mut g);
+            assert_eq!(roll_blocker(&cfg, &rs, now, &g, 800.0, 0.5), Some(want));
+        }
+        // weekly volume budget: the NEXT roll must fit
+        let near = RollState {
+            week_volume_usd: 99_300.0,
+            ..rs.clone()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &near, now, &g, 800.0, 0.5),
+            Some("weekly_volume_budget")
+        );
+        assert_eq!(roll_blocker(&cfg, &near, now, &g, 700.0, 0.5), None);
+        // weekly cost cap: the NEXT roll's worst-case cost must fit too
+        let near_cost = RollState {
+            week_cost_usd: 49.6,
+            ..rs.clone()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &near_cost, now, &g, 800.0, 0.5),
+            Some("weekly_cost_cap")
+        );
+        assert_eq!(roll_blocker(&cfg, &near_cost, now, &g, 800.0, 0.3), None);
+        let spent = RollState {
+            week_cost_usd: 50.0,
+            ..rs.clone()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &spent, now, &g, 800.0, 0.5),
+            Some("weekly_cost_cap")
+        );
+    }
+
+    #[test]
+    fn roll_clip_fits_the_net_tolerance_at_both_marks() {
+        // Arcus short marked 2 % below the long venue: sizing at the Arcus
+        // mark alone would put clip × long mark over the clip USD.
+        let (arcus, long) = (98.0, 100.0);
+        let clip_usd = 5_000.0;
+        let naive = qty_for_notional(clip_usd, arcus, 4);
+        assert!(naive * long > clip_usd);
+        let q = qty_for_notional(clip_usd, roll_sizing_mark(arcus, long), 4);
+        assert!(q * long <= clip_usd && q * arcus <= clip_usd);
+        // and when Arcus is the higher one, it is used
+        assert_eq!(roll_sizing_mark(101.0, 100.0), 101.0);
+    }
+
+    #[test]
+    fn roll_sends_only_within_the_reserved_price_margin() {
+        assert!(roll_price_ok(100.0, 100.05));
+        assert!(roll_price_ok(100.0, 99.95));
+        assert!(!roll_price_ok(100.0, 100.2));
+        assert!(!roll_price_ok(100.0, 99.8));
+        assert!(!roll_price_ok(0.0, 100.0));
+        // the reservation covers the worst allowed price
+        let (vol, cost) = roll_reserve(5_000.0, 3);
+        assert!(vol >= 5_000.0 * (1.0 + ROLL_PRICE_MARGIN) - 1e-9);
+        assert!(cost >= 5_000.0 * ROLL_PRICE_MARGIN);
+    }
+
+    #[test]
+    fn every_settled_execution_on_the_rolled_leg_books_its_actual_value() {
+        // a PLANNER repair (not a roll order) on the Arcus short leg: buy
+        // 0.05 @ 100.2 filled value 5.01 vs mark 100 → booked at its actual
+        // value, halted or not, whenever it happens
+        let b =
+            roll_execution_booking(Some(Leg::Short), Leg::Short, true, 0.05, 0.002, 5.01, 100.0)
+                .unwrap();
+        assert!((b.0 - 5.01).abs() < 1e-12);
+        assert!((b.1 - (0.002 + 0.01)).abs() < 1e-12);
+        let mut rs = RollState::default();
+        roll_book_actual(&mut rs, T0, b);
+        assert!((rs.week_volume_usd - 5.01).abs() < 1e-12);
+        // the Lighter long leg is not the rolled leg: never booked
+        assert_eq!(
+            roll_execution_booking(Some(Leg::Short), Leg::Long, true, 0.05, 0.0, 5.0, 100.0),
+            None
+        );
+        // no roll leg configured / nothing filled: nothing booked
+        assert_eq!(
+            roll_execution_booking(None, Leg::Short, true, 0.05, 0.0, 5.0, 100.0),
+            None
+        );
+        assert_eq!(
+            roll_execution_booking(Some(Leg::Short), Leg::Short, true, 0.0, 0.0, 0.0, 100.0),
+            None
+        );
+    }
+
+    #[test]
+    fn in_flight_reservations_follow_the_leg_and_are_never_double_counted() {
+        let r = roll_reserve(5_000.0, 3);
+        // settled leg: the reservation goes, the fill was booked at settle
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_settle_leg(&mut rs, "BTC", T0, Some((4_990.0, 1.2)));
+        roll_finish_in_flight(&mut rs, "BTC", true, false);
+        assert!(rs.in_flight.is_empty());
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (4_990.0, 1.2));
+        // uncertain leg: reservation kept, nothing booked yet …
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_finish_in_flight(&mut rs, "BTC", false, true);
+        assert_eq!(roll_in_flight_total(&rs), r);
+        assert_eq!(rs.week_volume_usd, 0.0);
+        // … released on evidence: observed fills replace it (once)
+        roll_release_booking(&mut rs, T0, "BTC", true, 0.05, 0.002, 5.01, 100.0);
+        assert!(rs.in_flight.is_empty());
+        assert!((rs.week_volume_usd - 5.01).abs() < 1e-12);
+        assert!((rs.week_cost_usd - (0.002 + 0.01)).abs() < 1e-12);
+        // … or cleared by RISK_ACK without evidence: worst case at the current mark
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_risk_ack_booking(&mut rs, T0, "BTC", true, 0.05, 110.0, 3);
+        assert!(rs.in_flight.is_empty());
+        let now = roll_reserve(0.05 * 110.0, 3);
+        assert_eq!(
+            (rs.week_volume_usd, rs.week_cost_usd),
+            (r.0.max(now.0), r.1.max(now.1))
+        );
+        // a small reservation and a risen market: the current-mark worst case wins
+        let small = roll_reserve(1.0, 3);
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), small);
+        roll_risk_ack_booking(&mut rs, T0, "BTC", true, 0.05, 110.0, 3);
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), now);
+        // … and never LESS than the send-time reservation (market fell since)
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        roll_risk_ack_booking(&mut rs, T0, "BTC", true, 0.05, 50.0, 3);
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), r);
+        // roll taker limits are absolute, bound to the reserved mark
+        assert_eq!(
+            roll_limit_dec(true, 100.0, None),
+            Some(Decimal::new(1001, 1))
+        );
+        assert_eq!(
+            roll_limit_dec(false, 100.0, None),
+            Some(Decimal::new(999, 1))
+        );
+    }
+
+    #[test]
+    fn a_zero_fill_below_the_touch_after_connector_rounding_is_a_refusal() {
+        let d = |v: f64| Decimal::from_f64(v).unwrap();
+        let (bid, ask) = (Some(d(1699.9)), Some(d(1700.1)));
+        // our limit crossed, but the connector sent it one coarser tier tick
+        // inward (1700.0 < ask 1700.1) and nothing filled: refusal
+        assert!(roll_unfilled_is_refusal(true, 0.0, d(1700.0), bid, ask));
+        // sell side mirror: sent above the bid
+        assert!(roll_unfilled_is_refusal(false, 0.0, d(1700.0), bid, ask));
+        // the sent price DID reach the touch and nothing filled: the book
+        // moved — a genuine unfilled roll, not a refusal
+        assert!(!roll_unfilled_is_refusal(true, 0.0, d(1700.1), bid, ask));
+        assert!(!roll_unfilled_is_refusal(false, 0.0, d(1699.9), bid, ask));
+        // anything filled ran, whatever price was sent
+        assert!(!roll_unfilled_is_refusal(true, 0.01, d(1700.0), bid, ask));
+    }
+
+    #[test]
+    fn a_planner_release_never_consumes_a_stale_roll_reservation() {
+        let r = roll_reserve(5_000.0, 3);
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), r);
+        // a PLANNER uncertain order on BTC released: books its own fill only
+        roll_release_booking(&mut rs, T0, "BTC", false, 0.01, 0.0, 1.0, 100.0);
+        assert_eq!(rs.in_flight.get("BTC"), Some(&r));
+        assert!((rs.week_volume_usd - 1.0).abs() < 1e-12);
+        // … and a planner RISK_ACK likewise
+        roll_risk_ack_booking(&mut rs, T0, "BTC", false, 0.01, 100.0, 3);
+        assert_eq!(rs.in_flight.get("BTC"), Some(&r));
+        // the planner entry does not keep it alive: the next tick books it
+        let mut unc = std::collections::BTreeMap::new();
+        unc.insert("BTC".to_string(), uncertain_btc("arcus", "a"));
+        let before = rs.week_volume_usd;
+        assert_eq!(
+            roll_settle_stale_in_flight(&mut rs, T0, &unc),
+            vec!["BTC".to_string()]
+        );
+        assert!(rs.in_flight.is_empty());
+        assert!((rs.week_volume_usd - (before + r.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stale_in_flight_after_a_restart_is_booked_not_lost() {
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), (5_005.0, 2.6));
+        rs.in_flight.insert("META".into(), (1_000.0, 0.5));
+        let mut unc = std::collections::BTreeMap::new();
+        unc.insert(
+            "META".to_string(),
+            UncertainOrder {
+                roll: true,
+                ..uncertain_btc("arcus", "a")
+            },
+        );
+        // BTC has no uncertain order behind it: booked and dropped; META stays
+        assert_eq!(
+            roll_settle_stale_in_flight(&mut rs, T0, &unc),
+            vec!["BTC".to_string()]
+        );
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (5_005.0, 2.6));
+        assert_eq!(roll_in_flight_total(&rs), (1_000.0, 0.5));
+    }
+
+    #[test]
+    fn the_next_roll_is_gated_on_actual_plus_in_flight_plus_its_inflated_reservations() {
+        let cfg = roll_cfg_on().roll; // 100k volume / 50 cost
+        let g = open_gate();
+        let (lv, lc) = roll_reserve(10_000.0, 3);
+        // exactly the raw two-leg notional left: the inflated reservation does not fit
+        let rs = RollState {
+            week_volume_usd: cfg.weekly_volume_usd - 20_000.0,
+            ..RollState::default()
+        };
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 20_000, &g, 2.0 * lv, 2.0 * lc),
+            Some("weekly_volume_budget")
+        );
+        // in-flight reservations count too
+        let mut rs = RollState::default();
+        rs.in_flight
+            .insert("BTC".into(), (cfg.weekly_volume_usd - 1_000.0, 0.0));
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 20_000, &g, 2.0 * lv, 2.0 * lc),
+            Some("weekly_volume_budget")
+        );
+        let mut rs = RollState::default();
+        rs.in_flight
+            .insert("BTC".into(), (0.0, cfg.weekly_cost_usd - 1.0));
+        assert_eq!(
+            roll_blocker(&cfg, &rs, 20_000, &g, 2.0 * lv, 2.0 * lc),
+            Some("weekly_cost_cap")
+        );
+        assert_eq!(
+            roll_blocker(&cfg, &RollState::default(), 20_000, &g, 2.0 * lv, 2.0 * lc),
+            None
+        );
+    }
+
+    #[test]
+    fn a_roll_ioc_is_sent_only_inside_the_reserved_margin_at_an_absolute_limit() {
+        // the leg's fresh mark 0.3 % away from the reserved mark: not sent
+        assert!(!roll_price_ok(100.0, 99.7));
+        assert!(!roll_price_ok(100.0, 100.3));
+        assert!(roll_price_ok(100.0, 99.95));
+        // and what IS sent is capped at the same margin, whatever the touch
+        let tick = Some(Decimal::new(1, 2));
+        let buy = roll_limit_dec(true, 100.0, tick).unwrap();
+        let sell = roll_limit_dec(false, 100.0, tick).unwrap();
+        assert!(buy <= Decimal::new(1001, 1) && buy > Decimal::new(100, 0));
+        assert!(sell >= Decimal::new(999, 1) && sell < Decimal::new(100, 0));
+    }
+
+    #[test]
+    fn roll_gates_on_the_net_exposure_after_the_close() {
+        // long-heavy by $400 (net +4 @100), $400 short close, $500 tol:
+        // the close would leave $800 of exposure -> refused
+        assert!(!roll_post_close_net_ok(4.0, Leg::Short, 4.0, 100.0, 500.0));
+        // short-heavy by $400: closing short moves it to 0 -> fine
+        assert!(roll_post_close_net_ok(-4.0, Leg::Short, 4.0, 100.0, 500.0));
+        // balanced book, clip within tolerance -> fine
+        assert!(roll_post_close_net_ok(0.0, Leg::Short, 4.0, 100.0, 500.0));
+        // long leg rolled: direction reverses
+        assert!(!roll_post_close_net_ok(-4.0, Leg::Long, 4.0, 100.0, 500.0));
+        assert!(roll_post_close_net_ok(4.0, Leg::Long, 4.0, 100.0, 500.0));
+    }
+
+    #[test]
+    fn roll_round_robin_skips_blocked_books() {
+        let order: Vec<String> = ["BTC", "META", "AMZN"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // BTC is persistently blocked: META must still be rolled, and the
+        // winner comes back with what its gate computed (not recomputed).
+        let picked = pick_roll_symbol(&order, |s| {
+            if s == "BTC" {
+                Err("unbalanced")
+            } else {
+                Ok((s.len() as f64, 0.5))
+            }
+        });
+        assert_eq!(picked, Ok(("META".to_string(), (4.0, 0.5))));
+        // Everyone blocked: the first candidate's reason is reported.
+        let none: Result<(String, ()), _> = pick_roll_symbol(&order, |_| Err("leverage"));
+        assert_eq!(none, Err(Some(("BTC".to_string(), "leverage"))));
+    }
+
+    fn d(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
+    #[test]
+    fn a_roll_ioc_that_cannot_reach_the_touch_is_not_sent() {
+        let s = |v: &str| Some(d(v));
+        // buy limit 100.1 vs asks
+        assert!(roll_limit_crosses(true, d("100.1"), s("99.9"), s("100.05")));
+        // wide book
+        assert!(!roll_limit_crosses(true, d("100.1"), s("99.8"), s("100.3")));
+        // sell limit 99.9 vs bids
+        assert!(roll_limit_crosses(false, d("99.9"), s("99.95"), s("100.1")));
+        assert!(!roll_limit_crosses(false, d("99.9"), s("99.7"), s("100.1")));
+        // exact touch is marketable on both sides; one tick short is not
+        // (no tolerance)
+        assert!(roll_limit_crosses(true, d("100.1"), s("99.9"), s("100.1")));
+        assert!(roll_limit_crosses(false, d("99.9"), s("99.9"), s("100.1")));
+        assert!(!roll_limit_crosses(
+            false,
+            d("99.91"),
+            s("99.9"),
+            s("100.1")
+        ));
+        assert!(!roll_limit_crosses(
+            true,
+            d("700.69"),
+            s("700.0"),
+            s("700.70")
+        ));
+        // no / one-sided / crossed book: not marketable
+        assert!(!roll_limit_crosses(true, d("100.1"), None, s("100.0")));
+        assert!(!roll_limit_crosses(true, d("100.1"), s("0"), s("100.0")));
+        assert!(!roll_limit_crosses(
+            true,
+            d("100.1"),
+            s("100.2"),
+            s("100.0")
+        ));
+    }
+
+    #[test]
+    fn the_roll_limit_is_rounded_like_the_venue_and_survives_binary_inexact_marks() {
+        // the pairtrade#315 trap: 700.0 * 1.001 in f64 is 700.6999999999999,
+        // which the connector's inward (buy-down) tick rounding turns into
+        // 700.69 — one tick short of a 700.70 ask. Decimal arithmetic does not.
+        assert_eq!(700.0_f64 * 1.001, 700.6999999999999);
+        let tick = Some(d("0.01"));
+        let buy = roll_limit_dec(true, 700.0, tick).unwrap();
+        assert_eq!(buy, d("700.7"));
+        assert!(roll_limit_crosses(
+            true,
+            buy,
+            Some(d("700.0")),
+            Some(d("700.70"))
+        ));
+        // sell: 700 × 0.999 = 699.3 exactly, rounded UP (inward) to the tick
+        assert_eq!(roll_limit_dec(false, 700.0, tick).unwrap(), d("699.3"));
+        // binary-inexact marks: rounding is inward (buy never above mark ×
+        // 1.001, sell never below mark × 0.999) and lands on the tick
+        let buy = roll_limit_dec(true, 1700.1, tick).unwrap();
+        assert_eq!(buy, d("1701.8")); // 1701.8001 floored
+        let sell = roll_limit_dec(false, 1700.1, tick).unwrap();
+        assert_eq!(sell, d("1698.4")); // 1698.3999 ceiled to the tick
+        let buy = roll_limit_dec(true, 84537.8, Some(d("0.1"))).unwrap();
+        assert_eq!(buy, d("84622.3")); // 84622.3378 floored
+                                       // a binary-inexact mark whose limit lands exactly ON a tick: 0.3 is
+                                       // 0.29999999999999998889… in f64, so from_f64_retain would give
+                                       // 0.30029999… and floor it a whole tick short to 0.3002
+        assert_eq!(
+            roll_limit_dec(true, 0.3, Some(d("0.0001"))).unwrap(),
+            d("0.3003")
+        );
+        // no tick: the exact decimal
+        assert_eq!(roll_limit_dec(true, 100.0, None).unwrap(), d("100.1"));
+        assert!(roll_limit_dec(true, 0.0, tick).is_none());
+        assert!(roll_limit_dec(true, f64::NAN, tick).is_none());
+    }
+
+    #[test]
+    fn one_cap_check_gates_the_roll_and_the_reopen_is_not_re_capped() {
+        let cfg = RollCfg {
+            weekly_volume_usd: 10_000.0,
+            weekly_cost_usd: 20.0,
+            ..roll_cfg_on().roll
+        };
+        let mut rs = RollState {
+            week_volume_usd: 5_000.0,
+            week_cost_usd: 5.0,
+            ..RollState::default()
+        };
+        assert_eq!(roll_fits(&cfg, &rs, roll_reserve(4_000.0, 3)), None);
+        assert_eq!(
+            roll_fits(&cfg, &rs, roll_reserve(5_100.0, 3)),
+            Some("weekly_volume_budget")
+        );
+        let tight = RollCfg {
+            weekly_cost_usd: 10.0,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            roll_fits(&tight, &rs, roll_reserve(4_000.0, 3)),
+            Some("weekly_cost_cap")
+        );
+        // exactly at the cap still fits
+        assert_eq!(roll_fits(&cfg, &rs, (5_000.0, 0.0)), None);
+        // other in-flight legs count too
+        rs.in_flight.insert("META".into(), (2_000.0, 1.0));
+        assert_eq!(
+            roll_fits(&cfg, &rs, roll_reserve(4_000.0, 3)),
+            Some("weekly_volume_budget")
+        );
+        // the pick-time gate IS that check (no second copy to drift)
+        let g = open_gate();
+        for (v, c) in [(1_000.0, 1.0), (4_000.0, 1.0), (1_000.0, 20.0)] {
+            assert_eq!(
+                roll_blocker(&cfg, &rs, u64::MAX / 2, &g, v, c),
+                roll_fits(&cfg, &rs, (v, c))
+            );
+        }
+        // growth gates re-read right before the re-open
+        assert_eq!(roll_reopen_blocked(false, true, true), None);
+        assert_eq!(
+            roll_reopen_blocked(true, true, true),
+            Some("reopen_blocked_kill")
+        );
+        assert_eq!(
+            roll_reopen_blocked(false, false, true),
+            Some("reopen_blocked_headroom")
+        );
+        assert_eq!(
+            roll_reopen_blocked(false, true, false),
+            Some("reopen_blocked_leverage")
+        );
+    }
+
+    #[test]
+    fn roll_fees_always_raise_the_booked_cost() {
+        let paid = roll_cost(true, 0.01, 0.02, 1.001, 100.0);
+        // a fee reported with the opposite sign books the same cost
+        assert!((roll_cost(true, 0.01, -0.02, 1.001, 100.0) - paid).abs() < 1e-12);
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), (1.0, 1.0));
+        roll_release_booking(&mut rs, T0, "BTC", true, 0.01, -0.02, 1.0, 100.0);
+        assert!((rs.week_cost_usd - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bookings_land_in_the_week_of_the_booking_time() {
+        let sat = 1_791_072_000 - 5; // Sat 23:59:55 UTC (next Sunday 00:00 = 1_791_072_000)
+        let sun = 1_791_072_000 + 7;
+        let mut rs = RollState::default();
+        roll_week_rollover(&mut rs, sat);
+        rs.week_volume_usd = 3_000.0;
+        // a roll started Saturday settles Sunday: it books into the NEW week
+        roll_book_actual(&mut rs, sun, (800.0, 0.5));
+        assert_eq!(rs.week, roll_week(sun));
+        assert_eq!((rs.week_volume_usd, rs.week_cost_usd), (800.0, 0.5));
+        // and the next tick-start rollover does not wipe it
+        assert!(!roll_week_rollover(&mut rs, sun + 30));
+        assert_eq!(rs.week_volume_usd, 800.0);
+        // same through the leg-settle path
+        let mut rs = RollState::default();
+        roll_week_rollover(&mut rs, sat);
+        rs.in_flight.insert("BTC".into(), (400.4, 0.3));
+        roll_settle_leg(&mut rs, "BTC", sun, Some((400.0, 0.2)));
+        assert_eq!(rs.week, roll_week(sun));
+        assert_eq!(rs.week_volume_usd, 400.0);
+    }
+
+    #[test]
+    fn a_settled_roll_leg_never_leaves_both_its_reservation_and_its_booking() {
+        let now = 1_791_072_000 + 100;
+        let mut rs = RollState::default();
+        roll_week_rollover(&mut rs, now);
+        rs.in_flight.insert("BTC".into(), roll_reserve(400.0, 3));
+        roll_settle_leg(&mut rs, "BTC", now, Some((400.0, 0.2)));
+        // the persisted state (one mutation) holds the actual only
+        assert!(!rs.in_flight.contains_key("BTC"));
+        assert_eq!(rs.week_volume_usd, 400.0);
+        // a restart then finds nothing stale to book on top
+        let stale = roll_settle_stale_in_flight(&mut rs, now, &Default::default());
+        assert!(stale.is_empty());
+        assert_eq!(rs.week_volume_usd, 400.0);
+        // an unfilled roll leg still drops its reservation
+        rs.in_flight.insert("META".into(), roll_reserve(100.0, 3));
+        roll_settle_leg(&mut rs, "META", now, None);
+        assert!(rs.in_flight.is_empty());
+        assert_eq!(rs.week_volume_usd, 400.0);
+    }
+
+    #[test]
+    fn roll_reservation_covers_the_worst_allowed_price() {
+        let reserved = roll_reserve(5_000.0, 3);
+        let worst = 5_000.0 * (1.0 + ROLL_PRICE_MARGIN);
+        assert!((reserved.0 - worst).abs() < 1e-9);
+        assert!(
+            (reserved.1 - (worst * 5.25 / 10_000.0 + 5_000.0 * ROLL_PRICE_MARGIN)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn roll_cost_is_fees_plus_slippage_against_the_mark() {
+        // buy 0.01 @ 100.1 vs mark 100: 0.001 slippage + 0.02 fee
+        assert!((roll_cost(true, 0.01, 0.02, 1.001, 100.0) - 0.021).abs() < 1e-12);
+        // sell 0.01 @ 99.9 vs mark 100
+        assert!((roll_cost(false, 0.01, 0.0, 0.999, 100.0) - 0.001).abs() < 1e-12);
+        // price improvement never credits the cap: a buy BELOW mark and a sell
+        // ABOVE mark book the fee only (never a negative cost)
+        assert!((roll_cost(true, 0.01, 0.001, 0.999, 100.0) - 0.001).abs() < 1e-12);
+        assert!((roll_cost(false, 0.01, 0.001, 1.001, 100.0) - 0.001).abs() < 1e-12);
+        assert_eq!(roll_cost(true, 0.01, 0.0, 0.5, 100.0), 0.0);
+        assert!(roll_cost(true, 0.01, -0.001, 0.999, 100.0) >= 0.0);
+    }
+
+    #[test]
+    fn roll_state_loads_from_older_state_json() {
+        let mut v = serde_json::to_value(State::default()).unwrap();
+        v.as_object_mut().unwrap().remove("roll");
+        let st: State = serde_json::from_value(v).unwrap();
+        assert_eq!(st.roll, RollState::default());
+    }
+
+    #[test]
     fn venue_parses_with_lighter_as_the_default() {
         assert_eq!(VenueKind::parse("").unwrap(), VenueKind::Lighter);
         assert_eq!(VenueKind::parse(" Lighter ").unwrap(), VenueKind::Lighter);
@@ -3792,8 +6437,10 @@ mod tests {
             order_id: Some("o1".into()),
             qty: 0.1,
             before_qty: 0.0,
+            mark: 100.0,
             sent_at: 1_000,
             reason: "t".into(),
+            roll: false,
         }
     }
 
@@ -3963,12 +6610,19 @@ mod tests {
                 order_id: None,
                 qty: 0.2,
                 before_qty: 0.5,
+                mark: 0.0,
                 sent_at: 7,
                 reason: "submission ambiguous".into(),
+                roll: true,
             },
         );
         let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
         assert_eq!(back.uncertain, st.uncertain);
+        // an entry persisted before the `roll` flag existed loads as a planner order
+        let mut e = serde_json::to_value(&st.uncertain["BTC"]).unwrap();
+        e.as_object_mut().unwrap().remove("roll");
+        let old_entry: UncertainOrder = serde_json::from_value(e).unwrap();
+        assert!(!old_entry.roll);
     }
 
     #[test]
@@ -3982,5 +6636,181 @@ mod tests {
         let mut c = cfg_for_test();
         c.fill_wait_secs = vec![];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn order_side_is_the_one_mapping_for_send_limit_and_cost() {
+        let o = |leg, qty| Order { leg, qty };
+        assert_eq!(order_side(&o(Leg::Long, 1.0)), (OrderSide::Long, false));
+        assert_eq!(order_side(&o(Leg::Long, -1.0)), (OrderSide::Short, true));
+        assert_eq!(order_side(&o(Leg::Short, 1.0)), (OrderSide::Short, false));
+        assert_eq!(order_side(&o(Leg::Short, -1.0)), (OrderSide::Long, true));
+    }
+
+    #[test]
+    fn kill_levelling_in_dry_run_reads_the_simulated_other_leg() {
+        let b = SymBook {
+            dry_long_qty: 0.47,
+            dry_short_qty: 0.42,
+            ..SymBook::default()
+        };
+        assert_eq!(roll_dry_leg_qty(&b, Leg::Long), 0.47);
+        assert_eq!(roll_dry_leg_qty(&b, Leg::Short), 0.42);
+        // the simulated long covers the gap: levelled from the dry book
+        assert_eq!(
+            roll_kill_levelling(0.05, roll_dry_leg_qty(&b, Leg::Long), 0.0001, 4),
+            Some(0.05)
+        );
+    }
+
+    #[test]
+    fn the_reopen_is_refused_on_a_price_move_or_when_it_no_longer_fits_the_caps() {
+        let cfg = roll_cfg_on().roll;
+        let rs = RollState::default();
+        let r = |m: f64| roll_reserve(4.0 * m, 3);
+        // within the margin and fits: sent
+        assert_eq!(
+            roll_reopen_decision(&cfg, &rs, 100.0, 100.05, r(100.05)),
+            None
+        );
+        // beyond the margin either way: refused, whatever the caps
+        assert_eq!(
+            roll_reopen_decision(&cfg, &rs, 100.0, 100.2, r(100.2)),
+            Some("reopen_price_moved")
+        );
+        assert_eq!(
+            roll_reopen_decision(&cfg, &rs, 100.0, 99.8, r(99.8)),
+            Some("reopen_price_moved")
+        );
+        // the fresh reservation no longer fits: refused
+        let full = RollState {
+            week_volume_usd: cfg.weekly_volume_usd - 100.0,
+            ..RollState::default()
+        };
+        assert_eq!(
+            roll_reopen_decision(&cfg, &full, 100.0, 100.05, r(100.05)),
+            Some("reopen_capped")
+        );
+        let costly = RollState {
+            week_cost_usd: cfg.weekly_cost_usd - 0.01,
+            ..RollState::default()
+        };
+        assert_eq!(
+            roll_reopen_decision(&cfg, &costly, 100.0, 100.05, r(100.05)),
+            Some("reopen_capped")
+        );
+    }
+
+    #[test]
+    fn the_balanced_gate_needs_the_book_within_tolerance_now_and_after_the_close() {
+        // net −0.01 BTC @ 80k = $800 > $500 now; closing the short 0.005
+        // brings it to $400 — the post-close check alone would pass it
+        assert!(roll_post_close_net_ok(
+            -0.01,
+            Leg::Short,
+            0.005,
+            80_000.0,
+            500.0
+        ));
+        assert!(!roll_balanced(-0.01, Leg::Short, 0.005, 80_000.0, 500.0));
+        // flat now, $400 after the close: rolls
+        assert!(roll_balanced(0.0, Leg::Short, 0.005, 80_000.0, 500.0));
+        // within now, beyond after the close: refused
+        assert!(!roll_balanced(0.002, Leg::Short, 0.005, 80_000.0, 500.0));
+    }
+
+    #[test]
+    fn a_roll_leg_is_reserved_only_right_before_its_send() {
+        let mut rs = RollState::default();
+        // a pre-send refusal (price guard / limit / touch) returned before
+        // the reservation: finishing it changes nothing, so nothing persists
+        assert!(!roll_finish_in_flight(&mut rs, "BTC", false, false));
+        assert!(rs.in_flight.is_empty());
+        // reserved right before the send, dropped after a non-uncertain Err
+        let r = roll_reserve(400.0, 3);
+        roll_reserve_for_send(&mut rs, "BTC", r);
+        assert_eq!(roll_in_flight_total(&rs), r);
+        assert!(roll_finish_in_flight(&mut rs, "BTC", false, false));
+        assert!(rs.in_flight.is_empty());
+        // kept while uncertain; a settled leg already dropped it at booking
+        roll_reserve_for_send(&mut rs, "BTC", r);
+        assert!(!roll_finish_in_flight(&mut rs, "BTC", false, true));
+        assert_eq!(roll_in_flight_total(&rs), r);
+        roll_settle_leg(&mut rs, "BTC", T0, None);
+        assert!(!roll_finish_in_flight(&mut rs, "BTC", true, false));
+        assert!(rs.in_flight.is_empty());
+    }
+
+    #[test]
+    fn growth_is_refused_when_it_would_take_the_venue_under_the_liq_guard() {
+        let mut cfg = cfg_for_test_multi_btc_meta();
+        cfg.symbols[1].short_mmr_pct = 25.0;
+        let s = snap(
+            &[
+                ("BTC", 0.1, -0.1, 80_000.0, 80_100.0),
+                ("META", 0.0, 0.0, 750.0, 752.0),
+            ],
+            3_200.0,
+            3_200.0,
+        );
+        let plan = vec![
+            (
+                "META".to_string(),
+                vec![
+                    Order {
+                        leg: Leg::Long,
+                        qty: 10.0,
+                    },
+                    Order {
+                        leg: Leg::Short,
+                        qty: 10.0,
+                    },
+                ],
+            ),
+            // a reduction adds nothing
+            (
+                "BTC".to_string(),
+                vec![Order {
+                    leg: Leg::Short,
+                    qty: -0.05,
+                }],
+            ),
+        ];
+        let after = legs_after_growth(&plan, &s, &cfg, Leg::Short);
+        assert!((after[0].0 - 8_010.0).abs() < 1e-9);
+        assert!((after[1].0 - 7_520.0).abs() < 1e-9);
+        assert_eq!(after[1].1, 25.0);
+        // within the leverage cap (15.5k on 3.2k equity < 5x) ...
+        let gross: f64 = after.iter().map(|l| l.0).sum();
+        assert!(leverage_ok(gross, 3_200.0, cfg.max_leverage));
+        // ... yet headroom (320000 − 9612 − 188000) / 15530 = 7.9 % < 8 %
+        assert!(!growth_headroom_ok(3_200.0, &after, cfg.liq_guard_pct));
+        // the long venue (1.2 % / 3 % MMR) keeps it: growth passes there
+        let after_l = legs_after_growth(&plan, &s, &cfg, Leg::Long);
+        assert!(growth_headroom_ok(3_200.0, &after_l, cfg.liq_guard_pct));
+        // nothing held after growth: ok
+        assert!(growth_headroom_ok(0.0, &[], cfg.liq_guard_pct));
+        // roll off: the guard never applies (pre-roll planner unchanged)
+        assert!(!growth_headroom_guard_applies(false, 5_000.0));
+        assert!(growth_headroom_guard_applies(true, 5_000.0));
+        assert!(!growth_headroom_guard_applies(true, 0.0));
+    }
+
+    #[test]
+    fn a_disabled_roll_drops_carried_in_flight_reservations_at_startup() {
+        let mut rs = RollState::default();
+        rs.in_flight.insert("BTC".into(), (400.4, 0.3));
+        rs.week_volume_usd = 1_000.0;
+        // enabled: kept (the stale sweep books it)
+        assert!(roll_drop_in_flight_when_disabled(&mut rs, true).is_empty());
+        assert_eq!(rs.in_flight.len(), 1);
+        // disabled: dropped unbooked, nothing else touched
+        assert_eq!(
+            roll_drop_in_flight_when_disabled(&mut rs, false),
+            vec!["BTC".to_string()]
+        );
+        assert!(rs.in_flight.is_empty());
+        assert_eq!(rs.week_volume_usd, 1_000.0);
+        assert_eq!(roll_in_flight_total(&rs), (0.0, 0.0));
     }
 }

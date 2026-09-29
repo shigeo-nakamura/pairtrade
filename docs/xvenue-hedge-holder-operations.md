@@ -153,7 +153,8 @@ Differences from Core to keep in mind:
 1. Create a **testnet** API key (testnet.arcus.xyz/api-keys) and fund it
    with **Testnet Deposit**.
 2. Run the dex-connector ignored smoke tests first (they place a post-only
-   order, cancel it, arm/disarm the dead man's switch, then IOC + close):
+   order, cancel it, arm/disarm the dead man's switch, then IOC + close —
+   connector-level; the holder's roll itself only sends IOCs):
    `ARCUS_TESTNET_ADDRESS=0x… ARCUS_TESTNET_API_PRIVATE_KEY_HEX=… cargo test --features arcus-sdk -- --ignored arcus`
    in dex-connector.
 3. Then run the holder in DRY_RUN against testnet, with the short leg on
@@ -203,6 +204,7 @@ swap the short leg while the RH long stays open:
 |---|---|---|
 | `net exposure ...` | legs unequal by > `HEDGE_NET_TOLERANCE_USD` for `HEDGE_NET_BREACH_TICKS` ticks (an IOC keeps failing on one venue) | check the failing venue / book; while halted the bot only *reduces* the larger leg; `RISK_ACK` |
 | `leverage: ...` | a growth order this tick would exceed `HEDGE_MAX_LEVERAGE` × that venue's equity; nothing was sent (checked before the first leg) — also what fires after a liquidation | deposit, `RISK_ACK`, re-`ARM` |
+| `growth headroom: ...` | (**only while `HEDGE_ROLL_ENABLED=true`**) a growth order this tick fits `HEDGE_MAX_LEVERAGE` but would leave that venue's liquidation headroom (over every hedged book, after all of the tick's growth) under `HEDGE_LIQ_GUARD_PCT` — e.g. a high-MMR symbol on thin equity; nothing grew (checked before the first leg). While halted the next ticks only reduce, so a lopsided book (a refused roll re-open's repair) is levelled **down** | deposit, `RISK_ACK`, re-`ARM` |
 | `liq_guard: ...` | a venue's account headroom (over every hedged book) fell under `HEDGE_LIQ_GUARD_PCT`; **every armed book was closed** | rebalance collateral, `RISK_ACK`, re-`ARM` |
 
 A halt never leaves the book lopsided on purpose: the tick loop keeps
@@ -265,3 +267,64 @@ the settle waits for the next readable tick.
 The unit does **not** close positions on stop; a delta-neutral book needs
 no supervision while the process is down, and the venue funding on both
 sides keeps netting. `DISARM` before stopping only if the book should go.
+
+## Arcus-leg roll (bot-strategy#1080) — default OFF
+
+Arcus points are reported (unofficially) at ~100 pt per $1M of **perps volume**, while the RH points come from **holding** (#1046). The roll therefore trades **only the Arcus leg**. The Lighter/RH leg is never rolled: holding earns RH points at ~$1–2/pt, versus ~$36–92/pt from volume, and Lighter's terms say artificial trading does not earn points.
+
+**Only enable it after** the owner's manual Arcus week has shown that volume earns points (#1075: the wallet's fills are reconciled against the weekly drop) and the official Arcus terms do not forbid it. Start with a small budget. Rolling a hedge leg is close to wash trading, which Arcus may filter or penalise.
+
+What one roll does, strictly sequentially and only on a tick that sent nothing else:
+1. A reduce-only close of `HEDGE_ROLL_CLIP_USD` on the Arcus leg, waited on until terminal (the Arcus settle above).
+2. A re-open on the same leg, sized to what the close actually filled. There is nothing to re-open if the close did not fill.
+
+The book is lopsided by at most one roll clip, and only between the two orders. There are never two orders on the account at once, so there is no self-trade. If the re-open fails or is uncertain, the uncertain guard holds the symbol until it is reconciled. The normal levelling then grows the short leg back, because the clip is at or below the net tolerance, so no breach is counted.
+
+A roll runs only when all of these hold:
+- the book is `On` and balanced within the tolerance, both **now** and **after the close** (the close moves the net by one clip)
+- the symbol is not backing off after refusals (per symbol, see below)
+- the bot is not halted and there is no KILL_SWITCH
+- the symbol has no uncertain order and the feed is healthy
+- the Arcus account headroom is at least `HEDGE_LIQ_GUARD_PCT` and it is within `HEDGE_MAX_LEVERAGE`
+- the Arcus leg holds at least one clip
+- the interval has elapsed
+- the weekly volume budget (including this roll's close and re-open) and the weekly cost cap are not exhausted
+
+Books are rolled round-robin.
+
+| env | default | meaning |
+|---|---|---|
+| `HEDGE_ROLL_ENABLED` | `false` | master switch; needs an Arcus leg |
+| `HEDGE_ROLL_INTERVAL_SECS` | `3600` | minimum time between rolls (>= tick) |
+| `HEDGE_ROLL_CLIP_USD` | — | notional per roll; must be <= `HEDGE_CLIP_USD` and <= `HEDGE_NET_TOLERANCE_USD` |
+| `HEDGE_ROLL_WEEKLY_VOLUME_USD` | — | weekly volume budget that **gates rolls only** (every Arcus-leg execution counts toward it, but only rolls are ever refused by it) |
+| `HEDGE_ROLL_WEEKLY_COST_USD` | — | weekly cap on fees + slippage vs mark; **gates rolls only**, like the volume budget |
+| `HEDGE_ROLL_MODE` | unset | leftover of the removed `maker_first` mode: the roll is **taker-only**. Unset / `taker` are accepted; any other value is a config error while the roll is enabled and is only logged while it is off |
+
+**Roll accounting (ground truth).** The weekly caps **gate rolls only**: they decide whether the next roll (or a roll's re-open) may be sent, and never block the planner. Levelling, repairs, ARM builds, DISARM closes and guard unwinds on the rolled Arcus leg always run; they are **booked** into the week (so they consume the roll budget) but are never refused by it — the caps are not a hard volume/cost limit on the Arcus account. Every execution on that leg books its **actual** executed value and cost (fee + slippage vs the mark it was sent against) into the week at the moment it is confirmed, so a repair is booked whenever it happens, at its real price. A roll leg is additionally **reserved** right before it is sent — after its price guard, limit and touch check passed, so a leg refused before the send never leaves a reservation behind for a restart to book: notional × (1 + 0.1 %), plus fee, slippage bound and that margin as cost. The reservation is dropped once the leg returns, because its fills were already booked where they settled. A leg that ends **uncertain** keeps its reservation (`in_flight`, kept across Sundays) until the uncertain entry is released on evidence, when its observed fills are booked, or cleared by `RISK_ACK`, when the larger of its send-time reservation and a full fill at the current mark is booked as the worst case. The next roll runs only if actual week + in-flight + its own two reservations fit under both caps (checked when the roll is picked), and the re-open is checked again on its fresh reservation (`reopen_capped` below). A refused re-open leaves the leg one clip short, and the planner's repair of it is **booked but never capped** — by design: the caps limit what the roll *chooses* to trade, never the hedge's own levelling, which must run to keep the book flat. Before every send, the leg's fresh mark must be within 0.1 % of the reserved mark and the absolute limit must reach the touch (buy ≥ best ask, sell ≤ best bid, compared exactly with no tolerance), else nothing is sent. The limit is built in `Decimal` from `Decimal::from_f64` (never `from_f64_retain`, pairtrade#315) and rounded **inward** to the venue tick at that price (buy down, sell up), exactly as the connector rounds it, so the marketability check sees the price that is actually sent. The re-open, sent only after the close settled, is re-anchored on a fresh mark: its reservation and limit use that mark (one ticker read supplies both the mark and its tick; it is not read again for the price guard). It is **refused** when that fresh mark moved more than 0.1 % from the mark the roll was gated and reserved at (`reopen_price_moved`) or when its fresh reservation no longer fits the caps (`reopen_capped`), and right before it KILL_SWITCH is re-read and the Arcus headroom / leverage are re-checked on a **fresh** equity read (a halt cannot start mid-roll: it is only set by the tick's guards). Any refusal leaves the leg one clip short for the planner to repair, except KILL_SWITCH, which levels the gap itself (see the outcomes). A roll leg's booking and the drop of its reservation are one state change (one persist; each state change is persisted once), and every booking lands in the week of its booking time. Fees are booked as absolute values (taker-only: always paid), and a leg's cost is never negative: price improvement over the mark books the fee only. Only a **roll** order's uncertain entry holds a reservation: releasing or `RISK_ACK`-clearing a planner uncertain order on the same symbol never consumes it. Reservations with no uncertain roll order behind them (a process that died mid-roll) are booked every live tick, right after the uncertain orders are reconciled and before planning. Counters reset every Sunday 00:00 UTC: at the start of the tick, and again by every booking (a booking always lands in the week of its own time). Roll IOCs are sent at an **absolute** limit bound to the reserved mark (not re-anchored to the touch), and every booking uses the Arcus leg's own mark. With the roll disabled none of this books anything, and reservations carried in from an earlier roll-enabled run are dropped (unbooked, logged `[STARTUP] roll disabled: dropping in-flight roll reservations`) at startup, so no phantom in-flight volume shows in the status.
+
+**Taker-only.** Both roll legs are IOCs (Arcus taker fee, Base tier 2.25 bp), sent at an absolute limit within 0.1 % of the reserved mark. An IOC never rests on the book, so a restart can never leave a roll order behind (the post-only `maker_first` mode and its restart reconciliation were removed, bot-strategy#1080). A roll blocks the tick for at most three IOC settles — close, re-open, or close + the KILL_SWITCH levelling IOC — (≈ 3 × the sum of `HEDGE_FILL_WAIT_SECS`), plus the ticker / book / equity reads.
+
+The roll week runs **Sunday 00:00 UTC to Sunday 00:00 UTC**. This is an assumption: the Arcus points API's weekly history starts on Sunday 2026-09-13 (#1075).
+
+**Refusals back off.** A roll attempt that sends nothing (refused before the send, or rejected synchronously) counts as a refusal. So does a roll IOC the venue accepted that filled **nothing** although the price the connector actually sent (after its own tick rounding, which can land on a coarser tick at a price-tier boundary) did not reach the pre-send touch: it is logged as `roll_leg` with `status` = `sent_unmarketable` and treated as not sent (backoff, no interval, no `week_count`). Backoff is **per symbol**: that symbol's consecutive refusals wait 60 s, 120 s, 240 s, … doubling up to 1 h; after 5 in a row **that symbol** is suspended until the next roll week (Sunday 00:00 UTC). The round robin skips a backing-off symbol, so an equity book refused off-hours never stops the others (e.g. BTC) from rolling. An attempt that sends an order resets that symbol's count and starts the (global) interval; the week rollover clears every symbol's backoff. Each distinct refusal reason emits one `roll_blocked` event and stays in `blocked_reason` for the whole backoff.
+
+**DRY_RUN flip.** Switching `DRY_RUN` on ↔ off resets the roll bookkeeping (week counters, in-flight reservations, per-symbol backoff) at startup, so simulated volume never gates live rolls and vice versa.
+
+Status: `hedge_holder.roll` (`enabled`, `mode` = `taker`, `leg`, week volume / cost / count, budgets, `last_roll_at`, `next_roll_at`, `blocked_reason`, `refusal_backoff` = per symbol `{refusals, retry_not_before}`). Events: `roll_start`, `roll_leg` (one per roll IOC that reached the venue: symbol, leg, `kind` = close / reopen, `status` = `settled` / `sent_unmarketable` / `uncertain`, `order_id` (when known), requested qty, mark, limit; settled ones add filled qty, fee, value, `sent_price`, `cost_usd`), `roll_done`, `roll_blocked` (reason, refusals, `retry_not_before`, `suspended`). Every `fill` event carries `"roll": true|false`, so roll volume can be told apart from planner volume in the log. `roll_done.outcome` is one of:
+
+| outcome | meaning |
+|---|---|
+| `done` | close and re-open both filled the clip |
+| `close_not_sent` | nothing executed: refused before the send (price moved beyond the margin, the limit does not reach the touch, a read failed), rejected synchronously by the venue, or accepted but sent at a price that did not reach the touch (`sent_unmarketable`). No volume, no cost; counts as a refusal (backoff above), not a whole interval |
+| `close_unfilled` | the close was accepted and filled nothing (e.g. the touch sat outside the price margin) |
+| `close_partial_below_min` | the close filled less than the venue minimum: nothing to re-open; the planner levels it later (booked when it settles) |
+| `close_uncertain` / `reopen_uncertain` | an order's outcome is unknown: the symbol is blocked until the uncertain machinery settles it (**needs attention if it escalates**) |
+| `reopen_partial` / `reopen_failed` | the re-open filled less than the close / failed (or its fresh mark / the fresh Arcus equity could not be read): the planner levels the gap next tick |
+| `reopen_blocked_kill_levelled` / `reopen_blocked_kill_unlevelled` | KILL_SWITCH was engaged while the close settled: the re-open is not sent, and the roll itself levels the gap with a reduce-only IOC of the closed quantity on the **other** leg (the planner does not run under KILL_SWITCH). `_unlevelled` = that reduction was not possible (other leg too small / read failed) or did not fully fill: **needs attention** |
+| `reopen_blocked_headroom` / `reopen_blocked_leverage` | the fresh Arcus equity read shows headroom below `HEDGE_LIQ_GUARD_PCT` / leverage above `HEDGE_MAX_LEVERAGE`: the growth re-open is not sent. The planner's next tick tries to grow the leg back; that repair passes the same tick guards (leverage, and liquidation headroom after the growth), and if one refuses it the bot **halts** (`leverage` / `growth headroom`) and levels the larger leg **down** instead |
+| `reopen_price_moved` | the fresh mark read after the close settled moved more than 0.1 % from the gated/reserved mark: the re-open is not sent; the planner repairs the gap (booked, uncapped) |
+| `reopen_capped` | the re-open's fresh reservation no longer fits the weekly volume budget / cost cap: not sent; the planner repairs the gap (booked, uncapped — by design, see Roll accounting) |
+
+A roll leg counts as **sent** only once the venue accepted it (it settled) or it became uncertain (it reached the venue and may have filled). `week_count` counts only rolls that sent at least one order; `last_roll_at` is when a roll last sent one (the interval counts from there). `orders_this_tick` in status includes roll orders. With the roll **disabled**, nothing books into the roll counters and the only roll step at startup is dropping reservations left by an earlier roll-enabled run: a default-off deployment otherwise behaves exactly as before the roll existed.
+
