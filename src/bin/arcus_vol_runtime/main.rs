@@ -31,10 +31,14 @@ use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{
     BatchModifyRequest, BatchOrderRequest, DexConnector, DexError, OrderBookLevel, OrderSide,
 };
-use ledger::{due_markouts, risk_check, Halt, Ledger, PendingMarkout};
+use ledger::{
+    append_synced, book_fill, due_markouts, may_forget_fill, risk_check, Booking, FillIn, Halt,
+    Ledger, PendingMarkout,
+};
 use logic::{
-    book_stale, flatten_reason, flatten_steps, plan_quotes, quote_action, shock, FlattenReason,
-    QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, Step,
+    book_stale, flatten_reason, flatten_steps, plan_quotes, quote_action, shock, shutdown_steps,
+    tick_plan, FlattenReason, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep,
+    Step, TickInputs, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -109,7 +113,8 @@ struct Runtime {
     pending_markouts: Vec<PendingMarkout>,
     quote_ids: HashSet<String>,
     ioc_ids: HashSet<String>,
-    seen_fills: tape::Dedupe,
+    /// Newest public print (venue µs) applied to the paper sim.
+    newest_print_ts_us: u64,
     position_mismatch_since_ms: Option<u64>,
     last_dms_ms: u64,
     last_reconcile_ms: u64,
@@ -164,45 +169,32 @@ impl Runtime {
         }
     }
 
-    fn record(&mut self, fill: FillRecord, now: u64) {
-        let notional = fill.qty * fill.px;
-        let realized = self
-            .ledger
-            .record_fill(fill.buy, fill.qty, fill.px, fill.fee, fill.maker, now);
-        let row = json!({
-            "kind": "fill",
-            "ts_ms": now,
-            "mode": self.cfg.mode(),
-            "side": if fill.buy { "buy" } else { "sell" },
-            "px": fill.px.to_string(),
-            "qty": fill.qty.to_string(),
-            "notional": notional.round_dp(4).to_string(),
-            "role": if fill.maker { "maker" } else { "taker" },
-            "fee": fill.fee.round_dp(6).to_string(),
-            "realized": realized.round_dp(6).to_string(),
-            "order_id": fill.order_id,
-            "fill_id": fill.fill_id,
-            "inventory": self.ledger.position.qty.to_string(),
-        });
-        if let Err(e) = append_jsonl(&self.fills_path, &row) {
-            log::warn!("[ARCUS_VOL] fills.jsonl append failed: {e}");
+    /// Book one fill durably (fills.jsonl fsynced before the ledger moves,
+    /// dedupe by trade id). The caller persists state.json afterwards.
+    fn book(&mut self, fill: FillIn, now: u64) -> std::io::Result<Booking> {
+        let path = self.fills_path.clone();
+        let outcome = book_fill(&mut self.ledger, &fill, now, |row| {
+            append_synced(&path, row)
+        })?;
+        if outcome != Booking::AlreadyBooked {
+            log::info!(
+                "[ARCUS_VOL] FILL {} {} {} @ {} fee {} inv {}",
+                if fill.maker { "maker" } else { "taker" },
+                if fill.buy { "buy" } else { "sell" },
+                fill.qty,
+                fill.px,
+                fill.fee.round_dp(4),
+                self.ledger.position.qty
+            );
+            self.pending_markouts.push(PendingMarkout {
+                fill_id: fill.trade_id,
+                ts_ms: now,
+                px: fill.px,
+                buy: fill.buy,
+                horizons: MARKOUT_HORIZONS.to_vec(),
+            });
         }
-        log::info!(
-            "[ARCUS_VOL] FILL {} {} {} @ {} fee {} inv {}",
-            if fill.maker { "maker" } else { "taker" },
-            if fill.buy { "buy" } else { "sell" },
-            fill.qty,
-            fill.px,
-            fill.fee.round_dp(4),
-            self.ledger.position.qty
-        );
-        self.pending_markouts.push(PendingMarkout {
-            fill_id: fill.fill_id,
-            ts_ms: now,
-            px: fill.px,
-            buy: fill.buy,
-            horizons: MARKOUT_HORIZONS.to_vec(),
-        });
+        Ok(outcome)
     }
 
     // ---------------------------------------------------------------- paper
@@ -212,11 +204,12 @@ impl Runtime {
             return;
         }
         let now = now_ms();
+        self.newest_print_ts_us = self.newest_print_ts_us.max(p.ts_us);
         for side in [QSide::Bid, QSide::Ask] {
             let Some((vq, _)) = self.virt.get_mut(&side) else {
                 continue;
             };
-            let filled = sim::apply_trade(vq, p.px, p.qty, p.taker);
+            let filled = sim::apply_trade(vq, p.ts_us, p.px, p.qty, p.taker);
             if filled.is_zero() {
                 continue;
             }
@@ -227,18 +220,20 @@ impl Runtime {
             }
             self.sim_seq += 1;
             let fee = self.fee(filled * px, true);
-            self.record(
-                FillRecord {
-                    buy: side == QSide::Bid,
-                    qty: filled,
-                    px,
-                    fee,
-                    maker: true,
-                    order_id: format!("sim-{}", side.as_str()),
-                    fill_id: format!("sim-{}-{}", self.sim_seq, p.trade_id),
-                },
-                now,
-            );
+            let fill = FillIn {
+                trade_id: format!("sim-{}-{}", self.sim_seq, p.trade_id),
+                buy: side == QSide::Bid,
+                qty: filled,
+                px,
+                fee,
+                maker: true,
+                order_id: format!("sim-{}", side.as_str()),
+            };
+            // A print cannot be replayed, so a paper fill whose row fails to
+            // write is lost (logged); live fills are retried instead.
+            if let Err(e) = self.book(fill, now) {
+                log::error!("[ARCUS_VOL] paper fill not recorded: {e}");
+            }
         }
     }
 
@@ -254,7 +249,11 @@ impl Runtime {
                 self.virt.remove(&side);
             }
             QuoteAction::Place(t) | QuoteAction::Modify(t) | QuoteAction::Replace(Some(t)) => {
-                let vq = sim::join(side, t.px, t.qty, &levels);
+                let placed = sim::placement_ts_us(
+                    self.book.as_ref().and_then(|b| b.ts_ms),
+                    self.newest_print_ts_us,
+                );
+                let vq = sim::join(side, t.px, t.qty, &levels, placed);
                 self.virt.insert(side, (vq, t.qty));
             }
         }
@@ -277,18 +276,18 @@ impl Runtime {
                     let px = if buy { ask } else { bid };
                     let fee = self.fee(qty * px, false);
                     self.sim_seq += 1;
-                    self.record(
-                        FillRecord {
-                            buy,
-                            qty,
-                            px,
-                            fee,
-                            maker: false,
-                            order_id: "sim-ioc".to_string(),
-                            fill_id: format!("sim-{}-ioc", self.sim_seq),
-                        },
-                        now,
-                    );
+                    let fill = FillIn {
+                        trade_id: format!("sim-{}-ioc", self.sim_seq),
+                        buy,
+                        qty,
+                        px,
+                        fee,
+                        maker: false,
+                        order_id: "sim-ioc".to_string(),
+                    };
+                    if let Err(e) = self.book(fill, now) {
+                        log::error!("[ARCUS_VOL] paper flatten not recorded: {e}");
+                    }
                 }
             }
         }
@@ -306,49 +305,79 @@ impl Runtime {
             }
         };
         for f in rows {
-            // Clear first: a row that cannot be booked must not stay pending
-            // and be re-read every tick (it is logged below).
-            if let Err(e) = self.dex.clear_filled_order(&market, &f.trade_id).await {
-                log::debug!("[ARCUS_VOL] clear_filled_order {}: {e}", f.trade_id);
-            }
-            let first = self.seen_fills.first(&f.trade_id);
-            if first && !f.is_rejected {
-                let (Some(side), Some(qty), Some(value)) =
-                    (f.filled_side, f.filled_size, f.filled_value)
-                else {
-                    log::warn!("[ARCUS_VOL] fill {} without side/size/value", f.trade_id);
-                    continue;
-                };
-                if qty.is_zero() {
-                    continue;
+            let bookable = match (f.filled_side, f.filled_size, f.filled_value) {
+                (Some(side), Some(qty), Some(value)) if !f.is_rejected && !qty.is_zero() => {
+                    Some((side, qty, value))
                 }
-                let fee = f.filled_fee.unwrap_or(Decimal::ZERO);
-                let maker = if self.ioc_ids.contains(&f.order_id) {
-                    false
-                } else if self.quote_ids.contains(&f.order_id) {
-                    true
-                } else {
-                    fee <= Decimal::ZERO
-                };
-                for r in self.resting.values_mut() {
-                    if r.order_id == f.order_id {
-                        r.filled += qty;
-                    }
-                }
-                self.resting.retain(|_, r| r.filled < r.qty);
-                self.record(
-                    FillRecord {
-                        buy: side == OrderSide::Long,
-                        qty,
-                        px: value / qty,
-                        fee,
-                        maker,
-                        order_id: f.order_id.clone(),
-                        fill_id: f.trade_id.clone(),
-                    },
-                    now,
+                _ => None,
+            };
+            let Some((side, qty, value)) = bookable else {
+                // Nothing to book: let the connector forget it.
+                log::warn!(
+                    "[ARCUS_VOL] fill {} not bookable (rejected/empty)",
+                    f.trade_id
                 );
+                self.clear_fill(&market, &f.trade_id).await;
+                continue;
+            };
+            let fee = f.filled_fee.unwrap_or(Decimal::ZERO);
+            let maker = if self.ioc_ids.contains(&f.order_id) {
+                false
+            } else if self.quote_ids.contains(&f.order_id) {
+                true
+            } else {
+                fee <= Decimal::ZERO
+            };
+            let fill = FillIn {
+                trade_id: f.trade_id.clone(),
+                buy: side == OrderSide::Long,
+                qty,
+                px: value / qty,
+                fee,
+                maker,
+                order_id: f.order_id.clone(),
+            };
+            let booking = self.book(fill, now);
+            match &booking {
+                Ok(Booking::Booked(_)) => {
+                    for r in self.resting.values_mut() {
+                        if r.order_id == f.order_id {
+                            r.filled += qty;
+                        }
+                    }
+                    self.resting.retain(|_, r| r.filled < r.qty);
+                }
+                Ok(Booking::AlreadyBooked) => {}
+                Err(e) => {
+                    // Kept in the connector; retried next tick.
+                    log::error!(
+                        "[ARCUS_VOL] fill {} not written, will retry: {e}",
+                        f.trade_id
+                    );
+                    continue;
+                }
             }
+            // The connector may forget the fill only once the booking is in
+            // state.json (Codex P1, pairtrade#361).
+            let persisted = match persist_json(&self.state_path, &self.ledger) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::error!(
+                        "[ARCUS_VOL] state write failed after fill {}, will retry: {e:#}",
+                        f.trade_id
+                    );
+                    false
+                }
+            };
+            if may_forget_fill(&booking, persisted) {
+                self.clear_fill(&market, &f.trade_id).await;
+            }
+        }
+    }
+
+    async fn clear_fill(&self, market: &str, trade_id: &str) {
+        if let Err(e) = self.dex.clear_filled_order(market, trade_id).await {
+            log::debug!("[ARCUS_VOL] clear_filled_order {trade_id}: {e}");
         }
     }
 
@@ -713,7 +742,7 @@ impl Runtime {
         // Stops.
         let kill = self.kill_path.exists();
         let halt_file = self.halt_path.exists();
-        let (halt, events) = risk_check(
+        let risk = risk_check(
             &mut self.ledger,
             mark,
             kill,
@@ -721,58 +750,35 @@ impl Runtime {
             self.cfg.daily_stop_usd,
             self.cfg.cum_stop_usd,
         );
-        for e in &events {
+        for e in &risk.events {
             log::warn!("[ARCUS_VOL] {e}");
         }
-        if self.ledger.sticky_halt && !halt_file {
+        if risk.write_halt_file {
             let body = self.ledger.sticky_reason.clone().unwrap_or_default();
             if let Err(e) = std::fs::write(&self.halt_path, format!("{body}\n")) {
                 log::error!("[ARCUS_VOL] cannot write HALT: {e}");
             }
         }
-        self.halt = halt;
+        self.halt = risk.halt;
 
-        if now < self.backoff_until_ms {
-            self.finish_tick(now, mid);
-            return;
-        }
-        let Some(m) = mid else {
-            self.pull_quotes().await;
-            self.finish_tick(now, mid);
-            return;
-        };
-
-        // Flatten (cap / max hold / halt / startup) comes before quoting.
+        // Flatten (cap / max hold / halt / startup) needs a mid.
         let halt_label = self.halt.as_ref().map(Halt::label);
-        let reason = if self.startup_flatten && !self.ledger.position.qty.is_zero() {
-            Some(FlattenReason::Startup)
-        } else {
-            self.startup_flatten = false;
-            flatten_reason(
-                self.ledger.position.qty,
-                m,
-                self.cfg.effective_cap_usd(),
-                self.ledger.position.opened_at_ms,
-                now,
-                self.cfg.max_hold_secs,
-                halt_label.as_deref(),
-            )
-        };
-        if let Some(reason) = reason {
-            log::info!(
-                "[ARCUS_VOL] flatten {:?}: inventory {}",
-                reason,
-                self.ledger.position.qty
-            );
-            if self.cfg.dry_run {
-                self.paper_flatten(now);
+        let flatten = mid.and_then(|m| {
+            if self.startup_flatten && !self.ledger.position.qty.is_zero() {
+                Some(FlattenReason::Startup)
             } else {
-                self.live_flatten(now).await;
+                self.startup_flatten = false;
+                flatten_reason(
+                    self.ledger.position.qty,
+                    m,
+                    self.cfg.effective_cap_usd(),
+                    self.ledger.position.opened_at_ms,
+                    now,
+                    self.cfg.max_hold_secs,
+                    halt_label.as_deref(),
+                )
             }
-            self.finish_tick(now, mid);
-            return;
-        }
-
+        });
         let stale = book_stale(
             self.book.as_ref().and_then(|b| b.ts_ms),
             now,
@@ -792,10 +798,41 @@ impl Runtime {
             }
             self.cooldown_until_ms = now + self.cfg.cooldown_secs * 1_000;
         }
-        if self.halt.is_some() || stale || now < self.cooldown_until_ms {
-            self.pull_quotes().await;
-            self.finish_tick(now, mid);
-            return;
+        // Safety actions are never gated by a 429 backoff; only new
+        // placement / modification is (Codex P1, pairtrade#361).
+        let plan = tick_plan(&TickInputs {
+            has_book: mid.is_some(),
+            halted: self.halt.is_some(),
+            stale,
+            shock_or_cooldown: now < self.cooldown_until_ms,
+            backoff: now < self.backoff_until_ms,
+            flatten,
+        });
+        match plan {
+            TickPlan::Flatten(reason) => {
+                log::info!(
+                    "[ARCUS_VOL] flatten {:?}: inventory {}",
+                    reason,
+                    self.ledger.position.qty
+                );
+                if self.cfg.dry_run {
+                    self.paper_flatten(now);
+                } else {
+                    self.live_flatten(now).await;
+                }
+                self.finish_tick(now, mid);
+                return;
+            }
+            TickPlan::PullQuotes(_) => {
+                self.pull_quotes().await;
+                self.finish_tick(now, mid);
+                return;
+            }
+            TickPlan::Wait => {
+                self.finish_tick(now, mid);
+                return;
+            }
+            TickPlan::Quote => {}
         }
 
         let (bid_px, ask_px) = {
@@ -885,36 +922,50 @@ impl Runtime {
     }
 
     async fn shutdown(&mut self) {
-        if !self.cfg.dry_run {
-            if let Err(e) = self
-                .dex
-                .cancel_all_orders(Some(self.cfg.market.clone()))
-                .await
-            {
-                log::error!("[ARCUS_VOL] shutdown cancel_all failed: {e}");
-            }
-            if let Err(e) = self.dex.schedule_cancel(None).await {
-                log::warn!("[ARCUS_VOL] shutdown DMS disarm failed: {e}");
+        for step in shutdown_steps(!self.cfg.dry_run) {
+            match step {
+                ShutdownStep::CancelAll => {
+                    if let Err(e) = self
+                        .dex
+                        .cancel_all_orders(Some(self.cfg.market.clone()))
+                        .await
+                    {
+                        log::error!("[ARCUS_VOL] shutdown cancel_all failed: {e}");
+                    }
+                    self.resting.clear();
+                }
+                ShutdownStep::HarvestFills => {
+                    // Fills that landed before the cancel acks; bounded so a
+                    // dead venue cannot hold the shutdown hostage.
+                    let harvest = async {
+                        for _ in 0..3 {
+                            self.live_fills(now_ms()).await;
+                            tokio::time::sleep(Duration::from_millis(700)).await;
+                        }
+                    };
+                    if tokio::time::timeout(Duration::from_secs(5), harvest)
+                        .await
+                        .is_err()
+                    {
+                        log::warn!("[ARCUS_VOL] shutdown fill harvest timed out");
+                    }
+                }
+                ShutdownStep::Persist => {
+                    self.virt.clear();
+                    self.finish_tick(now_ms(), self.book.as_ref().map(BookView::mid));
+                }
+                ShutdownStep::DisarmDms => {
+                    if let Err(e) = self.dex.schedule_cancel(None).await {
+                        log::warn!("[ARCUS_VOL] shutdown DMS disarm failed: {e}");
+                    }
+                }
             }
         }
-        self.virt.clear();
-        self.resting.clear();
-        self.finish_tick(now_ms(), self.book.as_ref().map(BookView::mid));
         log::info!(
             "[ARCUS_VOL] stopped; inventory left open: {} (not flattened on shutdown)",
             self.ledger.position.qty
         );
     }
-}
-
-struct FillRecord {
-    buy: bool,
-    qty: Decimal,
-    px: Decimal,
-    fee: Decimal,
-    maker: bool,
-    order_id: String,
-    fill_id: String,
 }
 
 #[tokio::main]
@@ -982,7 +1033,7 @@ async fn main() -> Result<()> {
         pending_markouts: Vec::new(),
         quote_ids: HashSet::new(),
         ioc_ids: HashSet::new(),
-        seen_fills: tape::Dedupe::new(50_000),
+        newest_print_ts_us: 0,
         position_mismatch_since_ms: None,
         last_dms_ms: 0,
         last_reconcile_ms: 0,

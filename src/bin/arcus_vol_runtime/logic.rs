@@ -223,6 +223,81 @@ pub fn shock(
     }
 }
 
+/// What one tick may do, decided before any IO (Codex P1, pairtrade#361).
+#[derive(Debug, Clone, Default)]
+pub struct TickInputs {
+    pub has_book: bool,
+    pub halted: bool,
+    pub stale: bool,
+    /// A book shock now or its cooldown still running.
+    pub shock_or_cooldown: bool,
+    /// A 429 cooldown is running.
+    pub backoff: bool,
+    pub flatten: Option<FlattenReason>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TickPlan {
+    /// Cancel quotes (hit side first) then reduce-only IOC.
+    Flatten(FlattenReason),
+    /// Pull every resting quote; the label says why.
+    PullQuotes(&'static str),
+    /// Rate-limit backoff with nothing unsafe resting: leave quotes as they are.
+    Wait,
+    Quote,
+}
+
+/// Safety first, and never gated by a rate-limit backoff: a flatten, then a
+/// quote pull for no book / halt / stale book / shock. Only new placement or
+/// modification waits out the backoff.
+pub fn tick_plan(i: &TickInputs) -> TickPlan {
+    if let Some(reason) = &i.flatten {
+        return TickPlan::Flatten(reason.clone());
+    }
+    if !i.has_book {
+        return TickPlan::PullQuotes("no_book");
+    }
+    if i.halted {
+        return TickPlan::PullQuotes("halt");
+    }
+    if i.stale {
+        return TickPlan::PullQuotes("stale_book");
+    }
+    if i.shock_or_cooldown {
+        return TickPlan::PullQuotes("shock");
+    }
+    if i.backoff {
+        return TickPlan::Wait;
+    }
+    TickPlan::Quote
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownStep {
+    CancelAll,
+    /// Book fills that landed up to the cancel acks (bounded wait).
+    HarvestFills,
+    Persist,
+    DisarmDms,
+}
+
+/// Shutdown order (Codex P1, pairtrade#361): cancel first so nothing new
+/// fills, then harvest the fills that did land and persist them, and only
+/// then disarm the dead man's switch (armed until our cancels are known
+/// good). DRY_RUN only persists.
+pub fn shutdown_steps(live: bool) -> Vec<ShutdownStep> {
+    if live {
+        vec![
+            ShutdownStep::CancelAll,
+            ShutdownStep::HarvestFills,
+            ShutdownStep::Persist,
+            ShutdownStep::DisarmDms,
+        ]
+    } else {
+        vec![ShutdownStep::Persist]
+    }
+}
+
 /// Book older than `stale_secs`, or served without a feed timestamp (REST
 /// fallback), is not quoted against.
 pub fn book_stale(book_ts_ms: Option<u64>, now_ms: u64, stale_secs: u64) -> bool {
@@ -433,6 +508,74 @@ mod tests {
         assert!(!shock(&h, 2_100, 2_000, d("5")));
         h.push_back((2_200, d("100090")));
         assert!(shock(&h, 2_200, 2_000, d("5")));
+    }
+
+    #[test]
+    fn safety_actions_run_during_a_rate_limit_backoff() {
+        let base = TickInputs {
+            has_book: true,
+            backoff: true,
+            ..TickInputs::default()
+        };
+        // Nothing unsafe: wait out the backoff.
+        assert_eq!(tick_plan(&base), TickPlan::Wait);
+        // Flatten beats everything, including the backoff and a halt.
+        let f = TickInputs {
+            flatten: Some(FlattenReason::Halt("kill_switch".into())),
+            halted: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            tick_plan(&f),
+            TickPlan::Flatten(FlattenReason::Halt("kill_switch".into()))
+        );
+        for (inputs, why) in [
+            (
+                TickInputs {
+                    has_book: false,
+                    ..base.clone()
+                },
+                "no_book",
+            ),
+            (
+                TickInputs {
+                    halted: true,
+                    ..base.clone()
+                },
+                "halt",
+            ),
+            (
+                TickInputs {
+                    stale: true,
+                    ..base.clone()
+                },
+                "stale_book",
+            ),
+            (
+                TickInputs {
+                    shock_or_cooldown: true,
+                    ..base.clone()
+                },
+                "shock",
+            ),
+        ] {
+            assert_eq!(tick_plan(&inputs), TickPlan::PullQuotes(why));
+        }
+        let clear = TickInputs {
+            backoff: false,
+            ..base
+        };
+        assert_eq!(tick_plan(&clear), TickPlan::Quote);
+    }
+
+    #[test]
+    fn shutdown_cancels_then_harvests_and_persists_before_disarming() {
+        let live = shutdown_steps(true);
+        let at = |s: ShutdownStep| live.iter().position(|x| *x == s).unwrap();
+        assert!(at(ShutdownStep::CancelAll) < at(ShutdownStep::HarvestFills));
+        assert!(at(ShutdownStep::HarvestFills) < at(ShutdownStep::Persist));
+        assert!(at(ShutdownStep::Persist) < at(ShutdownStep::DisarmDms));
+        assert_eq!(shutdown_steps(false), vec![ShutdownStep::Persist]);
     }
 
     #[test]

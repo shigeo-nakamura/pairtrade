@@ -67,10 +67,18 @@ fn int<T: FromStr>(name: &str, default: T) -> Result<T> {
     }
 }
 
-fn boolean(name: &str, default: bool) -> bool {
-    var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(default)
+/// Strict boolean: only true/false/1/0/yes/no (trimmed, any case); unset
+/// means `default`. Anything else is a startup error, so a typo in
+/// `ARCUS_VOL_DRY_RUN` can never select live (Codex P1, pairtrade#361).
+pub fn parse_bool(name: &str, raw: Option<&str>, default: bool) -> Result<bool> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(default);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" => Ok(false),
+        _ => bail!("{name}={raw} is not a boolean (use true/false/1/0/yes/no)"),
+    }
 }
 
 impl Config {
@@ -104,7 +112,11 @@ impl Config {
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
-            dry_run: boolean(&p("DRY_RUN"), true),
+            dry_run: parse_bool(
+                &p("DRY_RUN"),
+                std::env::var(p("DRY_RUN")).ok().as_deref(),
+                true,
+            )?,
             live_confirm: var(&p("LIVE_CONFIRM")).unwrap_or_default(),
             account_index: match var("ARCUS_ACCOUNT_INDEX") {
                 None => None,
@@ -201,6 +213,22 @@ mod tests {
         assert!(live_gate(false, LIVE_CONFIRM_TOKEN, None).is_err());
         assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(0)).is_err());
         assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(3)).is_ok());
+    }
+
+    #[test]
+    fn dry_run_parses_strictly_and_a_typo_is_an_error_not_live() {
+        let n = "ARCUS_VOL_DRY_RUN";
+        assert!(parse_bool(n, None, true).unwrap());
+        assert!(parse_bool(n, Some("  "), true).unwrap());
+        for t in ["true", "TRUE", " 1 ", "yes", "Yes"] {
+            assert!(parse_bool(n, Some(t), false).unwrap(), "{t}");
+        }
+        for f in ["false", "False", "0", "no", " NO "] {
+            assert!(!parse_bool(n, Some(f), true).unwrap(), "{f}");
+        }
+        for typo in ["flase", "treu", "off", "on", "2", "y", "n"] {
+            assert!(parse_bool(n, Some(typo), true).is_err(), "{typo}");
+        }
     }
 
     #[test]
