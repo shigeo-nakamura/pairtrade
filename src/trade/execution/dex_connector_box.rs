@@ -739,6 +739,24 @@ impl DexConnector for DexConnectorBox {
     async fn subscribe_symbols(&self, symbols: &[String]) -> Result<(), DexError> {
         self.inner.subscribe_symbols(symbols).await
     }
+
+    async fn schedule_cancel(&self, timeout_secs: Option<u64>) -> Result<(), DexError> {
+        self.inner.schedule_cancel(timeout_secs).await
+    }
+
+    async fn create_orders_batch(
+        &self,
+        orders: Vec<dex_connector::BatchOrderRequest>,
+    ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
+        self.inner.create_orders_batch(orders).await
+    }
+
+    async fn modify_orders_batch(
+        &self,
+        modifies: Vec<dex_connector::BatchModifyRequest>,
+    ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
+        self.inner.modify_orders_batch(modifies).await
+    }
 }
 
 #[cfg(test)]

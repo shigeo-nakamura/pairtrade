@@ -7975,6 +7975,27 @@ mod tests {
         ) -> Result<(), dex_connector::DexError> {
             unimplemented!("the test drives latest_price directly")
         }
+
+        async fn schedule_cancel(
+            &self,
+            _timeout_secs: Option<u64>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!("the test drives latest_price directly")
+        }
+
+        async fn create_orders_batch(
+            &self,
+            _orders: Vec<dex_connector::BatchOrderRequest>,
+        ) -> Result<Vec<dex_connector::BatchOrderResult>, dex_connector::DexError> {
+            unimplemented!("the test drives latest_price directly")
+        }
+
+        async fn modify_orders_batch(
+            &self,
+            _modifies: Vec<dex_connector::BatchModifyRequest>,
+        ) -> Result<Vec<dex_connector::BatchOrderResult>, dex_connector::DexError> {
+            unimplemented!("the test drives latest_price directly")
+        }
     }
 
     struct Harness {

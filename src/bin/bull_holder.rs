@@ -5495,6 +5495,27 @@ mod tests {
                 "QuoteOnly stub: subscribe_symbols must not be called on the DRY_RUN exit path"
             )
         }
+
+        async fn schedule_cancel(
+            &self,
+            _timeout_secs: Option<u64>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: not used on the DRY_RUN exit path")
+        }
+
+        async fn create_orders_batch(
+            &self,
+            _orders: Vec<dex_connector::BatchOrderRequest>,
+        ) -> Result<Vec<dex_connector::BatchOrderResult>, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: not used on the DRY_RUN exit path")
+        }
+
+        async fn modify_orders_batch(
+            &self,
+            _modifies: Vec<dex_connector::BatchModifyRequest>,
+        ) -> Result<Vec<dex_connector::BatchOrderResult>, dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: not used on the DRY_RUN exit path")
+        }
     }
 
     fn engine_with_stops(dir: &std::path::Path) -> Engine {
