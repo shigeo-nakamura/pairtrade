@@ -575,8 +575,14 @@ pub fn position_from_snapshots(snaps: &[PositionSnapshot], symbol: &str) -> Opti
     })
 }
 
-fn decimal(v: f64) -> Result<Decimal> {
-    Decimal::from_f64_retain(v).ok_or_else(|| anyhow!("{v} is not representable as Decimal"))
+/// An order quantity as a `Decimal`, via `from_f64` for the same reason as
+/// [`price_decimal`]: the connector truncates the size *toward zero* to the
+/// venue lot, so the binary expansion `from_f64_retain(0.3)` =
+/// `0.2999999999999999888977697537` loses a whole lot at one size decimal
+/// (0.2 instead of 0.3) -- an order one lot short of the intent
+/// (bot-strategy#1092).
+fn qty_decimal(v: f64) -> Result<Decimal> {
+    Decimal::from_f64(v).ok_or_else(|| anyhow!("{v} is not representable as Decimal"))
 }
 
 /// A limit price as a `Decimal`, via `from_f64` (the shortest decimal the
@@ -753,7 +759,7 @@ impl Executor for LiveExecutor {
             Side::Sell => OrderSide::Short,
         };
         let bound = send_price(self.slippage_bps, mid, touch, side, intent)?;
-        let size = decimal(intent.qty)?;
+        let size = qty_decimal(intent.qty)?;
         let (order_id, venue_error) = match self.send_capped(intent, size, side, bound).await {
             Ok(r) => (Some(r.order_id), None),
             // Provably never submitted: report it as a pre-send abort so
@@ -1037,6 +1043,35 @@ mod tests {
         assert!(!within_slippage(100.0, 99.4, Side::Sell, 50));
         assert!(within_slippage(100.0, 101.0, Side::Sell, 50)); // favourable
         assert!(!within_slippage(0.0, 100.0, Side::Buy, 50));
+    }
+
+    /// The size the connector truncates to its lot must be the intent's
+    /// quantity, not one lot less (bot-strategy#1092). Only values with no
+    /// exact binary form catch this; 0.5 or 0.25 would pass either way.
+    #[test]
+    fn an_order_quantity_survives_the_connectors_lot_truncation() {
+        use rust_decimal::RoundingStrategy::ToZero;
+        for (qty, lot_dp, want) in [
+            (0.3, 1, "0.3"),
+            (1.1, 1, "1.1"),
+            (0.07, 2, "0.07"),
+            (13.2841, 4, "13.2841"),
+            (0.47662, 5, "0.47662"),
+        ] {
+            let size = qty_decimal(qty).unwrap();
+            assert_eq!(
+                size.round_dp_with_strategy(lot_dp, ToZero),
+                Decimal::from_str_exact(want).unwrap(),
+                "{qty} at {lot_dp} size decimals became {size}"
+            );
+        }
+        // The binary expansion is what lost the lot: keep the premise visible.
+        assert_eq!(
+            Decimal::from_f64_retain(0.3)
+                .unwrap()
+                .round_dp_with_strategy(1, ToZero),
+            Decimal::from_str_exact("0.2").unwrap()
+        );
     }
 
     /// The bound the connector is actually called with, per branch
