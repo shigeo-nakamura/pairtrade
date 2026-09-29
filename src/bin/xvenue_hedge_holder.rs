@@ -983,9 +983,16 @@ fn roll_reopen_blocked(kill: bool, headroom_ok: bool, leverage_ok: bool) -> Opti
 /// the one-clip gap is closed by a REDUCTION of the other (non-rolled) leg
 /// instead — reduce-only, by exactly what the close filled. `None` when that
 /// cannot be one order (below the venue minimum) or the other leg holds less.
-fn roll_kill_levelling(close_filled: f64, other_leg_qty: f64, min_qty: f64) -> Option<f64> {
-    (close_filled > 0.0 && close_filled >= min_qty && other_leg_qty + 1e-12 >= close_filled)
-        .then_some(close_filled)
+fn roll_kill_levelling(
+    close_filled: f64,
+    other_leg_qty: f64,
+    min_qty: f64,
+    size_decimals: u32,
+) -> Option<f64> {
+    // floored to the submitted precision: execute rounds, which could round a
+    // finer-precision fill UP and close more of the other leg than was removed
+    let q = floor_to_decimals(close_filled, size_decimals);
+    (q > 0.0 && q >= min_qty && other_leg_qty + 1e-12 >= q).then_some(q)
 }
 
 /// Does an absolute IOC limit reach the touch (buy ≥ best ask, sell ≤ best
@@ -3157,14 +3164,39 @@ impl Engine {
                             }
                         }
                     };
-                let gate = match (kill_now, &fresh, &fresh_account) {
-                    (true, _, _) => roll_reopen_blocked(true, true, true),
-                    (false, Some((f, _)), Some((eq, pos))) => {
+                // FRESH marks for every OTHER held symbol too: the gates are
+                // account-wide, and a stale tick-start mark would understate a
+                // market that moved while the close settled.
+                let mut fresh_marks: Option<std::collections::BTreeMap<String, f64>> =
+                    fresh_account.as_ref().map(|_| Default::default());
+                if let (Some(marks), Some((_, pos))) = (fresh_marks.as_mut(), &fresh_account) {
+                    for (s, q) in pos {
+                        if *s == sym || q.abs() <= 0.0 {
+                            continue;
+                        }
+                        match self.venue(leg).dex.get_ticker(s, None).await {
+                            Ok(t) if t.price.to_f64().is_some_and(|p| p > 0.0) => {
+                                marks.insert(s.clone(), t.price.to_f64().unwrap_or(0.0));
+                            }
+                            other => {
+                                log::warn!(
+                                    "[ROLL] {sym} re-open: fresh {s} mark read failed ({})",
+                                    if other.is_ok() { "no price" } else { "error" }
+                                );
+                                fresh_marks = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let gate = match (kill_now, &fresh, &fresh_account, &fresh_marks) {
+                    (true, _, _, _) => roll_reopen_blocked(true, true, true),
+                    (false, Some((f, _)), Some((eq, pos)), Some(marks)) => {
                         let legs_after = reopen_legs_after(
                             &self.cfg.symbols,
                             leg,
                             |s| pos.get(s).copied().unwrap_or(0.0),
-                            |s| snap.mark_of(leg, s),
+                            |s| marks.get(s).copied().unwrap_or(0.0),
                             &sym,
                             reopen.qty,
                             *f,
@@ -3212,7 +3244,9 @@ impl Engine {
                                 }
                             }
                         };
-                        if let Some(q) = roll_kill_levelling(close_filled, other_qty, m.min_qty) {
+                        if let Some(q) =
+                            roll_kill_levelling(close_filled, other_qty, m.min_qty, m.size_decimals)
+                        {
                             let reduce = Order {
                                 leg: other,
                                 qty: -q,
@@ -5465,11 +5499,13 @@ mod tests {
     fn kill_switch_levels_the_roll_gap_by_reducing_the_other_leg() {
         // re-open blocked by KILL_SWITCH: reduce the other leg by what the
         // close filled, reduce-only
-        assert_eq!(roll_kill_levelling(0.05, 0.47, 0.0001), Some(0.05));
+        assert_eq!(roll_kill_levelling(0.05, 0.47, 0.0001, 4), Some(0.05));
         // not one orderable order, or the other leg holds less: nothing
-        assert_eq!(roll_kill_levelling(0.00005, 0.47, 0.0001), None);
-        assert_eq!(roll_kill_levelling(0.05, 0.03, 0.0001), None);
-        assert_eq!(roll_kill_levelling(0.0, 0.47, 0.0001), None);
+        assert_eq!(roll_kill_levelling(0.00005, 0.47, 0.0001, 4), None);
+        assert_eq!(roll_kill_levelling(0.05, 0.03, 0.0001, 4), None);
+        assert_eq!(roll_kill_levelling(0.0, 0.47, 0.0001, 4), None);
+        // a finer-precision fill is levelled FLOORED, never rounded up
+        assert_eq!(roll_kill_levelling(0.123456, 0.47, 0.0001, 4), Some(0.1234));
     }
 
     #[test]
@@ -6622,7 +6658,7 @@ mod tests {
         assert_eq!(roll_dry_leg_qty(&b, Leg::Short), 0.42);
         // the simulated long covers the gap: levelled from the dry book
         assert_eq!(
-            roll_kill_levelling(0.05, roll_dry_leg_qty(&b, Leg::Long), 0.0001),
+            roll_kill_levelling(0.05, roll_dry_leg_qty(&b, Leg::Long), 0.0001, 4),
             Some(0.05)
         );
     }
