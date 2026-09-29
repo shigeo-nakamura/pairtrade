@@ -98,22 +98,31 @@ pub enum FlattenReason {
 
 /// Flatten when inventory reaches the effective cap, has been open longer
 /// than `max_hold_secs`, or a halt is in force.
+///
+/// Startup, halt (incl. KILL_SWITCH) and max-hold need no book: side and
+/// size come from the position, and the live IOC prices off the connector's
+/// own view (Codex P1, pairtrade#361). Only the cap check needs a mid.
+#[allow(clippy::too_many_arguments)]
 pub fn flatten_reason(
     inv_qty: Decimal,
-    mid: Decimal,
+    mid: Option<Decimal>,
     effective_cap_usd: Decimal,
     opened_at_ms: Option<u64>,
     now_ms: u64,
     max_hold_secs: u64,
     halt: Option<&str>,
+    startup: bool,
 ) -> Option<FlattenReason> {
     if inv_qty.is_zero() {
         return None;
     }
+    if startup {
+        return Some(FlattenReason::Startup);
+    }
     if let Some(reason) = halt {
         return Some(FlattenReason::Halt(reason.to_string()));
     }
-    if (inv_qty * mid).abs() >= effective_cap_usd {
+    if mid.is_some_and(|m| (inv_qty * m).abs() >= effective_cap_usd) {
         return Some(FlattenReason::Cap);
     }
     if opened_at_ms.is_some_and(|t| now_ms.saturating_sub(t) > max_hold_secs * 1_000) {
@@ -233,6 +242,9 @@ pub struct TickInputs {
     pub shock_or_cooldown: bool,
     /// A 429 cooldown is running.
     pub backoff: bool,
+    /// Live: the dead man's switch is armed and its refresh is succeeding
+    /// (always true in DRY_RUN). No new quote without it.
+    pub dms_armed: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -266,15 +278,33 @@ pub fn tick_plan(i: &TickInputs) -> TickPlan {
     if i.shock_or_cooldown {
         return TickPlan::PullQuotes("shock");
     }
+    if !i.dms_armed {
+        // No resting quote without a dead man's switch behind it (Codex P1,
+        // pairtrade#361); main keeps trying to arm it every tick.
+        return TickPlan::PullQuotes("dms_unarmed");
+    }
     if i.backoff {
         return TickPlan::Wait;
     }
     TickPlan::Quote
 }
 
+/// The DMS counts as armed when the last successful arm/refresh is younger
+/// than its own deadline and the latest attempt did not fail.
+pub fn dms_armed(
+    last_ok_ms: Option<u64>,
+    last_attempt_failed: bool,
+    now_ms: u64,
+    dms_secs: u64,
+) -> bool {
+    !last_attempt_failed && last_ok_ms.is_some_and(|t| now_ms.saturating_sub(t) < dms_secs * 1_000)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownStep {
     CancelAll,
+    /// Read open orders back: the DMS is only disarmed when none of ours rest.
+    VerifyNoneResting,
     /// Book fills that landed up to the cancel acks (bounded wait).
     HarvestFills,
     Persist,
@@ -282,13 +312,14 @@ pub enum ShutdownStep {
 }
 
 /// Shutdown order (Codex P1, pairtrade#361): cancel first so nothing new
-/// fills, then harvest the fills that did land and persist them, and only
-/// then disarm the dead man's switch (armed until our cancels are known
-/// good). DRY_RUN only persists.
+/// fills, verify nothing of ours still rests, harvest the fills that did
+/// land and persist them, and only then disarm the dead man's switch (see
+/// `may_disarm_dms`). DRY_RUN only persists.
 pub fn shutdown_steps(live: bool) -> Vec<ShutdownStep> {
     if live {
         vec![
             ShutdownStep::CancelAll,
+            ShutdownStep::VerifyNoneResting,
             ShutdownStep::HarvestFills,
             ShutdownStep::Persist,
             ShutdownStep::DisarmDms,
@@ -296,6 +327,12 @@ pub fn shutdown_steps(live: bool) -> Vec<ShutdownStep> {
     } else {
         vec![ShutdownStep::Persist]
     }
+}
+
+/// Disarm the DMS at shutdown only when the cancel succeeded AND a
+/// read-back found none of our orders resting (`None` = the read failed).
+pub fn may_disarm_dms(cancel_ok: bool, open_after: Option<usize>) -> bool {
+    cancel_ok && open_after == Some(0)
 }
 
 /// Book older than `stale_secs`, or served without a feed timestamp (REST
@@ -391,35 +428,86 @@ mod tests {
     #[test]
     fn flatten_triggers_on_cap_max_hold_and_halt() {
         let cap = d("10000");
-        let mid = d("83642.95");
+        let m = Some(d("83642.95"));
+        let fr = |inv: &str, mid: Option<Decimal>, now: u64, halt: Option<&str>, startup: bool| {
+            flatten_reason(d(inv), mid, cap, Some(0), now, 300, halt, startup)
+        };
+        assert_eq!(fr("0", m, 1_000_000, Some("kill"), true), None);
         assert_eq!(
-            flatten_reason(
-                Decimal::ZERO,
-                mid,
-                cap,
-                Some(0),
-                1_000_000,
-                300,
-                Some("kill")
-            ),
-            None
+            fr("0.1", m, 1_000, Some("kill"), false),
+            Some(FlattenReason::Halt("kill".into()))
         );
+        assert_eq!(fr("-0.12", m, 1_000, None, false), Some(FlattenReason::Cap));
+        assert_eq!(fr("0.1", m, 300_000, None, false), None);
         assert_eq!(
-            flatten_reason(d("0.1"), mid, cap, Some(0), 1_000, 300, Some("kill")),
-            Some(FlattenReason::Halt("kill".to_string()))
-        );
-        assert_eq!(
-            flatten_reason(d("-0.12"), mid, cap, Some(0), 1_000, 300, None),
-            Some(FlattenReason::Cap)
-        );
-        assert_eq!(
-            flatten_reason(d("0.1"), mid, cap, Some(0), 300_000, 300, None),
-            None
-        );
-        assert_eq!(
-            flatten_reason(d("0.1"), mid, cap, Some(0), 300_001, 300, None),
+            fr("0.1", m, 300_001, None, false),
             Some(FlattenReason::MaxHold)
         );
+        assert_eq!(
+            fr("0.1", m, 1_000, Some("kill"), true),
+            Some(FlattenReason::Startup)
+        );
+    }
+
+    #[test]
+    fn halt_kill_startup_and_max_hold_flatten_without_a_book() {
+        let cap = d("10000");
+        let fr = |now: u64, halt: Option<&str>, startup: bool| {
+            flatten_reason(d("-0.12"), None, cap, Some(0), now, 300, halt, startup)
+        };
+        assert_eq!(
+            fr(1_000, Some("kill_switch"), false),
+            Some(FlattenReason::Halt("kill_switch".into()))
+        );
+        assert_eq!(fr(1_000, None, true), Some(FlattenReason::Startup));
+        assert_eq!(fr(300_001, None, false), Some(FlattenReason::MaxHold));
+        // Only the cap check needs a mid.
+        assert_eq!(fr(1_000, None, false), None);
+        // And the tick plan flattens with no book at all.
+        let plan = tick_plan(&TickInputs {
+            has_book: false,
+            halted: true,
+            backoff: true,
+            flatten: fr(1_000, Some("kill_switch"), false),
+            ..TickInputs::default()
+        });
+        assert_eq!(
+            plan,
+            TickPlan::Flatten(FlattenReason::Halt("kill_switch".into()))
+        );
+    }
+
+    #[test]
+    fn no_new_quotes_without_an_armed_dms_but_safety_still_runs() {
+        let armed = TickInputs {
+            has_book: true,
+            dms_armed: true,
+            ..TickInputs::default()
+        };
+        assert_eq!(tick_plan(&armed), TickPlan::Quote);
+        let unarmed = TickInputs {
+            dms_armed: false,
+            ..armed.clone()
+        };
+        assert_eq!(tick_plan(&unarmed), TickPlan::PullQuotes("dms_unarmed"));
+        let flat = TickInputs {
+            flatten: Some(FlattenReason::MaxHold),
+            ..unarmed
+        };
+        assert_eq!(tick_plan(&flat), TickPlan::Flatten(FlattenReason::MaxHold));
+        // armed = fresh success and no failed attempt since
+        assert!(dms_armed(Some(1_000), false, 30_999, 30));
+        assert!(!dms_armed(Some(1_000), false, 31_000, 30));
+        assert!(!dms_armed(Some(1_000), true, 2_000, 30));
+        assert!(!dms_armed(None, false, 2_000, 30));
+    }
+
+    #[test]
+    fn dms_is_disarmed_only_after_a_verified_clean_cancel() {
+        assert!(may_disarm_dms(true, Some(0)));
+        assert!(!may_disarm_dms(false, Some(0)));
+        assert!(!may_disarm_dms(true, Some(1)));
+        assert!(!may_disarm_dms(true, None));
     }
 
     #[test]
@@ -515,6 +603,7 @@ mod tests {
         let base = TickInputs {
             has_book: true,
             backoff: true,
+            dms_armed: true,
             ..TickInputs::default()
         };
         // Nothing unsafe: wait out the backoff.
@@ -572,6 +661,8 @@ mod tests {
     fn shutdown_cancels_then_harvests_and_persists_before_disarming() {
         let live = shutdown_steps(true);
         let at = |s: ShutdownStep| live.iter().position(|x| *x == s).unwrap();
+        assert!(at(ShutdownStep::CancelAll) < at(ShutdownStep::VerifyNoneResting));
+        assert!(at(ShutdownStep::VerifyNoneResting) < at(ShutdownStep::DisarmDms));
         assert!(at(ShutdownStep::CancelAll) < at(ShutdownStep::HarvestFills));
         assert!(at(ShutdownStep::HarvestFills) < at(ShutdownStep::Persist));
         assert!(at(ShutdownStep::Persist) < at(ShutdownStep::DisarmDms));

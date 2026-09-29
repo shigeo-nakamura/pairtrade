@@ -36,9 +36,9 @@ use ledger::{
     Ledger, PendingMarkout,
 };
 use logic::{
-    book_stale, flatten_reason, flatten_steps, plan_quotes, quote_action, shock, shutdown_steps,
-    tick_plan, FlattenReason, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep,
-    Step, TickInputs, TickPlan,
+    book_stale, dms_armed, flatten_reason, flatten_steps, may_disarm_dms, plan_quotes,
+    quote_action, shock, shutdown_steps, tick_plan, QSide, QuoteAction, QuoteParams, QuoteTarget,
+    Resting, ShutdownStep, Step, TickInputs, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -116,7 +116,9 @@ struct Runtime {
     /// Newest public print (venue µs) applied to the paper sim.
     newest_print_ts_us: u64,
     position_mismatch_since_ms: Option<u64>,
-    last_dms_ms: u64,
+    /// Last successful DMS arm/refresh, and whether the latest attempt failed.
+    dms_last_ok_ms: Option<u64>,
+    dms_last_failed: bool,
     last_reconcile_ms: u64,
     last_position_ms: u64,
     last_summary_ms: u64,
@@ -260,6 +262,8 @@ impl Runtime {
     }
 
     fn paper_flatten(&mut self, now: u64) {
+        // A paper flatten needs a touch to price at; without a book it waits
+        // for the next tick (live flattens price off the connector instead).
         let Some(book) = &self.book else { return };
         let (bid, ask) = (book.bid, book.ask);
         for step in flatten_steps(
@@ -708,10 +712,22 @@ impl Runtime {
 
         if !self.cfg.dry_run {
             self.live_fills(now).await;
-            if now.saturating_sub(self.last_dms_ms) >= self.cfg.dms_refresh_secs * 1_000 {
+            // Refresh on schedule; after a failure, retry every tick (no new
+            // quoting meanwhile, see `dms_armed` in the tick plan).
+            let due = self.dms_last_failed
+                || self
+                    .dms_last_ok_ms
+                    .is_none_or(|t| now.saturating_sub(t) >= self.cfg.dms_refresh_secs * 1_000);
+            if due {
                 match self.dex.schedule_cancel(Some(self.cfg.dms_secs)).await {
-                    Ok(()) => self.last_dms_ms = now,
-                    Err(e) => self.on_error("schedule_cancel", &e),
+                    Ok(()) => {
+                        self.dms_last_ok_ms = Some(now);
+                        self.dms_last_failed = false;
+                    }
+                    Err(e) => {
+                        self.dms_last_failed = true;
+                        self.on_error("schedule_cancel (no new quotes until armed)", &e);
+                    }
                 }
             }
             if self.need_reconcile {
@@ -761,24 +777,23 @@ impl Runtime {
         }
         self.halt = risk.halt;
 
-        // Flatten (cap / max hold / halt / startup) needs a mid.
+        // Startup / halt / kill / max-hold flatten need no book; only the
+        // cap check uses the mid (Codex P1, pairtrade#361).
         let halt_label = self.halt.as_ref().map(Halt::label);
-        let flatten = mid.and_then(|m| {
-            if self.startup_flatten && !self.ledger.position.qty.is_zero() {
-                Some(FlattenReason::Startup)
-            } else {
-                self.startup_flatten = false;
-                flatten_reason(
-                    self.ledger.position.qty,
-                    m,
-                    self.cfg.effective_cap_usd(),
-                    self.ledger.position.opened_at_ms,
-                    now,
-                    self.cfg.max_hold_secs,
-                    halt_label.as_deref(),
-                )
-            }
-        });
+        let startup = self.startup_flatten && !self.ledger.position.qty.is_zero();
+        if !startup {
+            self.startup_flatten = false;
+        }
+        let flatten = flatten_reason(
+            self.ledger.position.qty,
+            mid,
+            self.cfg.effective_cap_usd(),
+            self.ledger.position.opened_at_ms,
+            now,
+            self.cfg.max_hold_secs,
+            halt_label.as_deref(),
+            startup,
+        );
         let stale = book_stale(
             self.book.as_ref().and_then(|b| b.ts_ms),
             now,
@@ -806,6 +821,13 @@ impl Runtime {
             stale,
             shock_or_cooldown: now < self.cooldown_until_ms,
             backoff: now < self.backoff_until_ms,
+            dms_armed: self.cfg.dry_run
+                || dms_armed(
+                    self.dms_last_ok_ms,
+                    self.dms_last_failed,
+                    now,
+                    self.cfg.dms_secs,
+                ),
             flatten,
         });
         match plan {
@@ -922,17 +944,41 @@ impl Runtime {
     }
 
     async fn shutdown(&mut self) {
+        let mut cancel_ok = false;
+        let mut open_after: Option<usize> = None;
         for step in shutdown_steps(!self.cfg.dry_run) {
             match step {
                 ShutdownStep::CancelAll => {
-                    if let Err(e) = self
+                    match self
                         .dex
                         .cancel_all_orders(Some(self.cfg.market.clone()))
                         .await
                     {
-                        log::error!("[ARCUS_VOL] shutdown cancel_all failed: {e}");
+                        Ok(()) => {
+                            cancel_ok = true;
+                            self.resting.clear();
+                        }
+                        Err(e) => log::error!(
+                            "[ARCUS_VOL] SHUTDOWN CANCEL_ALL FAILED: {e}; quotes may still rest, DMS stays armed"
+                        ),
                     }
-                    self.resting.clear();
+                }
+                ShutdownStep::VerifyNoneResting => {
+                    match self.dex.get_open_orders(&self.cfg.market.clone()).await {
+                        Ok(open) => {
+                            open_after = Some(open.orders.len());
+                            if !open.orders.is_empty() {
+                                log::error!(
+                                    "[ARCUS_VOL] {} order(s) still resting after cancel_all: {:?}",
+                                    open.orders.len(),
+                                    open.orders.iter().map(|o| &o.order_id).collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                        Err(e) => log::error!(
+                            "[ARCUS_VOL] open-orders read-back failed: {e}; DMS stays armed"
+                        ),
+                    }
                 }
                 ShutdownStep::HarvestFills => {
                     // Fills that landed before the cancel acks; bounded so a
@@ -955,7 +1001,11 @@ impl Runtime {
                     self.finish_tick(now_ms(), self.book.as_ref().map(BookView::mid));
                 }
                 ShutdownStep::DisarmDms => {
-                    if let Err(e) = self.dex.schedule_cancel(None).await {
+                    if !may_disarm_dms(cancel_ok, open_after) {
+                        log::error!(
+                            "[ARCUS_VOL] DMS LEFT ARMED (cancel_ok={cancel_ok}, open_after={open_after:?}); the venue cancels everything when it fires"
+                        );
+                    } else if let Err(e) = self.dex.schedule_cancel(None).await {
                         log::warn!("[ARCUS_VOL] shutdown DMS disarm failed: {e}");
                     }
                 }
@@ -1002,6 +1052,31 @@ async fn main() -> Result<()> {
         Some(l) => l,
         None => Ledger::new(cfg.mode(), &utc_day()),
     };
+    let mut ledger = ledger;
+    let fills_path = cfg.state_dir.join("fills.jsonl");
+    // Close the crash window between the fsynced fills.jsonl row and the
+    // state.json write (Codex P1, pairtrade#361): book any row state missed.
+    if let Ok(text) = std::fs::read_to_string(&fills_path) {
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| match serde_json::from_str(line) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    // A torn tail from a crash mid-write was never booked.
+                    log::warn!("[ARCUS_VOL] skipping unparsable fills.jsonl line");
+                    None
+                }
+            })
+            .collect();
+        let replayed = ledger::replay_fills(&mut ledger, &rows)
+            .map_err(|e| anyhow!("fills.jsonl replay: {e}"))?;
+        if replayed > 0 {
+            persist_json(&state_path, &ledger)?;
+            log::warn!(
+                "[ARCUS_VOL] replayed {replayed} fill(s) from fills.jsonl missing in state.json"
+            );
+        }
+    }
 
     let dex = DexConnectorBox::create(
         "arcus",
@@ -1018,7 +1093,7 @@ async fn main() -> Result<()> {
         ledger,
         state_path,
         status_path: cfg.state_dir.join("status.json"),
-        fills_path: cfg.state_dir.join("fills.jsonl"),
+        fills_path,
         kill_path: cfg.state_dir.join("KILL_SWITCH"),
         halt_path: cfg.state_dir.join("HALT"),
         resting: HashMap::new(),
@@ -1035,7 +1110,8 @@ async fn main() -> Result<()> {
         ioc_ids: HashSet::new(),
         newest_print_ts_us: 0,
         position_mismatch_since_ms: None,
-        last_dms_ms: 0,
+        dms_last_ok_ms: None,
+        dms_last_failed: false,
         last_reconcile_ms: 0,
         last_position_ms: 0,
         last_summary_ms: 0,
@@ -1071,6 +1147,10 @@ async fn main() -> Result<()> {
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("SIGTERM handler")?;
+    // One persistent SIGINT stream: a `ctrl_c()` future re-created on every
+    // loop turn misses a signal that lands while a tick is awaiting IO.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("SIGINT handler")?;
     let mut interval = tokio::time::interval(Duration::from_millis(rt.cfg.tick_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1078,7 +1158,7 @@ async fn main() -> Result<()> {
             _ = interval.tick() => rt.tick().await,
             Some(p) = rx.recv() => rt.on_print(p),
             _ = sigterm.recv() => break,
-            _ = tokio::signal::ctrl_c() => break,
+            _ = sigint.recv() => break,
         }
     }
     rt.shutdown().await;

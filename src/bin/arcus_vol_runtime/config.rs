@@ -193,11 +193,12 @@ pub fn live_gate(dry_run: bool, confirm: &str, account_index: Option<u8>) -> Res
         ));
     }
     match account_index {
-        Some(i) if i > 0 => Ok(()),
-        _ => Err(
-            "live needs a dedicated Arcus subaccount: set ARCUS_ACCOUNT_INDEX to 1..=9 (0 is refused)"
-                .to_string(),
-        ),
+        // Arcus subaccounts are 0..=9; 0 holds the owner's manual trading.
+        Some(i) if (1..=9).contains(&i) => Ok(()),
+        other => Err(format!(
+            "live needs a dedicated Arcus subaccount: ARCUS_ACCOUNT_INDEX must be in 1..=9 (got {})",
+            other.map_or_else(|| "unset".to_string(), |i| i.to_string())
+        )),
     }
 }
 
@@ -213,6 +214,12 @@ mod tests {
         assert!(live_gate(false, LIVE_CONFIRM_TOKEN, None).is_err());
         assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(0)).is_err());
         assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(3)).is_ok());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(1)).is_ok());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(9)).is_ok());
+        for bad in [10u8, 42, 255] {
+            let err = live_gate(false, LIVE_CONFIRM_TOKEN, Some(bad)).unwrap_err();
+            assert!(err.contains("1..=9"), "{err}");
+        }
     }
 
     #[test]

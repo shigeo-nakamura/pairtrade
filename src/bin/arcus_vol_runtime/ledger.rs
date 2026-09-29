@@ -108,6 +108,10 @@ pub struct Ledger {
     /// Trade ids already booked (bounded, oldest dropped first).
     #[serde(default)]
     pub booked_ids: std::collections::VecDeque<String>,
+    /// ts_ms of the newest booked fill: replay never books anything older,
+    /// so an id aged out of `booked_ids` cannot be booked twice.
+    #[serde(default)]
+    pub last_booked_ts_ms: u64,
 }
 
 /// How many booked trade ids state.json remembers.
@@ -299,7 +303,8 @@ impl Ledger {
         self.booked_ids.iter().any(|id| id == trade_id)
     }
 
-    fn mark_booked(&mut self, trade_id: &str) {
+    fn mark_booked(&mut self, trade_id: &str, ts_ms: u64) {
+        self.last_booked_ts_ms = self.last_booked_ts_ms.max(ts_ms);
         self.booked_ids.push_back(trade_id.to_string());
         while self.booked_ids.len() > BOOKED_IDS_CAP {
             self.booked_ids.pop_front();
@@ -340,8 +345,56 @@ pub fn book_fill(
     });
     append(&row)?;
     let booked = l.record_fill(f.buy, f.qty, f.px, f.fee, f.maker, now_ms);
-    l.mark_booked(&f.trade_id);
+    l.mark_booked(&f.trade_id, now_ms);
     Ok(Booking::Booked(booked))
+}
+
+/// Book every fills.jsonl row the state does not have yet (Codex P1,
+/// pairtrade#361): the row is fsynced before the ledger moves, so a crash
+/// between that and the state write leaves a row state.json never saw.
+/// Only `kind: fill` rows of this ledger's mode count; a row older than
+/// `last_booked_ts_ms` or whose id is already booked is skipped, so replay
+/// is idempotent. Rows are applied in file (= booking) order. Returns the
+/// number of rows booked; an unparsable fill row is an error (never guess).
+pub fn replay_fills<'a>(
+    l: &mut Ledger,
+    rows: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Result<usize, String> {
+    use std::str::FromStr;
+    let mut booked = 0;
+    for row in rows {
+        if row.get("kind").and_then(|k| k.as_str()) != Some("fill")
+            || row.get("mode").and_then(|m| m.as_str()) != Some(l.mode.as_str())
+        {
+            continue;
+        }
+        let text = |k: &str| {
+            row.get(k)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("fill row without {k}: {row}"))
+        };
+        let dec = |k: &str| {
+            text(k).and_then(|v| Decimal::from_str(v).map_err(|e| format!("{k}={v}: {e}")))
+        };
+        let id = text("fill_id")?;
+        let ts = row
+            .get("ts_ms")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("fill row without ts_ms: {row}"))?;
+        if ts < l.last_booked_ts_ms || l.has_booked(id) {
+            continue;
+        }
+        let buy = match text("side")? {
+            "buy" => true,
+            "sell" => false,
+            other => return Err(format!("fill {id}: side {other}")),
+        };
+        let maker = text("role")? == "maker";
+        l.record_fill(buy, dec("qty")?, dec("px")?, dec("fee")?, maker, ts);
+        l.mark_booked(id, ts);
+        booked += 1;
+    }
+    Ok(booked)
 }
 
 /// The connector may forget a fill only when it is booked (or was already)
@@ -617,10 +670,67 @@ mod tests {
         assert!(back.has_booked("t1"));
         let mut l = back;
         for i in 0..BOOKED_IDS_CAP {
-            l.mark_booked(&format!("x{i}"));
+            l.mark_booked(&format!("x{i}"), 1);
         }
         assert_eq!(l.booked_ids.len(), BOOKED_IDS_CAP);
         assert!(!l.has_booked("t1"));
+    }
+
+    #[test]
+    fn replay_books_the_row_state_missed_exactly_once() {
+        // t1 booked and persisted; t2 fsynced to fills.jsonl but the crash
+        // came before state.json was written.
+        let mut rows = Vec::new();
+        let mut l = Ledger::new("live", "2026-09-30");
+        book_fill(&mut l, &fill_in("t1"), 1_000, |r| {
+            rows.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        let state = l.clone();
+        let mut t2 = fill_in("t2");
+        t2.buy = false;
+        t2.qty = d("0.04");
+        t2.px = d("83643.1");
+        t2.fee = d("0.75");
+        t2.maker = false;
+        book_fill(&mut l, &t2, 2_000, |r| {
+            rows.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        rows.push(serde_json::json!({"kind": "markout", "fill_id": "t2", "ts_ms": 7_000}));
+        rows.push(
+            serde_json::json!({"kind": "fill", "mode": "dry_run", "fill_id": "sim-1",
+                                     "ts_ms": 3_000, "side": "buy", "qty": "1", "px": "1",
+                                     "fee": "0", "role": "maker"}),
+        );
+        let mut restored = state;
+        assert_eq!(replay_fills(&mut restored, &rows).unwrap(), 1);
+        assert_eq!(restored.position, l.position);
+        assert_eq!(restored.cum_fees, l.cum_fees);
+        assert_eq!(restored.cum_taker_volume, l.cum_taker_volume);
+        assert_eq!(restored.fills, 2);
+        assert!(restored.has_booked("t2"));
+        // Idempotent across repeated restarts.
+        assert_eq!(replay_fills(&mut restored, &rows).unwrap(), 0);
+        assert_eq!(restored.fills, 2);
+    }
+
+    #[test]
+    fn replay_never_books_a_row_older_than_the_high_water_mark() {
+        let mut l = Ledger::new("live", "2026-09-30");
+        book_fill(&mut l, &fill_in("new"), 5_000, |_| Ok(())).unwrap();
+        // An old row whose id aged out of booked_ids.
+        let old = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": "old",
+                                     "ts_ms": 4_000, "side": "buy", "qty": "1", "px": "1",
+                                     "fee": "0", "role": "maker"});
+        assert_eq!(replay_fills(&mut l, [&old]).unwrap(), 0);
+        assert_eq!(l.fills, 1);
+        let bad = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": "b",
+                                     "ts_ms": 6_000, "side": "buy", "qty": "x", "px": "1",
+                                     "fee": "0", "role": "maker"});
+        assert!(replay_fills(&mut l, [&bad]).is_err());
     }
 
     #[test]
