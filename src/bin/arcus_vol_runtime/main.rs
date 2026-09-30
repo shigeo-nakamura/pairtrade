@@ -24,9 +24,9 @@ mod logic;
 mod sim;
 mod tape;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use config::Config;
-use debot::directional::{append_jsonl, load_json, persist_json};
+use debot::directional::persist_json;
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{
     BatchModifyRequest, BatchOrderRequest, DexConnector, DexError, OrderBookLevel, OrderSide,
@@ -401,6 +401,13 @@ impl Runtime {
     // ----------------------------------------------------------------- live
 
     async fn live_fills(&mut self, now: u64) {
+        self.harvest_fills(now, false).await;
+    }
+
+    /// Harvest and book fills. At shutdown (`shutting_down`) a fill without a
+    /// fee is booked at once at the taker fee instead of waiting: the
+    /// connector's fill cache dies with the process (Codex P1, pairtrade#361).
+    async fn harvest_fills(&mut self, now: u64, shutting_down: bool) {
         let market = self.cfg.market.clone();
         let rows = match self.dex.get_filled_orders(&market).await {
             Ok(r) => r.orders,
@@ -433,7 +440,7 @@ impl Runtime {
                 f.filled_fee,
                 first_seen,
                 now,
-                self.cfg.fee_wait_secs * 1_000,
+                ledger::fee_wait_ms(shutting_down, self.cfg.fee_wait_secs * 1_000),
                 value,
                 self.cfg.taker_fee_bps,
             ) {
@@ -953,7 +960,9 @@ impl Runtime {
                 if self.journal_unsafe {
                     continue;
                 }
-                if let Err(e) = append_jsonl(&self.fills_path, &row) {
+                // Rollback-safe like every journal append (Codex P1, pairtrade#361).
+                if let Err(e) = append_synced(&self.fills_path, &row) {
+                    self.note_append_error(&e);
                     log::warn!("[ARCUS_VOL] markout append failed: {e}");
                 }
             }
@@ -1194,7 +1203,7 @@ impl Runtime {
                     // dead venue cannot hold the shutdown hostage.
                     let harvest = async {
                         for _ in 0..3 {
-                            self.live_fills(now_ms()).await;
+                            self.harvest_fills(now_ms(), true).await;
                             tokio::time::sleep(Duration::from_millis(700)).await;
                         }
                     };
@@ -1272,34 +1281,13 @@ async fn main() -> Result<()> {
     // Before state.json is read or the venue touched (Codex P1, pairtrade#361).
     let _state_lock = ledger::acquire_state_lock(&cfg.state_dir).map_err(|e| anyhow!(e))?;
     let state_path = cfg.state_dir.join("state.json");
-    let loaded = load_json::<Ledger>(&state_path)?;
-    let state_market = loaded.as_ref().map(|l| l.market.clone());
-    let ledger = match loaded {
-        Some(l) if l.mode != cfg.mode() => bail!(
-            "{} was written in mode {} but this run is {}; move it aside first",
-            state_path.display(),
-            l.mode,
-            cfg.mode()
-        ),
-        Some(l) => l,
-        None => {
-            let mut l = Ledger::new(cfg.mode(), &utc_day());
-            l.market = cfg.market.clone();
-            l
-        }
-    };
-    let mut ledger = ledger;
-    // State bound to the market (Codex P1, pairtrade#361); journal rows are
-    // checked below once read.
-    ledger::check_market(state_market.as_deref(), &[], &cfg.market).map_err(|e| anyhow!(e))?;
     let fills_path = cfg.state_dir.join("fills.jsonl");
-    // Close the crash window between the fsynced fills.jsonl row and the
-    // state.json write (Codex P1, pairtrade#361): book any row state missed.
-    // Before any append: cut a crash-torn tail / add a missing final newline
-    // (Codex P1, pairtrade#361); a malformed complete line stops startup.
-    match ledger::repair_journal(&fills_path)
-        .with_context(|| format!("repair {} at startup", fills_path.display()))?
-    {
+    // Mode + market checked against state AND journal, torn tail repaired,
+    // missed rows replayed, and a fresh state written durably, all before
+    // any venue contact (Codex P1, pairtrade#361).
+    let opened = ledger::open_state(&cfg.state_dir, cfg.mode(), &cfg.market, &utc_day())
+        .map_err(|e| anyhow!(e))?;
+    match &opened.repair {
         ledger::JournalRepair::Clean => {}
         ledger::JournalRepair::NewlineAdded => {
             log::warn!("[ARCUS_VOL] fills.jsonl: appended the missing final newline")
@@ -1311,27 +1299,13 @@ async fn main() -> Result<()> {
             "[ARCUS_VOL] fills.jsonl: dropped a torn {dropped}-byte tail (hex {hex_preview}…)"
         ),
     }
-    if let Some(text) = ledger::read_journal(&fills_path)
-        .with_context(|| format!("read {} at startup", fills_path.display()))?
-    {
-        // After the repair every line is a complete row.
-        let rows = text
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<Result<Vec<_>, _>>()
-            .context("fills.jsonl row after repair")?;
-        ledger::check_market(state_market.as_deref(), &rows, &cfg.market)
-            .map_err(|e| anyhow!(e))?;
-        let replayed = ledger::replay_fills(&mut ledger, &rows)
-            .map_err(|e| anyhow!("fills.jsonl replay: {e}"))?;
-        if replayed > 0 {
-            persist_json(&state_path, &ledger)?;
-            log::warn!(
-                "[ARCUS_VOL] replayed {replayed} fill(s) from fills.jsonl missing in state.json"
-            );
-        }
+    if opened.replayed > 0 {
+        log::warn!(
+            "[ARCUS_VOL] replayed {} fill(s) from fills.jsonl missing in state.json",
+            opened.replayed
+        );
     }
+    let ledger = opened.ledger;
 
     let dex = DexConnectorBox::create(
         "arcus",

@@ -280,6 +280,97 @@ pub fn check_market(
     Ok(())
 }
 
+/// Write `value` as JSON to `path` durably: temp file, fsync, rename,
+/// fsync the directory.
+pub fn persist_durable<T: Serialize>(path: &std::path::Path, value: &T) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "state".to_string());
+    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// The state a runtime starts from.
+#[derive(Debug)]
+pub struct OpenedState {
+    pub ledger: Ledger,
+    pub repair: JournalRepair,
+    pub replayed: usize,
+}
+
+/// Open (or create) the state in `dir` for `mode` / `market`, BEFORE any
+/// venue contact (the caller holds `runtime.lock`):
+/// 1. load state.json (a mode mismatch is an error);
+/// 2. repair and read fills.jsonl;
+/// 3. check that state AND every journal row belong to `market`;
+/// 4. only then create a fresh ledger for `market` if there was none, book
+///    any journal rows state missed, and persist state.json durably
+///    (Codex P1, pairtrade#361), so market ownership is on disk before the
+///    first order can exist. Writing state before step 3 would let a crash
+///    leave a state.json that vouches for foreign journal rows.
+pub fn open_state(
+    dir: &std::path::Path,
+    mode: &str,
+    market: &str,
+    today: &str,
+) -> Result<OpenedState, String> {
+    let state_path = dir.join("state.json");
+    let fills_path = dir.join("fills.jsonl");
+    let loaded =
+        debot::directional::load_json::<Ledger>(&state_path).map_err(|e| format!("{e:#}"))?;
+    if let Some(l) = &loaded {
+        if l.mode != mode {
+            return Err(format!(
+                "{} was written in mode {} but this run is {mode}; move it aside first",
+                state_path.display(),
+                l.mode
+            ));
+        }
+    }
+    let state_market = loaded.as_ref().map(|l| l.market.clone());
+    let repair = repair_journal(&fills_path)
+        .map_err(|e| format!("repair {} at startup: {e}", fills_path.display()))?;
+    let rows = match read_journal(&fills_path)
+        .map_err(|e| format!("read {} at startup: {e}", fills_path.display()))?
+    {
+        None => Vec::new(),
+        Some(text) => text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("fills.jsonl row after repair: {e}"))?,
+    };
+    check_market(state_market.as_deref(), &rows, market)?;
+    let fresh = loaded.is_none();
+    let mut ledger = loaded.unwrap_or_else(|| {
+        let mut l = Ledger::new(mode, today);
+        l.market = market.to_string();
+        l
+    });
+    let replayed =
+        replay_fills(&mut ledger, &rows).map_err(|e| format!("fills.jsonl replay: {e}"))?;
+    if fresh || replayed > 0 {
+        persist_durable(&state_path, &ledger)
+            .map_err(|e| format!("persist {}: {e}", state_path.display()))?;
+    }
+    Ok(OpenedState {
+        ledger,
+        repair,
+        replayed,
+    })
+}
+
 /// What `repair_journal` did to fills.jsonl.
 #[derive(Debug, Clone, PartialEq)]
 pub enum JournalRepair {
@@ -678,9 +769,19 @@ pub enum FeeDecision {
     /// Fee unknown and still inside the wait: keep it in the connector.
     Wait,
     Exact(Decimal),
-    /// Fee still unknown after the wait: book the taker fee on the notional
+    /// Fee still unknown after the wait (or at shutdown): book the taker fee on the notional
     /// whatever the role (never understated), marked `fee_estimated`.
     Estimated(Decimal),
+}
+
+/// How long a missing fee may be waited for: nothing at shutdown, since the
+/// connector's fill cache dies with the process (Codex P1, pairtrade#361).
+pub fn fee_wait_ms(shutting_down: bool, configured_ms: u64) -> u64 {
+    if shutting_down {
+        0
+    } else {
+        configured_ms
+    }
 }
 
 /// A missing fee is never booked as zero (Codex P1, pairtrade#361).
@@ -951,6 +1052,86 @@ mod tests {
         assert_eq!(rows[0]["market"], "BTC-USD");
         let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         assert_eq!(back.market, "BTC-USD");
+    }
+
+    #[test]
+    fn a_fresh_state_dir_is_bound_to_its_market_on_disk_before_any_venue_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let opened = open_state(dir.path(), "live", "BTC-USD", "2026-09-30").unwrap();
+        assert_eq!(opened.ledger.market, "BTC-USD");
+        let on_disk: Ledger =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk.market, "BTC-USD");
+        assert_eq!(on_disk.mode, "live");
+        // A restart for another market is now refused.
+        let err = open_state(dir.path(), "live", "ETH-USD", "2026-09-30").unwrap_err();
+        assert!(err.contains("belongs to BTC-USD"), "{err}");
+        // Another mode too.
+        assert!(open_state(dir.path(), "dry_run", "BTC-USD", "2026-09-30").is_err());
+    }
+
+    #[test]
+    fn a_foreign_journal_is_refused_before_any_state_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fills.jsonl"),
+            "{\"kind\":\"markout\",\"market\":\"ETH-USD\"}\n",
+        )
+        .unwrap();
+        assert!(open_state(dir.path(), "live", "BTC-USD", "2026-09-30").is_err());
+        assert!(
+            !dir.path().join("state.json").exists(),
+            "no state vouching for it"
+        );
+    }
+
+    #[test]
+    fn a_partial_markout_write_is_rolled_back() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        append_synced(&path, &serde_json::json!({"kind": "fill", "fill_id": "t1"})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let markout = serde_json::json!({"kind": "markout", "fill_id": "t1", "horizon_s": 5,
+                                         "bps": "-0.5", "mid": "83642.9", "market": "BTC-USD"});
+        let err = append_journal(
+            &path,
+            &markout,
+            |f, b| {
+                f.write_all(&b[..9])?;
+                Err(std::io::Error::other("ENOSPC"))
+            },
+            |f, l| f.set_len(l),
+            |_| Ok(()),
+        );
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(repair_journal(&path).unwrap(), JournalRepair::Clean);
+    }
+
+    #[test]
+    fn the_runtime_never_appends_to_the_journal_without_rollback() {
+        // Every fills.jsonl append must go through append_synced /
+        // append_journal (Codex P1, pairtrade#361).
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("append_jsonl"),
+            "use append_synced for fills.jsonl"
+        );
+    }
+
+    #[test]
+    fn at_shutdown_a_fee_pending_fill_is_booked_at_once_with_the_taker_fee() {
+        let bps = d("2.25");
+        let wait = fee_wait_ms(true, 30_000);
+        assert_eq!(wait, 0);
+        // First seen during the shutdown harvest itself.
+        assert_eq!(
+            fee_decision(None, 5_000, 5_000, wait, d("10000"), bps),
+            FeeDecision::Estimated(d("2.25"))
+        );
+        assert_eq!(fee_wait_ms(false, 30_000), 30_000);
     }
 
     #[test]
