@@ -49,6 +49,10 @@ pub struct Config {
     /// `ARCUS_ACCOUNT_INDEX` (the connector's own env): live refuses 0.
     pub account_index: Option<u8>,
     pub ws_url: String,
+    /// `ARCUS_ADDRESS` (the connector's own env), for the account lock.
+    pub arcus_address: Option<String>,
+    /// Account-lock namespace, independent of STATE_DIR.
+    pub lock_dir: PathBuf,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -132,6 +136,13 @@ impl Config {
             },
             ws_url: var("ARCUS_WEBSOCKET_ENDPOINT")
                 .unwrap_or_else(|| "wss://api.arcus.xyz/v1/ws".to_string()),
+            arcus_address: var("ARCUS_ADDRESS"),
+            lock_dir: PathBuf::from(var(&p("LOCK_DIR")).unwrap_or_else(|| {
+                format!(
+                    "{}/.local/state/arcus_vol/locks",
+                    var("HOME").unwrap_or_else(|| "/tmp".to_string())
+                )
+            })),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -283,6 +294,8 @@ mod tests {
             live_confirm: String::new(),
             account_index: None,
             ws_url: String::new(),
+            arcus_address: None,
+            lock_dir: PathBuf::from("/tmp/unused"),
         }
     }
 }

@@ -245,7 +245,8 @@ impl Runtime {
             tape::HealthAction::None => {}
             tape::HealthAction::PullQuotes => self.virt.clear(),
             tape::HealthAction::GapEnded { start_ms, end_ms } => {
-                let row = json!({"kind": "tape_gap", "mode": self.cfg.mode(),
+                let row = json!({"kind": "tape_gap", "seq": self.ledger.take_seq(),
+                                 "mode": self.cfg.mode(),
                                  "market": self.cfg.market,
                                  "start_ms": start_ms, "end_ms": end_ms,
                                  "secs": (end_ms.saturating_sub(start_ms)) as f64 / 1_000.0});
@@ -954,7 +955,8 @@ impl Runtime {
         let now = now_ms();
         if let Some(m) = mid {
             for (fill_id, h, bps) in due_markouts(&mut self.pending_markouts, now, m) {
-                let row = json!({"kind": "markout", "ts_ms": now, "fill_id": fill_id,
+                let row = json!({"kind": "markout", "seq": self.ledger.take_seq(),
+                                 "ts_ms": now, "fill_id": fill_id,
                                  "market": self.cfg.market,
                                  "horizon_s": h, "bps": bps.round_dp(3).to_string(),
                                  "mid": m.to_string()});
@@ -1283,6 +1285,18 @@ async fn main() -> Result<()> {
         .with_context(|| format!("create {}", cfg.state_dir.display()))?;
     // Before state.json is read or the venue touched (Codex P1, pairtrade#361).
     let _state_lock = ledger::acquire_state_lock(&cfg.state_dir).map_err(|e| anyhow!(e))?;
+    // Account-wide, independent of STATE_DIR (Codex P1, pairtrade#361).
+    let _account_lock = match ledger::account_lock_path(
+        &cfg.lock_dir,
+        cfg.dry_run,
+        cfg.arcus_address.as_deref(),
+        cfg.account_index,
+    )
+    .map_err(|e| anyhow!(e))?
+    {
+        Some(path) => Some(ledger::acquire_lock_at(&path).map_err(|e| anyhow!(e))?),
+        None => None,
+    };
     let state_path = cfg.state_dir.join("state.json");
     let fills_path = cfg.state_dir.join("fills.jsonl");
     // Mode + market checked against state AND journal, torn tail repaired,

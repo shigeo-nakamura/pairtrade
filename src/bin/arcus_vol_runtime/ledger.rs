@@ -119,10 +119,15 @@ pub struct Ledger {
     /// Trade ids already booked (bounded, oldest dropped first).
     #[serde(default)]
     pub booked_ids: std::collections::VecDeque<String>,
-    /// ts_ms of the newest booked fill: replay never books anything older,
-    /// so an id aged out of `booked_ids` cannot be booked twice.
+    /// Next fills.jsonl row sequence number (Codex P2, pairtrade#361): every
+    /// journal row carries a strictly increasing `seq`, so replay order and
+    /// the "already booked" boundary never depend on clocks.
     #[serde(default)]
-    pub last_booked_ts_ms: u64,
+    pub next_seq: u64,
+    /// `seq` of the newest booked fill row: replay never books a row at or
+    /// below it, so an id aged out of `booked_ids` cannot be booked twice.
+    #[serde(default)]
+    pub last_booked_seq: Option<u64>,
 }
 
 /// How many booked trade ids state.json remembers.
@@ -217,14 +222,44 @@ pub enum Rollover {
 /// read or the venue touched; a held lock is a startup error. Keep the
 /// returned file alive (dropping it releases the lock).
 pub fn acquire_state_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    acquire_lock_at(&dir.join("runtime.lock"))
+}
+
+/// The account-wide lock path (Codex P1, pairtrade#361), in a namespace that
+/// does not depend on the state dir: two runtimes with different state dirs
+/// must not both trade one Arcus subaccount (the cap and the stray-order
+/// cancel are account-wide). Per account, not per market. DRY_RUN has no
+/// account and sends no venue orders, so it takes no account lock (`None`);
+/// its state dir lock is enough for a paper run.
+pub fn account_lock_path(
+    lock_dir: &std::path::Path,
+    dry_run: bool,
+    address: Option<&str>,
+    account_index: Option<u8>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if dry_run {
+        return Ok(None);
+    }
+    let address = address
+        .map(|a| a.trim().to_ascii_lowercase())
+        .filter(|a| !a.is_empty())
+        .ok_or("live needs ARCUS_ADDRESS for the account lock")?;
+    let index = account_index.ok_or("live needs ARCUS_ACCOUNT_INDEX for the account lock")?;
+    Ok(Some(lock_dir.join(format!("arcus_{address}_{index}.lock"))))
+}
+
+/// Exclusive flock on `path` (created if missing), held while the returned
+/// file lives; a held lock is an error.
+pub fn acquire_lock_at(path: &std::path::Path) -> Result<std::fs::File, String> {
     use fs2::FileExt;
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let path = dir.join("runtime.lock");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     file.try_lock_exclusive().map_err(|e| {
         format!(
@@ -396,7 +431,19 @@ pub fn open_state(
     });
     let replayed =
         replay_fills(&mut ledger, &rows).map_err(|e| format!("fills.jsonl replay: {e}"))?;
-    if fresh || replayed > 0 {
+    // seq = max(state.next_seq, max row seq + 1): never reused.
+    let mut seq_bumped = false;
+    if let Some(max) = rows
+        .iter()
+        .filter_map(|r| r.get("seq").and_then(|v| v.as_u64()))
+        .max()
+    {
+        if max + 1 > ledger.next_seq {
+            ledger.next_seq = max + 1;
+            seq_bumped = true;
+        }
+    }
+    if fresh || replayed > 0 || seq_bumped {
         persist_durable(&state_path, &ledger)
             .map_err(|e| format!("persist {}: {e}", state_path.display()))?;
     }
@@ -625,8 +672,16 @@ impl Ledger {
         self.booked_ids.iter().any(|id| id == trade_id)
     }
 
-    fn mark_booked(&mut self, trade_id: &str, ts_ms: u64) {
-        self.last_booked_ts_ms = self.last_booked_ts_ms.max(ts_ms);
+    /// The `seq` for a non-fill journal row (markout, tape_gap).
+    pub fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    fn mark_booked(&mut self, trade_id: &str, seq: u64) {
+        self.last_booked_seq = Some(self.last_booked_seq.map_or(seq, |l| l.max(seq)));
+        self.next_seq = self.next_seq.max(seq + 1);
         self.booked_ids.push_back(trade_id.to_string());
         while self.booked_ids.len() > BOOKED_IDS_CAP {
             self.booked_ids.pop_front();
@@ -650,8 +705,10 @@ pub fn book_fill(
     }
     let mut preview = l.position.clone();
     let realized = preview.apply(f.buy, f.qty, f.px, now_ms);
+    let seq = l.next_seq;
     let row = serde_json::json!({
         "kind": "fill",
+        "seq": seq,
         "ts_ms": now_ms,
         "mode": l.mode,
         "market": l.market,
@@ -669,17 +726,19 @@ pub fn book_fill(
     });
     append(&row)?;
     let booked = l.record_fill(f.buy, f.qty, f.px, f.fee, f.maker, now_ms);
-    l.mark_booked(&f.trade_id, now_ms);
+    l.mark_booked(&f.trade_id, seq);
     Ok(Booking::Booked(booked))
 }
 
 /// Book every fills.jsonl row the state does not have yet (Codex P1,
 /// pairtrade#361): the row is fsynced before the ledger moves, so a crash
 /// between that and the state write leaves a row state.json never saw.
-/// Only `kind: fill` rows of this ledger's mode count; a row older than
-/// `last_booked_ts_ms` or whose id is already booked is skipped, so replay
-/// is idempotent. Rows are applied in file (= booking) order. Returns the
-/// number of rows booked; an unparsable fill row is an error (never guess).
+/// Only `kind: fill` rows of this ledger's mode count; a row whose `seq` is
+/// at or below `last_booked_seq`, or whose id is already booked, is skipped,
+/// so replay is idempotent, by sequence and never by timestamp (Codex P2,
+/// pairtrade#361). A fill row without `seq` predates the sequence and is an
+/// error (fail closed). Returns the number of rows booked; an unparsable
+/// fill row is an error (never guess).
 pub fn replay_fills<'a>(
     l: &mut Ledger,
     rows: impl IntoIterator<Item = &'a serde_json::Value>,
@@ -701,11 +760,14 @@ pub fn replay_fills<'a>(
             text(k).and_then(|v| Decimal::from_str(v).map_err(|e| format!("{k}={v}: {e}")))
         };
         let id = text("fill_id")?;
+        let seq = row.get("seq").and_then(|v| v.as_u64()).ok_or_else(|| {
+            format!("fill row {id} has no seq (predates the journal sequence); move the state dir aside")
+        })?;
         let ts = row
             .get("ts_ms")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| format!("fill row without ts_ms: {row}"))?;
-        if ts < l.last_booked_ts_ms || l.has_booked(id) {
+        if l.last_booked_seq.is_some_and(|last| seq <= last) || l.has_booked(id) {
             continue;
         }
         let buy = match text("side")? {
@@ -715,7 +777,7 @@ pub fn replay_fills<'a>(
         };
         let maker = text("role")? == "maker";
         l.record_fill(buy, dec("qty")?, dec("px")?, dec("fee")?, maker, ts);
-        l.mark_booked(id, ts);
+        l.mark_booked(id, seq);
         booked += 1;
     }
     Ok(booked)
@@ -971,7 +1033,7 @@ mod tests {
         assert!(acquire_state_lock(dir.path()).is_ok());
     }
 
-    const ROW: &str = r#"{"kind":"fill","mode":"live","fill_id":"t1","ts_ms":1000,"side":"buy","qty":"0.1","px":"83642.9","fee":"0","role":"maker"}"#;
+    const ROW: &str = r#"{"kind":"fill","seq":0,"mode":"live","fill_id":"t1","ts_ms":1000,"side":"buy","qty":"0.1","px":"83642.9","fee":"0","role":"maker"}"#;
 
     #[test]
     fn a_torn_final_fragment_is_truncated() {
@@ -1035,7 +1097,7 @@ mod tests {
         std::fs::write(&p, format!("{ROW}\n{{\"kind\":\"fill\",\"mode\":\"li")).unwrap();
         // Restart: repair, then a new fill is appended.
         repair_journal(&p).unwrap();
-        let new_row = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": "t2",
+        let new_row = serde_json::json!({"kind": "fill", "seq": 1, "mode": "live", "fill_id": "t2",
             "ts_ms": 2000, "side": "sell", "qty": "0.1", "px": "83643.1", "fee": "0",
             "role": "maker"});
         append_synced(&p, &new_row).unwrap();
@@ -1211,6 +1273,40 @@ mod tests {
             "state.json must be written durably"
         );
         assert!(!main.contains("atomic_write(&self.state_path"));
+    }
+
+    #[test]
+    fn one_account_cannot_be_traded_from_two_state_dirs() {
+        let locks = tempfile::tempdir().unwrap();
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let _sa = acquire_state_lock(a.path()).unwrap();
+        let _sb = acquire_state_lock(b.path()).unwrap(); // different state dirs: fine
+        let p1 = account_lock_path(locks.path(), false, Some("0xA2C7Ab"), Some(1))
+            .unwrap()
+            .unwrap();
+        let p2 = account_lock_path(locks.path(), false, Some(" 0xa2c7ab "), Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p1, p2, "address case/whitespace must not split the lock");
+        let first = acquire_lock_at(&p1).unwrap();
+        assert!(
+            acquire_lock_at(&p2).is_err(),
+            "same account, second runtime refused"
+        );
+        // Another subaccount is another lock.
+        let other = account_lock_path(locks.path(), false, Some("0xa2c7ab"), Some(2))
+            .unwrap()
+            .unwrap();
+        assert!(acquire_lock_at(&other).is_ok());
+        drop(first);
+        assert!(acquire_lock_at(&p2).is_ok());
+        // Live without an address or index: error; DRY_RUN: no account lock.
+        assert!(account_lock_path(locks.path(), false, None, Some(1)).is_err());
+        assert!(account_lock_path(locks.path(), false, Some("0xa"), None).is_err());
+        assert_eq!(
+            account_lock_path(locks.path(), true, None, None).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1427,19 +1523,52 @@ mod tests {
     }
 
     #[test]
-    fn replay_never_books_a_row_older_than_the_high_water_mark() {
+    fn replay_goes_by_sequence_not_by_timestamp() {
+        let row = |id: &str, seq: Option<u64>, ts: u64| {
+            let mut v = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": id,
+                "ts_ms": ts, "side": "buy", "qty": "1", "px": "1", "fee": "0", "role": "maker"});
+            if let Some(seq) = seq {
+                v["seq"] = serde_json::json!(seq);
+            }
+            v
+        };
         let mut l = Ledger::new("live", "2026-09-30");
-        book_fill(&mut l, &fill_in("new"), 5_000, |_| Ok(())).unwrap();
-        // An old row whose id aged out of booked_ids.
-        let old = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": "old",
-                                     "ts_ms": 4_000, "side": "buy", "qty": "1", "px": "1",
-                                     "fee": "0", "role": "maker"});
+        book_fill(&mut l, &fill_in("a"), 5_000, |_| Ok(())).unwrap(); // seq 0
+        assert_eq!(l.last_booked_seq, Some(0));
+        // A later row whose clock ran BEHIND (earlier ts) is still replayed.
+        let later = row("b", Some(1), 4_000);
+        assert_eq!(replay_fills(&mut l, [&later]).unwrap(), 1);
+        assert!(l.has_booked("b"));
+        assert_eq!(l.next_seq, 2);
+        // A row at/below the booked sequence whose id aged out: skipped.
+        let old = row("old", Some(1), 9_000);
         assert_eq!(replay_fills(&mut l, [&old]).unwrap(), 0);
-        assert_eq!(l.fills, 1);
-        let bad = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": "b",
-                                     "ts_ms": 6_000, "side": "buy", "qty": "x", "px": "1",
-                                     "fee": "0", "role": "maker"});
+        // No seq: fail closed.
+        assert!(replay_fills(&mut l, [&row("x", None, 9_000)]).is_err());
+        let mut bad = row("bad", Some(7), 6_000);
+        bad["qty"] = serde_json::json!("x");
         assert!(replay_fills(&mut l, [&bad]).is_err());
+    }
+
+    #[test]
+    fn open_state_never_reuses_a_journal_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fills.jsonl"),
+            "{\"kind\":\"markout\",\"seq\":41,\"market\":\"BTC-USD\"}\n",
+        )
+        .unwrap();
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.market = "BTC-USD".into();
+        l.next_seq = 3;
+        persist_durable(&dir.path().join("state.json"), &l).unwrap();
+        let opened = open_state(dir.path(), "live", "BTC-USD", "2026-09-30").unwrap();
+        assert_eq!(opened.ledger.next_seq, 42);
+        // And it is on disk, so a crash right after cannot reuse 41.
+        let on_disk: Ledger =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk.next_seq, 42);
     }
 
     #[test]
