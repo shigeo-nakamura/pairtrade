@@ -261,7 +261,17 @@ impl Runtime {
             return;
         }
         let now = now_ms();
-        match self.tape.on_event(&event, now) {
+        let action = self.tape.on_event(&event, now);
+        self.apply_health(action);
+        if let tape::TapeEvent::Print(p) = event {
+            self.on_print(p);
+        }
+    }
+
+    /// Act on a tape health change: pull the virtual quotes, or record the
+    /// gap that just ended.
+    fn apply_health(&mut self, action: tape::HealthAction) {
+        match action {
             tape::HealthAction::None => {}
             tape::HealthAction::PullQuotes => self.virt.clear(),
             tape::HealthAction::GapEnded {
@@ -275,8 +285,8 @@ impl Runtime {
                                  "start_ms": start_ms, "end_ms": end_ms, "reason": reason,
                                  "secs": (end_ms.saturating_sub(start_ms)) as f64 / 1_000.0});
                 log::warn!(
-                    "[ARCUS_VOL] trades tape back after {}s gap",
-                    (end_ms - start_ms) / 1_000
+                    "[ARCUS_VOL] trades tape back after {}s gap ({reason})",
+                    end_ms.saturating_sub(start_ms) / 1_000
                 );
                 if self.journal_unsafe {
                     log::error!("[ARCUS_VOL] tape_gap row not written: journal unsafe");
@@ -286,23 +296,34 @@ impl Runtime {
                 }
             }
         }
-        if let tape::TapeEvent::Print(p) = event {
-            self.on_print(p);
-        }
     }
 
     fn on_print(&mut self, p: tape::Print) {
-        if !self.cfg.dry_run
-            || !sim::prints_apply(
-                self.tape.ready,
-                self.sim_halted.is_some(),
-                self.halt.is_some(),
-                self.flatten_pending,
-            )
-        {
+        if !self.cfg.dry_run {
             return;
         }
         let now = now_ms();
+        // A too-old print is a tape failure (pull, gap, not ready); the next
+        // fresh print re-arms (Codex P1, pairtrade#361; see on_print_age).
+        let time = sim::print_fill_time(p.ts_us, now, PRINT_FUTURE_TOLERANCE_MS, PRINT_MAX_AGE_MS);
+        let fresh = !matches!(time, sim::PrintTime::TooOld { .. });
+        let action = self.tape.on_print_age(fresh, now);
+        self.apply_health(action);
+        if let sim::PrintTime::TooOld { venue_ms } = time {
+            log::warn!(
+                "[ARCUS_VOL] print {} stamped {venue_ms} ms is too old vs {now}: tape not ready (stale_print), quotes pulled",
+                p.trade_id
+            );
+            return;
+        }
+        if !sim::prints_apply(
+            self.tape.ready,
+            self.sim_halted.is_some(),
+            self.halt.is_some(),
+            self.flatten_pending,
+        ) {
+            return;
+        }
         // Never book a paper fill onto a day whose rollover is not on disk:
         // the print is dropped (it cannot be replayed; conservative).
         if !self.ensure_rolled(now) {
@@ -321,13 +342,7 @@ impl Runtime {
                 );
                     now_ms
                 }
-                sim::PrintTime::TooOld { venue_ms } => {
-                    log::warn!(
-                        "[ARCUS_VOL] print {} stamped {venue_ms} ms is too old vs {now}; skipped",
-                        p.trade_id
-                    );
-                    return;
-                }
+                sim::PrintTime::TooOld { .. } => return,
             };
         self.newest_print_ts_us = self.newest_print_ts_us.max(p.ts_us);
         for side in [QSide::Bid, QSide::Ask] {

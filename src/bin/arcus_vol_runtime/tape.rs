@@ -65,6 +65,9 @@ pub struct TapeHealth {
     pub gap_since_ms: Option<u64>,
     /// Why the current outage started.
     pub gap_reason: Option<String>,
+    /// The outage was started by a stale print, not by the socket: the next
+    /// fresh print re-arms it (see `on_print_age`).
+    pub stale_down: bool,
 }
 
 /// What the runtime must do after a health event.
@@ -89,6 +92,8 @@ impl TapeHealth {
             TapeEvent::Down(reason) => {
                 let was_ready = self.ready;
                 self.ready = false;
+                // A real disconnect now owns the outage: only its Up re-arms.
+                self.stale_down = false;
                 if was_ready {
                     self.gap_reason = Some(reason.clone());
                     // Only the ready → down edge starts a gap, so the start
@@ -99,6 +104,7 @@ impl TapeHealth {
             }
             TapeEvent::Up => {
                 self.ready = true;
+                self.stale_down = false;
                 match self.gap_since_ms.take() {
                     Some(start_ms) => HealthAction::GapEnded {
                         start_ms,
@@ -109,6 +115,41 @@ impl TapeHealth {
                 }
             }
         }
+    }
+}
+
+impl TapeHealth {
+    /// A print older than the max age means the tape delivered it late, so
+    /// prints in between may be missing (Codex P1, pairtrade#361). Treat it
+    /// exactly like a tape failure: not ready (reason `stale_print`), pull
+    /// every virtual quote, start a gap. Re-arm on the next FRESH print, the
+    /// simplest option that is still safe: all virtual quotes were pulled,
+    /// so the next quotes rejoin the queue from the book under the
+    /// placement-time rules and nothing resumes from a queue state that may
+    /// have missed prints. A fresh print never re-arms an outage started by
+    /// a real disconnect; that waits for the resubscribe's `Up`.
+    pub fn on_print_age(&mut self, fresh: bool, now_ms: u64) -> HealthAction {
+        if !fresh {
+            if self.ready {
+                self.ready = false;
+                self.stale_down = true;
+                self.gap_since_ms = Some(now_ms);
+                self.gap_reason = Some("stale_print".to_string());
+            }
+            return HealthAction::PullQuotes;
+        }
+        if !self.ready && self.stale_down {
+            self.ready = true;
+            self.stale_down = false;
+            if let Some(start_ms) = self.gap_since_ms.take() {
+                return HealthAction::GapEnded {
+                    start_ms,
+                    end_ms: now_ms,
+                    reason: self.gap_reason.take().unwrap_or_default(),
+                };
+            }
+        }
+        HealthAction::None
     }
 }
 
@@ -384,6 +425,37 @@ mod tests {
             }
         );
         assert!(h.ready);
+    }
+
+    #[test]
+    fn a_stale_print_downs_the_tape_and_the_next_fresh_print_rearms_it() {
+        let mut h = TapeHealth::default();
+        h.on_event(&TapeEvent::Up, 1_000);
+        // Too old: not ready, quotes pulled, gap started; no fill can apply.
+        assert_eq!(h.on_print_age(false, 2_000), HealthAction::PullQuotes);
+        assert!(!h.ready);
+        assert!(!crate::sim::prints_apply(h.ready, false, false, false));
+        // Another stale one keeps the original start.
+        assert_eq!(h.on_print_age(false, 2_500), HealthAction::PullQuotes);
+        // The next fresh print re-arms and records the gap.
+        assert_eq!(
+            h.on_print_age(true, 3_000),
+            HealthAction::GapEnded {
+                start_ms: 2_000,
+                end_ms: 3_000,
+                reason: "stale_print".into()
+            }
+        );
+        assert!(h.ready);
+        assert_eq!(h.on_print_age(true, 3_100), HealthAction::None);
+        // A real disconnect is NOT re-armed by a fresh print; only by Up.
+        h.on_event(&TapeEvent::Down("disconnected".into()), 4_000);
+        assert_eq!(h.on_print_age(true, 4_500), HealthAction::None);
+        assert!(!h.ready);
+        assert!(matches!(
+            h.on_event(&TapeEvent::Up, 5_000),
+            HealthAction::GapEnded { .. }
+        ));
     }
 
     #[test]
