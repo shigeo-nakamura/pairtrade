@@ -254,6 +254,8 @@ pub struct TickInputs {
     /// Live: the last fill harvest succeeded and every fill it returned is
     /// booked (always true in DRY_RUN).
     pub fills_synced: bool,
+    /// DRY_RUN: the trades tape is subscribed (always true live).
+    pub tape_ready: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -286,6 +288,10 @@ pub fn tick_plan(i: &TickInputs) -> TickPlan {
     }
     if i.shock_or_cooldown {
         return TickPlan::PullQuotes("shock");
+    }
+    if !i.tape_ready {
+        // Paper quotes are only fair while the sim sees every print.
+        return TickPlan::PullQuotes("tape_not_ready");
     }
     if i.reconcile_pending {
         return TickPlan::PullQuotes("reconcile_pending");
@@ -325,6 +331,7 @@ pub struct PlanState {
     pub startup_reconciled: bool,
     pub reconcile_pending: bool,
     pub fills_synced: bool,
+    pub tape_ready: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -342,6 +349,7 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
         startup_reconciled: s.dry_run || s.startup_reconciled,
         reconcile_pending: !s.dry_run && s.reconcile_pending,
         fills_synced: s.dry_run || s.fills_synced,
+        tape_ready: !s.dry_run || s.tape_ready,
         flatten: s.flatten.clone(),
     }
 }
@@ -620,6 +628,7 @@ mod tests {
             dms_armed: true,
             startup_reconciled: true,
             fills_synced: true,
+            tape_ready: true,
             ..TickInputs::default()
         };
         assert_eq!(tick_plan(&armed), TickPlan::Quote);
@@ -682,6 +691,7 @@ mod tests {
             dry_run: true,
             dms_last_ok_ms: None,
             startup_reconciled: false,
+            tape_ready: true,
             ..live_state()
         };
         assert_eq!(tick_plan(&plan_inputs(&dry, 2_000)), TickPlan::Quote);
@@ -744,6 +754,7 @@ mod tests {
             dry_run: true,
             reconcile_pending: true,
             fills_synced: false,
+            tape_ready: true,
             ..live_state()
         };
         assert_eq!(tick_plan(&plan_inputs(&dry, 2_000)), TickPlan::Quote);
@@ -860,6 +871,39 @@ mod tests {
     }
 
     #[test]
+    fn paper_quotes_wait_for_the_tape_and_live_ignores_it() {
+        let dry = PlanState {
+            dry_run: true,
+            tape_ready: false,
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&dry, 2_000)),
+            TickPlan::PullQuotes("tape_not_ready")
+        );
+        let ready = PlanState {
+            tape_ready: true,
+            ..dry.clone()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&ready, 2_000)), TickPlan::Quote);
+        // Safety first even without a tape.
+        let f = PlanState {
+            flatten: Some(FlattenReason::MaxHold),
+            ..dry
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&f, 2_000)),
+            TickPlan::Flatten(FlattenReason::MaxHold)
+        );
+        // Live never reads the tape.
+        let live = PlanState {
+            tape_ready: false,
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&live, 2_000)), TickPlan::Quote);
+    }
+
+    #[test]
     fn dms_is_disarmed_only_after_a_verified_clean_cancel() {
         assert!(may_disarm_dms(true, Some(0)));
         assert!(!may_disarm_dms(false, Some(0)));
@@ -963,6 +1007,7 @@ mod tests {
             dms_armed: true,
             startup_reconciled: true,
             fills_synced: true,
+            tape_ready: true,
             ..TickInputs::default()
         };
         // Nothing unsafe: wait out the backoff.

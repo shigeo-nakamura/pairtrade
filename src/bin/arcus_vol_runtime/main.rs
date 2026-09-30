@@ -116,6 +116,8 @@ struct Runtime {
     ioc_ids: HashSet<String>,
     /// Newest public print (venue µs) applied to the paper sim.
     newest_print_ts_us: u64,
+    /// DRY_RUN: trades tape health (no virtual quotes until it is up).
+    tape: tape::TapeHealth,
     position_mismatch_since_ms: Option<u64>,
     /// Live: the last fill harvest succeeded and booked everything it got.
     fills_synced: bool,
@@ -211,8 +213,36 @@ impl Runtime {
 
     // ---------------------------------------------------------------- paper
 
+    /// Tape health and prints (DRY_RUN). A disconnect pulls every virtual
+    /// quote at once; the reconnect records the gap in fills.jsonl.
+    fn on_tape(&mut self, event: tape::TapeEvent) {
+        if !self.cfg.dry_run {
+            return;
+        }
+        let now = now_ms();
+        match self.tape.on_event(&event, now) {
+            tape::HealthAction::None => {}
+            tape::HealthAction::PullQuotes => self.virt.clear(),
+            tape::HealthAction::GapEnded { start_ms, end_ms } => {
+                let row = json!({"kind": "tape_gap", "mode": self.cfg.mode(),
+                                 "start_ms": start_ms, "end_ms": end_ms,
+                                 "secs": (end_ms.saturating_sub(start_ms)) as f64 / 1_000.0});
+                log::warn!(
+                    "[ARCUS_VOL] trades tape back after {}s gap",
+                    (end_ms - start_ms) / 1_000
+                );
+                if let Err(e) = append_synced(&self.fills_path, &row) {
+                    log::error!("[ARCUS_VOL] tape_gap row not written: {e}");
+                }
+            }
+        }
+        if let tape::TapeEvent::Print(p) = event {
+            self.on_print(p);
+        }
+    }
+
     fn on_print(&mut self, p: tape::Print) {
-        if !self.cfg.dry_run || self.sim_halted.is_some() {
+        if !self.cfg.dry_run || self.sim_halted.is_some() || !self.tape.ready {
             return;
         }
         let now = now_ms();
@@ -908,6 +938,7 @@ impl Runtime {
             startup_reconciled: self.startup_reconciled,
             reconcile_pending: self.need_reconcile,
             fills_synced: self.fills_synced,
+            tape_ready: self.tape.ready,
             flatten,
         };
         let plan = tick_plan(&plan_inputs(&state, now));
@@ -1002,6 +1033,7 @@ impl Runtime {
             "cooldown": now < self.cooldown_until_ms,
             "backoff": now < self.backoff_until_ms,
             "effective_cap_usd": self.cfg.effective_cap_usd().to_string(),
+            "tape": {"ready": self.tape.ready, "gap_since_ms": self.tape.gap_since_ms},
         });
         if let Err(e) = debot::directional::atomic_write(&self.status_path, &status.to_string()) {
             log::warn!("[ARCUS_VOL] status write failed: {e}");
@@ -1209,6 +1241,7 @@ async fn main() -> Result<()> {
         quote_ids: HashSet::new(),
         ioc_ids: HashSet::new(),
         newest_print_ts_us: 0,
+        tape: tape::TapeHealth::default(),
         position_mismatch_since_ms: None,
         fills_synced: false,
         dms_last_ok_ms: None,
@@ -1225,7 +1258,7 @@ async fn main() -> Result<()> {
         cfg,
     };
 
-    let (tx, mut rx) = mpsc::channel::<tape::Print>(4_096);
+    let (tx, mut rx) = mpsc::channel::<tape::TapeEvent>(4_096);
     if rt.cfg.dry_run {
         tokio::spawn(tape::run(rt.cfg.ws_url.clone(), rt.cfg.market.clone(), tx));
     } else {
@@ -1253,7 +1286,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => rt.tick().await,
-            Some(p) = rx.recv() => rt.on_print(p),
+            Some(ev) = rx.recv() => rt.on_tape(ev),
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
         }

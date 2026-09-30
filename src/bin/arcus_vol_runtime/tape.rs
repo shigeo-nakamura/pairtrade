@@ -35,6 +35,77 @@ struct TradeWire {
     side: String,
 }
 
+/// What the tape task tells the runtime: prints AND its own health
+/// (Codex P1, pairtrade#361), so the paper sim never quotes blind.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TapeEvent {
+    /// The venue acked the `trades` subscription.
+    Up,
+    /// The subscription was lost (error, close, silence); a reconnect follows.
+    Down,
+    Print(Print),
+}
+
+/// The venue's ack for our `trades` subscription.
+pub fn is_trades_ack(text: &str, market: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    v.get("type").and_then(|t| t.as_str()) == Some("subscribed")
+        && v.get("channel").and_then(|c| c.as_str()) == Some("trades")
+        && v.get("id").and_then(|i| i.as_str()) == Some(market)
+}
+
+/// Paper-sim tape health. Starts not ready; ready only after an ack.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TapeHealth {
+    pub ready: bool,
+    /// Start (ms) of the current outage after a disconnect.
+    pub gap_since_ms: Option<u64>,
+}
+
+/// What the runtime must do after a health event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HealthAction {
+    None,
+    /// Pull every virtual quote now: prints are no longer seen.
+    PullQuotes,
+    /// Back up after a gap: record [start, end] so the G1 readout can
+    /// exclude or count it.
+    GapEnded {
+        start_ms: u64,
+        end_ms: u64,
+    },
+}
+
+impl TapeHealth {
+    pub fn on_event(&mut self, event: &TapeEvent, now_ms: u64) -> HealthAction {
+        match event {
+            TapeEvent::Print(_) => HealthAction::None,
+            TapeEvent::Down => {
+                let was_ready = self.ready;
+                self.ready = false;
+                if was_ready {
+                    // Only the ready → down edge starts a gap, so the start
+                    // of an outage is never moved by a repeated Down.
+                    self.gap_since_ms = Some(now_ms);
+                }
+                HealthAction::PullQuotes
+            }
+            TapeEvent::Up => {
+                self.ready = true;
+                match self.gap_since_ms.take() {
+                    Some(start_ms) => HealthAction::GapEnded {
+                        start_ms,
+                        end_ms: now_ms,
+                    },
+                    None => HealthAction::None,
+                }
+            }
+        }
+    }
+}
+
 /// Parse one WS text frame; non-trade frames yield nothing.
 pub fn parse_frame(text: &str, market: &str) -> Vec<Print> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -101,8 +172,10 @@ impl Dedupe {
     }
 }
 
-/// Run forever: connect, subscribe, forward prints; reconnect with backoff.
-pub async fn run(url: String, market: String, tx: mpsc::Sender<Print>) {
+/// Run forever: connect, subscribe, forward prints and health events;
+/// reconnect with backoff. `Up` is sent on the venue's subscribe ack and
+/// `Down` whenever an acked subscription is lost.
+pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
     let mut backoff = Duration::from_secs(1);
     let mut dedupe = Dedupe::new(20_000);
     loop {
@@ -110,10 +183,8 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<Print>) {
             Ok((mut ws, _)) => {
                 let sub =
                     serde_json::json!({"type": "subscribe", "channel": "trades", "id": market});
-                let subscribed = ws.send(Message::Text(sub.to_string())).await.is_ok();
-                if subscribed {
-                    log::info!("[ARCUS_VOL] trades tape subscribed ({market})");
-                    backoff = Duration::from_secs(1);
+                let mut up = false;
+                if ws.send(Message::Text(sub.to_string())).await.is_ok() {
                     loop {
                         let next = tokio::time::timeout(Duration::from_secs(60), ws.next()).await;
                         let msg = match next {
@@ -132,8 +203,19 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<Print>) {
                         };
                         match msg {
                             Message::Text(text) => {
+                                if !up && is_trades_ack(&text, &market) {
+                                    up = true;
+                                    backoff = Duration::from_secs(1);
+                                    log::info!("[ARCUS_VOL] trades tape subscribed ({market})");
+                                    if tx.send(TapeEvent::Up).await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
                                 for p in parse_frame(&text, &market) {
-                                    if dedupe.first(&p.trade_id) && tx.send(p).await.is_err() {
+                                    if dedupe.first(&p.trade_id)
+                                        && tx.send(TapeEvent::Print(p)).await.is_err()
+                                    {
                                         return;
                                     }
                                 }
@@ -144,6 +226,14 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<Print>) {
                             Message::Close(_) => break,
                             _ => {}
                         }
+                    }
+                }
+                if up {
+                    log::warn!(
+                        "[ARCUS_VOL] trades tape down; paper quotes pulled until resubscribed"
+                    );
+                    if tx.send(TapeEvent::Down).await.is_err() {
+                        return;
                     }
                 }
             }
@@ -177,6 +267,53 @@ mod tests {
         )
         .is_empty());
         assert!(parse_frame("not json", "BTC-USD").is_empty());
+    }
+
+    #[test]
+    fn only_the_trades_ack_for_our_market_counts_as_up() {
+        let ack = r#"{"type":"subscribed","channel":"trades","id":"BTC-USD","contents":{}}"#;
+        assert!(is_trades_ack(ack, "BTC-USD"));
+        assert!(!is_trades_ack(ack, "ETH-USD"));
+        assert!(!is_trades_ack(
+            r#"{"type":"subscribed","channel":"bbo","id":"BTC-USD"}"#,
+            "BTC-USD"
+        ));
+        assert!(!is_trades_ack(r#"{"type":"connected"}"#, "BTC-USD"));
+        // A data frame on the channel is not the subscription ack.
+        assert!(!is_trades_ack(
+            r#"{"type":"channel_data","channel":"trades","id":"BTC-USD","contents":[]}"#,
+            "BTC-USD"
+        ));
+    }
+
+    #[test]
+    fn health_starts_not_ready_pulls_on_down_and_reports_the_gap() {
+        let mut h = TapeHealth::default();
+        assert!(!h.ready);
+        // A drop before the first ack is not a gap in a running tape.
+        assert_eq!(h.on_event(&TapeEvent::Down, 500), HealthAction::PullQuotes);
+        assert_eq!(h.gap_since_ms, None);
+        assert_eq!(h.on_event(&TapeEvent::Up, 1_000), HealthAction::None);
+        assert!(h.ready);
+        assert_eq!(
+            h.on_event(&TapeEvent::Down, 5_000),
+            HealthAction::PullQuotes
+        );
+        assert!(!h.ready);
+        // A second Down during the same outage keeps the original start.
+        assert_eq!(
+            h.on_event(&TapeEvent::Down, 6_000),
+            HealthAction::PullQuotes
+        );
+        assert_eq!(
+            h.on_event(&TapeEvent::Up, 9_000),
+            HealthAction::GapEnded {
+                start_ms: 5_000,
+                end_ms: 9_000
+            }
+        );
+        assert!(h.ready);
+        assert_eq!(h.gap_since_ms, None);
     }
 
     #[test]
