@@ -50,6 +50,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 const MARKOUT_HORIZONS: [u64; 3] = [5, 30, 60];
+/// A connector fill record missing side/size/value waits this long, then
+/// escalates to a sticky halt `fill_incomplete`.
+const FILL_INCOMPLETE_WAIT_MS: u64 = 60_000;
 /// A due markout horizon waits this long for a fresh mid, then is recorded
 /// as `markout_missing`.
 const MARKOUT_MAX_LATE_MS: u64 = 60_000;
@@ -128,8 +131,14 @@ struct Runtime {
     flatten_pending: bool,
     /// A rollover whose state write failed: retried before any fill harvest.
     rollover_unpersisted: bool,
+    /// The last `ensure_rolled` said no: nothing books, nothing new quotes.
+    rollover_blocked: bool,
+    /// The last tick plan, for status.json.
+    last_plan: String,
     last_mark_warn_ms: u64,
     last_roll_warn_ms: u64,
+    /// Connector fill records missing fields: first seen (ms).
+    incomplete_since: HashMap<String, u64>,
     /// A failed append could not be rolled back: no appends, no new quoting
     /// until a restart repairs fills.jsonl.
     journal_unsafe: bool,
@@ -289,6 +298,8 @@ impl Runtime {
         // Never book a paper fill onto a day whose rollover is not on disk:
         // the print is dropped (it cannot be replayed; conservative).
         if !self.ensure_rolled(now) {
+            // No quote may rest while nothing can book (Codex P2, pairtrade#361).
+            self.virt.clear();
             return;
         }
         self.newest_print_ts_us = self.newest_print_ts_us.max(p.ts_us);
@@ -340,6 +351,12 @@ impl Runtime {
     /// = book nothing now (see `ledger::ensure_rolled`). Shared by the tick's
     /// fill harvest and the paper `on_print`.
     fn ensure_rolled(&mut self, now: u64) -> bool {
+        let ok = self.ensure_rolled_inner(now);
+        self.rollover_blocked = !ok;
+        ok
+    }
+
+    fn ensure_rolled_inner(&mut self, now: u64) -> bool {
         let day_before = self.ledger.day.clone();
         let state_writer = &mut self.state_writer;
         let state_path = &self.state_path;
@@ -462,21 +479,46 @@ impl Runtime {
         };
         let mut all_booked = true;
         for f in rows {
-            let bookable = match (f.filled_side, f.filled_size, f.filled_value) {
-                (Some(side), Some(qty), Some(value)) if !f.is_rejected && !qty.is_zero() => {
-                    Some((side, qty, value))
+            // Only a confirmed rejected / zero-size record is cleared; an
+            // incomplete one waits, then halts (Codex P1, pairtrade#361).
+            let first_seen = *self
+                .incomplete_since
+                .entry(f.trade_id.clone())
+                .or_insert(now);
+            let (side, qty, value) = match ledger::classify_fill_record(
+                f.is_rejected,
+                f.filled_side,
+                f.filled_size,
+                f.filled_value,
+                first_seen,
+                now,
+                FILL_INCOMPLETE_WAIT_MS,
+            ) {
+                ledger::FillRecordAction::Book { side, qty, value } => (side, qty, value),
+                ledger::FillRecordAction::Clear => {
+                    log::warn!("[ARCUS_VOL] fill {} rejected/empty; cleared", f.trade_id);
+                    self.incomplete_since.remove(&f.trade_id);
+                    self.clear_fill(&market, &f.trade_id).await;
+                    continue;
                 }
-                _ => None,
+                ledger::FillRecordAction::Pending => {
+                    all_booked = false;
+                    continue;
+                }
+                ledger::FillRecordAction::Halt => {
+                    all_booked = false;
+                    let reason = format!(
+                        "fill_incomplete: trade {} still missing side/size/value after {}s",
+                        f.trade_id,
+                        FILL_INCOMPLETE_WAIT_MS / 1_000
+                    );
+                    if self.ledger.halt_sticky(reason.clone(), self.last_mark) {
+                        log::error!("[ARCUS_VOL] STICKY HALT {reason}");
+                    }
+                    continue;
+                }
             };
-            let Some((side, qty, value)) = bookable else {
-                // Nothing to book: let the connector forget it.
-                log::warn!(
-                    "[ARCUS_VOL] fill {} not bookable (rejected/empty)",
-                    f.trade_id
-                );
-                self.clear_fill(&market, &f.trade_id).await;
-                continue;
-            };
+            self.incomplete_since.remove(&f.trade_id);
             // A missing fee is never booked as zero (Codex P1, pairtrade#361).
             let first_seen = *self.fee_wait_since.entry(f.trade_id.clone()).or_insert(now);
             let (fee, fee_estimated) = match ledger::fee_decision(
@@ -1111,10 +1153,17 @@ impl Runtime {
             fills_synced: self.fills_synced,
             tape_ready: self.tape.ready,
             journal_unsafe: self.journal_unsafe,
+            rollover_pending: self.rollover_blocked,
             flatten,
         };
         let plan = tick_plan(&plan_inputs(&state, now));
         self.flatten_pending = matches!(plan, TickPlan::Flatten(_));
+        self.last_plan = match &plan {
+            TickPlan::Flatten(r) => format!("flatten:{r:?}"),
+            TickPlan::PullQuotes(why) => format!("pull:{why}"),
+            TickPlan::Wait => "wait".to_string(),
+            TickPlan::Quote => "quote".to_string(),
+        };
         match plan {
             TickPlan::Flatten(reason) => {
                 log::info!(
@@ -1207,6 +1256,7 @@ impl Runtime {
             "backoff": now < self.backoff_until_ms,
             "effective_cap_usd": self.cfg.effective_cap_usd().to_string(),
             "tape": {"ready": self.tape.ready, "gap_since_ms": self.tape.gap_since_ms},
+            "plan": self.last_plan,
         });
         // status.json is informational (dashboards, humans): a plain atomic
         // replace without fsync is enough; state.json above is the durable one.
@@ -1425,8 +1475,11 @@ async fn main() -> Result<()> {
         last_mark: None,
         flatten_pending: false,
         rollover_unpersisted: false,
+        rollover_blocked: false,
+        last_plan: String::new(),
         last_mark_warn_ms: 0,
         last_roll_warn_ms: 0,
+        incomplete_since: HashMap::new(),
         journal_unsafe: false,
         fee_wait_since: HashMap::new(),
         position_mismatch_since_ms: None,

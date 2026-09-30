@@ -259,6 +259,9 @@ pub struct TickInputs {
     /// A failed journal append could not be rolled back: no new quoting
     /// until a restart repairs fills.jsonl.
     pub journal_unsafe: bool,
+    /// The UTC rollover is not done / not on disk yet: nothing may book, so
+    /// nothing new is quoted either.
+    pub rollover_pending: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -282,6 +285,9 @@ pub fn tick_plan(i: &TickInputs) -> TickPlan {
     }
     if i.journal_unsafe {
         return TickPlan::PullQuotes("journal_unsafe");
+    }
+    if i.rollover_pending {
+        return TickPlan::PullQuotes("rollover_pending");
     }
     if !i.has_book {
         return TickPlan::PullQuotes("no_book");
@@ -339,6 +345,7 @@ pub struct PlanState {
     pub fills_synced: bool,
     pub tape_ready: bool,
     pub journal_unsafe: bool,
+    pub rollover_pending: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -358,6 +365,7 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
         fills_synced: s.dry_run || s.fills_synced,
         tape_ready: !s.dry_run || s.tape_ready,
         journal_unsafe: s.journal_unsafe,
+        rollover_pending: s.rollover_pending,
         flatten: s.flatten.clone(),
     }
 }
@@ -960,6 +968,46 @@ mod tests {
         assert_eq!(l.day_start_unrealized, d("-1"));
         // A REST book without a feed time is not fresh either.
         assert_eq!(fresh_mark(mid, None, 11_001, 5), None);
+    }
+
+    #[test]
+    fn a_pending_rollover_pulls_quotes_until_it_is_on_disk() {
+        use crate::ledger::{ensure_rolled, Ledger};
+        let mut l = Ledger::new("dry_run", "2026-09-30");
+        let mut pending = false;
+        // The rollover's persist fails: nothing may book, and quoting stops.
+        let ok = ensure_rolled(&mut l, "2026-10-01", Some(d("1")), &mut pending, |_| {
+            Err(std::io::Error::other("disk"))
+        })
+        .unwrap_or(false);
+        let s = PlanState {
+            dry_run: true,
+            tape_ready: true,
+            rollover_pending: !ok,
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&s, 2_000)),
+            TickPlan::PullQuotes("rollover_pending")
+        );
+        // Persisted on the retry: quoting resumes.
+        let ok = ensure_rolled(&mut l, "2026-10-01", Some(d("1")), &mut pending, |_| Ok(()))
+            .unwrap_or(false);
+        let s = PlanState {
+            rollover_pending: !ok,
+            ..s
+        };
+        assert_eq!(tick_plan(&plan_inputs(&s, 2_000)), TickPlan::Quote);
+        // A flatten still goes first.
+        let f = PlanState {
+            rollover_pending: true,
+            flatten: Some(FlattenReason::MaxHold),
+            ..s
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&f, 2_000)),
+            TickPlan::Flatten(FlattenReason::MaxHold)
+        );
     }
 
     #[test]

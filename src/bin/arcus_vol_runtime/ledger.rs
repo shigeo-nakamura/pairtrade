@@ -724,6 +724,18 @@ impl Ledger {
         true
     }
 
+    /// Sticky halt with `reason` (no-op when one is already in force).
+    /// Returns true when this call engaged it.
+    pub fn halt_sticky(&mut self, reason: String, mark: Option<Decimal>) -> bool {
+        if self.sticky_halt {
+            return false;
+        }
+        self.sticky_halt = true;
+        self.halted_at_net.get_or_insert(self.cum_net_at(mark));
+        self.sticky_reason = Some(reason);
+        true
+    }
+
     pub fn has_booked(&self, trade_id: &str) -> bool {
         self.booked_ids.iter().any(|id| id == trade_id)
     }
@@ -915,6 +927,44 @@ pub fn append_journal(
         sync_dir(dir.unwrap_or(std::path::Path::new(".")))?;
     }
     Ok(())
+}
+
+/// What to do with one connector fill record (Codex P1, pairtrade#361).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FillRecordAction {
+    Book {
+        side: dex_connector::OrderSide,
+        qty: Decimal,
+        value: Decimal,
+    },
+    /// Confirmed rejected or zero-size: nothing to book, clear it.
+    Clear,
+    /// Missing side / size / value: keep it in the connector, retry.
+    Pending,
+    /// Still incomplete after the wait: sticky halt `fill_incomplete`.
+    Halt,
+}
+
+/// Only an explicitly rejected or zero-size record is dropped; an
+/// incomplete one is never guessed at or cleared (it may be a real fill):
+/// it waits `wait_ms` from `first_seen_ms`, then escalates to a halt.
+pub fn classify_fill_record(
+    is_rejected: bool,
+    side: Option<dex_connector::OrderSide>,
+    size: Option<Decimal>,
+    value: Option<Decimal>,
+    first_seen_ms: u64,
+    now_ms: u64,
+    wait_ms: u64,
+) -> FillRecordAction {
+    if is_rejected || size.is_some_and(|q| q.is_zero()) {
+        return FillRecordAction::Clear;
+    }
+    match (side, size, value) {
+        (Some(side), Some(qty), Some(value)) => FillRecordAction::Book { side, qty, value },
+        _ if now_ms.saturating_sub(first_seen_ms) < wait_ms => FillRecordAction::Pending,
+        _ => FillRecordAction::Halt,
+    }
 }
 
 /// What to do with a live fill whose fee the venue may not have reported.
@@ -1480,6 +1530,61 @@ mod tests {
             .unwrap()
         );
         assert!(retried && !pending);
+    }
+
+    #[test]
+    fn an_incomplete_fill_record_waits_then_books_once_or_halts() {
+        use dex_connector::OrderSide;
+        let wait = 60_000;
+        // Incomplete (no value): pending, not cleared, not booked.
+        assert_eq!(
+            classify_fill_record(
+                false,
+                Some(OrderSide::Long),
+                Some(d("0.1")),
+                None,
+                1_000,
+                30_000,
+                wait
+            ),
+            FillRecordAction::Pending
+        );
+        // Completed later: booked, exactly once.
+        let act = classify_fill_record(
+            false,
+            Some(OrderSide::Long),
+            Some(d("0.1")),
+            Some(d("8364.29")),
+            1_000,
+            40_000,
+            wait,
+        );
+        assert!(matches!(act, FillRecordAction::Book { .. }));
+        let mut l = Ledger::new("live", "2026-09-30");
+        book_fill(&mut l, &fill_in("t1"), 1, |_| Ok(())).unwrap();
+        book_fill(&mut l, &fill_in("t1"), 2, |_| Ok(())).unwrap();
+        assert_eq!(l.fills, 1);
+        // Still incomplete past the wait: halt, never guessed or dropped.
+        assert_eq!(
+            classify_fill_record(false, None, Some(d("0.1")), None, 1_000, 61_000, wait),
+            FillRecordAction::Halt
+        );
+        assert!(l.halt_sticky("fill_incomplete: trade t9".into(), None));
+        assert!(l.sticky_halt);
+        assert!(l
+            .sticky_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("fill_incomplete"));
+        // Only confirmed rejected / zero-size records are cleared.
+        assert_eq!(
+            classify_fill_record(true, None, None, None, 1_000, 1_000, wait),
+            FillRecordAction::Clear
+        );
+        assert_eq!(
+            classify_fill_record(false, None, Some(Decimal::ZERO), None, 1_000, 1_000, wait),
+            FillRecordAction::Clear
+        );
     }
 
     #[test]
