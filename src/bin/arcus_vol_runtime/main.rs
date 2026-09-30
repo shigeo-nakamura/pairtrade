@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-const MARKOUT_HORIZONS: [u64; 3] = [5, 30, 60];
+use ledger::MARKOUT_HORIZONS;
 /// A connector fill record missing side/size/value waits this long, then
 /// escalates to a sticky halt `fill_incomplete`.
 const FILL_INCOMPLETE_WAIT_MS: u64 = 60_000;
@@ -260,11 +260,15 @@ impl Runtime {
         match self.tape.on_event(&event, now) {
             tape::HealthAction::None => {}
             tape::HealthAction::PullQuotes => self.virt.clear(),
-            tape::HealthAction::GapEnded { start_ms, end_ms } => {
+            tape::HealthAction::GapEnded {
+                start_ms,
+                end_ms,
+                reason,
+            } => {
                 let row = json!({"kind": "tape_gap", "seq": self.ledger.take_seq(),
                                  "mode": self.cfg.mode(),
                                  "market": self.cfg.market,
-                                 "start_ms": start_ms, "end_ms": end_ms,
+                                 "start_ms": start_ms, "end_ms": end_ms, "reason": reason,
                                  "secs": (end_ms.saturating_sub(start_ms)) as f64 / 1_000.0});
                 log::warn!(
                     "[ARCUS_VOL] trades tape back after {}s gap",
@@ -1438,6 +1442,7 @@ async fn main() -> Result<()> {
         );
     }
     let ledger = opened.ledger;
+    let journal_rows = opened.rows;
 
     let dex = DexConnectorBox::create(
         "arcus",
@@ -1497,6 +1502,37 @@ async fn main() -> Result<()> {
         halt: None,
         cfg,
     };
+
+    // Markouts owed before a restart come back from the journal; those too
+    // late to price are recorded as missing (Codex P2, pairtrade#361).
+    let (restored, missing) =
+        ledger::restore_markouts(&journal_rows, now_ms(), MARKOUT_MAX_LATE_MS)
+            .map_err(|e| anyhow!("restore markouts: {e}"))?;
+    if !restored.is_empty() || !missing.is_empty() {
+        log::info!(
+            "[ARCUS_VOL] markouts restored: {} fill(s) pending, {} horizon(s) missing (restart)",
+            restored.len(),
+            missing.len()
+        );
+    }
+    rt.pending_markouts = restored;
+    for m in missing {
+        if let ledger::Markout::Missing {
+            fill_id,
+            horizon_s,
+            reason,
+        } = m
+        {
+            let row = json!({"kind": "markout_missing", "seq": rt.ledger.take_seq(),
+                             "ts_ms": now_ms(), "fill_id": fill_id,
+                             "market": rt.cfg.market, "horizon_s": horizon_s,
+                             "reason": reason});
+            append_synced(&rt.fills_path, &row).map_err(|e| {
+                rt.note_append_error(&e);
+                anyhow!("record restart markout_missing: {e}")
+            })?;
+        }
+    }
 
     let (tx, mut rx) = mpsc::channel::<tape::TapeEvent>(4_096);
     if rt.cfg.dry_run {

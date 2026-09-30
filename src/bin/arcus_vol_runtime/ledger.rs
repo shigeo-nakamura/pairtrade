@@ -428,6 +428,8 @@ pub struct OpenedState {
     pub ledger: Ledger,
     pub repair: JournalRepair,
     pub replayed: usize,
+    /// The journal rows, for restoring pending markouts.
+    pub rows: Vec<serde_json::Value>,
 }
 
 /// Open (or create) the state in `dir` for `mode` / `market`, BEFORE any
@@ -474,6 +476,15 @@ pub fn open_state(
             .map_err(|e| format!("fills.jsonl row after repair: {e}"))?,
     };
     check_market(state_market.as_deref(), &rows, market)?;
+    // Day and stop state live only in state.json; never rebuild them from a
+    // journal (Codex P2, pairtrade#361).
+    if loaded.is_none() && !rows.is_empty() {
+        return Err(format!(
+            "{} has {} row(s) but there is no state.json: journal without state; restore state.json or move the journal aside",
+            fills_path.display(),
+            rows.len()
+        ));
+    }
     let fresh = loaded.is_none();
     let mut ledger = loaded.unwrap_or_else(|| {
         let mut l = Ledger::new(mode, today);
@@ -502,6 +513,7 @@ pub fn open_state(
         ledger,
         repair,
         replayed,
+        rows,
     })
 }
 
@@ -1002,6 +1014,77 @@ pub fn fee_decision(
         None if now_ms.saturating_sub(first_seen_ms) < wait_ms => FeeDecision::Wait,
         None => FeeDecision::Estimated(notional.abs() * taker_fee_bps / Decimal::from(10_000)),
     }
+}
+
+/// Markout horizons (seconds after the fill).
+pub const MARKOUT_HORIZONS: [u64; 3] = [5, 30, 60];
+
+/// Rebuild pending markouts from the journal at startup (Codex P2,
+/// pairtrade#361): for each fill row, every horizon without a `markout` /
+/// `markout_missing` row for that `fill_id` + `horizon_s` is still owed.
+/// Those still inside `max_late_ms` after they were due go back to pending;
+/// older ones come back as `Missing` with reason `restart`, for the caller
+/// to record, so nothing is resolved twice or left open forever.
+pub fn restore_markouts(
+    rows: &[serde_json::Value],
+    now_ms: u64,
+    max_late_ms: u64,
+) -> Result<(Vec<PendingMarkout>, Vec<Markout>), String> {
+    use std::collections::HashSet;
+    use std::str::FromStr;
+    let str_of =
+        |r: &serde_json::Value, k: &str| r.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let resolved: HashSet<(String, u64)> = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.get("kind").and_then(|k| k.as_str()),
+                Some("markout") | Some("markout_missing")
+            )
+        })
+        .filter_map(|r| Some((str_of(r, "fill_id")?, r.get("horizon_s")?.as_u64()?)))
+        .collect();
+    let mut pending = Vec::new();
+    let mut missing = Vec::new();
+    for r in rows
+        .iter()
+        .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some("fill"))
+    {
+        let id = str_of(r, "fill_id").ok_or_else(|| format!("fill row without fill_id: {r}"))?;
+        let ts = r
+            .get("ts_ms")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("fill {id} without ts_ms"))?;
+        let px = str_of(r, "px")
+            .and_then(|p| Decimal::from_str(&p).ok())
+            .ok_or_else(|| format!("fill {id} without px"))?;
+        let buy = str_of(r, "side").as_deref() == Some("buy");
+        let mut owed = Vec::new();
+        for h in MARKOUT_HORIZONS {
+            if resolved.contains(&(id.clone(), h)) {
+                continue;
+            }
+            if now_ms > ts + h * 1_000 + max_late_ms {
+                missing.push(Markout::Missing {
+                    fill_id: id.clone(),
+                    horizon_s: h,
+                    reason: "restart".to_string(),
+                });
+            } else {
+                owed.push(h);
+            }
+        }
+        if !owed.is_empty() {
+            pending.push(PendingMarkout {
+                fill_id: id,
+                ts_ms: ts,
+                px,
+                buy,
+                horizons: owed,
+            });
+        }
+    }
+    Ok((pending, missing))
 }
 
 /// A fill waiting for its +5/+30/+60 s markouts.
@@ -1585,6 +1668,72 @@ mod tests {
             classify_fill_record(false, None, Some(Decimal::ZERO), None, 1_000, 1_000, wait),
             FillRecordAction::Clear
         );
+    }
+
+    #[test]
+    fn a_journal_without_state_is_refused_but_an_empty_one_is_a_fresh_start() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fills.jsonl"),
+            format!(
+                "{}\n",
+                ROW.replace(
+                    "\"mode\":\"live\"",
+                    "\"mode\":\"live\",\"market\":\"BTC-USD\""
+                )
+            ),
+        )
+        .unwrap();
+        let err = open_state(dir.path(), "live", "BTC-USD", "2026-09-30").unwrap_err();
+        assert!(err.contains("journal without state"), "{err}");
+        assert!(!dir.path().join("state.json").exists());
+        // Empty journal, no state: fresh start.
+        std::fs::write(dir.path().join("fills.jsonl"), "").unwrap();
+        assert!(open_state(dir.path(), "live", "BTC-USD", "2026-09-30").is_ok());
+    }
+
+    #[test]
+    fn pending_markouts_survive_a_restart_and_resolve_once() {
+        let fill = serde_json::json!({"kind": "fill", "seq": 0, "fill_id": "f1", "ts_ms": 1_000,
+                                      "px": "100000", "side": "buy", "market": "BTC-USD"});
+        let m5 = serde_json::json!({"kind": "markout", "seq": 1, "fill_id": "f1", "horizon_s": 5,
+                                    "bps": "1", "market": "BTC-USD"});
+        let mut rows = vec![fill, m5];
+        // Restart at 20 s, before +30: +30 and +60 restored, +5 not.
+        let (mut pending, missing) = restore_markouts(&rows, 20_000, 60_000).unwrap();
+        assert!(missing.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].horizons, vec![30, 60]);
+        // They resolve once each; record them as the runtime does.
+        for now in [31_000, 61_000] {
+            for m in due_markouts(&mut pending, now, Some(d("100010")), 60_000) {
+                if let Markout::Priced {
+                    fill_id, horizon_s, ..
+                } = m
+                {
+                    rows.push(serde_json::json!({"kind": "markout", "fill_id": fill_id,
+                                                 "horizon_s": horizon_s, "market": "BTC-USD"}));
+                }
+            }
+        }
+        assert!(pending.is_empty());
+        assert_eq!(rows.iter().filter(|r| r["kind"] == "markout").count(), 3);
+        // A second restart owes nothing: no duplicates.
+        let (pending, missing) = restore_markouts(&rows, 70_000, 60_000).unwrap();
+        assert!(pending.is_empty() && missing.is_empty());
+    }
+
+    #[test]
+    fn markouts_too_late_at_restart_go_missing_with_reason_restart() {
+        let fill = serde_json::json!({"kind": "fill", "seq": 0, "fill_id": "f1", "ts_ms": 1_000,
+                                      "px": "100000", "side": "sell"});
+        // Down for 10 minutes: every horizon is past its lateness.
+        let (pending, missing) = restore_markouts(&[fill], 601_000, 60_000).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(missing.len(), 3);
+        assert!(missing
+            .iter()
+            .all(|m| matches!(m, Markout::Missing { reason, .. } if reason == "restart")));
     }
 
     #[test]

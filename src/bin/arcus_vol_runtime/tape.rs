@@ -41,8 +41,9 @@ struct TradeWire {
 pub enum TapeEvent {
     /// The venue acked the `trades` subscription.
     Up,
-    /// The subscription was lost (error, close, silence); a reconnect follows.
-    Down,
+    /// The subscription was lost (error, close, silence, or a malformed
+    /// trade row); a reconnect follows. Carries the reason.
+    Down(String),
     Print(Print),
 }
 
@@ -62,6 +63,8 @@ pub struct TapeHealth {
     pub ready: bool,
     /// Start (ms) of the current outage after a disconnect.
     pub gap_since_ms: Option<u64>,
+    /// Why the current outage started.
+    pub gap_reason: Option<String>,
 }
 
 /// What the runtime must do after a health event.
@@ -75,6 +78,7 @@ pub enum HealthAction {
     GapEnded {
         start_ms: u64,
         end_ms: u64,
+        reason: String,
     },
 }
 
@@ -82,10 +86,11 @@ impl TapeHealth {
     pub fn on_event(&mut self, event: &TapeEvent, now_ms: u64) -> HealthAction {
         match event {
             TapeEvent::Print(_) => HealthAction::None,
-            TapeEvent::Down => {
+            TapeEvent::Down(reason) => {
                 let was_ready = self.ready;
                 self.ready = false;
                 if was_ready {
+                    self.gap_reason = Some(reason.clone());
                     // Only the ready → down edge starts a gap, so the start
                     // of an outage is never moved by a repeated Down.
                     self.gap_since_ms = Some(now_ms);
@@ -98,6 +103,7 @@ impl TapeHealth {
                     Some(start_ms) => HealthAction::GapEnded {
                         start_ms,
                         end_ms: now_ms,
+                        reason: self.gap_reason.take().unwrap_or_default(),
                     },
                     None => HealthAction::None,
                 }
@@ -106,37 +112,48 @@ impl TapeHealth {
     }
 }
 
-/// Parse one WS text frame; non-trade frames yield nothing.
-pub fn parse_frame(text: &str, market: &str) -> Vec<Print> {
+/// Parse one WS text frame; non-trade frames yield `Ok(vec![])`. A row of
+/// a valid `trades` frame for our market that does not parse (missing
+/// field, unknown side, bad decimal) is an `Err` carrying the row
+/// (truncated): the tape is no longer trustworthy, so the caller drops the
+/// subscription instead of silently skipping a print (Codex P1,
+/// pairtrade#361).
+pub fn parse_frame(text: &str, market: &str) -> Result<Vec<Print>, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if v.get("channel").and_then(|c| c.as_str()) != Some("trades")
         || v.get("type").and_then(|t| t.as_str()) != Some("channel_data")
         || v.get("id").and_then(|i| i.as_str()) != Some(market)
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(rows) = v.get("contents").and_then(|c| c.as_array()) else {
-        return Vec::new();
+        return Err(truncate(&v.to_string()));
     };
     rows.iter()
-        .filter_map(|row| serde_json::from_value::<TradeWire>(row.clone()).ok())
-        .filter_map(|w| {
-            let taker = match w.side.as_str() {
-                "BUY" => OrderSide::Long,
-                "SELL" => OrderSide::Short,
-                _ => return None,
-            };
-            Some(Print {
-                trade_id: w.trade_id,
-                ts_us: w.timestamp,
-                px: Decimal::from_str(&w.price).ok()?,
-                qty: Decimal::from_str(&w.size).ok()?,
-                taker,
-            })
-        })
+        .map(|row| parse_row(row).ok_or_else(|| truncate(&row.to_string())))
         .collect()
+}
+
+fn parse_row(row: &serde_json::Value) -> Option<Print> {
+    let w = serde_json::from_value::<TradeWire>(row.clone()).ok()?;
+    let taker = match w.side.as_str() {
+        "BUY" => OrderSide::Long,
+        "SELL" => OrderSide::Short,
+        _ => return None,
+    };
+    Some(Print {
+        trade_id: w.trade_id,
+        ts_us: w.timestamp,
+        px: Decimal::from_str(&w.price).ok()?,
+        qty: Decimal::from_str(&w.size).ok()?,
+        taker,
+    })
+}
+
+fn truncate(s: &str) -> String {
+    s.chars().take(200).collect()
 }
 
 /// Bounded "seen" set: a reconnect never replays (no snapshot), but a
@@ -184,6 +201,7 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
                 let sub =
                     serde_json::json!({"type": "subscribe", "channel": "trades", "id": market});
                 let mut up = false;
+                let mut down_reason = "disconnected";
                 if ws.send(Message::Text(sub.to_string())).await.is_ok() {
                     loop {
                         let next = tokio::time::timeout(Duration::from_secs(60), ws.next()).await;
@@ -212,11 +230,22 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
                                     }
                                     continue;
                                 }
-                                for p in parse_frame(&text, &market) {
-                                    if dedupe.first(&p.trade_id)
-                                        && tx.send(TapeEvent::Print(p)).await.is_err()
-                                    {
-                                        return;
+                                match parse_frame(&text, &market) {
+                                    Ok(prints) => {
+                                        for p in prints {
+                                            if dedupe.first(&p.trade_id)
+                                                && tx.send(TapeEvent::Print(p)).await.is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Err(row) => {
+                                        log::warn!(
+                                            "[ARCUS_VOL] malformed trade row, resubscribing: {row}"
+                                        );
+                                        down_reason = "malformed_trade";
+                                        break;
                                     }
                                 }
                             }
@@ -232,7 +261,11 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
                     log::warn!(
                         "[ARCUS_VOL] trades tape down; paper quotes pulled until resubscribed"
                     );
-                    if tx.send(TapeEvent::Down).await.is_err() {
+                    if tx
+                        .send(TapeEvent::Down(down_reason.to_string()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -255,18 +288,19 @@ mod tests {
              "tradeId":"8943469","timestamp":1790709184183723,"makerOrderId":"a","takerOrderId":"b",
              "makerAddress":"0x1","takerAddress":"0x2","sequenceNumber":1},
             {"side":"SELL","price":"83642.9","size":"0.5","tradeId":"8943470","timestamp":1790709184183724}]}"#;
-        let prints = parse_frame(frame, "BTC-USD");
+        let prints = parse_frame(frame, "BTC-USD").unwrap();
         assert_eq!(prints.len(), 2);
         assert_eq!(prints[0].taker, OrderSide::Long);
         assert_eq!(prints[0].px, Decimal::from_str("83643").unwrap());
         assert_eq!(prints[1].taker, OrderSide::Short);
-        assert!(parse_frame(frame, "ETH-USD").is_empty());
+        assert!(parse_frame(frame, "ETH-USD").unwrap().is_empty());
         assert!(parse_frame(
             r#"{"type":"subscribed","channel":"trades","id":"BTC-USD","contents":{}}"#,
             "BTC-USD"
         )
+        .unwrap()
         .is_empty());
-        assert!(parse_frame("not json", "BTC-USD").is_empty());
+        assert!(parse_frame("not json", "BTC-USD").unwrap().is_empty());
     }
 
     #[test]
@@ -291,29 +325,65 @@ mod tests {
         let mut h = TapeHealth::default();
         assert!(!h.ready);
         // A drop before the first ack is not a gap in a running tape.
-        assert_eq!(h.on_event(&TapeEvent::Down, 500), HealthAction::PullQuotes);
+        assert_eq!(
+            h.on_event(&TapeEvent::Down("disconnected".into()), 500),
+            HealthAction::PullQuotes
+        );
         assert_eq!(h.gap_since_ms, None);
         assert_eq!(h.on_event(&TapeEvent::Up, 1_000), HealthAction::None);
         assert!(h.ready);
         assert_eq!(
-            h.on_event(&TapeEvent::Down, 5_000),
+            h.on_event(&TapeEvent::Down("disconnected".into()), 5_000),
             HealthAction::PullQuotes
         );
         assert!(!h.ready);
         // A second Down during the same outage keeps the original start.
         assert_eq!(
-            h.on_event(&TapeEvent::Down, 6_000),
+            h.on_event(&TapeEvent::Down("disconnected".into()), 6_000),
             HealthAction::PullQuotes
         );
         assert_eq!(
             h.on_event(&TapeEvent::Up, 9_000),
             HealthAction::GapEnded {
                 start_ms: 5_000,
-                end_ms: 9_000
+                end_ms: 9_000,
+                reason: "disconnected".into()
             }
         );
         assert!(h.ready);
         assert_eq!(h.gap_since_ms, None);
+    }
+
+    #[test]
+    fn a_malformed_trade_row_downs_the_tape_and_resubscribe_brings_it_back() {
+        let frame = r#"{"type":"channel_data","channel":"trades","id":"BTC-USD","contents":[
+            {"side":"BUY","price":"83643","size":"0.1","tradeId":"1","timestamp":10},
+            {"side":"HOLD","price":"83643","size":"0.1","tradeId":"2","timestamp":11}]}"#;
+        let err = parse_frame(frame, "BTC-USD").unwrap_err();
+        assert!(err.contains("HOLD"), "the offending row is surfaced: {err}");
+        for bad in [
+            r#"{"type":"channel_data","channel":"trades","id":"BTC-USD","contents":[{"side":"BUY","price":"x","size":"0.1","tradeId":"3","timestamp":1}]}"#,
+            r#"{"type":"channel_data","channel":"trades","id":"BTC-USD","contents":[{"side":"BUY","size":"0.1","tradeId":"4","timestamp":1}]}"#,
+        ] {
+            assert!(parse_frame(bad, "BTC-USD").is_err(), "{bad}");
+        }
+        // The tape task then sends Down("malformed_trade"): quotes pulled,
+        // and the resubscribe's Up records the gap with its reason.
+        let mut h = TapeHealth::default();
+        h.on_event(&TapeEvent::Up, 1_000);
+        assert_eq!(
+            h.on_event(&TapeEvent::Down("malformed_trade".into()), 2_000),
+            HealthAction::PullQuotes
+        );
+        assert_eq!(
+            h.on_event(&TapeEvent::Up, 3_500),
+            HealthAction::GapEnded {
+                start_ms: 2_000,
+                end_ms: 3_500,
+                reason: "malformed_trade".into()
+            }
+        );
+        assert!(h.ready);
     }
 
     #[test]
