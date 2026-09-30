@@ -248,6 +248,12 @@ pub struct TickInputs {
     /// Live: the startup position read succeeded and is in the ledger
     /// (always true in DRY_RUN). No new quote before it.
     pub startup_reconciled: bool,
+    /// Live: an ambiguous order outcome still awaits its cancel-all +
+    /// position read (always false in DRY_RUN).
+    pub reconcile_pending: bool,
+    /// Live: the last fill harvest succeeded and every fill it returned is
+    /// booked (always true in DRY_RUN).
+    pub fills_synced: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -281,6 +287,12 @@ pub fn tick_plan(i: &TickInputs) -> TickPlan {
     if i.shock_or_cooldown {
         return TickPlan::PullQuotes("shock");
     }
+    if i.reconcile_pending {
+        return TickPlan::PullQuotes("reconcile_pending");
+    }
+    if !i.fills_synced {
+        return TickPlan::PullQuotes("fills_unsynced");
+    }
     if !i.startup_reconciled {
         // Quoting on an unknown position could stack onto inventory we do
         // not know about (Codex P1, pairtrade#361); main retries the read.
@@ -311,6 +323,8 @@ pub struct PlanState {
     pub dms_last_failed: bool,
     pub dms_secs: u64,
     pub startup_reconciled: bool,
+    pub reconcile_pending: bool,
+    pub fills_synced: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -326,8 +340,89 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
         backoff: now_ms < s.backoff_until_ms,
         dms_armed: s.dry_run || dms_armed(s.dms_last_ok_ms, s.dms_last_failed, now_ms, s.dms_secs),
         startup_reconciled: s.dry_run || s.startup_reconciled,
+        reconcile_pending: !s.dry_run && s.reconcile_pending,
+        fills_synced: s.dry_run || s.fills_synced,
         flatten: s.flatten.clone(),
     }
+}
+
+/// Outcome of comparing the ledger with the venue position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PosCheck {
+    /// The venue read failed.
+    Unread,
+    InSync,
+    /// Different, but fills may still be in flight: wait.
+    Pending,
+    /// Still different after `grace_ms` with every fill harvested.
+    Mismatch,
+}
+
+/// Position check (Codex P1, pairtrade#361). The runtime NEVER adopts the
+/// venue quantity into the ledger: the connector cannot say which trade ids
+/// a venue position already includes, so any adoption could be counted a
+/// second time when a delayed fill arrives. A difference only waits (fills
+/// in flight) and, when it outlives `grace_ms` while fills are fully
+/// harvested, becomes `Mismatch` → sticky halt "position_mismatch" for a
+/// human. The grace clock only runs while fills are synced. Returns the
+/// verdict and the new "mismatch since" time.
+pub fn position_check(
+    ledger_qty: Decimal,
+    venue_qty: Option<Decimal>,
+    fills_synced: bool,
+    since_ms: Option<u64>,
+    now_ms: u64,
+    grace_ms: u64,
+) -> (PosCheck, Option<u64>) {
+    let Some(venue) = venue_qty else {
+        return (PosCheck::Unread, since_ms);
+    };
+    if (venue - ledger_qty).abs() <= Decimal::new(1, 8) {
+        return (PosCheck::InSync, None);
+    }
+    if !fills_synced {
+        return (PosCheck::Pending, None);
+    }
+    match since_ms {
+        Some(t) if now_ms.saturating_sub(t) >= grace_ms => (PosCheck::Mismatch, Some(t)),
+        Some(t) => (PosCheck::Pending, Some(t)),
+        None => (PosCheck::Pending, Some(now_ms)),
+    }
+}
+
+/// Prefix of the sticky-halt reason a position mismatch writes.
+pub const POSITION_MISMATCH: &str = "position_mismatch";
+
+/// The halt label to flatten on, if any: a position-mismatch halt pulls
+/// quotes but never auto-flattens (the position itself is in doubt).
+pub fn flatten_halt_label(halt_label: Option<&str>) -> Option<&str> {
+    halt_label.filter(|l| !l.contains(POSITION_MISMATCH))
+}
+
+/// Something that sends quote batches, each gated on the DMS at send time.
+pub(crate) trait BatchSink<B> {
+    /// DMS armed right now (fresh clock).
+    fn armed(&self) -> bool;
+    async fn send(&mut self, batch: B);
+}
+
+/// Send `batches` in order, re-checking `armed()` immediately before EACH
+/// one (Codex P1, pairtrade#361): a modify batch that took long must not
+/// let the place batch after it go out on a lapsed DMS. Returns how many
+/// were sent.
+pub(crate) async fn send_gated<B, S: BatchSink<B>>(sink: &mut S, batches: Vec<B>) -> usize {
+    let mut sent = 0;
+    for batch in batches {
+        if !sink.armed() {
+            log::warn!(
+                "[ARCUS_VOL] DMS not armed at send time; skipping the remaining quote batches"
+            );
+            break;
+        }
+        sink.send(batch).await;
+        sent += 1;
+    }
+    sent
 }
 
 /// The DMS counts as armed when the last successful arm/refresh is younger
@@ -524,6 +619,7 @@ mod tests {
             has_book: true,
             dms_armed: true,
             startup_reconciled: true,
+            fills_synced: true,
             ..TickInputs::default()
         };
         assert_eq!(tick_plan(&armed), TickPlan::Quote);
@@ -553,6 +649,7 @@ mod tests {
             dms_last_ok_ms: Some(1_000),
             dms_secs: 30,
             startup_reconciled: true,
+            fills_synced: true,
             ..PlanState::default()
         }
     }
@@ -614,6 +711,152 @@ mod tests {
             ..live_state()
         };
         assert_eq!(tick_plan(&plan_inputs(&ok, 2_000)), TickPlan::Quote);
+    }
+
+    #[test]
+    fn pending_reconcile_or_unsynced_fills_block_quoting_but_not_safety() {
+        let s = PlanState {
+            reconcile_pending: true,
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&s, 2_000)),
+            TickPlan::PullQuotes("reconcile_pending")
+        );
+        let f = PlanState {
+            fills_synced: false,
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&f, 2_000)),
+            TickPlan::PullQuotes("fills_unsynced")
+        );
+        let flat = PlanState {
+            flatten: Some(FlattenReason::MaxHold),
+            ..s
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&flat, 2_000)),
+            TickPlan::Flatten(FlattenReason::MaxHold)
+        );
+        // DRY_RUN has neither.
+        let dry = PlanState {
+            dry_run: true,
+            reconcile_pending: true,
+            fills_synced: false,
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&dry, 2_000)), TickPlan::Quote);
+    }
+
+    #[test]
+    fn position_check_waits_then_halts_and_never_adopts() {
+        let g = 5_000;
+        // Read failed.
+        assert_eq!(
+            position_check(d("0"), None, true, Some(1), 9, g),
+            (PosCheck::Unread, Some(1))
+        );
+        // In sync clears the timer.
+        assert_eq!(
+            position_check(d("0.1"), Some(d("0.1")), true, Some(1), 9, g),
+            (PosCheck::InSync, None)
+        );
+        // Fills unsynced: wait without starting the clock.
+        assert_eq!(
+            position_check(d("0"), Some(d("0.1")), false, None, 1_000, g),
+            (PosCheck::Pending, None)
+        );
+        // Synced: start the clock, wait, then halt.
+        assert_eq!(
+            position_check(d("0"), Some(d("0.1")), true, None, 1_000, g),
+            (PosCheck::Pending, Some(1_000))
+        );
+        assert_eq!(
+            position_check(d("0"), Some(d("0.1")), true, Some(1_000), 5_999, g),
+            (PosCheck::Pending, Some(1_000))
+        );
+        assert_eq!(
+            position_check(d("0"), Some(d("0.1")), true, Some(1_000), 6_000, g),
+            (PosCheck::Mismatch, Some(1_000))
+        );
+    }
+
+    #[test]
+    fn a_delayed_fill_after_a_mismatch_moves_inventory_exactly_once() {
+        use crate::ledger::{book_fill, FillIn, Ledger};
+        let g = 5_000;
+        let mut l = Ledger::new("live", "2026-09-30");
+        let venue = Some(d("0.1")); // the venue already holds the fill
+                                    // The fill is not reported yet; past the grace the check halts...
+        let (c, since) = position_check(l.position.qty, venue, true, None, 1_000, g);
+        assert_eq!(c, PosCheck::Pending);
+        let (c, _) = position_check(l.position.qty, venue, true, since, 7_000, g);
+        assert_eq!(c, PosCheck::Mismatch);
+        // ...and the ledger was never adopted to the venue.
+        assert!(l.position.qty.is_zero());
+        // The delayed fill arrives: booked once, now in sync.
+        let fill = FillIn {
+            trade_id: "late".into(),
+            buy: true,
+            qty: d("0.1"),
+            px: d("83642.9"),
+            fee: Decimal::ZERO,
+            maker: true,
+            order_id: "o".into(),
+        };
+        book_fill(&mut l, &fill, 8_000, |_| Ok(())).unwrap();
+        book_fill(&mut l, &fill, 9_000, |_| Ok(())).unwrap();
+        assert_eq!(l.position.qty, d("0.1"));
+        assert_eq!(
+            position_check(l.position.qty, venue, true, since, 9_000, g).0,
+            PosCheck::InSync
+        );
+    }
+
+    #[test]
+    fn a_position_mismatch_halt_never_auto_flattens() {
+        assert_eq!(flatten_halt_label(Some("kill_switch")), Some("kill_switch"));
+        assert_eq!(
+            flatten_halt_label(Some("sticky: position_mismatch: ledger 0 venue 0.1")),
+            None
+        );
+        assert_eq!(flatten_halt_label(None), None);
+    }
+
+    struct FakeSink {
+        armed: Vec<bool>,
+        sent: Vec<&'static str>,
+    }
+
+    impl BatchSink<&'static str> for FakeSink {
+        fn armed(&self) -> bool {
+            self.armed[self.sent.len()]
+        }
+        async fn send(&mut self, batch: &'static str) {
+            self.sent.push(batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn each_quote_batch_is_gated_on_the_dms_at_its_own_send_time() {
+        // Armed before the modify batch, lapsed before the place batch.
+        let mut sink = FakeSink {
+            armed: vec![true, false],
+            sent: Vec::new(),
+        };
+        assert_eq!(send_gated(&mut sink, vec!["modify", "place"]).await, 1);
+        assert_eq!(sink.sent, vec!["modify"]);
+        let mut sink = FakeSink {
+            armed: vec![true, true],
+            sent: Vec::new(),
+        };
+        assert_eq!(send_gated(&mut sink, vec!["modify", "place"]).await, 2);
+        let mut sink = FakeSink {
+            armed: vec![false, true],
+            sent: Vec::new(),
+        };
+        assert_eq!(send_gated(&mut sink, vec!["modify", "place"]).await, 0);
     }
 
     #[test]
@@ -719,6 +962,7 @@ mod tests {
             backoff: true,
             dms_armed: true,
             startup_reconciled: true,
+            fills_synced: true,
             ..TickInputs::default()
         };
         // Nothing unsafe: wait out the backoff.

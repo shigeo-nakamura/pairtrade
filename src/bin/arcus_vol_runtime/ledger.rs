@@ -14,6 +14,13 @@
 //! agreed clear, re-bases the cumulative stop at the current net
 //! (`cum_baseline`) so the next halt needs a further `CUM_STOP_USD` loss.
 //!
+//! Position mismatch: the ledger is never overwritten with the venue
+//! quantity (see `logic::position_check`). A persistent difference sets a
+//! sticky halt whose reason starts with "position_mismatch"; it pulls quotes
+//! and does NOT auto-flatten. To recover (bot stopped): flatten or fix the
+//! venue position by hand, set `position` in state.json to match the venue,
+//! then clear the halt as above (delete `HALT`, `"sticky_halt": false`).
+//!
 //! Fills are booked durably (Codex P1, pairtrade#361): the fills.jsonl row
 //! is appended and fsynced first, then the ledger books it and remembers its
 //! trade id (`booked_ids`, persisted in state.json), so a retry after a
@@ -299,6 +306,24 @@ pub enum Booking {
 }
 
 impl Ledger {
+    /// Sticky-halt on a persistent ledger/venue difference. Returns true when
+    /// this call engaged it (the reason then starts with
+    /// `logic::POSITION_MISMATCH`).
+    pub fn halt_position_mismatch(&mut self, venue_qty: Decimal, mark: Decimal) -> bool {
+        if self.sticky_halt {
+            return false;
+        }
+        self.sticky_halt = true;
+        self.halted_at_net.get_or_insert(self.cum_net(mark));
+        self.sticky_reason = Some(format!(
+            "{}: ledger {} ≠ venue {}",
+            crate::logic::POSITION_MISMATCH,
+            self.position.qty,
+            venue_qty
+        ));
+        true
+    }
+
     pub fn has_booked(&self, trade_id: &str) -> bool {
         self.booked_ids.iter().any(|id| id == trade_id)
     }
@@ -731,6 +756,26 @@ mod tests {
                                      "ts_ms": 6_000, "side": "buy", "qty": "x", "px": "1",
                                      "fee": "0", "role": "maker"});
         assert!(replay_fills(&mut l, [&bad]).is_err());
+    }
+
+    #[test]
+    fn a_position_mismatch_sticky_halts_without_touching_the_position() {
+        let mut l = Ledger::new("live", "2026-09-30");
+        book_fill(&mut l, &fill_in("t1"), 1, |_| Ok(())).unwrap();
+        assert!(l.halt_position_mismatch(d("0.3"), d("83642.9")));
+        assert!(l.sticky_halt);
+        assert_eq!(l.position.qty, d("0.1"));
+        assert!(l
+            .sticky_reason
+            .as_deref()
+            .unwrap()
+            .starts_with(crate::logic::POSITION_MISMATCH));
+        // A sticky halt already in force is left alone.
+        assert!(!l.halt_position_mismatch(d("0.5"), d("83642.9")));
+        // risk_check keeps it and asks for the HALT file.
+        let o = risk_check(&mut l, d("83642.9"), false, false, d("1000"), d("1000"));
+        assert!(matches!(o.halt, Some(Halt::Sticky(_))));
+        assert!(o.write_halt_file);
     }
 
     #[test]

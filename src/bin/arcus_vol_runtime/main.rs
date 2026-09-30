@@ -36,9 +36,10 @@ use ledger::{
     Ledger, PendingMarkout,
 };
 use logic::{
-    dms_armed, flatten_reason, flatten_steps, may_disarm_dms, plan_inputs, plan_quotes,
-    quote_action, shock, shutdown_steps, tick_plan, PlanState, QSide, QuoteAction, QuoteParams,
-    QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
+    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, may_disarm_dms, plan_inputs,
+    plan_quotes, position_check, quote_action, send_gated, shock, shutdown_steps, tick_plan,
+    BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
+    ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -116,6 +117,8 @@ struct Runtime {
     /// Newest public print (venue µs) applied to the paper sim.
     newest_print_ts_us: u64,
     position_mismatch_since_ms: Option<u64>,
+    /// Live: the last fill harvest succeeded and booked everything it got.
+    fills_synced: bool,
     /// Last successful DMS arm/refresh, and whether the latest attempt failed.
     dms_last_ok_ms: Option<u64>,
     dms_last_failed: bool,
@@ -324,10 +327,12 @@ impl Runtime {
         let rows = match self.dex.get_filled_orders(&market).await {
             Ok(r) => r.orders,
             Err(e) => {
+                self.fills_synced = false;
                 self.on_error("get_filled_orders", &e);
                 return;
             }
         };
+        let mut all_booked = true;
         for f in rows {
             let bookable = match (f.filled_side, f.filled_size, f.filled_value) {
                 (Some(side), Some(qty), Some(value)) if !f.is_rejected && !qty.is_zero() => {
@@ -378,6 +383,7 @@ impl Runtime {
                         "[ARCUS_VOL] fill {} not written, will retry: {e}",
                         f.trade_id
                     );
+                    all_booked = false;
                     continue;
                 }
             }
@@ -395,8 +401,11 @@ impl Runtime {
             };
             if may_forget_fill(&booking, persisted) {
                 self.clear_fill(&market, &f.trade_id).await;
+            } else {
+                all_booked = false;
             }
         }
+        self.fills_synced = all_booked;
     }
 
     async fn clear_fill(&self, market: &str, trade_id: &str) {
@@ -430,49 +439,47 @@ impl Runtime {
         }
     }
 
-    /// Adopt the venue position when it disagrees with the ledger for two
-    /// polls in a row (a single disagreement is usually a fill in flight).
-    /// Returns whether the venue position could be read.
-    async fn live_position_check(&mut self, now: u64, force: bool) -> bool {
-        let Some((venue, entry)) = self.venue_qty().await else {
-            return false;
-        };
-        let ours = self.ledger.position.qty;
-        if (venue - ours).abs() <= Decimal::new(1, 8) {
-            self.position_mismatch_since_ms = None;
-            return true;
-        }
-        let persisted = self
-            .position_mismatch_since_ms
-            .is_some_and(|t| now.saturating_sub(t) >= self.cfg.position_poll_secs * 1_000);
-        if force || persisted {
-            log::warn!("[ARCUS_VOL] position: ledger {ours} ≠ venue {venue}; adopting venue");
-            let p = &mut self.ledger.position;
-            p.qty = venue;
-            if venue.is_zero() {
-                p.avg_px = Decimal::ZERO;
-                p.opened_at_ms = None;
-            } else {
-                if let Some(e) = entry {
-                    p.avg_px = e;
-                }
-                if p.opened_at_ms.is_none() {
-                    p.opened_at_ms = Some(now);
-                }
+    /// Compare the ledger with the venue position; never adopts (see
+    /// `logic::position_check`). A persistent mismatch sticky-halts.
+    async fn check_position(&mut self, now: u64) -> PosCheck {
+        let venue = self.venue_qty().await.map(|(q, _)| q);
+        let (check, since) = position_check(
+            self.ledger.position.qty,
+            venue,
+            self.fills_synced,
+            self.position_mismatch_since_ms,
+            now,
+            self.cfg.position_poll_secs * 1_000,
+        );
+        self.position_mismatch_since_ms = since;
+        if let (PosCheck::Mismatch, Some(v)) = (check, venue) {
+            let mark = self
+                .book
+                .as_ref()
+                .map_or(self.ledger.position.avg_px, BookView::mid);
+            if self.ledger.halt_position_mismatch(v, mark) {
+                log::error!(
+                    "[ARCUS_VOL] POSITION MISMATCH: ledger {} vs venue {v}; sticky halt, quotes pulled, no auto-flatten",
+                    self.ledger.position.qty
+                );
             }
-            self.position_mismatch_since_ms = None;
-        } else if self.position_mismatch_since_ms.is_none() {
-            self.position_mismatch_since_ms = Some(now);
         }
-        true
+        check
     }
 
     /// Startup position read (live): until it succeeds no new quote goes
     /// out (Codex P1, pairtrade#361); a non-zero position is flattened first.
     async fn startup_reconcile(&mut self) {
-        if !self.live_position_check(now_ms(), true).await {
-            log::warn!("[ARCUS_VOL] startup position read failed; no quoting until it succeeds");
-            return;
+        // Harvest first so the comparison sees every reported fill.
+        self.live_fills(now_ms()).await;
+        match self.check_position(now_ms()).await {
+            PosCheck::InSync => {}
+            other => {
+                log::warn!(
+                    "[ARCUS_VOL] startup position check {other:?}; no quoting until in sync"
+                );
+                return;
+            }
         }
         self.startup_reconciled = true;
         self.startup_flatten = !self.ledger.position.qty.is_zero();
@@ -514,7 +521,12 @@ impl Runtime {
             return;
         }
         self.resting.clear();
-        self.live_position_check(now, true).await;
+        // Cleared only once the position read succeeded and was applied
+        // (Codex P1, pairtrade#361); otherwise retried next tick.
+        if self.check_position(now).await == PosCheck::Unread {
+            log::warn!("[ARCUS_VOL] reconcile: position read failed; still pending");
+            return;
+        }
         self.need_reconcile = false;
         log::info!(
             "[ARCUS_VOL] reconciled: all quotes cancelled, inventory {}",
@@ -598,7 +610,6 @@ impl Runtime {
     }
 
     async fn live_quotes(&mut self, plan: Vec<(QSide, QuoteAction)>) {
-        let market = self.cfg.market.clone();
         let mut places: Vec<QuoteTarget> = Vec::new();
         let mut modifies: Vec<(QSide, QuoteTarget, String)> = Vec::new();
         for (side, action) in plan {
@@ -618,82 +629,90 @@ impl Runtime {
                 }
             }
         }
-        // Cancels above always go; a new place/modify only while the DMS is
-        // still armed at send time (Codex P1, pairtrade#361).
-        if (!modifies.is_empty() || !places.is_empty()) && !self.dms_armed_now() {
-            log::warn!("[ARCUS_VOL] DMS no longer armed at send time; skipping new quotes");
-            return;
-        }
+        // Cancels above always go; each new place/modify batch only while the
+        // DMS is armed at its own send time (Codex P1, pairtrade#361).
+        let mut batches = Vec::new();
         if !modifies.is_empty() {
-            let reqs = modifies
-                .iter()
-                .map(|(side, t, id)| BatchModifyRequest {
-                    symbol: market.clone(),
-                    order_id: id.clone(),
-                    side: side.order_side(),
-                    target_total_size: t.qty,
-                    price: t.px,
-                    post_only: true,
-                    reduce_only: false,
-                })
-                .collect();
-            match self.dex.modify_orders_batch(reqs).await {
-                Ok(rows) => {
-                    for ((side, _, _), row) in modifies.into_iter().zip(rows) {
-                        match row {
-                            Ok(resp) => {
-                                self.quote_ids.insert(resp.order_id.clone());
-                                self.resting.insert(
-                                    side,
-                                    Resting {
-                                        order_id: resp.order_id,
-                                        px: resp.ordered_price,
-                                        qty: resp.ordered_size,
-                                        filled: Decimal::ZERO,
-                                    },
-                                );
-                            }
-                            Err(e) => self.on_error(&format!("modify {}", side.as_str()), &e),
-                        }
-                    }
-                }
-                Err(e) => self.on_error("modify batch", &e),
-            }
+            batches.push(QuoteBatch::Modify(modifies));
         }
         if !places.is_empty() {
-            let reqs = places
-                .iter()
-                .map(|t| BatchOrderRequest {
-                    symbol: market.clone(),
-                    side: t.side.order_side(),
-                    size: t.qty,
-                    price: t.px,
-                    post_only: true,
-                    reduce_only: false,
-                })
-                .collect();
-            match self.dex.create_orders_batch(reqs).await {
-                Ok(rows) => {
-                    for (t, row) in places.into_iter().zip(rows) {
-                        match row {
-                            Ok(resp) => {
-                                self.quote_ids.insert(resp.order_id.clone());
-                                self.resting.insert(
-                                    t.side,
-                                    Resting {
-                                        order_id: resp.order_id,
-                                        px: resp.ordered_price,
-                                        qty: resp.ordered_size,
-                                        filled: Decimal::ZERO,
-                                    },
-                                );
-                            }
-                            Err(e) => self.on_error(&format!("place {}", t.side.as_str()), &e),
+            batches.push(QuoteBatch::Place(places));
+        }
+        send_gated(self, batches).await;
+    }
+
+    async fn send_modifies(&mut self, modifies: Vec<(QSide, QuoteTarget, String)>) {
+        let market = self.cfg.market.clone();
+        let reqs = modifies
+            .iter()
+            .map(|(side, t, id)| BatchModifyRequest {
+                symbol: market.clone(),
+                order_id: id.clone(),
+                side: side.order_side(),
+                target_total_size: t.qty,
+                price: t.px,
+                post_only: true,
+                reduce_only: false,
+            })
+            .collect();
+        match self.dex.modify_orders_batch(reqs).await {
+            Ok(rows) => {
+                for ((side, _, _), row) in modifies.into_iter().zip(rows) {
+                    match row {
+                        Ok(resp) => {
+                            self.quote_ids.insert(resp.order_id.clone());
+                            self.resting.insert(
+                                side,
+                                Resting {
+                                    order_id: resp.order_id,
+                                    px: resp.ordered_price,
+                                    qty: resp.ordered_size,
+                                    filled: Decimal::ZERO,
+                                },
+                            );
                         }
+                        Err(e) => self.on_error(&format!("modify {}", side.as_str()), &e),
                     }
                 }
-                Err(e) => self.on_error("place batch", &e),
             }
+            Err(e) => self.on_error("modify batch", &e),
+        }
+    }
+
+    async fn send_places(&mut self, places: Vec<QuoteTarget>) {
+        let market = self.cfg.market.clone();
+        let reqs = places
+            .iter()
+            .map(|t| BatchOrderRequest {
+                symbol: market.clone(),
+                side: t.side.order_side(),
+                size: t.qty,
+                price: t.px,
+                post_only: true,
+                reduce_only: false,
+            })
+            .collect();
+        match self.dex.create_orders_batch(reqs).await {
+            Ok(rows) => {
+                for (t, row) in places.into_iter().zip(rows) {
+                    match row {
+                        Ok(resp) => {
+                            self.quote_ids.insert(resp.order_id.clone());
+                            self.resting.insert(
+                                t.side,
+                                Resting {
+                                    order_id: resp.order_id,
+                                    px: resp.ordered_price,
+                                    qty: resp.ordered_size,
+                                    filled: Decimal::ZERO,
+                                },
+                            );
+                        }
+                        Err(e) => self.on_error(&format!("place {}", t.side.as_str()), &e),
+                    }
+                }
+            }
+            Err(e) => self.on_error("place batch", &e),
         }
     }
 
@@ -792,15 +811,13 @@ impl Runtime {
             }
             if self.need_reconcile {
                 self.live_full_reconcile(now).await;
-                self.finish_tick(now, mid);
-                return;
             }
             if now.saturating_sub(self.last_reconcile_ms) >= self.cfg.reconcile_secs * 1_000 {
                 self.live_reconcile_orders().await;
                 self.last_reconcile_ms = now;
             }
             if now.saturating_sub(self.last_position_ms) >= self.cfg.position_poll_secs * 1_000 {
-                self.live_position_check(now, false).await;
+                self.check_position(now).await;
                 self.last_position_ms = now;
             }
         }
@@ -858,7 +875,7 @@ impl Runtime {
             self.ledger.position.opened_at_ms,
             now,
             self.cfg.max_hold_secs,
-            halt_label.as_deref(),
+            flatten_halt_label(halt_label.as_deref()),
             startup,
         );
         if shock(
@@ -889,6 +906,8 @@ impl Runtime {
             dms_last_failed: self.dms_last_failed,
             dms_secs: self.cfg.dms_secs,
             startup_reconciled: self.startup_reconciled,
+            reconcile_pending: self.need_reconcile,
+            fills_synced: self.fills_synced,
             flatten,
         };
         let plan = tick_plan(&plan_inputs(&state, now));
@@ -1080,6 +1099,25 @@ impl Runtime {
     }
 }
 
+/// One batch call that creates or modifies resting exposure.
+enum QuoteBatch {
+    Modify(Vec<(QSide, QuoteTarget, String)>),
+    Place(Vec<QuoteTarget>),
+}
+
+impl BatchSink<QuoteBatch> for Runtime {
+    fn armed(&self) -> bool {
+        self.dms_armed_now()
+    }
+
+    async fn send(&mut self, batch: QuoteBatch) {
+        match batch {
+            QuoteBatch::Modify(m) => self.send_modifies(m).await,
+            QuoteBatch::Place(p) => self.send_places(p).await,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logger();
@@ -1172,6 +1210,7 @@ async fn main() -> Result<()> {
         ioc_ids: HashSet::new(),
         newest_print_ts_us: 0,
         position_mismatch_since_ms: None,
+        fills_synced: false,
         dms_last_ok_ms: None,
         dms_last_failed: false,
         last_reconcile_ms: 0,
