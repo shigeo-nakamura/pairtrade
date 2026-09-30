@@ -414,6 +414,14 @@ pub fn position_check(
     }
 }
 
+/// Whether a pending reconcile may be cleared after a position check
+/// (Codex P1, pairtrade#361): only when the ledger agrees with the venue, or
+/// the mismatch has escalated to the sticky position_mismatch halt (which
+/// then holds quoting). `Pending` (a fill in flight) and `Unread` keep it.
+pub fn reconcile_cleared(check: PosCheck) -> bool {
+    matches!(check, PosCheck::InSync | PosCheck::Mismatch)
+}
+
 /// Prefix of the sticky-halt reason a position mismatch writes.
 pub const POSITION_MISMATCH: &str = "position_mismatch";
 
@@ -852,6 +860,53 @@ mod tests {
             position_check(l.position.qty, venue, true, since, 9_000, g).0,
             PosCheck::InSync
         );
+    }
+
+    #[test]
+    fn an_ambiguous_fill_keeps_the_reconcile_gate_until_it_is_booked() {
+        use crate::ledger::{book_fill, FillIn, Ledger};
+        let g = 5_000;
+        let mut l = Ledger::new("live", "2026-09-30");
+        let venue = Some(d("0.1")); // the fill shows in get_positions first
+                                    // get_filled_orders has not delivered it yet (fills unsynced).
+        let (c, since) = position_check(l.position.qty, venue, false, None, 1_000, g);
+        assert_eq!(c, PosCheck::Pending);
+        assert!(!reconcile_cleared(c));
+        // Still pending with fills synced but inside the grace.
+        let (c, since) = position_check(l.position.qty, venue, true, since, 2_000, g);
+        assert_eq!(c, PosCheck::Pending);
+        assert!(!reconcile_cleared(c));
+        let gated = PlanState {
+            reconcile_pending: !reconcile_cleared(c),
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&gated, 2_000)),
+            TickPlan::PullQuotes("reconcile_pending")
+        );
+        assert!(!reconcile_cleared(PosCheck::Unread));
+        // The fill is booked: in sync, the gate clears and quoting resumes.
+        let fill = FillIn {
+            trade_id: "amb".into(),
+            buy: true,
+            qty: d("0.1"),
+            px: d("83642.9"),
+            fee: Decimal::ZERO,
+            maker: true,
+            order_id: "o".into(),
+            fee_estimated: false,
+        };
+        book_fill(&mut l, &fill, 3_000, |_| Ok(())).unwrap();
+        let (c, _) = position_check(l.position.qty, venue, true, since, 3_000, g);
+        assert_eq!(c, PosCheck::InSync);
+        assert!(reconcile_cleared(c));
+        let clear = PlanState {
+            reconcile_pending: !reconcile_cleared(c),
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&clear, 3_000)), TickPlan::Quote);
+        // An escalated mismatch also clears it (the sticky halt takes over).
+        assert!(reconcile_cleared(PosCheck::Mismatch));
     }
 
     #[test]

@@ -36,9 +36,9 @@ use ledger::{
 };
 use logic::{
     dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, may_disarm_dms,
-    plan_inputs, plan_quotes, position_check, quote_action, send_gated, shock, shutdown_steps,
-    tick_plan, BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget,
-    Resting, ShutdownStep, Step, TickPlan,
+    plan_inputs, plan_quotes, position_check, quote_action, reconcile_cleared, send_gated, shock,
+    shutdown_steps, tick_plan, BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams,
+    QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -718,10 +718,12 @@ impl Runtime {
             return;
         }
         self.resting.clear();
-        // Cleared only once the position read succeeded and was applied
-        // (Codex P1, pairtrade#361); otherwise retried next tick.
-        if self.check_position(now).await == PosCheck::Unread {
-            log::warn!("[ARCUS_VOL] reconcile: position read failed; still pending");
+        // Cleared only when the position is in sync, or the mismatch has
+        // escalated to the sticky halt (Codex P1, pairtrade#361); Pending
+        // (a fill in flight) and Unread keep it and retry next tick.
+        let check = self.check_position(now).await;
+        if !reconcile_cleared(check) {
+            log::warn!("[ARCUS_VOL] reconcile: position check {check:?}; still pending");
             return;
         }
         self.need_reconcile = false;
