@@ -161,11 +161,17 @@ impl Ledger {
         realized
     }
 
-    /// Start a new UTC day. Returns true when it rolled.
-    pub fn rollover(&mut self, today: &str, mark: Decimal) -> bool {
+    /// Start a new UTC day at `mark`, a price from a live book (Codex P2,
+    /// pairtrade#361): with no mark the rollover is POSTPONED and the daily
+    /// stop keeps using the previous day's baseline until one arrives; the
+    /// entry price is never used as the mark.
+    pub fn rollover(&mut self, today: &str, mark: Option<Decimal>) -> Rollover {
         if self.day == today {
-            return false;
+            return Rollover::Same;
         }
+        let Some(mark) = mark else {
+            return Rollover::Postponed;
+        };
         self.day = today.to_string();
         self.day_realized = Decimal::ZERO;
         self.day_fees = Decimal::ZERO;
@@ -174,7 +180,7 @@ impl Ledger {
         self.day_taker_volume = Decimal::ZERO;
         self.day_start_unrealized = self.position.unrealized(mark);
         self.day_halt = false;
-        true
+        Rollover::Rolled
     }
 
     pub fn daily_net(&self, mark: Decimal) -> Decimal {
@@ -190,6 +196,49 @@ impl Ledger {
     pub fn cost_per_million(&self, mark: Decimal) -> Option<Decimal> {
         (self.cum_volume > Decimal::ZERO)
             .then(|| -self.cum_net(mark) / self.cum_volume * Decimal::from(1_000_000))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rollover {
+    Same,
+    Rolled,
+    /// A new UTC day, but no live-book mark yet.
+    Postponed,
+}
+
+/// Exclusive OS lock on `<dir>/runtime.lock`, held for the process lifetime
+/// (Codex P1, pairtrade#361): two runtimes on one state dir would book the
+/// same fills twice and fight over the venue. Taken before state.json is
+/// read or the venue touched; a held lock is a startup error. Keep the
+/// returned file alive (dropping it releases the lock).
+pub fn acquire_state_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join("runtime.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    file.try_lock_exclusive().map_err(|e| {
+        format!(
+            "{} is locked by another arcus_vol_runtime ({e}); refusing to start",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+/// Read fills.jsonl at startup: only a missing file counts as empty
+/// (Codex P2, pairtrade#361); any other error (permission, I/O, not UTF-8)
+/// is returned so startup fails instead of replaying nothing.
+pub fn read_journal(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -540,8 +589,8 @@ mod tests {
         l.record_fill(true, d("0.1"), d("100000"), d("2"), false, 1);
         l.day_halt = true;
         // mark 99990: unrealized −1
-        assert!(!l.rollover("2026-09-30", d("99990")));
-        assert!(l.rollover("2026-10-01", d("99990")));
+        assert_eq!(l.rollover("2026-09-30", Some(d("99990"))), Rollover::Same);
+        assert_eq!(l.rollover("2026-10-01", Some(d("99990"))), Rollover::Rolled);
         assert!(!l.day_halt);
         assert_eq!(l.day_fees, Decimal::ZERO);
         assert_eq!(l.day_start_unrealized, d("-1"));
@@ -549,6 +598,54 @@ mod tests {
         assert_eq!(l.daily_net(d("99980")), d("-1"));
         // cumulative keeps everything: −2 fee −2 unrealized
         assert_eq!(l.cum_net(d("99980")), d("-4"));
+    }
+
+    #[test]
+    fn rollover_waits_for_a_live_mark_and_never_uses_the_entry_price() {
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.record_fill(true, d("0.1"), d("100000"), d("2"), false, 1);
+        l.day_halt = true;
+        // New day, no book: postponed, yesterday's figures and halt stay.
+        assert_eq!(l.rollover("2026-10-01", None), Rollover::Postponed);
+        assert_eq!(l.day, "2026-09-30");
+        assert!(l.day_halt);
+        assert_eq!(l.day_fees, d("2"));
+        // The book returns: roll at THAT mark (unrealized −1), not at entry.
+        assert_eq!(l.rollover("2026-10-01", Some(d("99990"))), Rollover::Rolled);
+        assert_eq!(l.day, "2026-10-01");
+        assert_eq!(l.day_start_unrealized, d("-1"));
+        assert!(!l.day_halt);
+    }
+
+    #[test]
+    fn a_second_runtime_on_the_same_state_dir_fails_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_state_lock(dir.path()).unwrap();
+        let err = acquire_state_lock(dir.path()).unwrap_err();
+        assert!(err.contains("locked"), "{err}");
+        drop(first);
+        assert!(acquire_state_lock(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn only_a_missing_journal_counts_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_journal(&dir.path().join("fills.jsonl"))
+            .unwrap()
+            .is_none());
+        std::fs::write(dir.path().join("ok.jsonl"), "{}\n").unwrap();
+        assert_eq!(
+            read_journal(&dir.path().join("ok.jsonl"))
+                .unwrap()
+                .as_deref(),
+            Some("{}\n")
+        );
+        // Unreadable (a directory where the file should be): an error, not "empty".
+        std::fs::create_dir(dir.path().join("bad.jsonl")).unwrap();
+        assert!(read_journal(&dir.path().join("bad.jsonl")).is_err());
+        // Not UTF-8: an error too.
+        std::fs::write(dir.path().join("bin.jsonl"), [0xff, 0xfe]).unwrap();
+        assert!(read_journal(&dir.path().join("bin.jsonl")).is_err());
     }
 
     #[test]
@@ -570,7 +667,7 @@ mod tests {
             risk_check(&mut l, d("100000"), false, false, daily, cum).halt,
             Some(Halt::Day)
         );
-        l.rollover("2026-10-01", d("100000"));
+        l.rollover("2026-10-01", Some(d("100000")));
         assert_eq!(
             risk_check(&mut l, d("100000"), false, false, daily, cum).halt,
             None
@@ -584,7 +681,7 @@ mod tests {
         let o = risk_check(&mut l, d("99700"), false, false, daily, cum);
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(o.write_halt_file);
-        l.rollover("2026-10-02", d("100000"));
+        l.rollover("2026-10-02", Some(d("100000")));
         assert!(matches!(
             risk_check(&mut l, d("100000"), false, true, daily, cum).halt,
             Some(Halt::Sticky(_))

@@ -33,7 +33,7 @@ use dex_connector::{
 };
 use ledger::{
     append_synced, book_fill, due_markouts, may_forget_fill, risk_check, Booking, FillIn, Halt,
-    Ledger, PendingMarkout,
+    Ledger, PendingMarkout, Rollover,
 };
 use logic::{
     dms_armed, flatten_halt_label, flatten_reason, flatten_steps, may_disarm_dms, plan_inputs,
@@ -118,6 +118,8 @@ struct Runtime {
     newest_print_ts_us: u64,
     /// DRY_RUN: trades tape health (no virtual quotes until it is up).
     tape: tape::TapeHealth,
+    /// Last mid from a live book (the UTC-day rollover mark).
+    last_mark: Option<Decimal>,
     position_mismatch_since_ms: Option<u64>,
     /// Live: the last fill harvest succeeded and booked everything it got.
     fills_synced: bool,
@@ -812,8 +814,16 @@ impl Runtime {
             }
         }
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
-        if self.ledger.rollover(&utc_day(), mark) {
-            log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day);
+        if mid.is_some() {
+            self.last_mark = mid;
+        }
+        match self.ledger.rollover(&utc_day(), self.last_mark) {
+            Rollover::Rolled => log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day),
+            Rollover::Postponed => log::warn!(
+                "[ARCUS_VOL] UTC day rollover postponed: no live-book mark yet (daily stop stays on {})",
+                self.ledger.day
+            ),
+            Rollover::Same => {}
         }
 
         if !self.cfg.dry_run {
@@ -1173,6 +1183,8 @@ async fn main() -> Result<()> {
     );
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create {}", cfg.state_dir.display()))?;
+    // Before state.json is read or the venue touched (Codex P1, pairtrade#361).
+    let _state_lock = ledger::acquire_state_lock(&cfg.state_dir).map_err(|e| anyhow!(e))?;
     let state_path = cfg.state_dir.join("state.json");
     let ledger = match load_json::<Ledger>(&state_path)? {
         Some(l) if l.mode != cfg.mode() => bail!(
@@ -1188,7 +1200,9 @@ async fn main() -> Result<()> {
     let fills_path = cfg.state_dir.join("fills.jsonl");
     // Close the crash window between the fsynced fills.jsonl row and the
     // state.json write (Codex P1, pairtrade#361): book any row state missed.
-    if let Ok(text) = std::fs::read_to_string(&fills_path) {
+    if let Some(text) = ledger::read_journal(&fills_path)
+        .with_context(|| format!("read {} at startup", fills_path.display()))?
+    {
         let rows: Vec<serde_json::Value> = text
             .lines()
             .filter_map(|line| match serde_json::from_str(line) {
@@ -1242,6 +1256,7 @@ async fn main() -> Result<()> {
         ioc_ids: HashSet::new(),
         newest_print_ts_us: 0,
         tape: tape::TapeHealth::default(),
+        last_mark: None,
         position_mismatch_since_ms: None,
         fills_synced: false,
         dms_last_ok_ms: None,
