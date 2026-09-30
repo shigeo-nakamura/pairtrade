@@ -26,7 +26,6 @@ mod tape;
 
 use anyhow::{anyhow, Context, Result};
 use config::Config;
-use debot::directional::persist_json;
 use debot::trade::execution::dex_connector_box::DexConnectorBox;
 use dex_connector::{
     BatchModifyRequest, BatchOrderRequest, DexConnector, DexError, OrderBookLevel, OrderSide,
@@ -96,6 +95,8 @@ struct Runtime {
     dex: DexConnectorBox,
     ledger: Ledger,
     state_path: PathBuf,
+    /// Durable, change-only state.json writes.
+    state_writer: ledger::StateWriter,
     status_path: PathBuf,
     fills_path: PathBuf,
     kill_path: PathBuf,
@@ -501,8 +502,8 @@ impl Runtime {
             }
             // The connector may forget the fill only once the booking is in
             // state.json (Codex P1, pairtrade#361).
-            let persisted = match persist_json(&self.state_path, &self.ledger) {
-                Ok(()) => true,
+            let persisted = match self.state_writer.write(&self.state_path, &self.ledger) {
+                Ok(_) => true,
                 Err(e) => {
                     log::error!(
                         "[ARCUS_VOL] state write failed after fill {}, will retry: {e:#}",
@@ -1102,7 +1103,7 @@ impl Runtime {
     }
 
     fn finish_tick(&mut self, now: u64, mid: Option<Decimal>) {
-        if let Err(e) = persist_json(&self.state_path, &self.ledger) {
+        if let Err(e) = self.state_writer.write(&self.state_path, &self.ledger) {
             log::error!("[ARCUS_VOL] state write failed: {e:#}");
         }
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
@@ -1140,6 +1141,8 @@ impl Runtime {
             "effective_cap_usd": self.cfg.effective_cap_usd().to_string(),
             "tape": {"ready": self.tape.ready, "gap_since_ms": self.tape.gap_since_ms},
         });
+        // status.json is informational (dashboards, humans): a plain atomic
+        // replace without fsync is enough; state.json above is the durable one.
         if let Err(e) = debot::directional::atomic_write(&self.status_path, &status.to_string()) {
             log::warn!("[ARCUS_VOL] status write failed: {e}");
         }
@@ -1321,6 +1324,7 @@ async fn main() -> Result<()> {
         dex,
         ledger,
         state_path,
+        state_writer: ledger::StateWriter::default(),
         status_path: cfg.state_dir.join("status.json"),
         fills_path,
         kill_path: cfg.state_dir.join("KILL_SWITCH"),

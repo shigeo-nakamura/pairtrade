@@ -283,6 +283,11 @@ pub fn check_market(
 /// Write `value` as JSON to `path` durably: temp file, fsync, rename,
 /// fsync the directory.
 pub fn persist_durable<T: Serialize>(path: &std::path::Path, value: &T) -> std::io::Result<()> {
+    persist_durable_str(path, &serde_json::to_string_pretty(value)?)
+}
+
+/// `persist_durable` for already-serialized JSON.
+pub fn persist_durable_str(path: &std::path::Path, json: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     let dir = path
         .parent()
@@ -294,10 +299,41 @@ pub fn persist_durable<T: Serialize>(path: &std::path::Path, value: &T) -> std::
         .unwrap_or_else(|| "state".to_string());
     let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
+    f.write_all(json.as_bytes())?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// Writes state.json, always durably (Codex P2, pairtrade#361), and only
+/// when its contents changed since the last successful write, so the
+/// per-tick fsync costs nothing on quiet ticks. A failed write leaves the
+/// cache untouched, so the next call retries.
+#[derive(Debug, Default)]
+pub struct StateWriter {
+    last: Option<String>,
+}
+
+impl StateWriter {
+    /// Returns whether a write happened.
+    pub fn write(&mut self, path: &std::path::Path, ledger: &Ledger) -> std::io::Result<bool> {
+        self.write_with(path, ledger, persist_durable_str)
+    }
+
+    pub fn write_with(
+        &mut self,
+        path: &std::path::Path,
+        ledger: &Ledger,
+        persist: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        let json = serde_json::to_string_pretty(ledger)?;
+        if self.last.as_deref() == Some(json.as_str()) {
+            return Ok(false);
+        }
+        persist(path, &json)?;
+        self.last = Some(json);
+        Ok(true)
+    }
 }
 
 /// The state a runtime starts from.
@@ -1132,6 +1168,49 @@ mod tests {
             FeeDecision::Estimated(d("2.25"))
         );
         assert_eq!(fee_wait_ms(false, 30_000), 30_000);
+    }
+
+    #[test]
+    fn state_is_written_durably_only_when_changed_and_retried_after_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut w = StateWriter::default();
+        let mut l = Ledger::new("live", "2026-09-30");
+        assert!(w.write(&path, &l).unwrap());
+        let on_disk: Ledger =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk, l);
+        // Unchanged: no write at all.
+        assert!(!w
+            .write_with(&path, &l, |_, _| panic!(
+                "unchanged state must not be rewritten"
+            ))
+            .unwrap());
+        // Changed but the write fails: the next call must retry.
+        l.fills = 1;
+        assert!(w
+            .write_with(&path, &l, |_, _| Err(std::io::Error::other("disk")))
+            .is_err());
+        let mut retried = false;
+        assert!(w
+            .write_with(&path, &l, |_, _| {
+                retried = true;
+                Ok(())
+            })
+            .unwrap());
+        assert!(retried);
+    }
+
+    #[test]
+    fn the_runtime_never_writes_state_json_non_durably() {
+        // state.json only via StateWriter / persist_durable (Codex P2,
+        // pairtrade#361); status.json is informational and may stay plain.
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("persist_json"),
+            "state.json must be written durably"
+        );
+        assert!(!main.contains("atomic_write(&self.state_path"));
     }
 
     #[test]
