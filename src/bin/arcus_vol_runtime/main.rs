@@ -229,6 +229,7 @@ impl Runtime {
             tape::HealthAction::PullQuotes => self.virt.clear(),
             tape::HealthAction::GapEnded { start_ms, end_ms } => {
                 let row = json!({"kind": "tape_gap", "mode": self.cfg.mode(),
+                                 "market": self.cfg.market,
                                  "start_ms": start_ms, "end_ms": end_ms,
                                  "secs": (end_ms.saturating_sub(start_ms)) as f64 / 1_000.0});
                 log::warn!(
@@ -327,7 +328,12 @@ impl Runtime {
         }
         // Without a book the IOC waits for a price, but the quotes are pulled
         // now (`paper_flatten_steps`); live prices off the connector instead.
-        let touch = self.book.as_ref().map(|b| (b.bid, b.ask));
+        // Only a fresh book prices the IOC (same predicate as the plan).
+        let touch = sim::fresh_touch(
+            self.book.as_ref().map(|b| (b.bid, b.ask, b.ts_ms)),
+            now,
+            self.cfg.book_stale_secs,
+        );
         for step in sim::paper_flatten_steps(
             touch.is_some(),
             self.ledger.position.qty,
@@ -877,6 +883,7 @@ impl Runtime {
         if let Some(m) = mid {
             for (fill_id, h, bps) in due_markouts(&mut self.pending_markouts, now, m) {
                 let row = json!({"kind": "markout", "ts_ms": now, "fill_id": fill_id,
+                                 "market": self.cfg.market,
                                  "horizon_s": h, "bps": bps.round_dp(3).to_string(),
                                  "mid": m.to_string()});
                 if let Err(e) = append_jsonl(&self.fills_path, &row) {
@@ -1197,7 +1204,9 @@ async fn main() -> Result<()> {
     // Before state.json is read or the venue touched (Codex P1, pairtrade#361).
     let _state_lock = ledger::acquire_state_lock(&cfg.state_dir).map_err(|e| anyhow!(e))?;
     let state_path = cfg.state_dir.join("state.json");
-    let ledger = match load_json::<Ledger>(&state_path)? {
+    let loaded = load_json::<Ledger>(&state_path)?;
+    let state_market = loaded.as_ref().map(|l| l.market.clone());
+    let ledger = match loaded {
         Some(l) if l.mode != cfg.mode() => bail!(
             "{} was written in mode {} but this run is {}; move it aside first",
             state_path.display(),
@@ -1205,9 +1214,16 @@ async fn main() -> Result<()> {
             cfg.mode()
         ),
         Some(l) => l,
-        None => Ledger::new(cfg.mode(), &utc_day()),
+        None => {
+            let mut l = Ledger::new(cfg.mode(), &utc_day());
+            l.market = cfg.market.clone();
+            l
+        }
     };
     let mut ledger = ledger;
+    // State bound to the market (Codex P1, pairtrade#361); journal rows are
+    // checked below once read.
+    ledger::check_market(state_market.as_deref(), &[], &cfg.market).map_err(|e| anyhow!(e))?;
     let fills_path = cfg.state_dir.join("fills.jsonl");
     // Close the crash window between the fsynced fills.jsonl row and the
     // state.json write (Codex P1, pairtrade#361): book any row state missed.
@@ -1237,6 +1253,8 @@ async fn main() -> Result<()> {
             .map(serde_json::from_str::<serde_json::Value>)
             .collect::<Result<Vec<_>, _>>()
             .context("fills.jsonl row after repair")?;
+        ledger::check_market(state_market.as_deref(), &rows, &cfg.market)
+            .map_err(|e| anyhow!(e))?;
         let replayed = ledger::replay_fills(&mut ledger, &rows)
             .map_err(|e| anyhow!("fills.jsonl replay: {e}"))?;
         if replayed > 0 {

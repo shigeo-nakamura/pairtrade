@@ -53,6 +53,18 @@ pub fn prints_apply(
     tape_ready && !sim_halted && !halted && !flatten_pending
 }
 
+/// The touch a paper flatten may price at: only a FRESH book, judged by the
+/// same predicate the tick plan uses (Codex P1, pairtrade#361). A stale book
+/// is treated exactly like no book.
+pub fn fresh_touch(
+    book: Option<(Decimal, Decimal, Option<u64>)>,
+    now_ms: u64,
+    stale_secs: u64,
+) -> Option<(Decimal, Decimal)> {
+    let (bid, ask, ts) = book?;
+    (!crate::logic::book_stale(ts, now_ms, stale_secs)).then_some((bid, ask))
+}
+
 /// The paper flatten sequence. With a book it is `flatten_steps` (cancel
 /// quotes, then the IOC at the touch). Without one the IOC cannot be
 /// priced, but every virtual quote is still pulled at once so nothing can
@@ -377,6 +389,32 @@ mod tests {
         assert!(matches!(
             paper_flatten_steps(true, d("0.1"), false, false).as_slice(),
             [Step::Ioc { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_paper_flatten_prices_only_at_a_fresh_touch() {
+        use crate::logic::Step;
+        let book = Some((d("83642.9"), d("83643.0"), Some(10_000)));
+        // Stale (older than 5 s at plan time): like no book, quotes pulled,
+        // no IOC, so no fill is booked.
+        let touch = fresh_touch(book, 15_001, 5);
+        assert_eq!(touch, None);
+        assert_eq!(
+            paper_flatten_steps(touch.is_some(), d("0.1"), true, true),
+            vec![Step::Cancel(QSide::Bid), Step::Cancel(QSide::Ask)]
+        );
+        // REST-served book without a feed time: also not fresh.
+        assert_eq!(fresh_touch(Some((d("1"), d("2"), None)), 15_000, 5), None);
+        // Fresh: the IOC sells at that bid.
+        let touch = fresh_touch(book, 15_000, 5);
+        assert_eq!(touch, Some((d("83642.9"), d("83643.0"))));
+        assert!(matches!(
+            paper_flatten_steps(touch.is_some(), d("0.1"), false, false).as_slice(),
+            [Step::Ioc {
+                side: OrderSide::Short,
+                ..
+            }]
         ));
     }
 

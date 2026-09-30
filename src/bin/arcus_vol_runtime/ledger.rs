@@ -88,6 +88,10 @@ impl Position {
 pub struct Ledger {
     /// "dry_run" / "live": a state file is never reused across modes.
     pub mode: String,
+    /// The market this state belongs to (Codex P1, pairtrade#361); empty in
+    /// state written before the binding, which then fails `check_market`.
+    #[serde(default)]
+    pub market: String,
     /// UTC day (YYYY-MM-DD) the day_* fields belong to.
     pub day: String,
     pub position: Position,
@@ -229,6 +233,51 @@ pub fn acquire_state_lock(dir: &std::path::Path) -> Result<std::fs::File, String
         )
     })?;
     Ok(file)
+}
+
+/// Refuse a state dir that belongs to another market (Codex P1,
+/// pairtrade#361): state.json must name `market`, and every fills.jsonl row
+/// must carry `market` too. A row without the field (older runs) is only
+/// accepted when state.json explicitly names this market; nothing is ever
+/// isolated or merged silently.
+pub fn check_market(
+    state_market: Option<&str>,
+    rows: &[serde_json::Value],
+    market: &str,
+) -> Result<(), String> {
+    let hint = "use a separate ARCUS_VOL_STATE_DIR per market";
+    if let Some(m) = state_market {
+        if m != market {
+            let owner = if m.is_empty() {
+                "an unrecorded market (state.json predates market binding)"
+            } else {
+                m
+            };
+            return Err(format!(
+                "state dir belongs to {owner}, not {market} (state.json); {hint}"
+            ));
+        }
+    }
+    let state_confirms = state_market == Some(market);
+    for (i, row) in rows.iter().enumerate() {
+        match row.get("market").and_then(|v| v.as_str()) {
+            Some(m) if m == market => {}
+            Some(m) => {
+                return Err(format!(
+                    "state dir belongs to {m}, not {market} (fills.jsonl line {}); {hint}",
+                    i + 1
+                ))
+            }
+            None if state_confirms => {}
+            None => {
+                return Err(format!(
+                    "fills.jsonl line {} has no market and state.json does not confirm {market}; {hint}",
+                    i + 1
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What `repair_journal` did to fills.jsonl.
@@ -476,6 +525,7 @@ pub fn book_fill(
         "kind": "fill",
         "ts_ms": now_ms,
         "mode": l.mode,
+        "market": l.market,
         "side": if f.buy { "buy" } else { "sell" },
         "px": f.px.to_string(),
         "qty": f.qty.to_string(),
@@ -794,6 +844,44 @@ mod tests {
         assert_eq!(replay_fills(&mut l, &rows).unwrap(), 2);
         assert!(l.has_booked("t2"));
         assert!(l.position.qty.is_zero());
+    }
+
+    #[test]
+    fn a_state_or_journal_from_another_market_stops_startup() {
+        let btc = serde_json::json!({"kind": "fill", "market": "BTC-USD"});
+        let eth = serde_json::json!({"kind": "fill", "market": "ETH-USD"});
+        let bare = serde_json::json!({"kind": "fill"});
+        assert!(check_market(Some("BTC-USD"), std::slice::from_ref(&btc), "BTC-USD").is_ok());
+        assert!(check_market(None, &[], "BTC-USD").is_ok());
+        // state.json for another market
+        let err = check_market(Some("ETH-USD"), &[], "BTC-USD").unwrap_err();
+        assert!(err.contains("belongs to ETH-USD"), "{err}");
+        // pre-binding state (no market recorded): fail closed
+        assert!(check_market(Some(""), std::slice::from_ref(&btc), "BTC-USD").is_err());
+        // a journal row for another market, even with a matching state
+        let err = check_market(Some("BTC-USD"), &[btc.clone(), eth], "BTC-USD").unwrap_err();
+        assert!(
+            err.contains("belongs to ETH-USD") && err.contains("line 2"),
+            "{err}"
+        );
+        // rows without a market: only when state.json confirms the market
+        assert!(check_market(Some("BTC-USD"), std::slice::from_ref(&bare), "BTC-USD").is_ok());
+        assert!(check_market(None, &[bare], "BTC-USD").is_err());
+    }
+
+    #[test]
+    fn fill_rows_carry_the_ledger_market() {
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.market = "BTC-USD".to_string();
+        let mut rows = Vec::new();
+        book_fill(&mut l, &fill_in("t1"), 1, |r| {
+            rows.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows[0]["market"], "BTC-USD");
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        assert_eq!(back.market, "BTC-USD");
     }
 
     #[test]
