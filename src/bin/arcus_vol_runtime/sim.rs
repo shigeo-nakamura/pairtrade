@@ -99,8 +99,10 @@ pub fn sim_id(run_id: u64, seq: u64, tag: &str) -> String {
 
 /// Apply a print to a COPY of `q` and hand the fill to `book`; the updated
 /// quote is returned only when booking succeeded, so a fill that could not
-/// be recorded is never consumed (Codex P2, pairtrade#361). `Ok(None)` =
-/// the print did not touch the quote.
+/// be recorded is never consumed (Codex P2, pairtrade#361). A print that
+/// only eats queue ahead of us fills nothing, needs no booking, and its
+/// queue change is returned for an immediate commit (Codex P1,
+/// pairtrade#361). `Ok(None)` = the print did not change the quote.
 pub fn try_fill<E>(
     q: &VirtualQuote,
     ts_us: u64,
@@ -112,7 +114,7 @@ pub fn try_fill<E>(
     let mut next = q.clone();
     let filled = apply_trade(&mut next, ts_us, px, qty, taker);
     if filled.is_zero() {
-        return Ok(None);
+        return Ok((next != *q).then_some(next));
     }
     book(filled)?;
     Ok(Some(next))
@@ -417,6 +419,28 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn queue_only_prints_are_committed_so_the_crossing_print_fills() {
+        // 0.3 queued ahead; at-price sells of 0.1, 0.1, 0.15.
+        let mut q = join(QSide::Bid, d("83642.9"), d("0.12"), &levels(), 0);
+        let mut booked = Vec::new();
+        for size in ["0.1", "0.1", "0.15"] {
+            let r = try_fill(&q, 10, d("83642.9"), d(size), OrderSide::Short, |f| {
+                booked.push(f);
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+            if let Some(next) = r {
+                q = next;
+            }
+        }
+        // The first two only ate queue (committed without booking); the
+        // third crossed the cumulative 0.3 and filled 0.05.
+        assert_eq!(booked, vec![d("0.05")]);
+        assert_eq!(q.queue_ahead, Decimal::ZERO);
+        assert_eq!(q.remaining, d("0.07"));
     }
 
     #[test]

@@ -197,6 +197,24 @@ impl Ledger {
             - self.day_start_unrealized
     }
 
+    /// `daily_net` for risk (Codex P2, pairtrade#361): with no fresh mark the
+    /// unrealized part is deferred (realized − fees only); never priced at
+    /// the entry price.
+    pub fn daily_net_at(&self, mark: Option<Decimal>) -> Decimal {
+        match mark {
+            Some(m) => self.daily_net(m),
+            None => self.day_realized - self.day_fees,
+        }
+    }
+
+    /// `cum_net` for risk; see `daily_net_at`.
+    pub fn cum_net_at(&self, mark: Option<Decimal>) -> Decimal {
+        match mark {
+            Some(m) => self.cum_net(m),
+            None => self.cum_realized - self.cum_fees,
+        }
+    }
+
     pub fn cum_net(&self, mark: Decimal) -> Decimal {
         self.cum_realized - self.cum_fees + self.position.unrealized(mark)
     }
@@ -214,6 +232,23 @@ pub enum Rollover {
     Rolled,
     /// A new UTC day, but no live-book mark yet.
     Postponed,
+}
+
+/// Roll the UTC day and, when it rolled, persist the state at once via
+/// `persist` (Codex P2, pairtrade#361): the new day's baseline is on disk
+/// before any fill of the new day is booked. The caller must not harvest
+/// fills while this returns an error.
+pub fn rollover_durably(
+    l: &mut Ledger,
+    today: &str,
+    mark: Option<Decimal>,
+    persist: impl FnOnce(&Ledger) -> std::io::Result<()>,
+) -> std::io::Result<Rollover> {
+    let r = l.rollover(today, mark);
+    if r == Rollover::Rolled {
+        persist(l)?;
+    }
+    Ok(r)
 }
 
 /// Exclusive OS lock on `<dir>/runtime.lock`, held for the process lifetime
@@ -558,6 +593,9 @@ pub struct RiskOutcome {
     pub events: Vec<String>,
     /// Sticky halt in force but `HALT` missing: the caller must (re)write it.
     pub write_halt_file: bool,
+    /// Inventory is open but there is no fresh mark: the stops ran on
+    /// realized − fees only.
+    pub unrealized_deferred: bool,
 }
 
 /// Update the stop flags from the current marks and return the halt in
@@ -565,18 +603,19 @@ pub struct RiskOutcome {
 /// exists; see the module docs for how the file and `sticky_halt` interact.
 pub fn risk_check(
     l: &mut Ledger,
-    mark: Decimal,
+    mark: Option<Decimal>,
     kill: bool,
     halt_file: bool,
     daily_stop: Decimal,
     cum_stop: Decimal,
 ) -> RiskOutcome {
     let mut events = Vec::new();
+    let unrealized_deferred = mark.is_none() && !l.position.qty.is_zero();
     if !halt_file && !l.sticky_halt && l.halted_at_net.is_some() {
         // Both cleared by hand (file deleted AND state edited): re-base.
         l.halted_at_net = None;
         l.sticky_reason = None;
-        l.cum_baseline = l.cum_net(mark);
+        l.cum_baseline = l.cum_net_at(mark);
         events.push(format!(
             "HALT cleared by hand; cumulative stop re-based at net {}",
             l.cum_baseline.round_dp(2)
@@ -584,15 +623,15 @@ pub fn risk_check(
     }
     if halt_file && !l.sticky_halt {
         l.sticky_halt = true;
-        l.halted_at_net.get_or_insert(l.cum_net(mark));
+        l.halted_at_net.get_or_insert(l.cum_net_at(mark));
         let reason = "HALT file present".to_string();
         events.push(format!("STICKY HALT: {reason}"));
         l.sticky_reason = Some(reason);
     }
-    let cum_loss = l.cum_baseline - l.cum_net(mark);
+    let cum_loss = l.cum_baseline - l.cum_net_at(mark);
     if !l.sticky_halt && cum_loss > cum_stop {
         l.sticky_halt = true;
-        l.halted_at_net = Some(l.cum_net(mark));
+        l.halted_at_net = Some(l.cum_net_at(mark));
         let reason = format!(
             "cumulative net loss {} > {} (since baseline)",
             cum_loss.round_dp(2),
@@ -602,7 +641,7 @@ pub fn risk_check(
         l.sticky_reason = Some(reason);
     }
     let write_halt_file = l.sticky_halt && !halt_file;
-    let day_loss = -l.daily_net(mark);
+    let day_loss = -l.daily_net_at(mark);
     if !l.day_halt && day_loss > daily_stop {
         l.day_halt = true;
         events.push(format!(
@@ -624,6 +663,7 @@ pub fn risk_check(
         halt,
         events,
         write_halt_file,
+        unrealized_deferred,
     }
 }
 
@@ -653,12 +693,12 @@ impl Ledger {
     /// Sticky-halt on a persistent ledger/venue difference. Returns true when
     /// this call engaged it (the reason then starts with
     /// `logic::POSITION_MISMATCH`).
-    pub fn halt_position_mismatch(&mut self, venue_qty: Decimal, mark: Decimal) -> bool {
+    pub fn halt_position_mismatch(&mut self, venue_qty: Decimal, mark: Option<Decimal>) -> bool {
         if self.sticky_halt {
             return false;
         }
         self.sticky_halt = true;
-        self.halted_at_net.get_or_insert(self.cum_net(mark));
+        self.halted_at_net.get_or_insert(self.cum_net_at(mark));
         self.sticky_reason = Some(format!(
             "{}: ledger {} ≠ venue {}",
             crate::logic::POSITION_MISMATCH,
@@ -1310,6 +1350,57 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_book_failure_does_not_trip_the_daily_stop_on_entry_price() {
+        let (daily, cum) = (d("50"), d("250"));
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.record_fill(true, d("1"), d("100000"), Decimal::ZERO, true, 1);
+        // Rolled over while BTC was up 60: the day starts at +60 unrealized.
+        l.rollover("2026-10-01", Some(d("100060")));
+        assert_eq!(l.day_start_unrealized, d("60"));
+        // The book is gone: pricing at the entry price would read −60 today
+        // and trip the $50 daily stop. No fresh mark → unrealized deferred.
+        let o = risk_check(&mut l, None, false, false, daily, cum);
+        assert_eq!(o.halt, None);
+        assert!(o.unrealized_deferred);
+        assert!(!l.day_halt);
+        // Realized losses and fees still count without a mark.
+        l.record_fill(false, d("1"), d("99940"), d("1"), false, 2);
+        let o = risk_check(&mut l, None, false, false, daily, cum);
+        assert_eq!(o.halt, Some(Halt::Day)); // realized −60 − fee 1
+        assert!(!o.unrealized_deferred);
+    }
+
+    #[test]
+    fn a_rollover_is_persisted_before_any_new_day_fill() {
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.record_fill(true, d("0.1"), d("100000"), d("2"), false, 1);
+        let mut persisted: Option<Ledger> = None;
+        let r = rollover_durably(&mut l, "2026-10-01", Some(d("100000")), |s| {
+            persisted = Some(s.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(r, Rollover::Rolled);
+        let on_disk = persisted.expect("rollover persisted");
+        assert_eq!(on_disk.day, "2026-10-01");
+        assert_eq!(on_disk.day_fees, Decimal::ZERO);
+        // The first new-day fill comes after, so it lands on the new day.
+        book_fill(&mut l, &fill_in("n1"), 2, |_| Ok(())).unwrap();
+        assert_eq!(on_disk.fills + 1, l.fills);
+        // A failed persist is reported so the caller skips the harvest.
+        let mut l2 = Ledger::new("live", "2026-09-30");
+        assert!(rollover_durably(&mut l2, "2026-10-01", Some(d("1")), |_| {
+            Err(std::io::Error::other("disk"))
+        })
+        .is_err());
+        // No rollover, no write.
+        assert_eq!(
+            rollover_durably(&mut l, "2026-10-01", Some(d("1")), |_| panic!("no write")).unwrap(),
+            Rollover::Same
+        );
+    }
+
+    #[test]
     fn only_a_missing_journal_counts_as_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_journal(&dir.path().join("fills.jsonl"))
@@ -1337,35 +1428,35 @@ mod tests {
         l.record_fill(true, d("1"), d("100000"), Decimal::ZERO, true, 1);
         // −49.9: nothing
         assert_eq!(
-            risk_check(&mut l, d("99950.1"), false, false, daily, cum).halt,
+            risk_check(&mut l, Some(d("99950.1")), false, false, daily, cum).halt,
             None
         );
         // −60: day halt
-        let o = risk_check(&mut l, d("99940"), false, false, daily, cum);
+        let o = risk_check(&mut l, Some(d("99940")), false, false, daily, cum);
         assert_eq!(o.halt, Some(Halt::Day));
         assert_eq!(o.events.len(), 1);
         // recovering intraday does not lift it
         assert_eq!(
-            risk_check(&mut l, d("100000"), false, false, daily, cum).halt,
+            risk_check(&mut l, Some(d("100000")), false, false, daily, cum).halt,
             Some(Halt::Day)
         );
         l.rollover("2026-10-01", Some(d("100000")));
         assert_eq!(
-            risk_check(&mut l, d("100000"), false, false, daily, cum).halt,
+            risk_check(&mut l, Some(d("100000")), false, false, daily, cum).halt,
             None
         );
         // kill switch outranks a day halt
         assert_eq!(
-            risk_check(&mut l, d("100000"), true, false, daily, cum).halt,
+            risk_check(&mut l, Some(d("100000")), true, false, daily, cum).halt,
             Some(Halt::Kill)
         );
         // −300 cumulative: sticky, survives rollover and a recovery
-        let o = risk_check(&mut l, d("99700"), false, false, daily, cum);
+        let o = risk_check(&mut l, Some(d("99700")), false, false, daily, cum);
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(o.write_halt_file);
         l.rollover("2026-10-02", Some(d("100000")));
         assert!(matches!(
-            risk_check(&mut l, d("100000"), false, true, daily, cum).halt,
+            risk_check(&mut l, Some(d("100000")), false, true, daily, cum).halt,
             Some(Halt::Sticky(_))
         ));
     }
@@ -1375,17 +1466,17 @@ mod tests {
         let (daily, cum) = (d("1000"), d("250"));
         let mut l = Ledger::new("dry_run", "2026-09-30");
         // A HALT file present at load halts a clean state.
-        let o = risk_check(&mut l, d("100000"), false, true, daily, cum);
+        let o = risk_check(&mut l, Some(d("100000")), false, true, daily, cum);
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(l.sticky_halt);
         assert!(!o.write_halt_file);
         // File deleted while state is still sticky: stays halted, file recreated.
-        let o = risk_check(&mut l, d("100000"), false, false, daily, cum);
+        let o = risk_check(&mut l, Some(d("100000")), false, false, daily, cum);
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(o.write_halt_file);
         // State cleared but the file still there: still halted.
         l.sticky_halt = false;
-        let o = risk_check(&mut l, d("100000"), false, true, daily, cum);
+        let o = risk_check(&mut l, Some(d("100000")), false, true, daily, cum);
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
     }
 
@@ -1394,23 +1485,23 @@ mod tests {
         let (daily, cum) = (d("1000"), d("250"));
         let mut l = Ledger::new("dry_run", "2026-09-30");
         l.record_fill(true, d("1"), d("100000"), Decimal::ZERO, true, 1);
-        let o = risk_check(&mut l, d("99700"), false, false, daily, cum);
+        let o = risk_check(&mut l, Some(d("99700")), false, false, daily, cum);
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(o.write_halt_file);
         // Hand clear: file deleted AND state edited → cleared, baseline −300.
         l.sticky_halt = false;
-        let o = risk_check(&mut l, d("99700"), false, false, daily, cum);
+        let o = risk_check(&mut l, Some(d("99700")), false, false, daily, cum);
         assert_eq!(o.halt, None);
         assert_eq!(o.events.len(), 1);
         assert!(!o.write_halt_file);
         assert_eq!(l.cum_baseline, d("-300"));
         // another −200 is inside the re-based stop, −260 is not
         assert_eq!(
-            risk_check(&mut l, d("99500"), false, false, daily, cum).halt,
+            risk_check(&mut l, Some(d("99500")), false, false, daily, cum).halt,
             None
         );
         assert!(matches!(
-            risk_check(&mut l, d("99440"), false, false, daily, cum).halt,
+            risk_check(&mut l, Some(d("99440")), false, false, daily, cum).halt,
             Some(Halt::Sticky(_))
         ));
     }
@@ -1575,7 +1666,7 @@ mod tests {
     fn a_position_mismatch_sticky_halts_without_touching_the_position() {
         let mut l = Ledger::new("live", "2026-09-30");
         book_fill(&mut l, &fill_in("t1"), 1, |_| Ok(())).unwrap();
-        assert!(l.halt_position_mismatch(d("0.3"), d("83642.9")));
+        assert!(l.halt_position_mismatch(d("0.3"), Some(d("83642.9"))));
         assert!(l.sticky_halt);
         assert_eq!(l.position.qty, d("0.1"));
         assert!(l
@@ -1584,9 +1675,16 @@ mod tests {
             .unwrap()
             .starts_with(crate::logic::POSITION_MISMATCH));
         // A sticky halt already in force is left alone.
-        assert!(!l.halt_position_mismatch(d("0.5"), d("83642.9")));
+        assert!(!l.halt_position_mismatch(d("0.5"), Some(d("83642.9"))));
         // risk_check keeps it and asks for the HALT file.
-        let o = risk_check(&mut l, d("83642.9"), false, false, d("1000"), d("1000"));
+        let o = risk_check(
+            &mut l,
+            Some(d("83642.9")),
+            false,
+            false,
+            d("1000"),
+            d("1000"),
+        );
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(o.write_halt_file);
     }

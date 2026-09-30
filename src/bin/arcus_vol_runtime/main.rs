@@ -123,6 +123,9 @@ struct Runtime {
     last_mark: Option<Decimal>,
     /// The last tick planned a flatten (paper prints are ignored meanwhile).
     flatten_pending: bool,
+    /// A rollover whose state write failed: retried before any fill harvest.
+    rollover_unpersisted: bool,
+    last_mark_warn_ms: u64,
     /// A failed append could not be rolled back: no appends, no new quoting
     /// until a restart repairs fills.jsonl.
     journal_unsafe: bool,
@@ -567,11 +570,7 @@ impl Runtime {
         );
         self.position_mismatch_since_ms = since;
         if let (PosCheck::Mismatch, Some(v)) = (check, venue) {
-            let mark = self
-                .book
-                .as_ref()
-                .map_or(self.ledger.position.avg_px, BookView::mid);
-            if self.ledger.halt_position_mismatch(v, mark) {
+            if self.ledger.halt_position_mismatch(v, self.last_mark) {
                 log::error!(
                     "[ARCUS_VOL] POSITION MISMATCH: ledger {} vs venue {v}; sticky halt, quotes pulled, no auto-flatten",
                     self.ledger.position.qty
@@ -895,9 +894,8 @@ impl Runtime {
                 self.mid_hist.pop_front();
             }
         }
-        let mark = mid.unwrap_or(self.ledger.position.avg_px);
-        // Only a timestamp-fresh book may set the rollover mark (Codex P2,
-        // pairtrade#361).
+        // Only a timestamp-fresh book may set the mark used for the rollover
+        // and the stops (Codex P2, pairtrade#361); never the entry price.
         if let Some(m) = fresh_mark(
             mid,
             self.book.as_ref().and_then(|b| b.ts_ms),
@@ -906,17 +904,52 @@ impl Runtime {
         ) {
             self.last_mark = Some(m);
         }
-        match self.ledger.rollover(&utc_day(), self.last_mark) {
-            Rollover::Rolled => log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day),
-            Rollover::Postponed => log::warn!(
-                "[ARCUS_VOL] UTC day rollover postponed: no live-book mark yet (daily stop stays on {})",
-                self.ledger.day
-            ),
-            Rollover::Same => {}
-        }
+        // A rollover is on disk before any new-day fill is booked (Codex P2,
+        // pairtrade#361); while that write fails, no fills are harvested.
+        let state_writer = &mut self.state_writer;
+        let state_path = &self.state_path;
+        let rolled = ledger::rollover_durably(&mut self.ledger, &utc_day(), self.last_mark, |l| {
+            state_writer.write(state_path, l).map(|_| ())
+        });
+        let harvest_ok = match rolled {
+            Ok(Rollover::Rolled) => {
+                log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day);
+                self.rollover_unpersisted = false;
+                true
+            }
+            Ok(Rollover::Postponed) => {
+                log::warn!(
+                    "[ARCUS_VOL] UTC day rollover postponed: no live-book mark yet (daily stop stays on {})",
+                    self.ledger.day
+                );
+                true
+            }
+            Ok(Rollover::Same) if self.rollover_unpersisted => {
+                match self.state_writer.write(&self.state_path, &self.ledger) {
+                    Ok(_) => {
+                        self.rollover_unpersisted = false;
+                        true
+                    }
+                    Err(e) => {
+                        log::error!("[ARCUS_VOL] rollover state still not persisted: {e}");
+                        false
+                    }
+                }
+            }
+            Ok(Rollover::Same) => true,
+            Err(e) => {
+                log::error!("[ARCUS_VOL] rollover state not persisted ({e}); fills wait");
+                self.rollover_unpersisted = true;
+                false
+            }
+        };
 
         if !self.cfg.dry_run {
-            self.live_fills(now).await;
+            if harvest_ok {
+                self.live_fills(now).await;
+            } else {
+                self.fills_synced = false;
+            }
             // Refresh on schedule; after a failure, retry every tick (no new
             // quoting meanwhile, see `dms_armed` in the tick plan).
             let due = self.dms_last_failed
@@ -976,7 +1009,7 @@ impl Runtime {
         let halt_file = self.halt_path.exists();
         let risk = risk_check(
             &mut self.ledger,
-            mark,
+            self.last_mark,
             kill,
             halt_file,
             self.cfg.daily_stop_usd,
@@ -984,6 +1017,12 @@ impl Runtime {
         );
         for e in &risk.events {
             log::warn!("[ARCUS_VOL] {e}");
+        }
+        if risk.unrealized_deferred && now.saturating_sub(self.last_mark_warn_ms) >= 60_000 {
+            self.last_mark_warn_ms = now;
+            log::warn!(
+                "[ARCUS_VOL] no fresh mark yet: stops use realized − fees only (unrealized deferred)"
+            );
         }
         if risk.write_halt_file {
             let body = self.ledger.sticky_reason.clone().unwrap_or_default();
@@ -1359,6 +1398,8 @@ async fn main() -> Result<()> {
         tape: tape::TapeHealth::default(),
         last_mark: None,
         flatten_pending: false,
+        rollover_unpersisted: false,
+        last_mark_warn_ms: 0,
         journal_unsafe: false,
         fee_wait_since: HashMap::new(),
         position_mismatch_since_ms: None,
