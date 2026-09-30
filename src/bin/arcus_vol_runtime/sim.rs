@@ -89,6 +89,37 @@ pub fn paper_flatten_steps(
     steps
 }
 
+/// How a print's venue timestamp is used as a paper fill's time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrintTime {
+    /// Trusted: the venue time in ms.
+    Venue(u64),
+    /// Ahead of our clock by more than the tolerance: clamped to now.
+    ClampedFuture { venue_ms: u64, now_ms: u64 },
+    /// Older than `max_age_ms`: not a live print, skip it.
+    TooOld { venue_ms: u64 },
+}
+
+/// A paper fill is timed by the print's venue timestamp, not by when we
+/// processed it (Codex P2, pairtrade#361), guarded against a clock that is
+/// off: a little ahead of us is tolerated as-is, far ahead is clamped to
+/// now, and far behind is refused.
+pub fn print_fill_time(
+    ts_us: u64,
+    now_ms: u64,
+    future_tolerance_ms: u64,
+    max_age_ms: u64,
+) -> PrintTime {
+    let venue_ms = ts_us / 1_000;
+    if venue_ms > now_ms.saturating_add(future_tolerance_ms) {
+        PrintTime::ClampedFuture { venue_ms, now_ms }
+    } else if now_ms.saturating_sub(venue_ms) > max_age_ms {
+        PrintTime::TooOld { venue_ms }
+    } else {
+        PrintTime::Venue(venue_ms)
+    }
+}
+
 /// Simulated order/fill id: `run_id` (the process start, ms) keeps ids
 /// unique across restarts even though `seq` starts again at 1, so a paper
 /// fill after a restart never collides with a booked id (Codex P2,
@@ -441,6 +472,32 @@ mod tests {
         assert_eq!(booked, vec![d("0.05")]);
         assert_eq!(q.queue_ahead, Decimal::ZERO);
         assert_eq!(q.remaining, d("0.07"));
+    }
+
+    #[test]
+    fn a_print_three_seconds_old_times_the_fill_and_clock_skew_is_guarded() {
+        let now = 10_000;
+        assert_eq!(
+            print_fill_time(7_000_000, now, 5_000, 300_000),
+            PrintTime::Venue(7_000)
+        );
+        // A little ahead: trusted as-is; far ahead: clamped to now.
+        assert_eq!(
+            print_fill_time(12_000_000, now, 5_000, 300_000),
+            PrintTime::Venue(12_000)
+        );
+        assert_eq!(
+            print_fill_time(20_000_000, now, 5_000, 300_000),
+            PrintTime::ClampedFuture {
+                venue_ms: 20_000,
+                now_ms: now
+            }
+        );
+        // Absurdly old: refused.
+        assert_eq!(
+            print_fill_time(1_000, 400_000, 5_000, 300_000),
+            PrintTime::TooOld { venue_ms: 1 }
+        );
     }
 
     #[test]

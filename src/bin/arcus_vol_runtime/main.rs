@@ -31,8 +31,8 @@ use dex_connector::{
     BatchModifyRequest, BatchOrderRequest, DexConnector, DexError, OrderBookLevel, OrderSide,
 };
 use ledger::{
-    append_synced, book_fill, due_markouts, may_forget_fill, risk_check, Booking, FillIn, Halt,
-    Ledger, PendingMarkout,
+    append_synced, due_markouts, may_forget_fill, risk_check, Booking, FillIn, Halt, Ledger,
+    PendingMarkout,
 };
 use logic::{
     dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, may_disarm_dms,
@@ -49,7 +49,10 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-use ledger::MARKOUT_HORIZONS;
+/// A print stamped more than this ahead of our clock is clamped to now;
+/// one older than `PRINT_MAX_AGE_MS` is not a live print and is skipped.
+const PRINT_FUTURE_TOLERANCE_MS: u64 = 5_000;
+const PRINT_MAX_AGE_MS: u64 = 300_000;
 /// A connector fill record missing side/size/value waits this long, then
 /// escalates to a sticky halt `fill_incomplete`.
 const FILL_INCOMPLETE_WAIT_MS: u64 = 60_000;
@@ -212,13 +215,19 @@ impl Runtime {
     /// Book one fill durably (fills.jsonl fsynced before the ledger moves,
     /// dedupe by trade id). The caller persists state.json afterwards.
     fn book(&mut self, fill: FillIn, now: u64) -> std::io::Result<Booking> {
+        self.book_at(fill, now, now)
+    }
+
+    /// `book` with the fill's own time (`fill_ts`); `now` is only the
+    /// receive time (Codex P2, pairtrade#361).
+    fn book_at(&mut self, fill: FillIn, fill_ts: u64, now: u64) -> std::io::Result<Booking> {
         if self.journal_unsafe {
             return Err(std::io::Error::other(
                 "journal unsafe: appends stopped until restart",
             ));
         }
         let path = self.fills_path.clone();
-        let outcome = match book_fill(&mut self.ledger, &fill, now, |row| {
+        let outcome = match ledger::book_fill_at(&mut self.ledger, &fill, fill_ts, now, |row| {
             append_synced(&path, row)
         }) {
             Ok(o) => o,
@@ -237,13 +246,8 @@ impl Runtime {
                 fill.fee.round_dp(4),
                 self.ledger.position.qty
             );
-            self.pending_markouts.push(PendingMarkout {
-                fill_id: fill.trade_id,
-                ts_ms: now,
-                px: fill.px,
-                buy: fill.buy,
-                horizons: MARKOUT_HORIZONS.to_vec(),
-            });
+            self.pending_markouts
+                .push(ledger::markouts_for(&fill, fill_ts));
         }
         Ok(outcome)
     }
@@ -306,6 +310,25 @@ impl Runtime {
             self.virt.clear();
             return;
         }
+        // The fill's time is the print's venue time (Codex P2, pairtrade#361).
+        let fill_ts =
+            match sim::print_fill_time(p.ts_us, now, PRINT_FUTURE_TOLERANCE_MS, PRINT_MAX_AGE_MS) {
+                sim::PrintTime::Venue(ms) => ms,
+                sim::PrintTime::ClampedFuture { venue_ms, now_ms } => {
+                    log::warn!(
+                    "[ARCUS_VOL] print {} stamped {venue_ms} ms, ahead of us ({now_ms}); clamped",
+                    p.trade_id
+                );
+                    now_ms
+                }
+                sim::PrintTime::TooOld { venue_ms } => {
+                    log::warn!(
+                        "[ARCUS_VOL] print {} stamped {venue_ms} ms is too old vs {now}; skipped",
+                        p.trade_id
+                    );
+                    return;
+                }
+            };
         self.newest_print_ts_us = self.newest_print_ts_us.max(p.ts_us);
         for side in [QSide::Bid, QSide::Ask] {
             let Some((vq, orig)) = self.virt.get(&side).cloned() else {
@@ -324,7 +347,7 @@ impl Runtime {
                     order_id: format!("sim-{}", side.as_str()),
                     fee_estimated: false,
                 };
-                self.book(fill, now).map(|_| ())
+                self.book_at(fill, fill_ts, now).map(|_| ())
             });
             match result {
                 Ok(None) => {}

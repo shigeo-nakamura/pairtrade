@@ -774,22 +774,38 @@ impl Ledger {
 /// ledger untouched and the fill can be retried; an id already booked is
 /// never counted again. The caller persists state.json afterwards and only
 /// then lets the connector forget the fill.
+#[cfg(test)]
 pub fn book_fill(
     l: &mut Ledger,
     f: &FillIn,
     now_ms: u64,
     append: impl FnOnce(&serde_json::Value) -> std::io::Result<()>,
 ) -> std::io::Result<Booking> {
+    book_fill_at(l, f, now_ms, now_ms, append)
+}
+
+/// `book_fill` with the fill's own time (Codex P2, pairtrade#361): `ts_ms`
+/// is when the fill happened (a paper fill: the print's venue timestamp) and
+/// drives the row's `ts_ms`, the position open time (max-hold) and the
+/// markout horizons; `rx_ms` is only when we processed it (`rx_ms` field).
+pub fn book_fill_at(
+    l: &mut Ledger,
+    f: &FillIn,
+    ts_ms: u64,
+    rx_ms: u64,
+    append: impl FnOnce(&serde_json::Value) -> std::io::Result<()>,
+) -> std::io::Result<Booking> {
     if l.has_booked(&f.trade_id) {
         return Ok(Booking::AlreadyBooked);
     }
     let mut preview = l.position.clone();
-    let realized = preview.apply(f.buy, f.qty, f.px, now_ms);
+    let realized = preview.apply(f.buy, f.qty, f.px, ts_ms);
     let seq = l.next_seq;
     let row = serde_json::json!({
         "kind": "fill",
         "seq": seq,
-        "ts_ms": now_ms,
+        "ts_ms": ts_ms,
+        "rx_ms": rx_ms,
         "mode": l.mode,
         "market": l.market,
         "side": if f.buy { "buy" } else { "sell" },
@@ -805,9 +821,20 @@ pub fn book_fill(
         "inventory": preview.qty.to_string(),
     });
     append(&row)?;
-    let booked = l.record_fill(f.buy, f.qty, f.px, f.fee, f.maker, now_ms);
+    let booked = l.record_fill(f.buy, f.qty, f.px, f.fee, f.maker, ts_ms);
     l.mark_booked(&f.trade_id, seq);
     Ok(Booking::Booked(booked))
+}
+
+/// The markouts a just-booked fill owes, timed from the fill's own time.
+pub fn markouts_for(f: &FillIn, fill_ts_ms: u64) -> PendingMarkout {
+    PendingMarkout {
+        fill_id: f.trade_id.clone(),
+        ts_ms: fill_ts_ms,
+        px: f.px,
+        buy: f.buy,
+        horizons: MARKOUT_HORIZONS.to_vec(),
+    }
 }
 
 /// Book every fills.jsonl row the state does not have yet (Codex P1,
@@ -1734,6 +1761,31 @@ mod tests {
         assert!(missing
             .iter()
             .all(|m| matches!(m, Markout::Missing { reason, .. } if reason == "restart")));
+    }
+
+    #[test]
+    fn a_paper_fill_is_timed_by_the_print_not_by_processing_time() {
+        let mut l = Ledger::new("dry_run", "2026-09-30");
+        let f = fill_in("p1");
+        let (print_ms, now) = (7_000, 10_000); // the print is 3 s old
+        let mut rows = Vec::new();
+        book_fill_at(&mut l, &f, print_ms, now, |r| {
+            rows.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows[0]["ts_ms"], 7_000);
+        assert_eq!(rows[0]["rx_ms"], 10_000);
+        // Position opened at the print time: max-hold counts from there.
+        assert_eq!(l.position.opened_at_ms, Some(7_000));
+        // Markout horizons are due from the print time.
+        let mut pending = vec![markouts_for(&f, print_ms)];
+        assert!(due_markouts(&mut pending, 11_999, Some(d("1")), 60_000).is_empty());
+        let out = due_markouts(&mut pending, 12_000, Some(d("83642.9")), 60_000);
+        assert!(matches!(
+            out.as_slice(),
+            [Markout::Priced { horizon_s: 5, .. }]
+        ));
     }
 
     #[test]
