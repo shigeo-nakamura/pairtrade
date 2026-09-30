@@ -192,6 +192,12 @@ jobs:
       - name: Arcus Spot runtime binary tests
         run: cargo test --bin arcus-spot-runtime --no-default-features --features arcus-spot-sdk --locked
 
+      # arcus_vol_runtime (bot-strategy#1093) carries
+      # `required-features = ["arcus-sdk"]`, so `--all-targets` above never
+      # builds or tests it. Build/test only; nothing deploys it.
+      - name: Arcus volume runtime binary tests
+        run: cargo test --bin arcus_vol_runtime --features arcus-sdk --locked
+
   # bot-strategy#973: none of the passes in build-test above ever compiles
   # the `arcus-spot-live` feature -- the live executor that signs with KMS
   # and moves real inventory. Its two binaries carry

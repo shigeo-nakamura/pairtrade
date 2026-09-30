@@ -63,6 +63,12 @@ debot-utils = "1.0.*"
 dex-connector = { path = "../dex-connector", default-features = false }
 
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+# Public `trades` WS tape for the arcus_vol_runtime paper fill sim
+# (bot-strategy#1093): the trait's LastTrade carries no trade id/timestamp,
+# so the sim reads the channel itself. Same versions dex-connector already
+# pulls in, so the lockfile gains edges, not crates.
+tokio-tungstenite = { version = "0.20.0", features = ["rustls-tls-webpki-roots"], optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -76,7 +82,7 @@ lighter-sdk = ["dex-connector/lighter-sdk"]
 # Tokyo deployments build with `--no-default-features --features extended-sdk`
 # (no Go/libsigner toolchain on ARM). Frankfurt keeps the default.
 extended-sdk = ["dex-connector/extended-sdk"]
-arcus-sdk = ["dex-connector/arcus-sdk"]
+arcus-sdk = ["dex-connector/arcus-sdk", "dep:tokio-tungstenite", "dep:futures"]
 arcus-spot-sdk = ["dex-connector/arcus-spot-sdk"]
 arcus-spot-live = [
     "arcus-spot-sdk",
@@ -103,6 +109,12 @@ hyperliquid-sdk = ["dex-connector/hyperliquid-sdk"]
 [[bin]]
 name = "book-runtime"
 path = "src/bin/book_runtime.rs"
+
+# Arcus Perps maker-first volume runtime (bot-strategy#1093).
+[[bin]]
+name = "arcus_vol_runtime"
+path = "src/bin/arcus_vol_runtime/main.rs"
+required-features = ["arcus-sdk"]
 
 [[bin]]
 name = "bull-holder"

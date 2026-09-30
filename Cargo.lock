@@ -1360,6 +1360,7 @@ dependencies = [
  "env_logger",
  "ethers",
  "fs2",
+ "futures",
  "hex",
  "k256",
  "lazy_static",
@@ -1382,6 +1383,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "url",
  "zeroize",
 ]
