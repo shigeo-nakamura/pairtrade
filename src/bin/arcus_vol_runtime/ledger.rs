@@ -234,21 +234,37 @@ pub enum Rollover {
     Postponed,
 }
 
-/// Roll the UTC day and, when it rolled, persist the state at once via
-/// `persist` (Codex P2, pairtrade#361): the new day's baseline is on disk
-/// before any fill of the new day is booked. The caller must not harvest
-/// fills while this returns an error.
-pub fn rollover_durably(
+/// The one guard every fill-booking path goes through (Codex P2,
+/// pairtrade#361): roll the UTC day if due and have that state on disk
+/// before anything books. Returns whether booking may proceed now:
+/// - same day and nothing pending → yes;
+/// - rolled and persisted (or an earlier failed persist now succeeds) → yes;
+/// - rollover postponed (no fresh mark yet) or the persist failed → no, and
+///   the caller books nothing (live fills stay in the connector; a paper
+///   print is dropped, the conservative direction).
+///
+/// `pending_persist` carries a failed persist to the next call.
+pub fn ensure_rolled(
     l: &mut Ledger,
     today: &str,
     mark: Option<Decimal>,
+    pending_persist: &mut bool,
     persist: impl FnOnce(&Ledger) -> std::io::Result<()>,
-) -> std::io::Result<Rollover> {
-    let r = l.rollover(today, mark);
-    if r == Rollover::Rolled {
-        persist(l)?;
+) -> Result<bool, String> {
+    match l.rollover(today, mark) {
+        Rollover::Postponed => Err(format!("rollover to {today} postponed: no fresh mark yet")),
+        Rollover::Same if !*pending_persist => Ok(true),
+        Rollover::Rolled | Rollover::Same => match persist(l) {
+            Ok(()) => {
+                *pending_persist = false;
+                Ok(true)
+            }
+            Err(e) => {
+                *pending_persist = true;
+                Err(format!("rollover state not persisted: {e}"))
+            }
+        },
     }
-    Ok(r)
 }
 
 /// Exclusive OS lock on `<dir>/runtime.lock`, held for the process lifetime
@@ -961,20 +977,61 @@ pub fn markout_bps(buy: bool, px: Decimal, mid: Decimal) -> Decimal {
     sign * (mid - px) / px * Decimal::from(10_000)
 }
 
-/// Pop every horizon that is due; returns (fill_id, horizon_secs, bps).
+/// A resolved markout horizon.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Markout {
+    Priced {
+        fill_id: String,
+        horizon_s: u64,
+        bps: Decimal,
+    },
+    /// No fresh mid within `max_late_ms` after the horizon: recorded as
+    /// missing, never priced at a stale mid.
+    Missing {
+        fill_id: String,
+        horizon_s: u64,
+        reason: String,
+    },
+}
+
+/// Resolve due horizons against `fresh_mid`, a mid from a timestamp-fresh
+/// book only (`logic::fresh_mark`, Codex P2, pairtrade#361). While there is
+/// none, a due horizon stays pending; past `max_late_ms` after it is due it
+/// is dropped as `Missing`.
 pub fn due_markouts(
     pending: &mut Vec<PendingMarkout>,
     now_ms: u64,
-    mid: Decimal,
-) -> Vec<(String, u64, Decimal)> {
+    fresh_mid: Option<Decimal>,
+    max_late_ms: u64,
+) -> Vec<Markout> {
     let mut out = Vec::new();
     for p in pending.iter_mut() {
         p.horizons.retain(|h| {
-            if now_ms >= p.ts_ms + h * 1_000 {
-                out.push((p.fill_id.clone(), *h, markout_bps(p.buy, p.px, mid)));
-                false
-            } else {
-                true
+            let due = p.ts_ms + h * 1_000;
+            if now_ms < due {
+                return true;
+            }
+            match fresh_mid {
+                Some(mid) => {
+                    out.push(Markout::Priced {
+                        fill_id: p.fill_id.clone(),
+                        horizon_s: *h,
+                        bps: markout_bps(p.buy, p.px, mid),
+                    });
+                    false
+                }
+                None if now_ms > due + max_late_ms => {
+                    out.push(Markout::Missing {
+                        fill_id: p.fill_id.clone(),
+                        horizon_s: *h,
+                        reason: format!(
+                            "no fresh mid within {}s of the horizon",
+                            max_late_ms / 1_000
+                        ),
+                    });
+                    false
+                }
+                None => true,
             }
         });
     }
@@ -1374,30 +1431,55 @@ mod tests {
     fn a_rollover_is_persisted_before_any_new_day_fill() {
         let mut l = Ledger::new("live", "2026-09-30");
         l.record_fill(true, d("0.1"), d("100000"), d("2"), false, 1);
+        let old_day_volume = l.day_volume;
+        let mut pending = false;
         let mut persisted: Option<Ledger> = None;
-        let r = rollover_durably(&mut l, "2026-10-01", Some(d("100000")), |s| {
+        // A paper print after midnight, before any tick: roll + persist first.
+        let ok = ensure_rolled(&mut l, "2026-10-01", Some(d("100000")), &mut pending, |s| {
             persisted = Some(s.clone());
             Ok(())
         })
         .unwrap();
-        assert_eq!(r, Rollover::Rolled);
+        assert!(ok);
         let on_disk = persisted.expect("rollover persisted");
         assert_eq!(on_disk.day, "2026-10-01");
         assert_eq!(on_disk.day_fees, Decimal::ZERO);
-        // The first new-day fill comes after, so it lands on the new day.
+        // Then the fill books to the new day.
         book_fill(&mut l, &fill_in("n1"), 2, |_| Ok(())).unwrap();
-        assert_eq!(on_disk.fills + 1, l.fills);
-        // A failed persist is reported so the caller skips the harvest.
-        let mut l2 = Ledger::new("live", "2026-09-30");
-        assert!(rollover_durably(&mut l2, "2026-10-01", Some(d("1")), |_| {
-            Err(std::io::Error::other("disk"))
-        })
-        .is_err());
-        // No rollover, no write.
-        assert_eq!(
-            rollover_durably(&mut l, "2026-10-01", Some(d("1")), |_| panic!("no write")).unwrap(),
-            Rollover::Same
+        assert_eq!(l.day_volume, d("8364.29"));
+        assert_ne!(l.day_volume, old_day_volume + d("8364.29"));
+        // Same day afterwards: no write.
+        assert!(
+            ensure_rolled(&mut l, "2026-10-01", None, &mut pending, |_| panic!(
+                "no write"
+            ))
+            .unwrap()
         );
+    }
+
+    #[test]
+    fn no_booking_while_the_rollover_is_postponed_or_unpersisted() {
+        let mut l = Ledger::new("live", "2026-09-30");
+        let mut pending = false;
+        // No fresh mark: postponed, nothing may book.
+        assert!(ensure_rolled(&mut l, "2026-10-01", None, &mut pending, |_| Ok(())).is_err());
+        // Persist fails: nothing may book, and the next call retries it.
+        assert!(
+            ensure_rolled(&mut l, "2026-10-01", Some(d("1")), &mut pending, |_| {
+                Err(std::io::Error::other("disk"))
+            })
+            .is_err()
+        );
+        assert!(pending);
+        let mut retried = false;
+        assert!(
+            ensure_rolled(&mut l, "2026-10-01", Some(d("1")), &mut pending, |_| {
+                retried = true;
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert!(retried && !pending);
     }
 
     #[test]
@@ -1840,12 +1922,51 @@ mod tests {
             buy: true,
             horizons: vec![5, 30, 60],
         }];
-        assert!(due_markouts(&mut pending, 5_999, d("1")).is_empty());
-        let out = due_markouts(&mut pending, 6_000, d("99990"));
-        assert_eq!(out, vec![("f".to_string(), 5, d("-1"))]);
-        due_markouts(&mut pending, 31_000, d("1"));
+        assert!(due_markouts(&mut pending, 5_999, Some(d("1")), 60_000).is_empty());
+        let out = due_markouts(&mut pending, 6_000, Some(d("99990")), 60_000);
+        assert_eq!(
+            out,
+            vec![Markout::Priced {
+                fill_id: "f".into(),
+                horizon_s: 5,
+                bps: d("-1")
+            }]
+        );
+        due_markouts(&mut pending, 31_000, Some(d("1")), 60_000);
         assert_eq!(pending.len(), 1);
-        due_markouts(&mut pending, 61_000, d("1"));
+        due_markouts(&mut pending, 61_000, Some(d("1")), 60_000);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn markouts_wait_for_a_fresh_mid_and_go_missing_past_the_lateness() {
+        let mut pending = vec![PendingMarkout {
+            fill_id: "f".into(),
+            ts_ms: 1_000,
+            px: d("100000"),
+            buy: true,
+            horizons: vec![5, 30],
+        }];
+        // 5 s horizon due at 6 000 with a stale book: stays pending.
+        assert!(due_markouts(&mut pending, 6_000, None, 60_000).is_empty());
+        assert_eq!(pending[0].horizons, vec![5, 30]);
+        // Fresh mid later, within the lateness: priced at THAT mid.
+        let out = due_markouts(&mut pending, 20_000, Some(d("100020")), 60_000);
+        assert_eq!(
+            out,
+            vec![Markout::Priced {
+                fill_id: "f".into(),
+                horizon_s: 5,
+                bps: d("2")
+            }]
+        );
+        // 30 s horizon due at 31 000; stale until past 91 000 → missing.
+        assert!(due_markouts(&mut pending, 91_000, None, 60_000).is_empty());
+        let out = due_markouts(&mut pending, 91_001, None, 60_000);
+        assert!(matches!(
+            out.as_slice(),
+            [Markout::Missing { horizon_s: 30, .. }]
+        ));
         assert!(pending.is_empty());
     }
 }

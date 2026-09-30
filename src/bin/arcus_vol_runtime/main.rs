@@ -32,7 +32,7 @@ use dex_connector::{
 };
 use ledger::{
     append_synced, book_fill, due_markouts, may_forget_fill, risk_check, Booking, FillIn, Halt,
-    Ledger, PendingMarkout, Rollover,
+    Ledger, PendingMarkout,
 };
 use logic::{
     dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, may_disarm_dms,
@@ -50,6 +50,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 const MARKOUT_HORIZONS: [u64; 3] = [5, 30, 60];
+/// A due markout horizon waits this long for a fresh mid, then is recorded
+/// as `markout_missing`.
+const MARKOUT_MAX_LATE_MS: u64 = 60_000;
 
 fn init_logger() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -126,6 +129,7 @@ struct Runtime {
     /// A rollover whose state write failed: retried before any fill harvest.
     rollover_unpersisted: bool,
     last_mark_warn_ms: u64,
+    last_roll_warn_ms: u64,
     /// A failed append could not be rolled back: no appends, no new quoting
     /// until a restart repairs fills.jsonl.
     journal_unsafe: bool,
@@ -282,6 +286,11 @@ impl Runtime {
             return;
         }
         let now = now_ms();
+        // Never book a paper fill onto a day whose rollover is not on disk:
+        // the print is dropped (it cannot be replayed; conservative).
+        if !self.ensure_rolled(now) {
+            return;
+        }
         self.newest_print_ts_us = self.newest_print_ts_us.max(p.ts_us);
         for side in [QSide::Bid, QSide::Ask] {
             let Some((vq, orig)) = self.virt.get(&side).cloned() else {
@@ -324,6 +333,35 @@ impl Runtime {
             log::error!(
                 "[ARCUS_VOL] JOURNAL UNSAFE: {e}; no appends and no new quoting until a restart repairs fills.jsonl"
             );
+        }
+    }
+
+    /// Roll the UTC day if due and persist it before anything books; false
+    /// = book nothing now (see `ledger::ensure_rolled`). Shared by the tick's
+    /// fill harvest and the paper `on_print`.
+    fn ensure_rolled(&mut self, now: u64) -> bool {
+        let day_before = self.ledger.day.clone();
+        let state_writer = &mut self.state_writer;
+        let state_path = &self.state_path;
+        let result = ledger::ensure_rolled(
+            &mut self.ledger,
+            &utc_day(),
+            self.last_mark,
+            &mut self.rollover_unpersisted,
+            |l| state_writer.write(state_path, l).map(|_| ()),
+        );
+        if self.ledger.day != day_before {
+            log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day);
+        }
+        match result {
+            Ok(ok) => ok,
+            Err(e) => {
+                if now.saturating_sub(self.last_roll_warn_ms) >= 60_000 {
+                    self.last_roll_warn_ms = now;
+                    log::warn!("[ARCUS_VOL] {e}; no fill is booked until it is on disk");
+                }
+                false
+            }
         }
     }
 
@@ -905,44 +943,8 @@ impl Runtime {
             self.last_mark = Some(m);
         }
         // A rollover is on disk before any new-day fill is booked (Codex P2,
-        // pairtrade#361); while that write fails, no fills are harvested.
-        let state_writer = &mut self.state_writer;
-        let state_path = &self.state_path;
-        let rolled = ledger::rollover_durably(&mut self.ledger, &utc_day(), self.last_mark, |l| {
-            state_writer.write(state_path, l).map(|_| ())
-        });
-        let harvest_ok = match rolled {
-            Ok(Rollover::Rolled) => {
-                log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day);
-                self.rollover_unpersisted = false;
-                true
-            }
-            Ok(Rollover::Postponed) => {
-                log::warn!(
-                    "[ARCUS_VOL] UTC day rollover postponed: no live-book mark yet (daily stop stays on {})",
-                    self.ledger.day
-                );
-                true
-            }
-            Ok(Rollover::Same) if self.rollover_unpersisted => {
-                match self.state_writer.write(&self.state_path, &self.ledger) {
-                    Ok(_) => {
-                        self.rollover_unpersisted = false;
-                        true
-                    }
-                    Err(e) => {
-                        log::error!("[ARCUS_VOL] rollover state still not persisted: {e}");
-                        false
-                    }
-                }
-            }
-            Ok(Rollover::Same) => true,
-            Err(e) => {
-                log::error!("[ARCUS_VOL] rollover state not persisted ({e}); fills wait");
-                self.rollover_unpersisted = true;
-                false
-            }
-        };
+        // pairtrade#361); `ensure_rolled` is the one guard for every path.
+        let harvest_ok = self.ensure_rolled(now);
 
         if !self.cfg.dry_run {
             if harvest_ok {
@@ -986,21 +988,45 @@ impl Runtime {
         // Every awaited call of the tick is done: decide on a fresh clock
         // (Codex P1, pairtrade#361).
         let now = now_ms();
-        if let Some(m) = mid {
-            for (fill_id, h, bps) in due_markouts(&mut self.pending_markouts, now, m) {
-                let row = json!({"kind": "markout", "seq": self.ledger.take_seq(),
-                                 "ts_ms": now, "fill_id": fill_id,
-                                 "market": self.cfg.market,
-                                 "horizon_s": h, "bps": bps.round_dp(3).to_string(),
-                                 "mid": m.to_string()});
-                if self.journal_unsafe {
-                    continue;
-                }
-                // Rollback-safe like every journal append (Codex P1, pairtrade#361).
-                if let Err(e) = append_synced(&self.fills_path, &row) {
-                    self.note_append_error(&e);
-                    log::warn!("[ARCUS_VOL] markout append failed: {e}");
-                }
+        // Markouts only against a timestamp-fresh mid; late ones go missing
+        // rather than price at a stale mid (Codex P2, pairtrade#361).
+        let fresh_mid = fresh_mark(
+            mid,
+            self.book.as_ref().and_then(|b| b.ts_ms),
+            now,
+            self.cfg.book_stale_secs,
+        );
+        for m in due_markouts(
+            &mut self.pending_markouts,
+            now,
+            fresh_mid,
+            MARKOUT_MAX_LATE_MS,
+        ) {
+            let seq = self.ledger.take_seq();
+            let row = match m {
+                ledger::Markout::Priced {
+                    fill_id,
+                    horizon_s,
+                    bps,
+                } => json!({"kind": "markout", "seq": seq, "ts_ms": now, "fill_id": fill_id,
+                            "market": self.cfg.market, "horizon_s": horizon_s,
+                            "bps": bps.round_dp(3).to_string(),
+                            "mid": fresh_mid.map(|m| m.to_string())}),
+                ledger::Markout::Missing {
+                    fill_id,
+                    horizon_s,
+                    reason,
+                } => json!({"kind": "markout_missing", "seq": seq, "ts_ms": now,
+                            "fill_id": fill_id, "market": self.cfg.market,
+                            "horizon_s": horizon_s, "reason": reason}),
+            };
+            if self.journal_unsafe {
+                continue;
+            }
+            // Rollback-safe like every journal append (Codex P1, pairtrade#361).
+            if let Err(e) = append_synced(&self.fills_path, &row) {
+                self.note_append_error(&e);
+                log::warn!("[ARCUS_VOL] markout append failed: {e}");
             }
         }
 
@@ -1400,6 +1426,7 @@ async fn main() -> Result<()> {
         flatten_pending: false,
         rollover_unpersisted: false,
         last_mark_warn_ms: 0,
+        last_roll_warn_ms: 0,
         journal_unsafe: false,
         fee_wait_since: HashMap::new(),
         position_mismatch_since_ms: None,
