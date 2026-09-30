@@ -756,6 +756,16 @@ fn may_forget_stop(cancel_ok: bool, absence_confirmed: bool) -> bool {
     cancel_ok || absence_confirmed
 }
 
+/// The connector refused the cancel because the id cannot name any venue
+/// order at all (dex-connector v4.7.39 `InvalidInput { field: "order_id" }`,
+/// bot-strategy#1099) -- e.g. a `dry-run-stop-…` placeholder carried into a
+/// live run. Unlike a transport error this proves nothing rests under the
+/// id, so it counts as a successful cancel for `may_forget_stop`. (Before
+/// v4.7.39 the connector returned `Ok(())` for such an id.)
+fn cancel_refused_unknown_id(e: &dex_connector::DexError) -> bool {
+    matches!(e, dex_connector::DexError::InvalidInput { field, .. } if field == "order_id")
+}
+
 /// Is the outcome of a live order settled? Only when the holding could be
 /// read AND (it changed, or the order was definitively rejected and the
 /// holding did not change).
@@ -1890,7 +1900,7 @@ impl Engine {
         if let Some(old) = &leg.stop_order_id {
             if !self.cfg.dry_run {
                 if let Err(e) = self.lt.cancel_order(symbol, old).await {
-                    if may_forget_stop(false, leg.stop_absence_confirmed) {
+                    if may_forget_stop(cancel_refused_unknown_id(&e), leg.stop_absence_confirmed) {
                         // Cancelling an order the VENUE has already
                         // reported gone fails for the obvious reason.
                         // Deferring on that would block the replacement
@@ -2139,13 +2149,18 @@ impl Engine {
         // in the cancelled feed either. Two independent settlements:
         // the venue reports it cancelled, or a READY account snapshot
         // shows it is not resting.
+        let mut unknown_id = false;
         if let Err(e) = self.lt.cancel_order(symbol, &id).await {
             // A timed-out cancel may still have been processed, and a
             // repeat cancel of an already-cancelled id returns not-found —
             // so the request's outcome never gates the evidence below.
+            // The one exception is an id no venue order can have: nothing
+            // rests under it by construction.
+            unknown_id = cancel_refused_unknown_id(&e);
             log::warn!("[STOP] {symbol}: cancel of unconfirmed stop {id} failed: {e:?}");
         }
-        let settled = self.cancel_confirmed(symbol, &id).await
+        let settled = unknown_id
+            || self.cancel_confirmed(symbol, &id).await
             || self.stop_absent_confirmed(symbol, &id).await;
         if !settled {
             log::warn!(
@@ -2468,7 +2483,7 @@ impl Engine {
                 // transport error on top of it would drop an id whose
                 // reduce-only trigger may still rest — and a later ARM
                 // would inherit it against the new position.
-                if !may_forget_stop(false, leg.stop_absence_confirmed) {
+                if !may_forget_stop(cancel_refused_unknown_id(&e), leg.stop_absence_confirmed) {
                     log::warn!(
                         "[STOP] cancel {id} failed, leaving it tracked in state (order may still be resting): {e:?}"
                     );
@@ -5150,6 +5165,10 @@ mod tests {
         price: Decimal,
         /// Live-path knob: `cancel_order` fails (the venue kept the stop).
         cancel_fails: bool,
+        /// Live-path knob: `cancel_order` refuses the id as one no venue
+        /// order can have (`InvalidInput { field: "order_id" }`,
+        /// dex-connector v4.7.39). Takes precedence over `cancel_fails`.
+        cancel_unknown_id: bool,
         /// Live-path knob: signed perp position `get_positions` reports for
         /// every symbol (`None` = the call is unexpected).
         perp_position: Option<f64>,
@@ -5423,7 +5442,12 @@ mod tests {
             _symbol: &str,
             _order_id: &str,
         ) -> Result<(), dex_connector::DexError> {
-            if self.cancel_fails {
+            if self.cancel_unknown_id {
+                Err(dex_connector::DexError::InvalidInput {
+                    field: "order_id".into(),
+                    value: "dry-run-stop-1 (not a Lighter order index)".into(),
+                })
+            } else if self.cancel_fails {
                 Err(dex_connector::DexError::Transient(
                     "cancel timed out".into(),
                 ))
@@ -5554,6 +5578,7 @@ mod tests {
         let quote: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: false,
+            cancel_unknown_id: false,
             perp_position: None,
             trigger_calls: None,
             stop_rests: None,
@@ -5938,6 +5963,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: true,
+            cancel_unknown_id: false,
             perp_position: None,
             trigger_calls: None,
             stop_rests: None,
@@ -5981,6 +6007,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: true,
+            cancel_unknown_id: false,
             perp_position: None,
             trigger_calls: None,
             stop_rests: None,
@@ -6094,6 +6121,7 @@ mod tests {
         let venue = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: false,
+            cancel_unknown_id: false,
             perp_position: Some(0.005),
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: None,
@@ -6202,6 +6230,7 @@ mod tests {
         let venue = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: true,
+            cancel_unknown_id: false,
             perp_position: Some(0.005),
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: None,
@@ -6256,6 +6285,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: true,
+            cancel_unknown_id: false,
             perp_position: None,
             trigger_calls: None,
             stop_rests: None,
@@ -6342,6 +6372,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: false,
+            cancel_unknown_id: false,
             perp_position: Some(-0.005),
             trigger_calls: None,
             stop_rests: None,
@@ -6384,6 +6415,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(1),
             cancel_fails: false,
+            cancel_unknown_id: false,
             perp_position: Some(0.00505),
             trigger_calls: None,
             stop_rests: None,
@@ -6426,6 +6458,7 @@ mod tests {
         let venue = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: false,
+            cancel_unknown_id: false,
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: Some("stop-1".into()),
@@ -6474,6 +6507,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: false,
+            cancel_unknown_id: false,
             perp_position: Some(0.005), // a ready account snapshot
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: None, // acknowledged, never rests
@@ -6525,6 +6559,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn unknown_id_venue(trigger_calls: bool) -> Arc<QuoteOnly> {
+        Arc::new(QuoteOnly {
+            price: Decimal::from(80_000),
+            cancel_fails: true,
+            cancel_unknown_id: true,
+            perp_position: Some(0.005),
+            trigger_calls: trigger_calls.then(|| std::sync::Mutex::new(Vec::new())),
+            stop_rests: None,
+            canceled: Vec::new(),
+        })
+    }
+
+    /// bot-strategy#1099: an id no venue order can have (the connector's
+    /// `InvalidInput { field: "order_id" }`, e.g. a DRY_RUN placeholder
+    /// carried into a live run) proves nothing rests under it. Holding it
+    /// "for a retried DISARM" would halt the book on an order that cannot
+    /// exist — the exit must complete, as for a successful cancel.
+    #[tokio::test(start_paused = true)]
+    async fn exit_drops_a_stop_id_no_venue_order_can_have() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_exit_unknown_id_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue: Arc<dyn DexConnector + Send + Sync> = unknown_id_venue(false);
+        e.hl = venue.clone();
+        e.lt = venue;
+        for leg in e.state.legs.values_mut() {
+            leg.spot_size = 0.0;
+            leg.perp_size = 0.0;
+            leg.stop_absence_confirmed = false; // no venue evidence at all
+        }
+        e.exit_all("test").await;
+        assert_eq!(e.state.mode, Mode::Exited);
+        assert!(!e.state.halted);
+        assert!(e.state.legs.values().all(|l| l.stop_order_id.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The replacement site: an unknown id must not defer the new stop
+    /// forever (absence is never "confirmed" while any other order rests
+    /// on the market), unlike a transport error.
+    #[tokio::test(start_paused = true)]
+    async fn a_replacement_proceeds_past_a_stop_id_no_venue_order_can_have() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_replace_unknown_id_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        let venue = unknown_id_venue(true);
+        let dyn_venue: Arc<dyn DexConnector + Send + Sync> = venue.clone();
+        e.lt = dyn_venue.clone();
+        e.hl = dyn_venue;
+        for leg in e.state.legs.values_mut() {
+            leg.stop_level = Some(1.0); // stale, so a replacement is due
+            leg.stop_presumed_gone = true; // inferred from the grace only
+            leg.stop_absence_confirmed = false;
+        }
+        // The new stop never shows at this stub venue, so place_stop ends
+        // in its own not-recorded error — what matters is that it got past
+        // the cancel and rested a replacement.
+        let _ = e.place_stop("BTC").await;
+        assert_ne!(
+            e.state.legs["BTC"].stop_order_id.as_deref(),
+            Some("stop-BTC"),
+            "the unknown id is not kept for a retry"
+        );
+        assert_eq!(
+            venue.trigger_calls.as_ref().unwrap().lock().unwrap().len(),
+            1,
+            "a replacement stop was sent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unconfirmed-stop site: an unknown id is settled at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_unconfirmed_stop_id_no_venue_order_can_have_is_settled() {
+        let dir = std::env::temp_dir().join(format!(
+            "bull_holder_unconfirmed_unknown_id_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut e = engine_with_stops(&dir);
+        e.cfg.dry_run = false;
+        e.lt = unknown_id_venue(true);
+        if let Some(l) = e.state.legs.get_mut("BTC") {
+            l.stop_unconfirmed_id = Some("dry-run-stop-1".into());
+        }
+        assert!(e.drop_unconfirmed_stop("BTC").await);
+        assert_eq!(e.state.legs["BTC"].stop_unconfirmed_id, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A cancel that fails leaves the unconfirmed stop tracked: forgetting
     /// an order that may be resting is the failure mode this guards.
     #[tokio::test(start_paused = true)]
@@ -6540,6 +6675,7 @@ mod tests {
         let venue: Arc<dyn DexConnector + Send + Sync> = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
             cancel_fails: true,
+            cancel_unknown_id: false,
             perp_position: None,
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: None,
@@ -6572,7 +6708,8 @@ mod tests {
         e.cfg.dry_run = false;
         let venue = Arc::new(QuoteOnly {
             price: Decimal::from(80_000),
-            cancel_fails: true,         // the uncertain stop cannot be settled
+            cancel_fails: true,
+            cancel_unknown_id: false, // the uncertain stop cannot be settled
             perp_position: Some(0.005), // ready snapshot...
             trigger_calls: Some(std::sync::Mutex::new(Vec::new())),
             stop_rests: Some("ghost-9".into()), // ...and it shows the stop IS resting
