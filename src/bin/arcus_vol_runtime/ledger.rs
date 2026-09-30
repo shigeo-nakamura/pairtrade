@@ -463,6 +463,8 @@ pub struct FillIn {
     pub fee: Decimal,
     pub maker: bool,
     pub order_id: String,
+    /// The venue gave no fee and `fee` is the conservative taker estimate.
+    pub fee_estimated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -535,6 +537,7 @@ pub fn book_fill(
         "realized": realized.round_dp(6).to_string(),
         "order_id": f.order_id,
         "fill_id": f.trade_id,
+        "fee_estimated": f.fee_estimated,
         "inventory": preview.qty.to_string(),
     });
     append(&row)?;
@@ -599,19 +602,49 @@ pub fn may_forget_fill(booking: &std::io::Result<Booking>, state_persisted: bool
 }
 
 /// Append one JSON line and fsync it. When this call CREATED the file, the
-/// parent directory is fsynced too, so the new directory entry survives a
-/// crash (Codex P2, pairtrade#361).
+/// parent directory is fsynced too (Codex P2, pairtrade#361). A failed write
+/// or fsync is rolled back (Codex P1, pairtrade#361): the file is truncated
+/// to its length before the append and fsynced, then the error returned; if
+/// that rollback fails the error carries `JournalUnsafe` (see
+/// `is_journal_unsafe`), and the caller must stop appending until a restart
+/// repairs the tail.
 pub fn append_synced(path: &std::path::Path, row: &serde_json::Value) -> std::io::Result<()> {
-    append_synced_with(path, row, |dir| std::fs::File::open(dir)?.sync_all())
+    use std::io::Write as _;
+    append_journal(
+        path,
+        row,
+        |f, bytes| f.write_all(bytes),
+        |f, len| f.set_len(len),
+        |dir| std::fs::File::open(dir)?.sync_all(),
+    )
 }
 
-/// `append_synced` with the directory sync injected (test seam).
-pub fn append_synced_with(
+/// The rollback of a failed append itself failed: the journal may end in a
+/// partial row.
+#[derive(Debug)]
+pub struct JournalUnsafe(pub String);
+
+impl std::fmt::Display for JournalUnsafe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "journal unsafe: {}", self.0)
+    }
+}
+
+impl std::error::Error for JournalUnsafe {}
+
+pub fn is_journal_unsafe(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<JournalUnsafe>())
+}
+
+/// `append_synced` with the write, truncate and directory sync injected
+/// (test seams).
+pub fn append_journal(
     path: &std::path::Path,
     row: &serde_json::Value,
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    truncate: impl FnOnce(&std::fs::File, u64) -> std::io::Result<()>,
     sync_dir: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
     if let Some(dir) = dir {
         std::fs::create_dir_all(dir)?;
@@ -622,12 +655,48 @@ pub fn append_synced_with(
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(f, "{row}")?;
-    f.sync_all()?;
+    let len_before = f.metadata()?.len();
+    let line = format!("{row}\n");
+    if let Err(e) = write(&mut f, line.as_bytes()).and_then(|_| f.sync_all()) {
+        return match truncate(&f, len_before).and_then(|_| f.sync_all()) {
+            Ok(()) => Err(e),
+            Err(rollback) => Err(std::io::Error::other(JournalUnsafe(format!(
+                "append failed ({e}) and truncating {} back to {len_before} bytes failed ({rollback})",
+                path.display()
+            )))),
+        };
+    }
     if !existed {
         sync_dir(dir.unwrap_or(std::path::Path::new(".")))?;
     }
     Ok(())
+}
+
+/// What to do with a live fill whose fee the venue may not have reported.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeeDecision {
+    /// Fee unknown and still inside the wait: keep it in the connector.
+    Wait,
+    Exact(Decimal),
+    /// Fee still unknown after the wait: book the taker fee on the notional
+    /// whatever the role (never understated), marked `fee_estimated`.
+    Estimated(Decimal),
+}
+
+/// A missing fee is never booked as zero (Codex P1, pairtrade#361).
+pub fn fee_decision(
+    fee: Option<Decimal>,
+    first_seen_ms: u64,
+    now_ms: u64,
+    wait_ms: u64,
+    notional: Decimal,
+    taker_fee_bps: Decimal,
+) -> FeeDecision {
+    match fee {
+        Some(f) => FeeDecision::Exact(f),
+        None if now_ms.saturating_sub(first_seen_ms) < wait_ms => FeeDecision::Wait,
+        None => FeeDecision::Estimated(notional.abs() * taker_fee_bps / Decimal::from(10_000)),
+    }
 }
 
 /// A fill waiting for its +5/+30/+60 s markouts.
@@ -999,6 +1068,7 @@ mod tests {
             fee: Decimal::ZERO,
             maker: true,
             order_id: "o".to_string(),
+            fee_estimated: false,
         }
     }
 
@@ -1132,28 +1202,134 @@ mod tests {
         assert!(o.write_halt_file);
     }
 
+    fn write_all(f: &mut std::fs::File, b: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        f.write_all(b)
+    }
+
     #[test]
     fn creating_the_journal_fsyncs_its_directory_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fills.jsonl");
         let mut synced = Vec::new();
-        append_synced_with(&path, &serde_json::json!({"a": 1}), |d| {
-            synced.push(d.to_path_buf());
-            Ok(())
-        })
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            write_all,
+            |f, l| f.set_len(l),
+            |d| {
+                synced.push(d.to_path_buf());
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(synced, vec![dir.path().to_path_buf()]);
         // Appending to an existing file does not.
-        append_synced_with(&path, &serde_json::json!({"a": 2}), |_| {
-            panic!("no dir sync for an existing file")
-        })
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 2}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| panic!("no dir sync for an existing file"),
+        )
         .unwrap();
         // A failed directory sync is not reported as durable.
         let other = dir.path().join("other.jsonl");
-        assert!(append_synced_with(&other, &serde_json::json!({}), |_| {
-            Err(std::io::Error::other("dir sync"))
-        })
+        assert!(append_journal(
+            &other,
+            &serde_json::json!({}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| { Err(std::io::Error::other("dir sync")) }
+        )
         .is_err());
+    }
+
+    #[test]
+    fn a_partial_append_is_rolled_back_before_the_error_returns() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        append_synced(&path, &serde_json::json!({"a": 1})).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // The writer gets 7 bytes out, then fails.
+        let err = append_journal(
+            &path,
+            &serde_json::json!({"kind": "fill", "fill_id": "t2"}),
+            |f, b| {
+                f.write_all(&b[..7])?;
+                Err(std::io::Error::other("disk full"))
+            },
+            |f, l| f.set_len(l),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(!is_journal_unsafe(&err));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "partial bytes rolled back"
+        );
+        // The next append lands on a clean line boundary.
+        append_synced(&path, &serde_json::json!({"a": 3})).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":1}\n{\"a\":3}\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_rollback_marks_the_journal_unsafe() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        append_synced(&path, &serde_json::json!({"a": 1})).unwrap();
+        let err = append_journal(
+            &path,
+            &serde_json::json!({"a": 2}),
+            |f, b| {
+                f.write_all(&b[..3])?;
+                Err(std::io::Error::other("disk full"))
+            },
+            |_, _| Err(std::io::Error::other("truncate failed")),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(is_journal_unsafe(&err), "{err}");
+    }
+
+    #[test]
+    fn a_missing_fee_waits_then_books_the_taker_fee_never_zero() {
+        let (wait, bps) = (30_000, d("2.25"));
+        let notional = d("8364.29");
+        // Unknown, inside the wait: keep it un-booked.
+        assert_eq!(
+            fee_decision(None, 1_000, 30_999, wait, notional, bps),
+            FeeDecision::Wait
+        );
+        // Known later: the exact fee (maker 0 is fine when the venue says so).
+        assert_eq!(
+            fee_decision(Some(Decimal::ZERO), 1_000, 5_000, wait, notional, bps),
+            FeeDecision::Exact(Decimal::ZERO)
+        );
+        // Timed out: the taker fee on the notional, whatever the role.
+        assert_eq!(
+            fee_decision(None, 1_000, 31_000, wait, notional, bps),
+            FeeDecision::Estimated(d("1.88196525"))
+        );
+        // The estimated row says so.
+        let mut l = Ledger::new("live", "2026-09-30");
+        let mut f = fill_in("t9");
+        f.fee = d("1.88196525");
+        f.fee_estimated = true;
+        let mut rows = Vec::new();
+        book_fill(&mut l, &f, 1, |r| {
+            rows.push(r.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows[0]["fee_estimated"], true);
+        assert_eq!(l.cum_fees, d("1.88196525"));
     }
 
     #[test]

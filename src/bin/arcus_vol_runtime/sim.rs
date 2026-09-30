@@ -316,6 +316,7 @@ mod tests {
             fee: Decimal::ZERO,
             maker: false,
             order_id: "sim-ioc".to_string(),
+            fee_estimated: false,
         };
         crate::ledger::book_fill(&mut ledger, &fill, 1, |_| Ok(())).unwrap();
         // Restart: seq starts at 1 again, the run id differs.

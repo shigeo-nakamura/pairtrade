@@ -256,6 +256,9 @@ pub struct TickInputs {
     pub fills_synced: bool,
     /// DRY_RUN: the trades tape is subscribed (always true live).
     pub tape_ready: bool,
+    /// A failed journal append could not be rolled back: no new quoting
+    /// until a restart repairs fills.jsonl.
+    pub journal_unsafe: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -276,6 +279,9 @@ pub enum TickPlan {
 pub fn tick_plan(i: &TickInputs) -> TickPlan {
     if let Some(reason) = &i.flatten {
         return TickPlan::Flatten(reason.clone());
+    }
+    if i.journal_unsafe {
+        return TickPlan::PullQuotes("journal_unsafe");
     }
     if !i.has_book {
         return TickPlan::PullQuotes("no_book");
@@ -332,6 +338,7 @@ pub struct PlanState {
     pub reconcile_pending: bool,
     pub fills_synced: bool,
     pub tape_ready: bool,
+    pub journal_unsafe: bool,
     pub flatten: Option<FlattenReason>,
 }
 
@@ -350,6 +357,7 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
         reconcile_pending: !s.dry_run && s.reconcile_pending,
         fills_synced: s.dry_run || s.fills_synced,
         tape_ready: !s.dry_run || s.tape_ready,
+        journal_unsafe: s.journal_unsafe,
         flatten: s.flatten.clone(),
     }
 }
@@ -431,6 +439,18 @@ pub(crate) async fn send_gated<B, S: BatchSink<B>>(sink: &mut S, batches: Vec<B>
         sent += 1;
     }
     sent
+}
+
+/// The UTC-rollover mark: only the mid of a timestamp-fresh book, by the
+/// same predicate `plan_inputs` uses (Codex P2, pairtrade#361); a stale
+/// snapshot never becomes the new day's baseline.
+pub fn fresh_mark(
+    mid: Option<Decimal>,
+    book_ts_ms: Option<u64>,
+    now_ms: u64,
+    stale_secs: u64,
+) -> Option<Decimal> {
+    mid.filter(|_| !book_stale(book_ts_ms, now_ms, stale_secs))
 }
 
 /// The DMS counts as armed when the last successful arm/refresh is younger
@@ -815,6 +835,7 @@ mod tests {
             fee: Decimal::ZERO,
             maker: true,
             order_id: "o".into(),
+            fee_estimated: false,
         };
         book_fill(&mut l, &fill, 8_000, |_| Ok(())).unwrap();
         book_fill(&mut l, &fill, 9_000, |_| Ok(())).unwrap();
@@ -901,6 +922,44 @@ mod tests {
             ..live_state()
         };
         assert_eq!(tick_plan(&plan_inputs(&live, 2_000)), TickPlan::Quote);
+    }
+
+    #[test]
+    fn an_unsafe_journal_blocks_quoting_but_not_the_flatten() {
+        let s = PlanState {
+            journal_unsafe: true,
+            ..live_state()
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&s, 2_000)),
+            TickPlan::PullQuotes("journal_unsafe")
+        );
+        let f = PlanState {
+            flatten: Some(FlattenReason::MaxHold),
+            ..s
+        };
+        assert_eq!(
+            tick_plan(&plan_inputs(&f, 2_000)),
+            TickPlan::Flatten(FlattenReason::MaxHold)
+        );
+    }
+
+    #[test]
+    fn a_stale_snapshot_after_midnight_postpones_the_rollover() {
+        use crate::ledger::{Ledger, Rollover};
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.record_fill(true, d("0.1"), d("100000"), Decimal::ZERO, true, 1);
+        let mid = Some(d("99990"));
+        // Book stamped 10 s before the plan clock (> 5 s): not a mark.
+        let mark = fresh_mark(mid, Some(1_000), 11_001, 5);
+        assert_eq!(mark, None);
+        assert_eq!(l.rollover("2026-10-01", mark), Rollover::Postponed);
+        // A fresh one: rolled at it.
+        let mark = fresh_mark(mid, Some(11_000), 11_001, 5);
+        assert_eq!(l.rollover("2026-10-01", mark), Rollover::Rolled);
+        assert_eq!(l.day_start_unrealized, d("-1"));
+        // A REST book without a feed time is not fresh either.
+        assert_eq!(fresh_mark(mid, None, 11_001, 5), None);
     }
 
     #[test]

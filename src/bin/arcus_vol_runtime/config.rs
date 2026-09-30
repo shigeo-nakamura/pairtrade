@@ -40,6 +40,9 @@ pub struct Config {
     pub qty_decimals: u32,
     pub min_quote_usd: Decimal,
     pub flatten_slippage_bps: u32,
+    /// How long a live fill with no reported fee waits before it is booked
+    /// at the taker fee (`fee_estimated`).
+    pub fee_wait_secs: u64,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -109,6 +112,7 @@ impl Config {
             qty_decimals: int(&p("QTY_DECIMALS"), 5u32)?,
             min_quote_usd: dec(&p("MIN_QUOTE_USD"), "50")?,
             flatten_slippage_bps: int(&p("FLATTEN_SLIPPAGE_BPS"), 20u32)?,
+            fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -273,6 +277,7 @@ mod tests {
             qty_decimals: 5,
             min_quote_usd: Decimal::from(50),
             flatten_slippage_bps: 20,
+            fee_wait_secs: 30,
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),

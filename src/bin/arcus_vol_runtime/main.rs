@@ -36,10 +36,10 @@ use ledger::{
     Ledger, PendingMarkout, Rollover,
 };
 use logic::{
-    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, may_disarm_dms, plan_inputs,
-    plan_quotes, position_check, quote_action, send_gated, shock, shutdown_steps, tick_plan,
-    BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
-    ShutdownStep, Step, TickPlan,
+    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, may_disarm_dms,
+    plan_inputs, plan_quotes, position_check, quote_action, send_gated, shock, shutdown_steps,
+    tick_plan, BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget,
+    Resting, ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -122,6 +122,11 @@ struct Runtime {
     last_mark: Option<Decimal>,
     /// The last tick planned a flatten (paper prints are ignored meanwhile).
     flatten_pending: bool,
+    /// A failed append could not be rolled back: no appends, no new quoting
+    /// until a restart repairs fills.jsonl.
+    journal_unsafe: bool,
+    /// Live fills with no reported fee: first seen (ms).
+    fee_wait_since: HashMap<String, u64>,
     position_mismatch_since_ms: Option<u64>,
     /// Live: the last fill harvest succeeded and booked everything it got.
     fills_synced: bool,
@@ -190,10 +195,21 @@ impl Runtime {
     /// Book one fill durably (fills.jsonl fsynced before the ledger moves,
     /// dedupe by trade id). The caller persists state.json afterwards.
     fn book(&mut self, fill: FillIn, now: u64) -> std::io::Result<Booking> {
+        if self.journal_unsafe {
+            return Err(std::io::Error::other(
+                "journal unsafe: appends stopped until restart",
+            ));
+        }
         let path = self.fills_path.clone();
-        let outcome = book_fill(&mut self.ledger, &fill, now, |row| {
+        let outcome = match book_fill(&mut self.ledger, &fill, now, |row| {
             append_synced(&path, row)
-        })?;
+        }) {
+            Ok(o) => o,
+            Err(e) => {
+                self.note_append_error(&e);
+                return Err(e);
+            }
+        };
         if outcome != Booking::AlreadyBooked {
             log::info!(
                 "[ARCUS_VOL] FILL {} {} {} @ {} fee {} inv {}",
@@ -236,7 +252,10 @@ impl Runtime {
                     "[ARCUS_VOL] trades tape back after {}s gap",
                     (end_ms - start_ms) / 1_000
                 );
-                if let Err(e) = append_synced(&self.fills_path, &row) {
+                if self.journal_unsafe {
+                    log::error!("[ARCUS_VOL] tape_gap row not written: journal unsafe");
+                } else if let Err(e) = append_synced(&self.fills_path, &row) {
+                    self.note_append_error(&e);
                     log::error!("[ARCUS_VOL] tape_gap row not written: {e}");
                 }
             }
@@ -274,6 +293,7 @@ impl Runtime {
                     fee: self.fee(filled * vq.px, true),
                     maker: true,
                     order_id: format!("sim-{}", side.as_str()),
+                    fee_estimated: false,
                 };
                 self.book(fill, now).map(|_| ())
             });
@@ -290,6 +310,15 @@ impl Runtime {
                     return;
                 }
             }
+        }
+    }
+
+    fn note_append_error(&mut self, e: &std::io::Error) {
+        if ledger::is_journal_unsafe(e) && !self.journal_unsafe {
+            self.journal_unsafe = true;
+            log::error!(
+                "[ARCUS_VOL] JOURNAL UNSAFE: {e}; no appends and no new quoting until a restart repairs fills.jsonl"
+            );
         }
     }
 
@@ -358,6 +387,7 @@ impl Runtime {
                         fee,
                         maker: false,
                         order_id: "sim-ioc".to_string(),
+                        fee_estimated: false,
                     };
                     if let Err(e) = self.book(fill, now) {
                         self.halt_sim(format!("paper flatten could not be recorded: {e}"));
@@ -397,7 +427,30 @@ impl Runtime {
                 self.clear_fill(&market, &f.trade_id).await;
                 continue;
             };
-            let fee = f.filled_fee.unwrap_or(Decimal::ZERO);
+            // A missing fee is never booked as zero (Codex P1, pairtrade#361).
+            let first_seen = *self.fee_wait_since.entry(f.trade_id.clone()).or_insert(now);
+            let (fee, fee_estimated) = match ledger::fee_decision(
+                f.filled_fee,
+                first_seen,
+                now,
+                self.cfg.fee_wait_secs * 1_000,
+                value,
+                self.cfg.taker_fee_bps,
+            ) {
+                ledger::FeeDecision::Wait => {
+                    all_booked = false;
+                    continue;
+                }
+                ledger::FeeDecision::Exact(fee) => (fee, false),
+                ledger::FeeDecision::Estimated(fee) => {
+                    log::error!(
+                        "[ARCUS_VOL] fill {} still has no fee after {}s; booking the taker fee {fee} (fee_estimated)",
+                        f.trade_id,
+                        self.cfg.fee_wait_secs
+                    );
+                    (fee, true)
+                }
+            };
             let maker = if self.ioc_ids.contains(&f.order_id) {
                 false
             } else if self.quote_ids.contains(&f.order_id) {
@@ -413,10 +466,12 @@ impl Runtime {
                 fee,
                 maker,
                 order_id: f.order_id.clone(),
+                fee_estimated,
             };
             let booking = self.book(fill, now);
             match &booking {
                 Ok(Booking::Booked(_)) => {
+                    self.fee_wait_since.remove(&f.trade_id);
                     for r in self.resting.values_mut() {
                         if r.order_id == f.order_id {
                             r.filled += qty;
@@ -424,7 +479,9 @@ impl Runtime {
                     }
                     self.resting.retain(|_, r| r.filled < r.qty);
                 }
-                Ok(Booking::AlreadyBooked) => {}
+                Ok(Booking::AlreadyBooked) => {
+                    self.fee_wait_since.remove(&f.trade_id);
+                }
                 Err(e) => {
                     // Kept in the connector; retried next tick.
                     log::error!(
@@ -830,8 +887,15 @@ impl Runtime {
             }
         }
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
-        if mid.is_some() {
-            self.last_mark = mid;
+        // Only a timestamp-fresh book may set the rollover mark (Codex P2,
+        // pairtrade#361).
+        if let Some(m) = fresh_mark(
+            mid,
+            self.book.as_ref().and_then(|b| b.ts_ms),
+            now,
+            self.cfg.book_stale_secs,
+        ) {
+            self.last_mark = Some(m);
         }
         match self.ledger.rollover(&utc_day(), self.last_mark) {
             Rollover::Rolled => log::info!("[ARCUS_VOL] new UTC day {}", self.ledger.day),
@@ -886,6 +950,9 @@ impl Runtime {
                                  "market": self.cfg.market,
                                  "horizon_s": h, "bps": bps.round_dp(3).to_string(),
                                  "mid": m.to_string()});
+                if self.journal_unsafe {
+                    continue;
+                }
                 if let Err(e) = append_jsonl(&self.fills_path, &row) {
                     log::warn!("[ARCUS_VOL] markout append failed: {e}");
                 }
@@ -966,6 +1033,7 @@ impl Runtime {
             reconcile_pending: self.need_reconcile,
             fills_synced: self.fills_synced,
             tape_ready: self.tape.ready,
+            journal_unsafe: self.journal_unsafe,
             flatten,
         };
         let plan = tick_plan(&plan_inputs(&state, now));
@@ -1299,6 +1367,8 @@ async fn main() -> Result<()> {
         tape: tape::TapeHealth::default(),
         last_mark: None,
         flatten_pending: false,
+        journal_unsafe: false,
+        fee_wait_since: HashMap::new(),
         position_mismatch_since_ms: None,
         fills_synced: false,
         dms_last_ok_ms: None,
