@@ -1200,20 +1200,32 @@ async fn main() -> Result<()> {
     let fills_path = cfg.state_dir.join("fills.jsonl");
     // Close the crash window between the fsynced fills.jsonl row and the
     // state.json write (Codex P1, pairtrade#361): book any row state missed.
+    // Before any append: cut a crash-torn tail / add a missing final newline
+    // (Codex P1, pairtrade#361); a malformed complete line stops startup.
+    match ledger::repair_journal(&fills_path)
+        .with_context(|| format!("repair {} at startup", fills_path.display()))?
+    {
+        ledger::JournalRepair::Clean => {}
+        ledger::JournalRepair::NewlineAdded => {
+            log::warn!("[ARCUS_VOL] fills.jsonl: appended the missing final newline")
+        }
+        ledger::JournalRepair::Truncated {
+            dropped,
+            hex_preview,
+        } => log::warn!(
+            "[ARCUS_VOL] fills.jsonl: dropped a torn {dropped}-byte tail (hex {hex_preview}…)"
+        ),
+    }
     if let Some(text) = ledger::read_journal(&fills_path)
         .with_context(|| format!("read {} at startup", fills_path.display()))?
     {
-        let rows: Vec<serde_json::Value> = text
+        // After the repair every line is a complete row.
+        let rows = text
             .lines()
-            .filter_map(|line| match serde_json::from_str(line) {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    // A torn tail from a crash mid-write was never booked.
-                    log::warn!("[ARCUS_VOL] skipping unparsable fills.jsonl line");
-                    None
-                }
-            })
-            .collect();
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .context("fills.jsonl row after repair")?;
         let replayed = ledger::replay_fills(&mut ledger, &rows)
             .map_err(|e| anyhow!("fills.jsonl replay: {e}"))?;
         if replayed > 0 {

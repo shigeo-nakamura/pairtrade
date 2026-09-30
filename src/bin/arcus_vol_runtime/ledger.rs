@@ -231,6 +231,76 @@ pub fn acquire_state_lock(dir: &std::path::Path) -> Result<std::fs::File, String
     Ok(file)
 }
 
+/// What `repair_journal` did to fills.jsonl.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JournalRepair {
+    /// Missing, empty, or every line complete and parsable.
+    Clean,
+    /// The final line parsed but had no trailing newline: one was appended.
+    NewlineAdded,
+    /// A torn, unparsable final fragment was cut off.
+    Truncated { dropped: usize, hex_preview: String },
+}
+
+/// Make fills.jsonl safe to append to (Codex P1, pairtrade#361). A crash
+/// mid-append leaves a torn final fragment; appending after it would glue
+/// the next row onto the fragment and lose that row at the next replay.
+/// Run at startup before any append:
+/// - no trailing newline and the fragment after the last `\n` does not parse
+///   → truncate to just after that `\n`, fsync the file and its directory;
+/// - no trailing newline but the final line parses → append the `\n`;
+/// - any COMPLETE line that does not parse is an error (never truncated:
+///   only a crash-torn tail is ours to drop).
+pub fn repair_journal(path: &std::path::Path) -> std::io::Result<JournalRepair> {
+    use std::io::Write as _;
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(JournalRepair::Clean),
+        Err(e) => return Err(e),
+    };
+    let complete_end = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    for (n, line) in bytes[..complete_end].split(|b| *b == b'\n').enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        if serde_json::from_slice::<serde_json::Value>(line).is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} line {} is malformed and not a torn tail; refusing to start",
+                    path.display(),
+                    n + 1
+                ),
+            ));
+        }
+    }
+    let tail = &bytes[complete_end..];
+    if tail.is_empty() {
+        return Ok(JournalRepair::Clean);
+    }
+    if serde_json::from_slice::<serde_json::Value>(tail).is_ok() {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+        return Ok(JournalRepair::NewlineAdded);
+    }
+    let hex_preview = tail
+        .iter()
+        .take(32)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.set_len(complete_end as u64)?;
+    f.sync_all()?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(JournalRepair::Truncated {
+        dropped: tail.len(),
+        hex_preview,
+    })
+}
+
 /// Read fills.jsonl at startup: only a missing file counts as empty
 /// (Codex P2, pairtrade#361); any other error (permission, I/O, not UTF-8)
 /// is returned so startup fails instead of replaying nothing.
@@ -625,6 +695,87 @@ mod tests {
         assert!(err.contains("locked"), "{err}");
         drop(first);
         assert!(acquire_state_lock(dir.path()).is_ok());
+    }
+
+    const ROW: &str = r#"{"kind":"fill","mode":"live","fill_id":"t1","ts_ms":1000,"side":"buy","qty":"0.1","px":"83642.9","fee":"0","role":"maker"}"#;
+
+    #[test]
+    fn a_torn_final_fragment_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fills.jsonl");
+        std::fs::write(&p, format!("{ROW}\n{{\"kind\":\"fi")).unwrap();
+        let r = repair_journal(&p).unwrap();
+        assert_eq!(
+            r,
+            JournalRepair::Truncated {
+                // `{"kind":"fi` = 11 bytes
+                dropped: 11,
+                hex_preview: "7b226b696e64223a226669".to_string()
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("{ROW}\n"));
+        // Idempotent.
+        assert_eq!(repair_journal(&p).unwrap(), JournalRepair::Clean);
+    }
+
+    #[test]
+    fn a_malformed_line_that_is_not_the_torn_tail_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fills.jsonl");
+        let text = format!("{ROW}\nnot json\n{ROW}\n");
+        std::fs::write(&p, &text).unwrap();
+        assert!(repair_journal(&p).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            text,
+            "never truncated"
+        );
+        // Also when a torn tail follows it.
+        let text = format!("{ROW}\nnot json\n{{\"to");
+        std::fs::write(&p, &text).unwrap();
+        assert!(repair_journal(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), text);
+    }
+
+    #[test]
+    fn a_complete_final_row_without_newline_gets_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fills.jsonl");
+        std::fs::write(&p, format!("{ROW}\n{ROW}")).unwrap();
+        assert_eq!(repair_journal(&p).unwrap(), JournalRepair::NewlineAdded);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            format!("{ROW}\n{ROW}\n")
+        );
+        assert_eq!(
+            repair_journal(&dir.path().join("missing")).unwrap(),
+            JournalRepair::Clean
+        );
+    }
+
+    #[test]
+    fn crash_torn_tail_then_restart_then_append_is_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fills.jsonl");
+        // Crash mid-append of a second row.
+        std::fs::write(&p, format!("{ROW}\n{{\"kind\":\"fill\",\"mode\":\"li")).unwrap();
+        // Restart: repair, then a new fill is appended.
+        repair_journal(&p).unwrap();
+        let new_row = serde_json::json!({"kind": "fill", "mode": "live", "fill_id": "t2",
+            "ts_ms": 2000, "side": "sell", "qty": "0.1", "px": "83643.1", "fee": "0",
+            "role": "maker"});
+        append_synced(&p, &new_row).unwrap();
+        // Next restart: every line parses and replay books both rows.
+        let text = std::fs::read_to_string(&p).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line parses"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let mut l = Ledger::new("live", "2026-09-30");
+        assert_eq!(replay_fills(&mut l, &rows).unwrap(), 2);
+        assert!(l.has_booked("t2"));
+        assert!(l.position.qty.is_zero());
     }
 
     #[test]
