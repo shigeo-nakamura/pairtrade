@@ -548,18 +548,36 @@ pub fn may_forget_fill(booking: &std::io::Result<Booking>, state_persisted: bool
     booking.is_ok() && state_persisted
 }
 
-/// Append one JSON line and fsync it.
+/// Append one JSON line and fsync it. When this call CREATED the file, the
+/// parent directory is fsynced too, so the new directory entry survives a
+/// crash (Codex P2, pairtrade#361).
 pub fn append_synced(path: &std::path::Path, row: &serde_json::Value) -> std::io::Result<()> {
+    append_synced_with(path, row, |dir| std::fs::File::open(dir)?.sync_all())
+}
+
+/// `append_synced` with the directory sync injected (test seam).
+pub fn append_synced_with(
+    path: &std::path::Path,
+    row: &serde_json::Value,
+    sync_dir: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::io::Write as _;
-    if let Some(dir) = path.parent() {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(dir) = dir {
         std::fs::create_dir_all(dir)?;
     }
+    // Single writer (runtime.lock), so "existed" cannot race another append.
+    let existed = path.exists();
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
     writeln!(f, "{row}")?;
-    f.sync_all()
+    f.sync_all()?;
+    if !existed {
+        sync_dir(dir.unwrap_or(std::path::Path::new(".")))?;
+    }
+    Ok(())
 }
 
 /// A fill waiting for its +5/+30/+60 s markouts.
@@ -1024,6 +1042,30 @@ mod tests {
         let o = risk_check(&mut l, d("83642.9"), false, false, d("1000"), d("1000"));
         assert!(matches!(o.halt, Some(Halt::Sticky(_))));
         assert!(o.write_halt_file);
+    }
+
+    #[test]
+    fn creating_the_journal_fsyncs_its_directory_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        let mut synced = Vec::new();
+        append_synced_with(&path, &serde_json::json!({"a": 1}), |d| {
+            synced.push(d.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced, vec![dir.path().to_path_buf()]);
+        // Appending to an existing file does not.
+        append_synced_with(&path, &serde_json::json!({"a": 2}), |_| {
+            panic!("no dir sync for an existing file")
+        })
+        .unwrap();
+        // A failed directory sync is not reported as durable.
+        let other = dir.path().join("other.jsonl");
+        assert!(append_synced_with(&other, &serde_json::json!({}), |_| {
+            Err(std::io::Error::other("dir sync"))
+        })
+        .is_err());
     }
 
     #[test]

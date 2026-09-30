@@ -40,6 +40,43 @@ pub fn placement_ts_us(book_ts_ms: Option<u64>, newest_print_ts_us: u64) -> u64 
     book_us.max(newest_print_ts_us.saturating_add(1))
 }
 
+/// Whether a public print may touch the virtual quotes at all (Codex P1,
+/// pairtrade#361): not while the sim is halted, the tape is down, the
+/// runtime is halted, or a flatten is pending — those states must not add
+/// fills the flatten then has to chase.
+pub fn prints_apply(
+    tape_ready: bool,
+    sim_halted: bool,
+    halted: bool,
+    flatten_pending: bool,
+) -> bool {
+    tape_ready && !sim_halted && !halted && !flatten_pending
+}
+
+/// The paper flatten sequence. With a book it is `flatten_steps` (cancel
+/// quotes, then the IOC at the touch). Without one the IOC cannot be
+/// priced, but every virtual quote is still pulled at once so nothing can
+/// fill while the flatten waits for a book (Codex P1, pairtrade#361).
+pub fn paper_flatten_steps(
+    has_book: bool,
+    inv_qty: Decimal,
+    resting_bid: bool,
+    resting_ask: bool,
+) -> Vec<crate::logic::Step> {
+    use crate::logic::{flatten_steps, Step};
+    if has_book {
+        return flatten_steps(inv_qty, resting_bid, resting_ask);
+    }
+    let mut steps = Vec::new();
+    if resting_bid {
+        steps.push(Step::Cancel(QSide::Bid));
+    }
+    if resting_ask {
+        steps.push(Step::Cancel(QSide::Ask));
+    }
+    steps
+}
+
 /// Simulated order/fill id: `run_id` (the process start, ms) keeps ids
 /// unique across restarts even though `seq` starts again at 1, so a paper
 /// fill after a restart never collides with a booked id (Codex P2,
@@ -303,6 +340,44 @@ mod tests {
             )),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn a_halt_without_a_book_pulls_quotes_and_later_prints_cannot_fill() {
+        use crate::logic::Step;
+        use std::collections::HashMap;
+        let mut virt: HashMap<QSide, VirtualQuote> = HashMap::new();
+        virt.insert(
+            QSide::Bid,
+            join(QSide::Bid, d("83642.9"), d("0.12"), &[], 0),
+        );
+        virt.insert(
+            QSide::Ask,
+            join(QSide::Ask, d("83643.0"), d("0.12"), &[], 0),
+        );
+        // Halt with inventory and no book: no IOC, but both quotes pulled.
+        let steps = paper_flatten_steps(false, d("0.1"), true, true);
+        assert_eq!(
+            steps,
+            vec![Step::Cancel(QSide::Bid), Step::Cancel(QSide::Ask)]
+        );
+        for s in steps {
+            if let Step::Cancel(side) = s {
+                virt.remove(&side);
+            }
+        }
+        assert!(virt.is_empty());
+        // A print arriving now is not applied (halted / flatten pending).
+        assert!(!prints_apply(true, false, true, false));
+        assert!(!prints_apply(true, false, false, true));
+        assert!(!prints_apply(false, false, false, false));
+        assert!(!prints_apply(true, true, false, false));
+        assert!(prints_apply(true, false, false, false));
+        // With a book the flatten includes its IOC.
+        assert!(matches!(
+            paper_flatten_steps(true, d("0.1"), false, false).as_slice(),
+            [Step::Ioc { .. }]
+        ));
     }
 
     #[test]

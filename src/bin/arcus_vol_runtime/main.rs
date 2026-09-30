@@ -120,6 +120,8 @@ struct Runtime {
     tape: tape::TapeHealth,
     /// Last mid from a live book (the UTC-day rollover mark).
     last_mark: Option<Decimal>,
+    /// The last tick planned a flatten (paper prints are ignored meanwhile).
+    flatten_pending: bool,
     position_mismatch_since_ms: Option<u64>,
     /// Live: the last fill harvest succeeded and booked everything it got.
     fills_synced: bool,
@@ -244,7 +246,14 @@ impl Runtime {
     }
 
     fn on_print(&mut self, p: tape::Print) {
-        if !self.cfg.dry_run || self.sim_halted.is_some() || !self.tape.ready {
+        if !self.cfg.dry_run
+            || !sim::prints_apply(
+                self.tape.ready,
+                self.sim_halted.is_some(),
+                self.halt.is_some(),
+                self.flatten_pending,
+            )
+        {
             return;
         }
         let now = now_ms();
@@ -313,14 +322,14 @@ impl Runtime {
     }
 
     fn paper_flatten(&mut self, now: u64) {
-        // A paper flatten needs a touch to price at; without a book it waits
-        // for the next tick (live flattens price off the connector instead).
-        let Some(book) = &self.book else { return };
         if self.sim_halted.is_some() {
             return;
         }
-        let (bid, ask) = (book.bid, book.ask);
-        for step in flatten_steps(
+        // Without a book the IOC waits for a price, but the quotes are pulled
+        // now (`paper_flatten_steps`); live prices off the connector instead.
+        let touch = self.book.as_ref().map(|b| (b.bid, b.ask));
+        for step in sim::paper_flatten_steps(
+            touch.is_some(),
             self.ledger.position.qty,
             self.virt.contains_key(&QSide::Bid),
             self.virt.contains_key(&QSide::Ask),
@@ -330,6 +339,7 @@ impl Runtime {
                     self.virt.remove(&side);
                 }
                 Step::Ioc { side, qty } => {
+                    let Some((bid, ask)) = touch else { return };
                     let buy = side == OrderSide::Long;
                     let px = if buy { ask } else { bid };
                     let fee = self.fee(qty * px, false);
@@ -952,6 +962,7 @@ impl Runtime {
             flatten,
         };
         let plan = tick_plan(&plan_inputs(&state, now));
+        self.flatten_pending = matches!(plan, TickPlan::Flatten(_));
         match plan {
             TickPlan::Flatten(reason) => {
                 log::info!(
@@ -1269,6 +1280,7 @@ async fn main() -> Result<()> {
         newest_print_ts_us: 0,
         tape: tape::TapeHealth::default(),
         last_mark: None,
+        flatten_pending: false,
         position_mismatch_since_ms: None,
         fills_synced: false,
         dms_last_ok_ms: None,
