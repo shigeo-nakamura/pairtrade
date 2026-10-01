@@ -1182,8 +1182,8 @@ mod tests {
     async fn a_baseline_sample_on_both_lagging_views_does_not_settle() {
         let v = MockVenue::new((99.9, 100.1)).with(|s| {
             s.fill_on_cancel = Some(0.4);
-            s.position_delay = 1;
-            s.record_delay = 3;
+            s.position_delay = 2;
+            s.record_delay = 4;
             s.ioc_fills = true;
         });
         let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
