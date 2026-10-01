@@ -13,6 +13,48 @@
 //!   and a dedicated non-zero `ARCUS_ACCOUNT_INDEX` (plus the usual
 //!   `ARCUS_ADDRESS` / `ARCUS_API_PRIVATE_KEY` + `ENCRYPTED_DATA_KEY`).
 //!
+//! Presence quoting (`ARCUS_VOL_QUOTE_OFFSET_BPS` > 0, bot-strategy#1093
+//! option B): quotes rest that many bp BEHIND the touch instead of at it and
+//! are kept while their distance from the touch stays within
+//! `ARCUS_VOL_REPEG_BAND_BPS` (> 0, < the offset) of the offset; outside the
+//! band they are re-pegged by cancel + place. At an offset a quote fills
+//! only when a sweep reaches it, so volume and adverse selection are near
+//! zero; the mode exists to test whether resting quotes alone ("quoting
+//! tight, deep, and consistently") earn Arcus market-making points. Details:
+//! - Live sends the unrounded offset price; the connector rounds a resting
+//!   price away from the touch to the venue tick and reports the price it
+//!   used, which is what the band is judged on. The runtime needs no tick,
+//!   so the band must be wider than one tick in bp of price: config
+//!   requires a band of at least 1 bp, and on a coarse-tick market (tick
+//!   ≥ 1 bp of price) the band must be set above the tick.
+//! - Live, the peg reference excludes our own resting quote, so a quote
+//!   that becomes the best price is not re-pegged off itself. With no
+//!   reference on a side (only our quote is displayed there) nothing is
+//!   placed and a resting offset quote stays where it is; one that must not
+//!   quote, or whose size is off, is cancelled.
+//! - The feed's book is at times crossed (a few ticks, or longer when one
+//!   side of it freezes). A crossed book prices nothing: nothing is placed
+//!   until it uncrosses, and resting offset quotes are not cancelled for
+//!   it, except one whose size is off or that is no longer `offset − band`
+//!   behind BOTH book tops (nothing says which side is the stale one).
+//! - During a 429 backoff nothing is placed, but the plan still runs for
+//!   its cancels, so a quote that must go is not left resting.
+//! - After a sweep fill the inventory-reducing side quotes AT the touch,
+//!   sized to the inventory, to exit as a maker; the growing side stays at
+//!   the offset. Skew, cap, max-hold flatten, stops and the DMS are as at
+//!   the touch.
+//! - DRY_RUN reads a 100-level book and, best-effort, the venue tick, so a
+//!   deep virtual quote is rounded like a live one and joins behind the
+//!   size displayed at its price. Without a tick, or at a price with no
+//!   displayed level, it joins with queue 0, so paper presence fills are
+//!   approximate (optimistic on queue position, and they still need a print
+//!   through the price).
+//!
+//! `status.json` shows `quote_offset_bps`, `repeg_band_bps`, `paper_tick`
+//! (DRY_RUN only) and, per quote, `dist_bps` (from the peg reference the
+//! band is judged on) and `dist_touch_bps` (from the raw touch). Offset 0
+//! (default) is the at-touch behaviour, unchanged.
+//!
 //! Files in `ARCUS_VOL_STATE_DIR`: `state.json` (ledger, atomic), `status.json`
 //! (every tick), `fills.jsonl` (fills + later markout rows), and the
 //! sentinels `KILL_SWITCH` (cancel + flatten + halt while present) and `HALT`
@@ -35,11 +77,12 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position,
-    may_disarm_dms, plan_inputs, plan_quotes, position_check, position_gate_after, quote_action,
-    read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan,
-    BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
-    ShutdownStep, Step, TickPlan,
+    book_depth, dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
+    market_position, may_disarm_dms, own_displayed, paper_tick_due, plan_inputs, plan_quotes,
+    position_check, position_gate_after, quote_action, quote_dists, quote_pass, read_within,
+    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan, touches,
+    BatchSink, PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget,
+    Resting, ShutdownStep, SidePlan, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -91,6 +134,13 @@ fn now_ms() -> u64 {
 fn utc_day() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
+
+/// DRY_RUN presence quoting: how often the paper sim re-reads the venue tick
+/// (tick tiers depend on price), how soon a failed read is retried, and how
+/// long one read may take.
+const TICK_REFRESH_MS: u64 = 60_000;
+const TICK_RETRY_MS: u64 = 30_000;
+const TICK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct BookView {
     bid: Decimal,
@@ -176,6 +226,11 @@ struct Runtime {
     last_position_ms: u64,
     last_summary_ms: u64,
     last_book_warn_ms: u64,
+    /// DRY_RUN presence quoting: the venue's price tick, read best-effort
+    /// for the paper sim only (`refresh_paper_tick`). Live never needs one.
+    paper_tick: Option<Decimal>,
+    next_tick_read_ms: u64,
+    last_peg_warn_ms: u64,
     sim_seq: u64,
     /// Process start (ms): the per-run part of simulated ids.
     run_id: u64,
@@ -195,6 +250,43 @@ impl Runtime {
             cap_usd: self.cfg.quote_cap_usd(),
             min_quote_usd: self.cfg.min_quote_usd,
             qty_decimals: self.cfg.qty_decimals,
+            presence: self.cfg.presence(),
+        }
+    }
+
+    /// DRY_RUN presence quoting only: a best-effort read of the venue's
+    /// price tick, so a virtual quote is rounded like a live one and lands
+    /// on a real price level (`sim::paper_px`). It never gates quoting. It
+    /// runs with the tick's other awaited reads, before the plan is decided
+    /// on a fresh clock (so nothing is awaited between the decision and
+    /// `paper_quote`), never during a 429 backoff, is bounded by
+    /// `TICK_READ_TIMEOUT`, and a failed read goes through `on_error` (so a
+    /// 429 backs off) and is retried later.
+    async fn refresh_paper_tick(&mut self, now: u64) {
+        if !paper_tick_due(
+            self.cfg.dry_run,
+            self.cfg.presence().on(),
+            now,
+            self.next_tick_read_ms,
+            self.backoff_until_ms,
+        ) {
+            return;
+        }
+        self.next_tick_read_ms = now + TICK_RETRY_MS;
+        let market = self.cfg.market.clone();
+        let read = tokio::time::timeout(TICK_READ_TIMEOUT, self.dex.get_ticker(&market, None));
+        match read.await {
+            Ok(Ok(ticker)) => {
+                if let Some(tick) = ticker.min_tick.filter(|t| *t > Decimal::ZERO) {
+                    if self.paper_tick != Some(tick) {
+                        log::info!("[ARCUS_VOL] paper tick for {market} = {tick}");
+                    }
+                    self.paper_tick = Some(tick);
+                    self.next_tick_read_ms = now + TICK_REFRESH_MS;
+                }
+            }
+            Ok(Err(e)) => self.on_error("paper tick", &e),
+            Err(_) => log::warn!("[ARCUS_VOL] paper tick read timed out"),
         }
     }
 
@@ -451,11 +543,6 @@ impl Runtime {
     }
 
     fn paper_quote(&mut self, side: QSide, action: QuoteAction) {
-        let levels = match (&self.book, side) {
-            (Some(b), QSide::Bid) => b.bids.clone(),
-            (Some(b), QSide::Ask) => b.asks.clone(),
-            (None, _) => Vec::new(),
-        };
         match action {
             QuoteAction::Keep => {}
             QuoteAction::Replace(None) => {
@@ -466,7 +553,13 @@ impl Runtime {
                     self.book.as_ref().and_then(|b| b.ts_ms),
                     self.newest_print_ts_us,
                 );
-                let vq = sim::join(side, t.px, t.qty, &levels, placed);
+                let levels: &[OrderBookLevel] = match (&self.book, side) {
+                    (Some(b), QSide::Bid) => &b.bids,
+                    (Some(b), QSide::Ask) => &b.asks,
+                    (None, _) => &[],
+                };
+                let px = sim::paper_px(side, t.px, self.paper_tick);
+                let vq = sim::join(side, px, t.qty, levels, placed);
                 self.virt.insert(side, (vq, t.qty));
             }
         }
@@ -1203,7 +1296,12 @@ impl Runtime {
     // ----------------------------------------------------------------- tick
 
     async fn read_book(&mut self, now: u64) {
-        match self.dex.get_order_book(&self.cfg.market.clone(), 10).await {
+        let depth = book_depth(self.cfg.dry_run, self.cfg.presence().on());
+        match self
+            .dex
+            .get_order_book(&self.cfg.market.clone(), depth)
+            .await
+        {
             Ok(b) => {
                 let (Some(bid), Some(ask)) = (b.bids.first(), b.asks.first()) else {
                     self.book = None;
@@ -1301,6 +1399,7 @@ impl Runtime {
                 self.last_position_ms = now;
             }
         }
+        self.refresh_paper_tick(now).await;
         // Every awaited call of the tick is done: decide on a fresh clock
         // (Codex P1, pairtrade#361).
         let now = now_ms();
@@ -1459,28 +1558,46 @@ impl Runtime {
                 self.finish_tick(now, mid);
                 return;
             }
-            TickPlan::Wait => {
-                self.finish_tick(now, mid);
-                return;
-            }
-            TickPlan::Quote => {}
+            TickPlan::Wait | TickPlan::Quote => {}
         }
-
-        let (bid_px, ask_px) = {
-            let b = self.book.as_ref().expect("mid implies book");
-            (b.bid, b.ask)
+        // `Quote` is the full pass; a presence-mode `Wait` (429 backoff)
+        // still runs the plan, for its cancels only.
+        let Some(pass) = quote_pass(&plan, self.cfg.presence().on()) else {
+            self.finish_tick(now, mid);
+            return;
         };
-        let (bid, ask) = plan_quotes(
-            bid_px,
-            ask_px,
-            self.ledger.position.qty,
-            &self.quote_params(),
-        );
-        let plan: Vec<(QSide, QuoteAction)> = [(QSide::Bid, bid), (QSide::Ask, ask)]
-            .into_iter()
-            .map(|(side, target)| {
-                let current = self.current_quote(side);
-                (side, quote_action(current.as_ref(), target.as_ref()))
+
+        let params = self.quote_params();
+        let inv = self.ledger.position.qty;
+        // Our own resting quote is excluded from its side's peg reference.
+        let own = |side: QSide| own_displayed(self.cfg.dry_run, self.resting.get(&side));
+        let book = self
+            .book
+            .as_ref()
+            .and_then(|b| touches(&b.bids, &b.asks, own(QSide::Bid), own(QSide::Ask)));
+        let Some(book) = book else {
+            // Unreachable: quotes are only planned with a two-sided book.
+            self.finish_tick(now, mid);
+            return;
+        };
+        let (bid, ask) = plan_quotes(&book, inv, &params);
+        let unpriced = |p: &SidePlan| p.qty.is_some() && !matches!(p.price, PricePlan::At { .. });
+        if (unpriced(&bid) || unpriced(&ask)) && now.saturating_sub(self.last_peg_warn_ms) > 30_000
+        {
+            self.last_peg_warn_ms = now;
+            log::warn!(
+                "[ARCUS_VOL] no price for a side this tick (book {}/{}, peg {:?}/{:?}: crossed, or only our own quote is displayed): nothing new is placed; a resting quote stays unless a crossed book has come too close to it",
+                book.bid,
+                book.ask,
+                book.peg_bid,
+                book.peg_ask
+            );
+        }
+        let plan: Vec<(QSide, QuoteAction)> = [bid, ask]
+            .iter()
+            .map(|p| {
+                let action = quote_action(self.current_quote(p.side).as_ref(), p);
+                (p.side, pass.apply(action))
             })
             .collect();
         if self.cfg.dry_run {
@@ -1498,10 +1615,22 @@ impl Runtime {
             log::error!("[ARCUS_VOL] state write failed: {e:#}");
         }
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
+        // Presence-quoting monitor: each resting quote's distance from the
+        // reference its band is judged on (`dist_bps`) and from the raw
+        // touch (`dist_touch_bps`); null without a book / a reference.
+        let own = |side: QSide| own_displayed(self.cfg.dry_run, self.resting.get(&side));
+        let book = self
+            .book
+            .as_ref()
+            .and_then(|b| touches(&b.bids, &b.asks, own(QSide::Bid), own(QSide::Ask)));
         let quote = |side: QSide| {
             self.current_quote(side).map(|r| {
+                let dists = book.map(|t| quote_dists(side, r.px, &t));
+                let show = |d: Decimal| d.round_dp(3).to_string();
                 json!({"px": r.px.to_string(), "qty": r.qty.to_string(),
-                       "filled": r.filled.to_string(), "order_id": r.order_id})
+                       "filled": r.filled.to_string(), "order_id": r.order_id,
+                       "dist_bps": dists.and_then(|(peg, _)| peg).map(show),
+                       "dist_touch_bps": dists.map(|(_, raw)| show(raw))})
             })
         };
         let l = &self.ledger;
@@ -1512,6 +1641,9 @@ impl Runtime {
             "market": self.cfg.market,
             "book": self.book.as_ref().map(|b| json!({"bid": b.bid.to_string(), "ask": b.ask.to_string()})),
             "quotes": {"bid": quote(QSide::Bid), "ask": quote(QSide::Ask)},
+            "quote_offset_bps": self.cfg.quote_offset_bps.to_string(),
+            "repeg_band_bps": self.cfg.repeg_band_bps.to_string(),
+            "paper_tick": self.paper_tick.map(|t| t.to_string()),
             "inventory": {"qty": l.position.qty.to_string(),
                           "usd": (l.position.qty * mark).round_dp(2).to_string(),
                           "avg_px": l.position.avg_px.round_dp(4).to_string(),
@@ -1703,6 +1835,15 @@ async fn main() -> Result<()> {
         cfg.cum_stop_usd,
         cfg.state_dir.display()
     );
+    if cfg.quote_offset_bps > Decimal::ZERO {
+        log::info!(
+            "[ARCUS_VOL] PRESENCE quoting: quotes rest {} bp behind the touch, kept while within ±{} bp of that; fills only on sweeps; the reducing side exits at the touch",
+            cfg.quote_offset_bps,
+            cfg.repeg_band_bps
+        );
+    } else {
+        log::info!("[ARCUS_VOL] quoting at the touch (ARCUS_VOL_QUOTE_OFFSET_BPS=0)");
+    }
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create {}", cfg.state_dir.display()))?;
     // Before state.json is read or the venue touched (Codex P1, pairtrade#361).
@@ -1803,6 +1944,9 @@ async fn main() -> Result<()> {
         last_position_ms: 0,
         last_summary_ms: 0,
         last_book_warn_ms: 0,
+        paper_tick: None,
+        next_tick_read_ms: 0,
+        last_peg_warn_ms: 0,
         sim_seq: 0,
         run_id: now_ms(),
         sim_halted: None,

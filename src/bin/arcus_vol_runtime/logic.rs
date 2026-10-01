@@ -1,7 +1,7 @@
 //! Pure decision logic: what to quote, when to flatten and in which order,
 //! book shocks. The async loop in `main.rs` only wires these to IO.
 
-use dex_connector::OrderSide;
+use dex_connector::{OrderBookLevel, OrderSide};
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::VecDeque;
 
@@ -35,6 +35,27 @@ pub struct QuoteTarget {
     pub qty: Decimal,
 }
 
+/// Presence quoting (bot-strategy#1093 option B): quotes rest `offset_bps`
+/// behind the touch so they fill only on a sweep, and stay put while the
+/// touch moves within `band_bps` of the offset, so they rest for a long time
+/// ("quoting consistently") instead of being cancelled and re-placed every
+/// tick. `offset_bps == 0` is plain at-touch quoting. Config guarantees
+/// `0 < band_bps < offset_bps` whenever the offset is on, so a quote that is
+/// kept can never be at or through the touch. The band must be wider than
+/// one price tick (in bp): the venue rounds a resting price away from the
+/// touch by up to a tick.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Presence {
+    pub offset_bps: Decimal,
+    pub band_bps: Decimal,
+}
+
+impl Presence {
+    pub fn on(&self) -> bool {
+        self.offset_bps > Decimal::ZERO
+    }
+}
+
 pub struct QuoteParams {
     pub clip_usd: Decimal,
     pub skew_usd: Decimal,
@@ -42,22 +63,225 @@ pub struct QuoteParams {
     pub cap_usd: Decimal,
     pub min_quote_usd: Decimal,
     pub qty_decimals: u32,
+    pub presence: Presence,
 }
 
-/// Quotes at the touch. A side is dropped when inventory already sits at the
-/// skew on the side it would grow, and every quote is sized so its full fill
-/// keeps |inventory| within `cap_usd`. `inv_qty` is signed base.
-pub fn plan_quotes(
-    best_bid: Decimal,
-    best_ask: Decimal,
-    inv_qty: Decimal,
-    p: &QuoteParams,
-) -> (Option<QuoteTarget>, Option<QuoteTarget>) {
-    if best_bid <= Decimal::ZERO || best_ask <= best_bid {
-        return (None, None);
+const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
+
+/// The price `offset_bps` behind `touch` on `side` (bid below, ask above),
+/// NOT rounded to a tick: the connector rounds a resting price away from
+/// the touch when it places the order and reports the price it used, and
+/// keep / re-peg is judged on the distance band, so the runtime needs no
+/// tick of its own. Offset 0 is the touch itself.
+pub fn offset_px(side: QSide, touch: Decimal, offset_bps: Decimal) -> Decimal {
+    let frac = offset_bps.max(Decimal::ZERO) / BPS;
+    match side {
+        QSide::Bid => touch * (Decimal::ONE - frac),
+        QSide::Ask => touch * (Decimal::ONE + frac),
     }
-    let mid = (best_bid + best_ask) / Decimal::TWO;
+}
+
+/// `px` rounded AWAY from the touch to `tick` (bid down, ask up), so
+/// rounding can only make a quote more passive. Fails closed: without a
+/// positive tick there is no rounded price (`None`), and the caller must
+/// decide explicitly what to do instead.
+pub fn round_away(side: QSide, px: Decimal, tick: Option<Decimal>) -> Option<Decimal> {
+    let tick = tick.filter(|t| *t > Decimal::ZERO)?;
+    let px = match side {
+        QSide::Bid => (px / tick).floor() * tick,
+        QSide::Ask => (px / tick).ceil() * tick,
+    };
+    (px > Decimal::ZERO).then_some(px)
+}
+
+/// How far `px` rests behind `touch` on `side`, in bp of the touch
+/// (negative = through the touch).
+pub fn dist_bps(side: QSide, px: Decimal, touch: Decimal) -> Decimal {
+    if touch <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    match side {
+        QSide::Bid => (touch - px) / touch * BPS,
+        QSide::Ask => (px - touch) / touch * BPS,
+    }
+}
+
+/// A resting quote's two distances for `status.json`, in bp: from its side's
+/// peg reference (the price the band decision uses, i.e. excluding our own
+/// quote; `None` when only our quote is displayed), and from the raw touch.
+pub fn quote_dists(side: QSide, px: Decimal, t: &Touches) -> (Option<Decimal>, Decimal) {
+    let (raw, peg) = match side {
+        QSide::Bid => (t.bid, t.peg_bid),
+        QSide::Ask => (t.ask, t.peg_ask),
+    };
+    (
+        peg.map(|touch| dist_bps(side, px, touch)),
+        dist_bps(side, px, raw),
+    )
+}
+
+/// Book levels to read per side. Paper presence quotes join the queue
+/// displayed at a deep price, so the sim needs that level in the snapshot
+/// (100 = the venue's maximum); everything else needs only the top.
+pub fn book_depth(dry_run: bool, presence_on: bool) -> usize {
+    if dry_run && presence_on {
+        100
+    } else {
+        10
+    }
+}
+
+/// Whether the paper sim should (re-)read the venue's price tick now. Only
+/// DRY_RUN presence quoting ever reads one (to put a virtual quote on a real
+/// price level); live never does, the connector rounds its orders. Never
+/// during a 429 backoff.
+pub fn paper_tick_due(
+    dry_run: bool,
+    presence_on: bool,
+    now_ms: u64,
+    next_read_ms: u64,
+    backoff_until_ms: u64,
+) -> bool {
+    dry_run && presence_on && now_ms >= next_read_ms && now_ms >= backoff_until_ms
+}
+
+/// The best price on one side of the book that is NOT our own resting quote
+/// (live presence quoting): pegging off a touch our own order makes would
+/// measure a distance of 0 and walk the quote outward every tick. `levels`
+/// is that side of the book, best first (only the first two are read);
+/// `own` is our resting quote's `(price, open size)` on that side. The best
+/// level counts as ours when its price equals ours and it shows no more
+/// than our open size (+1%); the next level is then the reference. `None` =
+/// nothing but our own quote is displayed.
+pub fn peg_touch(levels: &[OrderBookLevel], own: Option<(Decimal, Decimal)>) -> Option<Decimal> {
+    let best = levels.first()?;
+    let Some((own_px, own_open)) = own else {
+        return Some(best.price);
+    };
+    let only_ours = best.price == own_px && best.size <= own_open + own_open / Decimal::ONE_HUNDRED;
+    if only_ours {
+        levels.get(1).map(|l| l.price)
+    } else {
+        Some(best.price)
+    }
+}
+
+/// Our own quote on a side as the book displays it, `(price, open size)`,
+/// for `peg_touch`. Paper quotes are virtual (never in the book): `None`.
+pub fn own_displayed(dry_run: bool, resting: Option<&Resting>) -> Option<(Decimal, Decimal)> {
+    if dry_run {
+        return None;
+    }
+    resting.map(|r| (r.px, r.qty - r.filled))
+}
+
+/// What one tick's quotes are planned against: the raw top of book, plus
+/// (presence quoting) each side's peg reference, i.e. the best price that
+/// is not our own quote.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Touches {
+    pub bid: Decimal,
+    pub ask: Decimal,
+    /// `peg_touch` per side; `None` = only our own quote is displayed.
+    pub peg_bid: Option<Decimal>,
+    pub peg_ask: Option<Decimal>,
+}
+
+/// `Touches` from the two sides of a book (best first) and our own resting
+/// quotes' `(price, open size)`; `None` when a side is empty.
+pub fn touches(
+    bids: &[OrderBookLevel],
+    asks: &[OrderBookLevel],
+    own_bid: Option<(Decimal, Decimal)>,
+    own_ask: Option<(Decimal, Decimal)>,
+) -> Option<Touches> {
+    Some(Touches {
+        bid: bids.first()?.price,
+        ask: asks.first()?.price,
+        peg_bid: peg_touch(bids, own_bid),
+        peg_ask: peg_touch(asks, own_ask),
+    })
+}
+
+/// One side's plan for this tick: everything `quote_action` needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidePlan {
+    pub side: QSide,
+    /// Size to quote. `None` = this side must not quote (inventory at the
+    /// skew, no cap room, unusable book): a resting quote is cancelled.
+    pub qty: Option<Decimal>,
+    pub price: PricePlan,
+}
+
+/// Where a side quotes this tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PricePlan {
+    /// Quote at `px`; a resting price is compared with it per `tol`.
+    At { px: Decimal, tol: PriceTol },
+    /// No price can be formed this tick (presence quoting: only our own
+    /// quote is displayed on the side): nothing is placed. A resting quote
+    /// of the right size stays; one whose size is off is cancelled and
+    /// comes back when the side is priced again.
+    Unpriced,
+    /// Presence quoting while the book is crossed: as `Unpriced`, and
+    /// nothing says which side of a crossed book is the stale one, so a
+    /// resting quote is kept only while it is still at least `min_bps`
+    /// behind `near`, the book top nearer to it (the lower of the two for a
+    /// bid, the higher for an ask). Closer than that it is cancelled.
+    Crossed { near: Decimal, min_bps: Decimal },
+}
+
+#[cfg(test)]
+impl SidePlan {
+    /// The quote this plan would place; `None` when the side is suppressed
+    /// or has no price.
+    pub fn target(&self) -> Option<QuoteTarget> {
+        let PricePlan::At { px, .. } = self.price else {
+            return None;
+        };
+        Some(QuoteTarget {
+            side: self.side,
+            px,
+            qty: self.qty?,
+        })
+    }
+}
+
+/// Both sides' plans. A side is suppressed when inventory already sits at
+/// the skew on the side it would grow, and every quote is sized so its full
+/// fill keeps |inventory| within `cap_usd`. `inv_qty` is signed base. The
+/// mid of the raw top of book is the one price used for sizing, the skew
+/// and the exit decision.
+///
+/// At-touch quoting (offset 0): both sides quote the raw touch and are kept
+/// only at exactly that price; a crossed book suppresses both sides.
+///
+/// Presence quoting: the exit side is decided ONCE here (`exit_quote`). It
+/// quotes at the raw touch, exact price, sized to the inventory only (never
+/// more, so working a sweep fill out cannot flip the position and start
+/// at-touch churn), and like any at-touch quote it is suppressed while the
+/// book is crossed. Every other side rests `offset_bps` behind its peg
+/// reference and is kept inside the band. With no peg reference it has no
+/// price this tick and a resting offset quote stays where it is. While the
+/// book is crossed (the feed does that for a few ticks at a time, and for
+/// longer when one side of it freezes) it has no price either, and a
+/// resting offset quote stays only while it is still `offset − band` behind
+/// BOTH book tops (`PricePlan::Crossed`). Inventory too small to quote
+/// (< `min_quote_usd`) has no exit side and is left to max-hold.
+pub fn plan_quotes(t: &Touches, inv_qty: Decimal, p: &QuoteParams) -> (SidePlan, SidePlan) {
+    let presence = p.presence;
+    let crossed = t.ask <= t.bid;
+    if t.bid <= Decimal::ZERO || t.ask <= Decimal::ZERO || (crossed && !presence.on()) {
+        let none = |side| SidePlan {
+            side,
+            qty: None,
+            price: PricePlan::Unpriced,
+        };
+        return (none(QSide::Bid), none(QSide::Ask));
+    }
+    let mid = (t.bid + t.ask) / Decimal::TWO;
     let inv_usd = inv_qty * mid;
+    let exit = exit_quote(inv_qty, mid, p);
     let size = |room_usd: Decimal| -> Option<Decimal> {
         let usd = p.clip_usd.min(room_usd);
         if usd < p.min_quote_usd {
@@ -66,26 +290,83 @@ pub fn plan_quotes(
         let qty = (usd / mid).round_dp_with_strategy(p.qty_decimals, RoundingStrategy::ToZero);
         (qty > Decimal::ZERO).then_some(qty)
     };
+    let side_plan = |side: QSide, qty: Option<Decimal>| -> SidePlan {
+        let (raw, peg) = match side {
+            QSide::Bid => (t.bid, t.peg_bid),
+            QSide::Ask => (t.ask, t.peg_ask),
+        };
+        let exit_qty = exit.filter(|(s, _)| *s == side).map(|(_, q)| q);
+        if !presence.on() || exit_qty.is_some() {
+            // At the touch. Crossed here means presence mode's exit side.
+            let qty = qty.map(|q| exit_qty.map_or(q, |e| q.min(e)));
+            let (qty, price) = if crossed {
+                (None, PricePlan::Unpriced)
+            } else {
+                let tol = PriceTol::Exact;
+                (qty, PricePlan::At { px: raw, tol })
+            };
+            return SidePlan { side, qty, price };
+        }
+        let price = match peg {
+            _ if crossed => PricePlan::Crossed {
+                near: match side {
+                    QSide::Bid => t.bid.min(t.ask),
+                    QSide::Ask => t.bid.max(t.ask),
+                },
+                min_bps: presence.offset_bps - presence.band_bps,
+            },
+            None => PricePlan::Unpriced,
+            Some(touch) => PricePlan::At {
+                px: offset_px(side, touch, presence.offset_bps),
+                tol: PriceTol::Band {
+                    touch,
+                    offset_bps: presence.offset_bps,
+                    band_bps: presence.band_bps,
+                },
+            },
+        };
+        SidePlan { side, qty, price }
+    };
     // A bid fill moves inventory up by q: |inv + q| ≤ cap ⇔ q ≤ cap − inv.
-    let bid = if inv_usd >= p.skew_usd {
+    let bid_qty = if inv_usd >= p.skew_usd {
         None
     } else {
-        size(p.cap_usd - inv_usd).map(|qty| QuoteTarget {
-            side: QSide::Bid,
-            px: best_bid,
-            qty,
-        })
+        size(p.cap_usd - inv_usd)
     };
-    let ask = if -inv_usd >= p.skew_usd {
+    let ask_qty = if -inv_usd >= p.skew_usd {
         None
     } else {
-        size(p.cap_usd + inv_usd).map(|qty| QuoteTarget {
-            side: QSide::Ask,
-            px: best_ask,
-            qty,
-        })
+        size(p.cap_usd + inv_usd)
     };
-    (bid, ask)
+    (
+        side_plan(QSide::Bid, bid_qty),
+        side_plan(QSide::Ask, ask_qty),
+    )
+}
+
+/// Presence mode only: the side that works existing inventory out AT the
+/// touch, and how much (the inventory, rounded down to the size step). The
+/// side that reduces a non-zero inventory exits at the touch, so a sweep
+/// fill is worked out as a maker instead of waiting for max-hold and paying
+/// taker. `None` when presence is off, flat, or the inventory is too small
+/// to quote (< `min_quote_usd`): then both sides rest at the offset. Only
+/// `plan_quotes` decides this.
+fn exit_quote(inv_qty: Decimal, mid: Decimal, p: &QuoteParams) -> Option<(QSide, Decimal)> {
+    if !p.presence.on() || inv_qty.is_zero() {
+        return None;
+    }
+    let qty = inv_qty
+        .abs()
+        .round_dp_with_strategy(p.qty_decimals, RoundingStrategy::ToZero);
+    if qty * mid < p.min_quote_usd {
+        return None;
+    }
+    let side = if inv_qty > Decimal::ZERO {
+        QSide::Ask
+    } else {
+        QSide::Bid
+    };
+    Some((side, qty))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,23 +479,134 @@ pub enum QuoteAction {
 /// Re-enable once the connector's batch modify is fixed and verified.
 pub const MODIFY_ENABLED: bool = false;
 
-/// Requote only when the price moved, or the size is off by more than 1%.
-pub fn quote_action(resting: Option<&Resting>, target: Option<&QuoteTarget>) -> QuoteAction {
-    match (resting, target) {
-        (None, None) => QuoteAction::Keep,
-        (None, Some(t)) => QuoteAction::Place(t.clone()),
-        (Some(_), None) => QuoteAction::Replace(None),
-        (Some(r), Some(t)) => {
-            let open = r.qty - r.filled;
-            let size_off = (open - t.qty).abs() > t.qty / Decimal::ONE_HUNDRED;
-            if r.px == t.px && !size_off {
-                QuoteAction::Keep
-            } else if MODIFY_ENABLED && r.filled.is_zero() {
-                QuoteAction::Modify(t.clone())
-            } else {
-                QuoteAction::Replace(Some(t.clone()))
+/// When a resting quote's price still counts as "on target".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PriceTol {
+    /// At-touch quoting: only the exact target price.
+    Exact,
+    /// Presence quoting: the target price, or anywhere whose distance from
+    /// `touch` (the peg reference on the quote's side) lies within
+    /// `offset_bps ± band_bps`.
+    Band {
+        touch: Decimal,
+        offset_bps: Decimal,
+        band_bps: Decimal,
+    },
+}
+
+impl PriceTol {
+    fn holds(&self, side: QSide, resting_px: Decimal, target_px: Decimal) -> bool {
+        if resting_px == target_px {
+            return true;
+        }
+        match *self {
+            PriceTol::Exact => false,
+            PriceTol::Band {
+                touch,
+                offset_bps,
+                band_bps,
+            } => {
+                let dist = dist_bps(side, resting_px, touch);
+                dist >= offset_bps - band_bps && dist <= offset_bps + band_bps
             }
         }
+    }
+}
+
+/// The one requote rule, per side. A suppressed side (`plan.qty` None) is
+/// cancelled, whatever else is unknown. Otherwise a resting quote is kept
+/// while its price is on target and its open size is within 1% of the
+/// target, and requoted (cancel + place while `MODIFY_ENABLED` is off) when
+/// either is off. With no price this tick (`Unpriced` / `Crossed`) NOTHING
+/// is ever placed: the book cannot be trusted to price an order. The price
+/// counts as on target, a quote whose size is off is cancelled (it comes
+/// back once the side is priced again), and in a crossed book a quote that
+/// is no longer far enough behind both book tops is cancelled too.
+pub fn quote_action(resting: Option<&Resting>, plan: &SidePlan) -> QuoteAction {
+    let side = plan.side;
+    let Some(qty) = plan.qty else {
+        return match resting {
+            Some(_) => QuoteAction::Replace(None),
+            None => QuoteAction::Keep,
+        };
+    };
+    let Some(r) = resting else {
+        return match plan.price {
+            PricePlan::At { px, .. } => QuoteAction::Place(QuoteTarget { side, px, qty }),
+            PricePlan::Unpriced | PricePlan::Crossed { .. } => QuoteAction::Keep,
+        };
+    };
+    let open = r.qty - r.filled;
+    let size_off = (open - qty).abs() > qty / Decimal::ONE_HUNDRED;
+    let px = match plan.price {
+        PricePlan::At { px, tol } => {
+            if tol.holds(side, r.px, px) && !size_off {
+                return QuoteAction::Keep;
+            }
+            px
+        }
+        PricePlan::Unpriced => return unpriced_action(size_off),
+        PricePlan::Crossed { near, min_bps } => {
+            return unpriced_action(size_off || dist_bps(side, r.px, near) < min_bps);
+        }
+    };
+    let target = QuoteTarget { side, px, qty };
+    if MODIFY_ENABLED && r.filled.is_zero() {
+        QuoteAction::Modify(target)
+    } else {
+        QuoteAction::Replace(Some(target))
+    }
+}
+
+/// A resting quote on a side with no price: keep it, or cancel it. Never a
+/// new order.
+fn unpriced_action(cancel: bool) -> QuoteAction {
+    if cancel {
+        QuoteAction::Replace(None)
+    } else {
+        QuoteAction::Keep
+    }
+}
+
+/// What the quote section of a tick may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotePass {
+    /// Place, requote and cancel.
+    Full,
+    /// A 429 backoff is running: cancels only (`cancel_only`).
+    CancelOnly,
+}
+
+/// Whether the tick plans quotes at all, and how. `Quote` is the full pass.
+/// While waiting out a 429 backoff, presence quoting still runs the plan
+/// for its cancels (a suppressed side, a crossed book come too close): a
+/// quote that must go is never left resting because of a rate limit.
+/// At-touch quoting leaves its quotes as they are while waiting, as before.
+pub fn quote_pass(plan: &TickPlan, presence_on: bool) -> Option<QuotePass> {
+    match plan {
+        TickPlan::Quote => Some(QuotePass::Full),
+        TickPlan::Wait if presence_on => Some(QuotePass::CancelOnly),
+        _ => None,
+    }
+}
+
+impl QuotePass {
+    /// The action this pass actually executes for a planned `action`.
+    pub fn apply(self, action: QuoteAction) -> QuoteAction {
+        match self {
+            QuotePass::Full => action,
+            QuotePass::CancelOnly => cancel_only(action),
+        }
+    }
+}
+
+/// The cancel-only form of an action: nothing is placed or modified. A
+/// quote that would be requoted is off target, so it is cancelled; it is
+/// placed again by the first full pass after the backoff.
+fn cancel_only(action: QuoteAction) -> QuoteAction {
+    match action {
+        QuoteAction::Keep | QuoteAction::Place(_) => QuoteAction::Keep,
+        QuoteAction::Modify(_) | QuoteAction::Replace(_) => QuoteAction::Replace(None),
     }
 }
 
@@ -603,12 +995,35 @@ mod tests {
             cap_usd: d("9500"),
             min_quote_usd: d("50"),
             qty_decimals: 5,
+            presence: Presence::default(),
         }
+    }
+
+    /// A book whose peg references are its raw top (no quote of ours in it).
+    fn at(bid: &str, ask: &str) -> Touches {
+        Touches {
+            bid: d(bid),
+            ask: d(ask),
+            peg_bid: Some(d(bid)),
+            peg_ask: Some(d(ask)),
+        }
+    }
+
+    fn priced(px: Decimal, tol: PriceTol) -> PricePlan {
+        PricePlan::At { px, tol }
+    }
+
+    fn targets(plans: (SidePlan, SidePlan)) -> (Option<QuoteTarget>, Option<QuoteTarget>) {
+        (plans.0.target(), plans.1.target())
     }
 
     #[test]
     fn flat_quotes_both_sides_sized_to_the_cap_headroom() {
-        let (bid, ask) = plan_quotes(d("83642.9"), d("83643.0"), Decimal::ZERO, &params());
+        let (bid, ask) = targets(plan_quotes(
+            &at("83642.9", "83643.0"),
+            Decimal::ZERO,
+            &params(),
+        ));
         let bid = bid.unwrap();
         let ask = ask.unwrap();
         assert_eq!(bid.px, d("83642.9"));
@@ -625,7 +1040,7 @@ mod tests {
         p.skew_usd = d("5000");
         let mid = d("83642.95");
         let inv = d("0.06"); // ~$5,019 ≥ skew
-        let (bid, ask) = plan_quotes(d("83642.9"), d("83643.0"), inv, &p);
+        let (bid, ask) = targets(plan_quotes(&at("83642.9", "83643.0"), inv, &p));
         assert!(bid.is_none());
         let ask = ask.unwrap();
         // cap + inv = 9500 + 5018.58 → clip 10k binds.
@@ -638,7 +1053,7 @@ mod tests {
     #[test]
     fn short_inventory_below_skew_shrinks_the_growing_ask_to_the_cap() {
         let inv = d("-0.05"); // ~ -$4,182
-        let (bid, ask) = plan_quotes(d("83642.9"), d("83643.0"), inv, &params());
+        let (bid, ask) = targets(plan_quotes(&at("83642.9", "83643.0"), inv, &params()));
         let mid = d("83642.95");
         // ask grows |short|: room = 9500 − 4182.1475 = 5317.85
         let ask = ask.unwrap();
@@ -651,7 +1066,7 @@ mod tests {
     #[test]
     fn a_side_with_less_room_than_the_minimum_is_not_quoted() {
         let inv = d("0.1133"); // ~$9,477: bid room $23 < $50
-        let (bid, ask) = plan_quotes(d("83642.9"), d("83643.0"), inv, &params());
+        let (bid, ask) = targets(plan_quotes(&at("83642.9", "83643.0"), inv, &params()));
         assert!(bid.is_none());
         assert!(ask.is_some());
     }
@@ -659,11 +1074,11 @@ mod tests {
     #[test]
     fn crossed_or_empty_book_quotes_nothing() {
         assert_eq!(
-            plan_quotes(d("100"), d("100"), Decimal::ZERO, &params()),
+            targets(plan_quotes(&at("100", "100"), Decimal::ZERO, &params())),
             (None, None)
         );
         assert_eq!(
-            plan_quotes(Decimal::ZERO, d("100"), Decimal::ZERO, &params()),
+            targets(plan_quotes(&at("0", "100"), Decimal::ZERO, &params())),
             (None, None)
         );
     }
@@ -1264,6 +1679,633 @@ mod tests {
         assert!(flatten_steps(Decimal::ZERO, true, true).is_empty());
     }
 
+    fn presence(offset: &str, band: &str) -> Presence {
+        Presence {
+            offset_bps: d(offset),
+            band_bps: d(band),
+        }
+    }
+
+    fn lv(px: &str, size: &str) -> OrderBookLevel {
+        OrderBookLevel {
+            price: d(px),
+            size: d(size),
+        }
+    }
+
+    fn resting(px: &str, qty: &str) -> Resting {
+        Resting {
+            order_id: "o".into(),
+            px: d(px),
+            qty: d(qty),
+            filled: Decimal::ZERO,
+        }
+    }
+
+    /// Presence params used by the tests below: $500 clip, 5 bp ± 2 bp.
+    fn presence_params() -> QuoteParams {
+        QuoteParams {
+            clip_usd: d("500"),
+            skew_usd: d("2000"),
+            cap_usd: d("2000"),
+            presence: presence("5", "2"),
+            ..params()
+        }
+    }
+
+    #[test]
+    fn offset_prices_are_unrounded_and_rounding_fails_closed_without_a_tick() {
+        // Presence quoting (bot-strategy#1093 B). The runtime's offset price
+        // is NOT rounded (review 2 A): 83438.4 × 0.9995 and 83438.5 × 1.0005.
+        assert_eq!(offset_px(QSide::Bid, d("83438.4"), d("5")), d("83396.6808"));
+        assert_eq!(
+            offset_px(QSide::Ask, d("83438.5"), d("5")),
+            d("83480.21925")
+        );
+        // Offset 0 is the touch itself.
+        assert_eq!(
+            offset_px(QSide::Bid, d("84600.13"), Decimal::ZERO),
+            d("84600.13")
+        );
+        assert_eq!(
+            offset_px(QSide::Ask, d("84600.13"), Decimal::ZERO),
+            d("84600.13")
+        );
+        // Rounding (paper sim only) goes AWAY from the touch: bid down, ask
+        // up; a price already on the tick is not pushed a further tick.
+        let tick = Some(d("0.1"));
+        assert_eq!(
+            round_away(QSide::Bid, d("83396.6808"), tick),
+            Some(d("83396.6"))
+        );
+        assert_eq!(
+            round_away(QSide::Ask, d("83480.21925"), tick),
+            Some(d("83480.3"))
+        );
+        assert_eq!(round_away(QSide::Bid, d("99950"), tick), Some(d("99950")));
+        assert_eq!(round_away(QSide::Ask, d("100050"), tick), Some(d("100050")));
+        // Fail closed: asking for rounding with no / zero / negative tick
+        // gives NO price, never the unrounded one.
+        for bad in [None, Some(Decimal::ZERO), Some(d("-0.1"))] {
+            assert_eq!(round_away(QSide::Bid, d("83396.6808"), bad), None);
+            assert_eq!(round_away(QSide::Ask, d("83480.21925"), bad), None);
+        }
+        // Distance is measured from the quote's own side of the touch.
+        assert!(dist_bps(QSide::Bid, d("83396.6"), d("83438.4")) > d("5"));
+        assert!(dist_bps(QSide::Bid, d("83396.6"), d("83438.4")) < d("5.02"));
+        assert!(dist_bps(QSide::Ask, d("83480.3"), d("83438.5")) > d("5"));
+        assert!(dist_bps(QSide::Ask, d("83438.4"), d("83438.5")) < Decimal::ZERO);
+
+        // plan_quotes: offset 0 quotes the touch; an offset moves both sides
+        // when flat, with no tick involved anywhere.
+        let book = at("83438.4", "83438.5");
+        let (bid, ask) = targets(plan_quotes(&book, Decimal::ZERO, &params()));
+        assert_eq!(bid.unwrap().px, d("83438.4"));
+        assert_eq!(ask.unwrap().px, d("83438.5"));
+        let p = presence_params();
+        let (bid, ask) = plan_quotes(&book, Decimal::ZERO, &p);
+        assert_eq!(bid.target().unwrap().px, d("83396.6808"));
+        assert_eq!(ask.target().unwrap().px, d("83480.21925"));
+        // The connector rounds the resting price away from the touch and
+        // reports it (83396.6 / 83480.3). Judged on distance, those quotes
+        // are on target although they differ from the unrounded targets.
+        assert_eq!(
+            quote_action(Some(&resting("83396.6", "0.00599")), &bid),
+            QuoteAction::Keep
+        );
+        assert_eq!(
+            quote_action(Some(&resting("83480.3", "0.00599")), &ask),
+            QuoteAction::Keep
+        );
+    }
+
+    #[test]
+    fn only_the_paper_sim_ever_reads_a_tick() {
+        // Review 2 A: live needs no tick (and so cannot be gated or delayed
+        // by reading one); the paper sim reads it when due.
+        assert!(paper_tick_due(true, true, 1_000, 1_000, 0));
+        assert!(paper_tick_due(true, true, 1_001, 1_000, 0));
+        assert!(!paper_tick_due(true, true, 999, 1_000, 0));
+        assert!(!paper_tick_due(false, true, 5_000, 1_000, 0));
+        assert!(!paper_tick_due(true, false, 5_000, 1_000, 0));
+        // Never during a 429 backoff; again once it is over.
+        assert!(!paper_tick_due(true, true, 5_000, 1_000, 5_001));
+        assert!(paper_tick_due(true, true, 5_000, 1_000, 5_000));
+        // And no tick state can pull quotes: a healthy live state quotes.
+        assert_eq!(
+            tick_plan(&plan_inputs(&live_state(), 2_000)),
+            TickPlan::Quote
+        );
+    }
+
+    #[test]
+    fn the_peg_reference_excludes_our_own_resting_quote() {
+        // Review #1 (live self-reference). Our bid 83396.6 × 0.006 became
+        // the best bid; pegging off it would measure 0 bp and walk it out.
+        let levels = [lv("83396.6", "0.006"), lv("83390.1", "1.2")];
+        let own = Some((d("83396.6"), d("0.006")));
+        assert_eq!(peg_touch(&levels, own), Some(d("83390.1")));
+        // Within the 1% size tolerance it is still only us.
+        let dusty = [lv("83396.6", "0.00605"), lv("83390.1", "1.2")];
+        assert_eq!(peg_touch(&dusty, own), Some(d("83390.1")));
+        // Someone else rests at our price too: that level is a real touch.
+        let shared = [lv("83396.6", "0.5"), lv("83390.1", "1.2")];
+        assert_eq!(peg_touch(&shared, own), Some(d("83396.6")));
+        // Our quote is behind the best: the best is the reference.
+        let behind = [lv("83438.4", "0.4"), lv("83396.6", "0.006")];
+        assert_eq!(peg_touch(&behind, own), Some(d("83438.4")));
+        // Partly filled: only the open size is ours.
+        let partly = [lv("83396.6", "0.004")];
+        assert_eq!(peg_touch(&partly, Some((d("83396.6"), d("0.004")))), None);
+        // Nothing but our own quote is displayed → no reference.
+        assert_eq!(peg_touch(&levels[..1], own), None);
+        // No quote of ours (DRY_RUN, or nothing resting): the plain best.
+        assert_eq!(peg_touch(&levels, None), Some(d("83396.6")));
+        assert_eq!(peg_touch(&[], own), None);
+
+        // `touches` wires each side's own quote to that side only: the raw
+        // top stays the book's, the bid peg skips our quote, the ask peg
+        // (no ask of ours) is the best ask.
+        let asks = [lv("83438.5", "0.3"), lv("83440", "2")];
+        let t = touches(&levels, &asks, own, None).unwrap();
+        assert_eq!(
+            t,
+            Touches {
+                bid: d("83396.6"),
+                ask: d("83438.5"),
+                peg_bid: Some(d("83390.1")),
+                peg_ask: Some(d("83438.5")),
+            }
+        );
+        // Our ask alone at the top of the asks, no bid of ours.
+        let own_ask = Some((d("83438.5"), d("0.3")));
+        let t = touches(&levels, &asks, None, own_ask).unwrap();
+        assert_eq!(t.peg_bid, Some(d("83396.6")));
+        assert_eq!(t.peg_ask, Some(d("83440")));
+        assert_eq!(touches(&[], &asks, None, None), None);
+        // What `touches` is fed: live, the resting quote's price and OPEN
+        // size; in DRY_RUN nothing (virtual quotes are not in the book).
+        let partly = Resting {
+            filled: d("0.002"),
+            ..resting("83396.6", "0.006")
+        };
+        assert_eq!(
+            own_displayed(false, Some(&partly)),
+            Some((d("83396.6"), d("0.004")))
+        );
+        assert_eq!(own_displayed(true, Some(&partly)), None);
+        assert_eq!(own_displayed(false, None), None);
+        assert_eq!(touches(&levels, &[], None, None), None);
+
+        // With the next level as reference our 83396.6 bid is THROUGH it
+        // (−0.8 bp): out of the 3..7 bp band → re-peg behind the real touch.
+        let p = presence_params();
+        let t = touches(&levels, &asks, own, None).unwrap();
+        let (bid, _) = plan_quotes(&t, Decimal::ZERO, &p);
+        let r = resting("83396.6", "0.006");
+        assert_eq!(
+            quote_action(Some(&r), &bid),
+            QuoteAction::Replace(Some(QuoteTarget {
+                side: QSide::Bid,
+                px: offset_px(QSide::Bid, d("83390.1"), d("5")),
+                qty: bid.qty.unwrap(),
+            }))
+        );
+    }
+
+    #[test]
+    fn with_no_peg_reference_the_target_is_still_honoured() {
+        // Review 2 B. Only our own bid is displayed → no price this tick.
+        let own = Some((d("83396.6"), d("0.00599")));
+        let asks = [lv("83438.5", "0.3")];
+        let t = touches(&[lv("83396.6", "0.00599")], &asks, own, None).unwrap();
+        assert_eq!(t.peg_bid, None);
+        let p = presence_params();
+        let r = resting("83396.6", "0.00599");
+        // Price cannot be judged, size is on target → keep where it is.
+        let (bid, _) = plan_quotes(&t, Decimal::ZERO, &p);
+        assert_eq!(bid.price, PricePlan::Unpriced);
+        assert!(bid.qty.is_some());
+        assert_eq!(quote_action(Some(&r), &bid), QuoteAction::Keep);
+        // Nothing resting and no price → nothing is placed.
+        assert_eq!(quote_action(None, &bid), QuoteAction::Keep);
+        // Size off by more than 1% → cancel only (review 3 #1): with no
+        // price nothing is ever placed, not even at the resting price.
+        let big = resting("83396.6", "0.012");
+        assert_eq!(quote_action(Some(&big), &bid), QuoteAction::Replace(None));
+        let partly = Resting {
+            filled: d("0.003"),
+            ..resting("83396.6", "0.00599")
+        };
+        assert_eq!(
+            quote_action(Some(&partly), &bid),
+            QuoteAction::Replace(None)
+        );
+        // Within 1% → still kept.
+        let near = resting("83396.6", "0.00603");
+        assert_eq!(quote_action(Some(&near), &bid), QuoteAction::Keep);
+        // Long past the skew: the bid is suppressed and MUST be cancelled
+        // even though there is no reference to price against.
+        let (bid, _) = plan_quotes(&t, d("0.03"), &p); // ~$2,503 ≥ skew $2,000
+        assert_eq!((bid.qty, bid.price), (None, PricePlan::Unpriced));
+        assert_eq!(quote_action(Some(&r), &bid), QuoteAction::Replace(None));
+        assert_eq!(quote_action(None, &bid), QuoteAction::Keep);
+    }
+
+    #[test]
+    fn a_crossed_book_keeps_resting_offset_quotes_in_presence_mode() {
+        // Review 2 C: the feed's book is briefly crossed (ask ≤ bid) on a
+        // few ticks a minute. Presence quotes must not be cancelled for it.
+        let crossed = at("83438.6", "83438.5");
+        let p = presence_params();
+        let (bid, ask) = plan_quotes(&crossed, Decimal::ZERO, &p);
+        // No price; the guard is offset − band = 3 bp behind the NEARER book
+        // top: the lower one for the bid, the higher one for the ask.
+        let guard = |near: &str| PricePlan::Crossed {
+            near: d(near),
+            min_bps: d("3"),
+        };
+        assert_eq!((bid.price, ask.price), (guard("83438.5"), guard("83438.6")));
+        let rb = resting("83396.6", "0.00599");
+        let ra = resting("83480.3", "0.00599");
+        assert_eq!(quote_action(Some(&rb), &bid), QuoteAction::Keep);
+        assert_eq!(quote_action(Some(&ra), &ask), QuoteAction::Keep);
+        // Nothing is placed into a crossed book.
+        assert_eq!(quote_action(None, &bid), QuoteAction::Keep);
+        assert_eq!(quote_action(None, &ask), QuoteAction::Keep);
+        // A partial fill during the crossed book (review 3 #1): the open
+        // size is off, the quote is CANCELLED and no new order goes into a
+        // book that cannot be trusted; same for any other size mismatch.
+        let partly = Resting {
+            filled: d("0.003"),
+            ..rb.clone()
+        };
+        assert_eq!(
+            quote_action(Some(&partly), &bid),
+            QuoteAction::Replace(None)
+        );
+        let fat = resting("83480.3", "0.012");
+        assert_eq!(quote_action(Some(&fat), &ask), QuoteAction::Replace(None));
+        // A suppressed side is cancelled.
+        let (bid, ask) = plan_quotes(&crossed, d("0.03"), &p);
+        assert_eq!(quote_action(Some(&rb), &bid), QuoteAction::Replace(None));
+        // The exit side (an AT-touch quote) is cancelled in a crossed book,
+        // exactly like at-touch quoting.
+        assert_eq!(ask.qty, None);
+        let exit = resting("83438.5", "0.00599");
+        assert_eq!(quote_action(Some(&exit), &ask), QuoteAction::Replace(None));
+
+        // A frozen side (seen in the 2026-10-01 smoke: the ask stuck at
+        // 83868.8 for ~100 s while the bid climbed to 83892 and beyond). The
+        // resting ask 83902.8 is 4.1 bp behind the stale ask but only 1.3 bp
+        // behind the live bid: it must NOT be kept blind, it is cancelled.
+        let frozen = at("83892", "83868.8");
+        let (bid, ask) = plan_quotes(&frozen, Decimal::ZERO, &p);
+        assert_eq!((bid.price, ask.price), (guard("83868.8"), guard("83892")));
+        let ask_q = resting("83902.8", "0.00596");
+        assert_eq!(quote_action(Some(&ask_q), &ask), QuoteAction::Replace(None));
+        // The bid, 6.6 bp below the lower top, is far from both: kept, even
+        // though it is 9.4 bp (outside the band) from the higher top.
+        let bid_q = resting("83813.4", "0.00596");
+        assert_eq!(quote_action(Some(&bid_q), &bid), QuoteAction::Keep);
+        // Mirror: the bid side frozen high, the live ask falling toward our
+        // bid → the bid is cancelled once it is under 3 bp from the ask.
+        let (bid, ask) = plan_quotes(&at("83892", "83830"), Decimal::ZERO, &p);
+        assert_eq!(quote_action(Some(&bid_q), &bid), QuoteAction::Replace(None));
+        let far_ask = resting("83990", "0.00596"); // 11.7 bp above the bid
+        assert_eq!(quote_action(Some(&far_ask), &ask), QuoteAction::Keep);
+        // Exactly at the guard distance is still kept (3 bp of 100000).
+        let (bid, _) = plan_quotes(&at("100001", "100000"), Decimal::ZERO, &p);
+        assert_eq!(
+            quote_action(Some(&resting("99970", "0.00499")), &bid),
+            QuoteAction::Keep
+        );
+        assert_eq!(
+            quote_action(Some(&resting("99970.1", "0.00499")), &bid),
+            QuoteAction::Replace(None)
+        );
+
+        // An unusable book (no positive price) suppresses everything.
+        let (bid, ask) = plan_quotes(&at("0", "83438.5"), Decimal::ZERO, &p);
+        assert_eq!(quote_action(Some(&rb), &bid), QuoteAction::Replace(None));
+        assert_eq!(quote_action(Some(&ra), &ask), QuoteAction::Replace(None));
+        // At offset 0 a crossed book cancels both quotes, as before.
+        let (bid, ask) = plan_quotes(&crossed, Decimal::ZERO, &params());
+        let touch_bid = resting("83438.6", "0.11385");
+        let touch_ask = resting("83438.5", "0.11385");
+        assert_eq!(
+            quote_action(Some(&touch_bid), &bid),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            quote_action(Some(&touch_ask), &ask),
+            QuoteAction::Replace(None)
+        );
+    }
+
+    #[test]
+    fn a_pegged_quote_is_kept_inside_the_band_and_repegged_outside() {
+        let p = presence_params();
+        // The plan for a flat book whose touch on `side` is `touch`.
+        let plan = |side: QSide, touch: &str| {
+            let book = match side {
+                QSide::Bid => Touches {
+                    ask: d(touch) + d("0.1"),
+                    ..at(touch, touch)
+                },
+                QSide::Ask => Touches {
+                    bid: d(touch) - d("0.1"),
+                    ..at(touch, touch)
+                },
+            };
+            let (bid, ask) = plan_quotes(&book, Decimal::ZERO, &p);
+            let plan = if side == QSide::Bid { bid } else { ask };
+            assert_eq!(
+                plan.price,
+                priced(
+                    offset_px(side, d(touch), d("5")),
+                    PriceTol::Band {
+                        touch: d(touch),
+                        offset_bps: d("5"),
+                        band_bps: d("2"),
+                    }
+                )
+            );
+            plan
+        };
+        let act = |r: &Resting, side: QSide, touch: &str| quote_action(Some(r), &plan(side, touch));
+        let repeg = |side: QSide, touch: &str| {
+            QuoteAction::Replace(Some(plan(side, touch).target().unwrap()))
+        };
+        // Bid resting 5 bp below a 83438.4 touch (as the connector rounded it).
+        let bid = resting("83396.6", "0.00599");
+        assert_eq!(act(&bid, QSide::Bid, "83438.4"), QuoteAction::Keep);
+        // Touch moves AWAY (up): 5.9 bp is inside 3..7 → keep; 7.6 bp → re-peg.
+        assert_eq!(act(&bid, QSide::Bid, "83446"), QuoteAction::Keep);
+        assert_eq!(act(&bid, QSide::Bid, "83460"), repeg(QSide::Bid, "83460"));
+        // Touch moves TOWARD the quote (down): 3.4 bp → keep; 2.8 bp → re-peg
+        // back out to 5 bp, so a kept quote never reaches the touch.
+        assert_eq!(act(&bid, QSide::Bid, "83425"), QuoteAction::Keep);
+        assert_eq!(act(&bid, QSide::Bid, "83420"), repeg(QSide::Bid, "83420"));
+        // Ask resting 5 bp above a 83438.5 touch: mirror image.
+        let ask = resting("83480.3", "0.00599");
+        assert_eq!(act(&ask, QSide::Ask, "83438.5"), QuoteAction::Keep);
+        assert_eq!(act(&ask, QSide::Ask, "83431"), QuoteAction::Keep); // away: 5.9 bp
+        assert_eq!(act(&ask, QSide::Ask, "83417"), repeg(QSide::Ask, "83417")); // away: 7.6 bp
+        assert_eq!(act(&ask, QSide::Ask, "83452"), QuoteAction::Keep); // toward: 3.4 bp
+        assert_eq!(act(&ask, QSide::Ask, "83457"), repeg(QSide::Ask, "83457")); // toward: 2.8 bp
+                                                                                // In the band but the size is off by more than 1% → requote.
+        let fat = resting("83396.6", "0.007");
+        assert_eq!(act(&fat, QSide::Bid, "83446"), repeg(QSide::Bid, "83446"));
+        // The other arms: place when nothing rests, cancel when suppressed.
+        let fresh = plan(QSide::Bid, "83438.4");
+        assert_eq!(
+            quote_action(None, &fresh),
+            QuoteAction::Place(fresh.target().unwrap())
+        );
+        let suppressed = SidePlan { qty: None, ..fresh };
+        assert_eq!(
+            quote_action(Some(&bid), &suppressed),
+            QuoteAction::Replace(None)
+        );
+    }
+
+    #[test]
+    fn at_touch_quoting_keeps_the_exact_price_rule() {
+        // Offset 0: both sides are planned at the raw touch with the Exact
+        // rule, whatever the band or the peg references say, so the one
+        // requote rule behaves exactly as before presence mode existed.
+        let mut p = params();
+        p.presence = presence("0", "5");
+        let book = Touches {
+            peg_bid: Some(d("99")),
+            peg_ask: None,
+            ..at("100.2", "100.3")
+        };
+        let (bid, ask) = plan_quotes(&book, Decimal::ZERO, &p);
+        assert_eq!(bid.price, priced(d("100.2"), PriceTol::Exact));
+        assert_eq!(ask.price, priced(d("100.3"), PriceTol::Exact));
+        // 1 bp from the touch: would be inside a band, but must requote.
+        let qty = bid.qty.unwrap().to_string();
+        assert_eq!(
+            quote_action(Some(&resting("100.19", &qty)), &bid),
+            QuoteAction::Replace(Some(bid.target().unwrap()))
+        );
+        assert_eq!(
+            quote_action(Some(&resting("100.2", &qty)), &bid),
+            QuoteAction::Keep
+        );
+        // And at-touch plan_quotes never moves a price off the touch or caps
+        // the reducing side at the inventory (that is presence-only): long
+        // 0.05, the ask is still a full $10k clip at the touch.
+        let (bid, ask) = targets(plan_quotes(&at("83438.4", "83438.5"), d("0.05"), &params()));
+        assert_eq!(bid.unwrap().px, d("83438.4"));
+        let ask = ask.unwrap();
+        assert_eq!(ask.px, d("83438.5"));
+        assert_eq!(ask.qty, d("0.11984"));
+    }
+
+    #[test]
+    fn in_presence_mode_the_reducing_side_quotes_at_the_touch_sized_to_inventory() {
+        // Review #3 / review 2 D: a sweep filled our deep bid → long 0.004.
+        // plan_quotes alone decides the exit side: the ask (reducing) goes to
+        // the RAW touch with exactly the inventory and the exact-price rule;
+        // the bid (growing) rests 5 bp behind its peg with the band rule.
+        let p = presence_params();
+        let (bb, ba) = (d("83438.4"), d("83438.5"));
+        let book = at("83438.4", "83438.5");
+        let band = |touch: Decimal| PriceTol::Band {
+            touch,
+            offset_bps: d("5"),
+            band_bps: d("2"),
+        };
+        let (bid, ask) = plan_quotes(&book, d("0.004"), &p);
+        assert_eq!(ask.price, priced(ba, PriceTol::Exact));
+        assert_eq!(ask.qty, Some(d("0.004")));
+        assert_eq!(bid.price, priced(d("83396.6808"), band(bb)));
+        // Short: the bid is the reducing side, at the touch, sized to cover.
+        let (bid, ask) = plan_quotes(&book, d("-0.004"), &p);
+        assert_eq!(bid.price, priced(bb, PriceTol::Exact));
+        assert_eq!(bid.qty, Some(d("0.004")));
+        assert_eq!(ask.price, priced(d("83480.21925"), band(ba)));
+        // Inventory above one clip: the exit quote is still at most a clip.
+        let (_, ask) = plan_quotes(&book, d("0.02"), &p);
+        assert_eq!(ask.price, priced(ba, PriceTol::Exact));
+        assert_eq!(ask.qty, Some(d("0.00599"))); // $500 / mid, rounded down
+                                                 // Dust below min_quote_usd ($50) cannot be worked as a maker: no
+                                                 // exit side, the ask stays at the offset (max-hold deals with it).
+        let (_, ask) = plan_quotes(&book, d("0.0002"), &p);
+        assert_eq!(ask.price, priced(d("83480.21925"), band(ba)));
+        // Flat: both sides at the offset.
+        let (bid, ask) = plan_quotes(&book, Decimal::ZERO, &p);
+        assert_eq!(bid.price, priced(d("83396.6808"), band(bb)));
+        assert_eq!(ask.price, priced(d("83480.21925"), band(ba)));
+
+        // ONE reference set: the exit side uses the raw touch even when its
+        // peg differs (our own exit quote IS the best ask, peg = next level),
+        // so the exit quote is kept instead of chasing the level behind it;
+        // the offset side uses its peg; sizes come from the raw mid for both
+        // (0.00599 = $500 / 83438.45, not $500 / a peg-based mid).
+        let own_top = Touches {
+            peg_bid: Some(d("83000")),
+            peg_ask: Some(d("83450")),
+            ..book
+        };
+        let (bid, ask) = plan_quotes(&own_top, d("0.004"), &p);
+        assert_eq!(ask.price, priced(ba, PriceTol::Exact));
+        assert_eq!(
+            quote_action(Some(&resting("83438.5", "0.004")), &ask),
+            QuoteAction::Keep
+        );
+        assert_eq!(
+            bid.price,
+            priced(offset_px(QSide::Bid, d("83000"), d("5")), band(d("83000")))
+        );
+        assert_eq!(bid.qty, Some(d("0.00599")));
+        // The exit side needs no peg at all; the offset side without one
+        // has no price.
+        let no_pegs = Touches {
+            peg_bid: None,
+            peg_ask: None,
+            ..book
+        };
+        let (bid, ask) = plan_quotes(&no_pegs, d("0.004"), &p);
+        assert_eq!(ask.price, priced(ba, PriceTol::Exact));
+        assert_eq!(bid.price, PricePlan::Unpriced);
+    }
+
+    #[test]
+    fn only_paper_presence_reads_a_deep_book() {
+        // Review #7: a deep virtual quote must find its level in the
+        // snapshot to join behind the displayed size.
+        assert_eq!(book_depth(true, true), 100);
+        assert_eq!(book_depth(true, false), 10);
+        assert_eq!(book_depth(false, true), 10);
+        assert_eq!(book_depth(false, false), 10);
+        // With the level in the snapshot the quote joins behind it; without
+        // it the queue is 0 (approximate, see `sim::join`).
+        let levels = vec![lv("83438.4", "0.5"), lv("83396.6", "1.25")];
+        let deep = crate::sim::join(QSide::Bid, d("83396.6"), d("0.006"), &levels, 1);
+        assert_eq!(deep.queue_ahead, d("1.25"));
+        let off_book = crate::sim::join(QSide::Bid, d("83396.5"), d("0.006"), &levels, 1);
+        assert_eq!(off_book.queue_ahead, Decimal::ZERO);
+        // The paper quote price: rounded away from the touch onto a real
+        // level when the tick is known, else the unrounded price (queue 0).
+        use crate::sim::paper_px;
+        assert_eq!(
+            paper_px(QSide::Bid, d("83396.6808"), Some(d("0.1"))),
+            d("83396.6")
+        );
+        assert_eq!(
+            paper_px(QSide::Ask, d("83480.21925"), Some(d("0.1"))),
+            d("83480.3")
+        );
+        assert_eq!(paper_px(QSide::Bid, d("83396.6808"), None), d("83396.6808"));
+        let px = paper_px(QSide::Bid, d("83396.6808"), Some(d("0.1")));
+        assert_eq!(
+            crate::sim::join(QSide::Bid, px, d("0.006"), &levels, 1).queue_ahead,
+            d("1.25")
+        );
+    }
+
+    #[test]
+    fn a_backoff_still_cancels_in_presence_mode_but_never_places() {
+        // Review 3 #2. Which pass the quote section runs.
+        assert_eq!(quote_pass(&TickPlan::Quote, true), Some(QuotePass::Full));
+        assert_eq!(quote_pass(&TickPlan::Quote, false), Some(QuotePass::Full));
+        assert_eq!(
+            quote_pass(&TickPlan::Wait, true),
+            Some(QuotePass::CancelOnly)
+        );
+        // At-touch quoting leaves its quotes alone while waiting, as before.
+        assert_eq!(quote_pass(&TickPlan::Wait, false), None);
+        assert_eq!(quote_pass(&TickPlan::PullQuotes("halt"), true), None);
+        assert_eq!(
+            quote_pass(&TickPlan::Flatten(FlattenReason::MaxHold), true),
+            None
+        );
+        // The cancel-only form: cancels stay, a requote becomes a cancel,
+        // nothing is placed or modified.
+        let t = QuoteTarget {
+            side: QSide::Ask,
+            px: d("83480.3"),
+            qty: d("0.00599"),
+        };
+        assert_eq!(cancel_only(QuoteAction::Keep), QuoteAction::Keep);
+        assert_eq!(
+            cancel_only(QuoteAction::Place(t.clone())),
+            QuoteAction::Keep
+        );
+        assert_eq!(
+            cancel_only(QuoteAction::Replace(None)),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            cancel_only(QuoteAction::Replace(Some(t.clone()))),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            cancel_only(QuoteAction::Modify(t)),
+            QuoteAction::Replace(None)
+        );
+        // End to end: the frozen-ask book during a backoff. The ask that the
+        // live bid has come too close to is cancelled; the bid stays; the
+        // empty side gets nothing.
+        let p = presence_params();
+        let (bid, ask) = plan_quotes(&at("83892", "83868.8"), Decimal::ZERO, &p);
+        let ask_q = resting("83902.8", "0.00596");
+        let bid_q = resting("83813.4", "0.00596");
+        assert_eq!(
+            cancel_only(quote_action(Some(&ask_q), &ask)),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            cancel_only(quote_action(Some(&bid_q), &bid)),
+            QuoteAction::Keep
+        );
+        let (bid, _) = plan_quotes(&at("83438.4", "83438.5"), Decimal::ZERO, &p);
+        let place = quote_action(None, &bid);
+        assert!(matches!(place, QuoteAction::Place(_)));
+        assert_eq!(cancel_only(place.clone()), QuoteAction::Keep);
+        // What main executes: the full pass runs the action unchanged, the
+        // cancel-only pass its cancel-only form.
+        assert_eq!(QuotePass::Full.apply(place.clone()), place);
+        assert_eq!(QuotePass::CancelOnly.apply(place), QuoteAction::Keep);
+        let requote = QuoteAction::Replace(Some(bid.target().unwrap()));
+        assert_eq!(QuotePass::Full.apply(requote.clone()), requote);
+        assert_eq!(
+            QuotePass::CancelOnly.apply(requote),
+            QuoteAction::Replace(None)
+        );
+    }
+
+    #[test]
+    fn status_distances_use_the_band_reference_and_the_raw_touch() {
+        // Review 3 #5. Our bid 83396.6 is the best bid; the band is judged
+        // against the next level 83390.1 (−0.78 bp: through it), while the
+        // raw touch is our own price (0 bp).
+        let t = Touches {
+            bid: d("83396.6"),
+            ask: d("83438.5"),
+            peg_bid: Some(d("83390.1")),
+            peg_ask: Some(d("83438.5")),
+        };
+        let (peg, raw) = quote_dists(QSide::Bid, d("83396.6"), &t);
+        assert_eq!(peg, Some(dist_bps(QSide::Bid, d("83396.6"), d("83390.1"))));
+        assert!(peg.unwrap() < Decimal::ZERO);
+        assert_eq!(raw, Decimal::ZERO);
+        // Ask: no quote of ours at the top, both distances agree (5 bp).
+        let (peg, raw) = quote_dists(QSide::Ask, d("83480.3"), &t);
+        assert_eq!(peg, Some(raw));
+        assert!(raw > d("5") && raw < d("5.02"));
+        // Only our own quote displayed: no band reference, raw still there.
+        let alone = Touches { peg_bid: None, ..t };
+        assert_eq!(
+            quote_dists(QSide::Bid, d("83396.6"), &alone),
+            (None, Decimal::ZERO)
+        );
+    }
+
     #[test]
     fn quote_action_keeps_modifies_or_replaces() {
         let t = QuoteTarget {
@@ -1271,13 +2313,18 @@ mod tests {
             px: d("100.1"),
             qty: d("1"),
         };
+        let exact = |t: &QuoteTarget| SidePlan {
+            side: t.side,
+            qty: Some(t.qty),
+            price: priced(t.px, PriceTol::Exact),
+        };
         let r = Resting {
             order_id: "o".into(),
             px: d("100.1"),
             qty: d("1"),
             filled: Decimal::ZERO,
         };
-        assert_eq!(quote_action(Some(&r), Some(&t)), QuoteAction::Keep);
+        assert_eq!(quote_action(Some(&r), &exact(&t)), QuoteAction::Keep);
         let moved = QuoteTarget {
             px: d("100.2"),
             ..t.clone()
@@ -1285,7 +2332,7 @@ mod tests {
         // In-place modify is disabled (MODIFY_ENABLED = false, mainnet
         // rejected batch modify): a moved untouched quote is cancel + place.
         assert_eq!(
-            quote_action(Some(&r), Some(&moved)),
+            quote_action(Some(&r), &exact(&moved)),
             QuoteAction::Replace(Some(moved.clone()))
         );
         let partly = Resting {
@@ -1293,16 +2340,27 @@ mod tests {
             ..r.clone()
         };
         assert_eq!(
-            quote_action(Some(&partly), Some(&t)),
+            quote_action(Some(&partly), &exact(&t)),
             QuoteAction::Replace(Some(t.clone()))
         );
-        assert_eq!(quote_action(Some(&r), None), QuoteAction::Replace(None));
-        assert_eq!(quote_action(None, Some(&t)), QuoteAction::Place(t.clone()));
+        let suppressed = SidePlan {
+            qty: None,
+            ..exact(&t)
+        };
+        assert_eq!(
+            quote_action(Some(&r), &suppressed),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(quote_action(None, &suppressed), QuoteAction::Keep);
+        assert_eq!(
+            quote_action(None, &exact(&t)),
+            QuoteAction::Place(t.clone())
+        );
         let tiny = QuoteTarget {
             qty: d("1.005"),
             ..t.clone()
         };
-        assert_eq!(quote_action(Some(&r), Some(&tiny)), QuoteAction::Keep);
+        assert_eq!(quote_action(Some(&r), &exact(&tiny)), QuoteAction::Keep);
     }
 
     #[test]
