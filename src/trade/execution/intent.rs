@@ -214,17 +214,19 @@ mod tests {
         }
     }
 
-    /// Codex on #371: the intent must carry the bound the wrapped executor
-    /// really uses, not a separate number it ignores.
+    /// Codex on #371: the intent carries the wrapped executor's own
+    /// guarantee. Paper prices off the CURRENT mid without a drift check, so
+    /// vs the reference it guarantees nothing.
     #[tokio::test]
-    async fn book_taker_reports_the_executors_own_slippage_bound() {
+    async fn book_taker_reports_no_bound_for_paper() {
         let paper = PaperExecutor::new(100.0, 2.0);
-        paper.set_price("BTC", 100.0).await;
+        paper.set_price("BTC", 110.0).await; // moved after planning at 100
         let taker = BookTaker { executor: &paper };
         let order = book_order(BookSide::Buy, 1.0, false);
-        assert_eq!(taker.intent_for(&order).max_slip_bps, Some(100.0));
+        assert_eq!(taker.intent_for(&order).max_slip_bps, None);
         let (_, outcome) = taker.execute(&order).await.unwrap();
-        assert!((outcome.fills[0].slippage_bps - 100.0).abs() < 1e-6);
+        // 110 * 1.01 = 111.1 vs reference 100: 1,110 bp, which no bound covered.
+        assert!((outcome.fills[0].slippage_bps - 1_110.0).abs() < 1e-6);
     }
 
     /// An executor whose bound depends on reduce_only, like the live one.
@@ -352,12 +354,8 @@ mod tests {
             assert_eq!(got, expect);
             assert_eq!(outcome.filled_qty, expect.filled_qty);
             assert_eq!(outcome.fills[0].fee_usd, expect.fee_usd);
-            // Paper fills at mid ± 10 bp: the derived cost sees exactly that,
-            // and it is within the executor's own bound.
+            // Paper fills at mid ± 10 bp: the derived cost sees exactly that.
             assert!((outcome.fills[0].slippage_bps - 10.0).abs() < 1e-6);
-            assert!(
-                outcome.fills[0].slippage_bps <= wrapped.slippage_bound_bps(false).unwrap() + 1e-9
-            );
         }
     }
 }

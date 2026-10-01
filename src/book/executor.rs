@@ -182,9 +182,11 @@ impl Executor for PaperExecutor {
         true
     }
 
-    /// Paper always fills at exactly `mid ± slippage_bps`.
+    /// Paper fills at `current mid ± slippage_bps` without checking the
+    /// current mid against the intent's reference, so a move after planning
+    /// is unbounded vs the reference: no guarantee (Codex on #371).
     fn slippage_bound_bps(&self, _reduce_only: bool) -> Option<f64> {
-        Some(self.slippage_bps)
+        None
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
