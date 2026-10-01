@@ -36,9 +36,9 @@ use ledger::{
 };
 use logic::{
     dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, may_disarm_dms,
-    plan_inputs, plan_quotes, position_check, quote_action, reconcile_cleared, send_gated, shock,
-    shutdown_steps, tick_plan, BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams,
-    QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
+    plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, reconcile_cleared,
+    send_gated, shock, shutdown_steps, tick_plan, BatchSink, PlanState, PosCheck, QSide,
+    QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -59,6 +59,9 @@ const FILL_INCOMPLETE_WAIT_MS: u64 = 60_000;
 /// A due markout horizon waits this long for a fresh mid, then is recorded
 /// as `markout_missing`.
 const MARKOUT_MAX_LATE_MS: u64 = 60_000;
+/// Shutdown keeps polling incomplete fill records this long before
+/// spilling the rest to pending_fills.jsonl (pre-G2, Codex P1 4146269818).
+const SHUTDOWN_HARVEST_BUDGET: Duration = Duration::from_secs(30);
 
 fn init_logger() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -108,6 +111,9 @@ struct Runtime {
     state_writer: ledger::StateWriter,
     status_path: PathBuf,
     fills_path: PathBuf,
+    /// Connector fill records still unbooked at the last shutdown (pre-G2,
+    /// Codex P1 4146269818); resolved first at the next live start.
+    pending_path: PathBuf,
     kill_path: PathBuf,
     halt_path: PathBuf,
     /// Live: our resting quotes as we believe they rest.
@@ -119,6 +125,9 @@ struct Runtime {
     cooldown_until_ms: u64,
     backoff_until_ms: u64,
     need_reconcile: bool,
+    /// The last periodic position check didn't clear (Pending / Unread):
+    /// no new quotes, re-checked every tick (pre-G2, Codex P1 4146269811).
+    position_pending: bool,
     startup_flatten: bool,
     flatten_inflight_until_ms: u64,
     pending_markouts: Vec<PendingMarkout>,
@@ -477,6 +486,12 @@ impl Runtime {
                 }
                 Step::Ioc { side, qty } => {
                     let Some((bid, ask)) = touch else { return };
+                    // Same rollover guard as every other booking path
+                    // (pre-G2, Codex P2 4146548930): the quotes are already
+                    // pulled; the IOC waits until the rollover is on disk.
+                    if !self.ensure_rolled(now) {
+                        return;
+                    }
                     let buy = side == OrderSide::Long;
                     let px = if buy { ask } else { bid };
                     let fee = self.fee(qty * px, false);
@@ -510,6 +525,14 @@ impl Runtime {
     /// fee is booked at once at the taker fee instead of waiting: the
     /// connector's fill cache dies with the process (Codex P1, pairtrade#361).
     async fn harvest_fills(&mut self, now: u64, shutting_down: bool) {
+        // Every live booking path (tick, startup, shutdown) books only after
+        // the UTC-day rollover is on disk (pre-G2, Codex 4146113066 /
+        // 4146548930); unbooked records stay in the connector (and are
+        // spilled at shutdown).
+        if !self.ensure_rolled(now) {
+            self.fills_synced = false;
+            return;
+        }
         let market = self.cfg.market.clone();
         let rows = match self.dex.get_filled_orders(&market).await {
             Ok(r) => r.orders,
@@ -702,10 +725,120 @@ impl Runtime {
         check
     }
 
+    /// Resolve `pending_fills.jsonl`: book complete records (dedupe makes a
+    /// repeat harmless), sticky-halt `fill_incomplete` on incomplete ones,
+    /// then persist and set the file aside. False = retry next tick; no
+    /// quoting meanwhile (startup isn't reconciled).
+    fn resolve_pending_fills(&mut self, now: u64) -> bool {
+        let pending = match ledger::read_pending(&self.pending_path) {
+            Ok(p) => p,
+            Err(e) => {
+                let reason = format!("pending_fills unreadable: {e}");
+                if self.ledger.halt_sticky(reason.clone(), self.last_mark) {
+                    log::error!("[ARCUS_VOL] STICKY HALT {reason}");
+                }
+                return false;
+            }
+        };
+        if pending.is_empty() {
+            return true;
+        }
+        if !self.ensure_rolled(now) {
+            return false;
+        }
+        for p in &pending {
+            match ledger::resolve_pending(p, self.cfg.taker_fee_bps) {
+                ledger::PendingResolution::Book(fill) => {
+                    if let Err(e) = self.book(fill, now) {
+                        log::error!(
+                            "[ARCUS_VOL] pending fill {} not written, will retry: {e}",
+                            p.trade_id
+                        );
+                        return false;
+                    }
+                }
+                ledger::PendingResolution::Clear => {}
+                ledger::PendingResolution::Halt(reason) => {
+                    if self.ledger.halt_sticky(reason.clone(), self.last_mark) {
+                        log::error!("[ARCUS_VOL] STICKY HALT {reason}");
+                    }
+                }
+            }
+        }
+        if let Err(e) = self.state_writer.write(&self.state_path, &self.ledger) {
+            log::error!("[ARCUS_VOL] state write after pending fills failed, will retry: {e:#}");
+            return false;
+        }
+        let aside = self
+            .pending_path
+            .with_file_name(format!("pending_fills.resolved-{now}.jsonl"));
+        if let Err(e) = std::fs::rename(&self.pending_path, &aside) {
+            log::error!("[ARCUS_VOL] could not set pending_fills aside ({e}); will retry");
+            return false;
+        }
+        log::warn!(
+            "[ARCUS_VOL] resolved {} pending fill record(s) from the last shutdown (kept as {})",
+            pending.len(),
+            aside.display()
+        );
+        true
+    }
+
+    /// At shutdown, write every fill record the connector still holds (i.e.
+    /// not yet booked and cleared) to `pending_fills.jsonl`, durably, so a
+    /// restart can't lose it (pre-G2, Codex P1 4146269818).
+    async fn spill_unbooked(&mut self, now: u64) {
+        let market = self.cfg.market.clone();
+        let rows = match self.dex.get_filled_orders(&market).await {
+            Ok(r) => r.orders,
+            Err(e) => {
+                log::error!(
+                    "[ARCUS_VOL] SHUTDOWN: cannot read unbooked fills ({e}); reconcile the venue fills by hand"
+                );
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let pending: Vec<ledger::PendingFill> = rows
+            .iter()
+            .map(|f| {
+                let hint = if self.ioc_ids.contains(&f.order_id) {
+                    Some(false)
+                } else if self.quote_ids.contains(&f.order_id) {
+                    Some(true)
+                } else {
+                    None
+                };
+                ledger::PendingFill::from_record(f, hint, now)
+            })
+            .collect();
+        match ledger::spill_pending(&self.pending_path, &pending) {
+            Ok(()) => log::error!(
+                "[ARCUS_VOL] SHUTDOWN: {} unbooked fill record(s) written to {}; resolved at the next start",
+                pending.len(),
+                self.pending_path.display()
+            ),
+            Err(e) => log::error!(
+                "[ARCUS_VOL] SHUTDOWN: writing {} unbooked fill record(s) FAILED ({e}); reconcile by hand: {:?}",
+                pending.len(),
+                pending.iter().map(|p| &p.trade_id).collect::<Vec<_>>()
+            ),
+        }
+    }
+
     /// Startup position read (live): until it succeeds no new quote goes
     /// out (Codex P1, pairtrade#361); a non-zero position is flattened first.
     async fn startup_reconcile(&mut self) {
-        // Harvest first so the comparison sees every reported fill.
+        // Fills left unbooked by the last shutdown come first (pre-G2, Codex
+        // P1 4146269818); they need the rollover on disk, like any booking.
+        if !self.resolve_pending_fills(now_ms()) {
+            return;
+        }
+        // Harvest first so the comparison sees every reported fill (the
+        // harvest itself waits for a durable rollover: pre-G2, Codex
+        // 4146113066).
         self.live_fills(now_ms()).await;
         match self.check_position(now_ms()).await {
             PosCheck::InSync => {}
@@ -1066,8 +1199,14 @@ impl Runtime {
                 self.live_reconcile_orders().await;
                 self.last_reconcile_ms = now;
             }
-            if now.saturating_sub(self.last_position_ms) >= self.cfg.position_poll_secs * 1_000 {
-                self.check_position(now).await;
+            if self.position_pending
+                || now.saturating_sub(self.last_position_ms) >= self.cfg.position_poll_secs * 1_000
+            {
+                let check = self.check_position(now).await;
+                self.position_pending = position_gate_after(check);
+                if self.position_pending {
+                    log::warn!("[ARCUS_VOL] position check {check:?}: no new quotes until in sync");
+                }
                 self.last_position_ms = now;
             }
         }
@@ -1194,6 +1333,7 @@ impl Runtime {
             dms_secs: self.cfg.dms_secs,
             startup_reconciled: self.startup_reconciled,
             reconcile_pending: self.need_reconcile,
+            position_pending: self.position_pending,
             fills_synced: self.fills_synced,
             tape_ready: self.tape.ready,
             journal_unsafe: self.journal_unsafe,
@@ -1365,18 +1505,27 @@ impl Runtime {
                 ShutdownStep::HarvestFills => {
                     // Fills that landed before the cancel acks; bounded so a
                     // dead venue cannot hold the shutdown hostage.
+                    // At least 3 polls, then keep polling (bounded) while any
+                    // record is still incomplete (pre-G2, Codex P1 4146269818);
+                    // whatever is left is spilled to pending_fills.jsonl.
                     let harvest = async {
-                        for _ in 0..3 {
+                        let mut polls = 0;
+                        loop {
                             self.harvest_fills(now_ms(), true).await;
+                            polls += 1;
+                            if polls >= 3 && self.fills_synced {
+                                break;
+                            }
                             tokio::time::sleep(Duration::from_millis(700)).await;
                         }
                     };
-                    if tokio::time::timeout(Duration::from_secs(5), harvest)
+                    if tokio::time::timeout(SHUTDOWN_HARVEST_BUDGET, harvest)
                         .await
                         .is_err()
                     {
-                        log::warn!("[ARCUS_VOL] shutdown fill harvest timed out");
+                        log::warn!("[ARCUS_VOL] shutdown fill harvest budget used up");
                     }
+                    self.spill_unbooked(now_ms()).await;
                 }
                 ShutdownStep::Persist => {
                     self.virt.clear();
@@ -1501,6 +1650,7 @@ async fn main() -> Result<()> {
         state_writer: ledger::StateWriter::default(),
         status_path: cfg.state_dir.join("status.json"),
         fills_path,
+        pending_path: cfg.state_dir.join("pending_fills.jsonl"),
         kill_path: cfg.state_dir.join("KILL_SWITCH"),
         halt_path: cfg.state_dir.join("HALT"),
         resting: HashMap::new(),
@@ -1510,6 +1660,7 @@ async fn main() -> Result<()> {
         cooldown_until_ms: 0,
         backoff_until_ms: 0,
         need_reconcile: false,
+        position_pending: false,
         startup_flatten: false,
         flatten_inflight_until_ms: 0,
         pending_markouts: Vec::new(),

@@ -342,6 +342,9 @@ pub struct PlanState {
     pub dms_secs: u64,
     pub startup_reconciled: bool,
     pub reconcile_pending: bool,
+    /// The periodic position check last returned Pending/Unread
+    /// (pre-G2, Codex P1 4146269811): same quote gate as a reconcile.
+    pub position_pending: bool,
     pub fills_synced: bool,
     pub tape_ready: bool,
     pub journal_unsafe: bool,
@@ -361,7 +364,7 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
         backoff: now_ms < s.backoff_until_ms,
         dms_armed: s.dry_run || dms_armed(s.dms_last_ok_ms, s.dms_last_failed, now_ms, s.dms_secs),
         startup_reconciled: s.dry_run || s.startup_reconciled,
-        reconcile_pending: !s.dry_run && s.reconcile_pending,
+        reconcile_pending: !s.dry_run && (s.reconcile_pending || s.position_pending),
         fills_synced: s.dry_run || s.fills_synced,
         tape_ready: !s.dry_run || s.tape_ready,
         journal_unsafe: s.journal_unsafe,
@@ -420,6 +423,15 @@ pub fn position_check(
 /// then holds quoting). `Pending` (a fill in flight) and `Unread` keep it.
 pub fn reconcile_cleared(check: PosCheck) -> bool {
     matches!(check, PosCheck::InSync | PosCheck::Mismatch)
+}
+
+/// The periodic position check's quote gate (pre-G2, Codex P1 4146269811):
+/// the same rule as the reconcile path. While the venue shows exposure the
+/// ledger hasn't booked yet (Pending) or the read failed (Unread), no new
+/// quote goes out; it clears on InSync, or once the mismatch has escalated
+/// to the sticky position_mismatch halt (which then holds quoting itself).
+pub fn position_gate_after(check: PosCheck) -> bool {
+    !reconcile_cleared(check)
 }
 
 /// Prefix of the sticky-halt reason a position mismatch writes.
@@ -697,6 +709,40 @@ mod tests {
             fills_synced: true,
             ..PlanState::default()
         }
+    }
+
+    #[test]
+    fn a_pending_periodic_position_check_gates_quoting_until_in_sync() {
+        // pre-G2, Codex P1 4146269811: an acknowledged quote fill shows up in
+        // get_positions before get_filled_orders; the periodic check returns
+        // Pending and must hold new quotes, like the reconcile path does.
+        let now = 1_500;
+        let quoting = |check: PosCheck| {
+            let s = PlanState {
+                position_pending: position_gate_after(check),
+                ..live_state()
+            };
+            tick_plan(&plan_inputs(&s, now))
+        };
+        assert_eq!(
+            quoting(PosCheck::Pending),
+            TickPlan::PullQuotes("reconcile_pending")
+        );
+        assert_eq!(
+            quoting(PosCheck::Unread),
+            TickPlan::PullQuotes("reconcile_pending")
+        );
+        assert_eq!(quoting(PosCheck::InSync), TickPlan::Quote);
+        // An escalated mismatch clears this gate; the sticky halt holds quotes.
+        assert!(!position_gate_after(PosCheck::Mismatch));
+        // Paper mode has no venue position: never gated by it.
+        let dry = PlanState {
+            dry_run: true,
+            position_pending: true,
+            tape_ready: true,
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&dry, now)), TickPlan::Quote);
     }
 
     #[test]

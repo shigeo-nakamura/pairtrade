@@ -696,7 +696,7 @@ pub fn risk_check(
 }
 
 /// One fill to book (live from the connector, or simulated).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FillIn {
     pub trade_id: String,
     pub buy: bool,
@@ -962,10 +962,125 @@ pub fn append_journal(
             )))),
         };
     }
-    if !existed {
+    // The directory entry must be durable before the first row is reported
+    // durable. An empty file means no row has been yet, even if it exists:
+    // a failed first append (rolled back to 0 bytes) left it behind, so the
+    // next successful append still syncs the parent (pre-G2, Codex P2
+    // 4146418683).
+    if !existed || len_before == 0 {
         sync_dir(dir.unwrap_or(std::path::Path::new(".")))?;
     }
     Ok(())
+}
+
+/// A connector fill record still unbooked when the runtime shut down
+/// (pre-G2, Codex P1 4146269818). The connector's fill cache dies with the
+/// process and its REST cursor starts at construction, so such a record
+/// would be gone after a restart: it is written durably to
+/// `pending_fills.jsonl` instead and resolved first at the next start.
+/// Never dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingFill {
+    pub trade_id: String,
+    pub order_id: String,
+    pub is_rejected: bool,
+    /// `None` when the venue hadn't reported the side yet.
+    pub buy: Option<bool>,
+    pub size: Option<Decimal>,
+    pub value: Option<Decimal>,
+    pub fee: Option<Decimal>,
+    /// Our own IOC (false) / quote (true) order, when known.
+    pub maker_hint: Option<bool>,
+    pub spilled_at_ms: u64,
+}
+
+impl PendingFill {
+    pub fn from_record(
+        f: &dex_connector::FilledOrder,
+        maker_hint: Option<bool>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            trade_id: f.trade_id.clone(),
+            order_id: f.order_id.clone(),
+            is_rejected: f.is_rejected,
+            buy: f
+                .filled_side
+                .map(|s| matches!(s, dex_connector::OrderSide::Long)),
+            size: f.filled_size,
+            value: f.filled_value,
+            fee: f.filled_fee,
+            maker_hint,
+            spilled_at_ms: now_ms,
+        }
+    }
+}
+
+/// Durably append every unbooked record (same rollback-safe journal append
+/// as fills.jsonl). An error means some record may not be on disk: the
+/// caller logs it loudly; the process is exiting anyway.
+pub fn spill_pending(path: &std::path::Path, pending: &[PendingFill]) -> std::io::Result<()> {
+    for p in pending {
+        let row = serde_json::to_value(p).map_err(std::io::Error::other)?;
+        append_synced(path, &row)?;
+    }
+    Ok(())
+}
+
+/// Read `pending_fills.jsonl` strictly: missing = nothing pending; any
+/// unparsable line is a startup error (never skipped: it may be a fill).
+pub fn read_pending(path: &std::path::Path) -> Result<Vec<PendingFill>, String> {
+    let Some(text) = read_journal(path).map_err(|e| format!("{}: {e}", path.display()))? else {
+        return Ok(Vec::new());
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str(l).map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))
+        })
+        .collect()
+}
+
+/// How a spilled record is resolved at startup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingResolution {
+    /// Complete: book it (dedupe by trade id makes a repeat harmless). A
+    /// missing fee is the conservative taker estimate, marked.
+    Book(FillIn),
+    /// Confirmed rejected / zero-size.
+    Clear,
+    /// Still incomplete: it can't complete any more (the connector that held
+    /// it is gone), so a human must resolve it: sticky halt.
+    Halt(String),
+}
+
+pub fn resolve_pending(p: &PendingFill, taker_fee_bps: Decimal) -> PendingResolution {
+    if p.is_rejected || p.size.is_some_and(|q| q.is_zero()) {
+        return PendingResolution::Clear;
+    }
+    match (p.buy, p.size, p.value) {
+        (Some(buy), Some(qty), Some(value)) if qty > Decimal::ZERO => {
+            let (fee, fee_estimated) = match p.fee {
+                Some(f) => (f, false),
+                None => (value.abs() * taker_fee_bps / Decimal::from(10_000), true),
+            };
+            PendingResolution::Book(FillIn {
+                trade_id: p.trade_id.clone(),
+                buy,
+                qty,
+                px: value / qty,
+                fee,
+                maker: p.maker_hint.unwrap_or(fee <= Decimal::ZERO),
+                order_id: p.order_id.clone(),
+                fee_estimated,
+            })
+        }
+        _ => PendingResolution::Halt(format!(
+            "fill_incomplete: trade {} was still incomplete at the last shutdown (pending_fills.jsonl); resolve by hand",
+            p.trade_id
+        )),
+    }
 }
 
 /// What to do with one connector fill record (Codex P1, pairtrade#361).
@@ -1474,6 +1589,54 @@ mod tests {
             !main.contains("append_jsonl"),
             "use append_synced for fills.jsonl"
         );
+    }
+
+    /// The body of `fn <name>` in main.rs (up to the next method).
+    fn main_fn_body(name: &str) -> String {
+        let main = include_str!("main.rs");
+        let start = main
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found in main.rs"));
+        let rest = &main[start..];
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .into_iter()
+            .chain(rest[1..].find("\n    fn "))
+            .min()
+            .map_or(rest.len(), |i| i + 1);
+        rest[..end].to_string()
+    }
+
+    fn before(body: &str, first: &str, then: &str) -> bool {
+        match (body.find(first), body.find(then)) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn every_booking_path_waits_for_a_durable_rollover() {
+        // pre-G2, Codex 4146113066 / 4146548930: the live harvest (tick,
+        // startup, shutdown), the paper flatten IOC and the pending-fill
+        // resolution all book only after ensure_rolled.
+        let harvest = main_fn_body("harvest_fills");
+        assert!(
+            before(&harvest, "ensure_rolled(", "get_filled_orders"),
+            "harvest_fills must check the rollover before reading/booking fills"
+        );
+        let flatten = main_fn_body("paper_flatten");
+        assert!(
+            before(&flatten, "ensure_rolled(", "self.book(fill"),
+            "paper_flatten must check the rollover before booking its IOC"
+        );
+        let resolve = main_fn_body("resolve_pending_fills");
+        assert!(before(&resolve, "ensure_rolled(", "self.book(fill"));
+        // Startup resolves the last shutdown's leftovers before harvesting.
+        let startup = main_fn_body("startup_reconcile");
+        assert!(before(&startup, "resolve_pending_fills(", "live_fills("));
+        // Shutdown spills whatever the harvest couldn't book (4146269818).
+        let shutdown = main_fn_body("shutdown");
+        assert!(before(&shutdown, "harvest_fills(", "spill_unbooked("));
     }
 
     #[test]
@@ -2118,6 +2281,105 @@ mod tests {
             |_| { Err(std::io::Error::other("dir sync")) }
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_failed_first_append_still_dir_syncs_on_the_next_success() {
+        // pre-G2, Codex P2 4146418683: the first append creates the file but
+        // its write fails and is rolled back to 0 bytes; the retry sees the
+        // file as existing, yet must still fsync the directory entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        let err = append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            |_, _| Err(std::io::Error::other("ENOSPC")),
+            |f, l| f.set_len(l),
+            |_| Ok(()),
+        );
+        assert!(err.is_err());
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let mut synced = 0;
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| {
+                synced += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(synced, 1, "the retry must fsync the parent directory");
+        // Once a row is durable, later appends don't.
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 2}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| panic!("no dir sync once the file holds a row"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unbooked_fills_at_shutdown_are_spilled_and_resolved_never_dropped() {
+        use std::str::FromStr;
+        // pre-G2, Codex P1 4146269818.
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending_fills.jsonl");
+        let complete = dex_connector::FilledOrder {
+            trade_id: "t1".into(),
+            order_id: "o1".into(),
+            filled_side: Some(dex_connector::OrderSide::Short),
+            filled_size: Some(d("0.002")),
+            filled_value: Some(d("167.2")),
+            filled_fee: None,
+            ..Default::default()
+        };
+        let incomplete = dex_connector::FilledOrder {
+            trade_id: "t2".into(),
+            order_id: "o2".into(),
+            filled_size: Some(d("0.001")),
+            ..Default::default()
+        };
+        let rejected = dex_connector::FilledOrder {
+            trade_id: "t3".into(),
+            is_rejected: true,
+            ..Default::default()
+        };
+        let spilled: Vec<PendingFill> = [&complete, &incomplete, &rejected]
+            .iter()
+            .map(|f| PendingFill::from_record(f, Some(true), 9))
+            .collect();
+        spill_pending(&path, &spilled).unwrap();
+        let back = read_pending(&path).unwrap();
+        assert_eq!(back, spilled, "every unbooked record survives the restart");
+        let res: Vec<_> = back.iter().map(|p| resolve_pending(p, d("2.25"))).collect();
+        match &res[0] {
+            PendingResolution::Book(f) => {
+                assert!(!f.buy);
+                assert_eq!(f.qty, d("0.002"));
+                assert_eq!(f.px, d("83600"));
+                // Missing fee → conservative taker estimate, never zero.
+                assert_eq!(f.fee, d("0.03762"));
+                assert!(f.fee_estimated);
+                assert!(f.maker);
+            }
+            other => panic!("complete record must book, got {other:?}"),
+        }
+        assert!(matches!(&res[1], PendingResolution::Halt(r) if r.starts_with("fill_incomplete")));
+        assert_eq!(res[2], PendingResolution::Clear);
+        // A torn/garbled line is a startup error, never skipped.
+        std::fs::write(&path, "{\"trade_id\": \"t9\"\n").unwrap();
+        assert!(read_pending(&path).is_err());
+        // Missing file: nothing pending.
+        assert!(read_pending(&dir.path().join("none.jsonl"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
