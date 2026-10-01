@@ -206,16 +206,22 @@ impl Run<'_> {
 }
 
 impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
-    async fn harvest(&self, run: &mut Run<'_>) {
+    /// `false` when the fills could not be read (the book is then stale and
+    /// must not count as a fresh sample).
+    async fn harvest(&self, run: &mut Run<'_>) -> bool {
         match self.venue.fills(&run.intent.symbol).await {
             Ok(fills) => {
                 let (intent, ids) = (run.intent, &run.ids);
                 run.book.harvest(intent, &fills, ids);
+                true
             }
-            Err(e) => log::warn!(
-                "[MAKER_FIRST] {}: fills unreadable: {e:?}",
-                run.intent.symbol
-            ),
+            Err(e) => {
+                log::warn!(
+                    "[MAKER_FIRST] {}: fills unreadable: {e:?}",
+                    run.intent.symbol
+                );
+                false
+            }
         }
     }
 
@@ -244,13 +250,18 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
     async fn settle(&self, run: &mut Run<'_>) -> bool {
         let mut prev: Option<(f64, f64)> = None;
         for i in 0..=self.timing.settle_polls {
-            self.harvest(run).await;
-            if let Some(p) = self.read_position(run).await {
-                let sample = (run.book.filled, p);
-                if run.agrees(p) && prev == Some(sample) {
-                    return true;
+            // Only fully successful reads are samples; a failed read resets
+            // the run of agreeing samples (Codex on #374).
+            let fresh = self.harvest(run).await;
+            match (fresh, self.read_position(run).await) {
+                (true, Some(p)) => {
+                    let sample = (run.book.filled, p);
+                    if run.agrees(p) && prev == Some(sample) {
+                        return true;
+                    }
+                    prev = Some(sample);
                 }
-                prev = Some(sample);
+                _ => prev = None,
             }
             if i < self.timing.settle_polls {
                 tokio::time::sleep(self.timing.poll).await;
@@ -542,12 +553,15 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         // slices of a multi-counterparty IOC still arriving otherwise).
         let mut prev: Option<f64> = None;
         for _ in 0..=self.timing.ioc_fill_polls {
-            self.harvest(run).await;
-            if let Some(p) = self.read_position(run).await {
-                if run.book.filled > before + run.eps && run.agrees(p) && prev == Some(p) {
-                    return;
+            let fresh = self.harvest(run).await;
+            match (fresh, self.read_position(run).await) {
+                (true, Some(p)) => {
+                    if run.book.filled > before + run.eps && run.agrees(p) && prev == Some(p) {
+                        return;
+                    }
+                    prev = Some(p);
                 }
-                prev = Some(p);
+                _ => prev = None,
             }
             tokio::time::sleep(self.timing.poll).await;
         }
@@ -746,6 +760,8 @@ mod tests {
         fills_calls: usize,
         position: f64,
         canceled: HashSet<String>,
+        /// `fills()` calls (1-based) that fail.
+        fills_fail_on: Vec<usize>,
         /// The open-orders view drops live orders (a cache gap): they are
         /// neither cancelled nor filled.
         open_omits_live: bool,
@@ -909,6 +925,9 @@ mod tests {
             }
             st.fills_calls += 1;
             let now = st.fills_calls;
+            if st.fills_fail_on.contains(&now) {
+                return Err(DexError::Transient("fills read failed".into()));
+            }
             let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.pending)
                 .into_iter()
                 .partition(|(d, _)| *d <= now);
@@ -1324,5 +1343,41 @@ mod tests {
         );
         assert!(v.s().iocs.is_empty(), "no taker while m1 may be live");
         assert_eq!(o.unresolved, vec!["m1".to_string()]);
+    }
+
+    /// Codex on #374 (round 4): a failed fills read must not count as an
+    /// unchanged second sample.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fills_read_is_not_a_settling_sample() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.position_delay = 3;
+            s.record_delay = 4;
+            s.fills_fail_on = vec![2];
+        });
+        let i = buy(1.0, Some(50.0), 250);
+        let ex = MakerFirstExecutor {
+            venue: &v,
+            timing: timing(),
+        };
+        let mut run = Run {
+            intent: &i,
+            pos0: 0.0,
+            eps: 1e-9,
+            ids: HashMap::from([("m1".to_string(), Role::Maker)]),
+            book: Book {
+                rows: Vec::new(),
+                seen: HashSet::new(),
+                filled: 0.0,
+            },
+            unresolved: Vec::new(),
+            last_pos: Some(0.0),
+            order_qty: HashMap::new(),
+        };
+        push_fill(&mut v.s(), "m1", 0.4, 99.9);
+        assert!(ex.settle(&mut run).await);
+        assert!(
+            (run.book.filled - 0.4).abs() < 1e-12,
+            "settled on a failed read"
+        );
     }
 }
