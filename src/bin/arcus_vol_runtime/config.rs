@@ -198,7 +198,17 @@ impl Config {
 
 /// Live needs all three: DRY_RUN off, the confirm token, and a dedicated
 /// non-zero subaccount (subaccount 0 holds the owner's manual trading).
-pub fn live_gate(dry_run: bool, confirm: &str, account_index: Option<u8>) -> Result<(), String> {
+/// Exact value of `ARCUS_VOL_ALLOW_ACCOUNT0` that lets live run on subaccount
+/// 0, which is shared with the owner's manual trading (owner decision
+/// 2026-10-01, bot-strategy#1093).
+pub const ALLOW_ACCOUNT0_TOKEN: &str = "I-understand-shared-account";
+
+pub fn live_gate(
+    dry_run: bool,
+    confirm: &str,
+    account_index: Option<u8>,
+    allow_account0: &str,
+) -> Result<(), String> {
     if dry_run {
         return Ok(());
     }
@@ -210,8 +220,10 @@ pub fn live_gate(dry_run: bool, confirm: &str, account_index: Option<u8>) -> Res
     match account_index {
         // Arcus subaccounts are 0..=9; 0 holds the owner's manual trading.
         Some(i) if (1..=9).contains(&i) => Ok(()),
+        Some(0) if allow_account0 == ALLOW_ACCOUNT0_TOKEN => Ok(()),
         other => Err(format!(
-            "live needs a dedicated Arcus subaccount: ARCUS_ACCOUNT_INDEX must be in 1..=9 (got {})",
+            "live needs a dedicated Arcus subaccount: ARCUS_ACCOUNT_INDEX must be in 1..=9 (got {}); \
+             subaccount 0 is shared with manual trading and needs ARCUS_VOL_ALLOW_ACCOUNT0={ALLOW_ACCOUNT0_TOKEN}",
             other.map_or_else(|| "unset".to_string(), |i| i.to_string())
         )),
     }
@@ -223,16 +235,31 @@ mod tests {
 
     #[test]
     fn live_gate_needs_token_and_nonzero_subaccount() {
-        assert!(live_gate(true, "", None).is_ok());
-        assert!(live_gate(false, "", Some(1)).is_err());
-        assert!(live_gate(false, "1093", Some(1)).is_err());
-        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, None).is_err());
-        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(0)).is_err());
-        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(3)).is_ok());
-        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(1)).is_ok());
-        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(9)).is_ok());
+        assert!(live_gate(true, "", None, "").is_ok());
+        assert!(live_gate(false, "", Some(1), "").is_err());
+        assert!(live_gate(false, "1093", Some(1), "").is_err());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, None, "").is_err());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(0), "").is_err());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(3), "").is_ok());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(1), "").is_ok());
+        // Subaccount 0 (shared with manual trading) only with the exact opt-in.
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(0), "yes").is_err());
+        assert!(live_gate(
+            false,
+            LIVE_CONFIRM_TOKEN,
+            Some(0),
+            "i-understand-shared-account"
+        )
+        .is_err());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(0), ALLOW_ACCOUNT0_TOKEN).is_ok());
+        assert!(live_gate(false, "", Some(0), ALLOW_ACCOUNT0_TOKEN).is_err());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(10), ALLOW_ACCOUNT0_TOKEN).is_err());
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(255), ALLOW_ACCOUNT0_TOKEN).is_err());
+        let refused = live_gate(false, LIVE_CONFIRM_TOKEN, Some(0), "").unwrap_err();
+        assert!(refused.contains("ARCUS_VOL_ALLOW_ACCOUNT0"), "{refused}");
+        assert!(live_gate(false, LIVE_CONFIRM_TOKEN, Some(9), "").is_ok());
         for bad in [10u8, 42, 255] {
-            let err = live_gate(false, LIVE_CONFIRM_TOKEN, Some(bad)).unwrap_err();
+            let err = live_gate(false, LIVE_CONFIRM_TOKEN, Some(bad), "").unwrap_err();
             assert!(err.contains("1..=9"), "{err}");
         }
     }

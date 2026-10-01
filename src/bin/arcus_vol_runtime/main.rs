@@ -1558,7 +1558,23 @@ impl BatchSink<QuoteBatch> for Runtime {
 async fn main() -> Result<()> {
     init_logger();
     let cfg = Config::from_env()?;
-    config::live_gate(cfg.dry_run, &cfg.live_confirm, cfg.account_index).map_err(|e| anyhow!(e))?;
+    let allow_account0 = std::env::var("ARCUS_VOL_ALLOW_ACCOUNT0").unwrap_or_default();
+    config::live_gate(
+        cfg.dry_run,
+        &cfg.live_confirm,
+        cfg.account_index,
+        &allow_account0,
+    )
+    .map_err(|e| anyhow!(e))?;
+    if !cfg.dry_run && cfg.account_index == Some(0) {
+        log::warn!(
+            "[ARCUS_VOL] LIVE ON SUBACCOUNT 0 (shared with manual trading): stray {} orders get \
+             cancelled, a {} position mismatch halts, and the dead man's switch cancels ALL \
+             orders on the account (every market) if this process stops refreshing it",
+            cfg.market,
+            cfg.market
+        );
+    }
     log::info!(
         "[ARCUS_VOL] start mode={} market={} clip=${} skew=${} hard_cap=${} margin=${}x{} → effective_cap=${} (quotes sized to ${}) max_hold={}s daily_stop=${} cum_stop=${} state={}",
         cfg.mode(),
