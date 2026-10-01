@@ -190,6 +190,14 @@ pub enum QuoteAction {
     Replace(Option<QuoteTarget>),
 }
 
+/// In-place modify is OFF: on mainnet (2026-10-01, first live run) every
+/// `batchModifyOrders` row was rejected with "provide exactly one of orderId
+/// or clientId (not both)" (dex-connector sends both), so quotes could not be
+/// repriced. Requotes go through cancel + place instead, both verified live;
+/// Arcus modify is a cancel-replace anyway, so no queue priority is lost.
+/// Re-enable once the connector's batch modify is fixed and verified.
+pub const MODIFY_ENABLED: bool = false;
+
 /// Requote only when the price moved, or the size is off by more than 1%.
 pub fn quote_action(resting: Option<&Resting>, target: Option<&QuoteTarget>) -> QuoteAction {
     match (resting, target) {
@@ -201,7 +209,7 @@ pub fn quote_action(resting: Option<&Resting>, target: Option<&QuoteTarget>) -> 
             let size_off = (open - t.qty).abs() > t.qty / Decimal::ONE_HUNDRED;
             if r.px == t.px && !size_off {
                 QuoteAction::Keep
-            } else if r.filled.is_zero() {
+            } else if MODIFY_ENABLED && r.filled.is_zero() {
                 QuoteAction::Modify(t.clone())
             } else {
                 QuoteAction::Replace(Some(t.clone()))
@@ -1274,9 +1282,11 @@ mod tests {
             px: d("100.2"),
             ..t.clone()
         };
+        // In-place modify is disabled (MODIFY_ENABLED = false, mainnet
+        // rejected batch modify): a moved untouched quote is cancel + place.
         assert_eq!(
             quote_action(Some(&r), Some(&moved)),
-            QuoteAction::Modify(moved.clone())
+            QuoteAction::Replace(Some(moved.clone()))
         );
         let partly = Resting {
             filled: d("0.4"),
