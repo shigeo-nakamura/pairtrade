@@ -62,6 +62,8 @@ pub struct VenueFill {
     pub qty: f64,
     pub price: f64,
     pub fee_usd: Option<f64>,
+    /// `Venue` for a real venue's fill record, `Paper` for a simulated one.
+    pub price_source: PriceSource,
 }
 
 /// The few venue operations the executor needs.
@@ -158,7 +160,7 @@ impl Book {
                 order_id: Some(f.order_id.clone()),
                 role: *role,
                 price: f.price,
-                price_source: PriceSource::Venue,
+                price_source: f.price_source,
                 qty: f.qty,
                 fee_usd: f.fee_usd,
                 arrival_mid: intent.reference_price,
@@ -692,6 +694,7 @@ impl<'a> OrderVenue for DexVenue<'a> {
                     qty,
                     price: value / qty,
                     fee_usd: f.filled_fee.and_then(|d| d.to_f64()),
+                    price_source: PriceSource::Venue,
                 })
             })
             .collect())
@@ -819,6 +822,7 @@ mod tests {
                 qty,
                 price,
                 fee_usd: Some(0.0),
+                price_source: PriceSource::Venue,
             },
         ));
     }

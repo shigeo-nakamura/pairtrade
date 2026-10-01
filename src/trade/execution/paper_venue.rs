@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use dex_connector::DexError;
 
-use super::intent::Side;
+use super::intent::{PriceSource, Side};
 use super::maker_first::{OrderVenue, VenueFill};
 
 /// Per-tier delays and fees.
@@ -92,6 +92,7 @@ struct Resting {
     price: f64,
     remaining: f64,
     queue_ahead: f64,
+    reduce_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,7 @@ enum Effect {
         side: Side,
         qty: f64,
         price: f64,
+        reduce_only: bool,
     },
     Remove {
         id: String,
@@ -110,6 +112,7 @@ enum Effect {
         side: Side,
         qty: f64,
         limit: f64,
+        reduce_only: bool,
     },
 }
 
@@ -214,6 +217,7 @@ impl PaperBook {
                 side,
                 qty,
                 price,
+                reduce_only,
             } => {
                 self.pending.remove(&id);
                 // Cancelled before it ever went live.
@@ -242,6 +246,7 @@ impl PaperBook {
                         price,
                         remaining: qty,
                         queue_ahead,
+                        reduce_only,
                     },
                 );
             }
@@ -255,11 +260,19 @@ impl PaperBook {
                 side,
                 qty,
                 limit,
+                reduce_only,
             } => {
                 self.pending.remove(&id);
                 if !self.valid {
                     return;
                 }
+                // A reduce-only IOC never trades past flat (as live venues
+                // and the book PaperExecutor do; Codex on #376).
+                let qty = if reduce_only {
+                    qty.min(self.reducible(side))
+                } else {
+                    qty
+                };
                 let levels: Vec<Level> = match side {
                     Side::Buy => self.asks.clone(),
                     Side::Sell => self.bids.clone(),
@@ -281,6 +294,14 @@ impl PaperBook {
         }
     }
 
+    /// How much an order on `side` can still reduce the position by.
+    fn reducible(&self, side: Side) -> f64 {
+        match side {
+            Side::Buy => (-self.position).max(0.0),
+            Side::Sell => self.position.max(0.0),
+        }
+    }
+
     fn book_fill(&mut self, id: &str, side: Side, qty: f64, price: f64, fee_bps: f64) {
         if qty <= 0.0 {
             return;
@@ -296,6 +317,7 @@ impl PaperBook {
             qty,
             price,
             fee_usd: Some(qty * price * fee_bps / 1e4),
+            price_source: PriceSource::Paper,
         });
     }
 
@@ -330,6 +352,10 @@ impl PaperBook {
             .collect();
         ids.sort(); // deterministic order
         for id in ids {
+            let reducible = {
+                let r = &self.live[&id];
+                r.reduce_only.then(|| self.reducible(r.side))
+            };
             let r = self.live.get_mut(&id).unwrap();
             let at_price = price == r.price;
             let through = match hit_side {
@@ -345,6 +371,17 @@ impl PaperBook {
                 (size - consumed).min(r.remaining)
             } else {
                 0.0
+            };
+            // A reduce-only maker never fills past flat; one that can no
+            // longer reduce anything is cancelled, as a venue would.
+            if reducible == Some(0.0) {
+                self.live.remove(&id);
+                self.canceled.insert(id);
+                continue;
+            }
+            let fill = match reducible {
+                Some(max) => fill.min(max),
+                None => fill,
             };
             if fill <= 0.0 {
                 continue;
@@ -367,7 +404,14 @@ impl PaperBook {
         )
     }
 
-    pub fn place_post_only(&mut self, now: u64, side: Side, qty: f64, price: f64) -> String {
+    pub fn place_post_only(
+        &mut self,
+        now: u64,
+        side: Side,
+        qty: f64,
+        price: f64,
+        reduce_only: bool,
+    ) -> String {
         self.next_id += 1;
         let id = format!("pm{}", self.next_id);
         self.pending.insert(id.clone());
@@ -379,6 +423,7 @@ impl PaperBook {
                 side,
                 qty,
                 price,
+                reduce_only,
             },
         );
         id
@@ -389,7 +434,14 @@ impl PaperBook {
         self.schedule(at, Effect::Remove { id: id.to_string() });
     }
 
-    pub fn place_ioc(&mut self, now: u64, side: Side, qty: f64, limit: f64) -> String {
+    pub fn place_ioc(
+        &mut self,
+        now: u64,
+        side: Side,
+        qty: f64,
+        limit: f64,
+        reduce_only: bool,
+    ) -> String {
         self.next_id += 1;
         let id = format!("pi{}", self.next_id);
         self.pending.insert(id.clone());
@@ -401,6 +453,7 @@ impl PaperBook {
                 side,
                 qty,
                 limit,
+                reduce_only,
             },
         );
         id
@@ -457,10 +510,10 @@ impl OrderVenue for PaperVenue {
         side: Side,
         qty: f64,
         price: f64,
-        _: bool,
+        reduce_only: bool,
     ) -> Result<String, DexError> {
         let now = (self.clock)();
-        Ok(self.b().place_post_only(now, side, qty, price))
+        Ok(self.b().place_post_only(now, side, qty, price, reduce_only))
     }
     async fn cancel(&self, _: &str, order_id: &str) -> Result<(), DexError> {
         let now = (self.clock)();
@@ -482,10 +535,10 @@ impl OrderVenue for PaperVenue {
         side: Side,
         qty: f64,
         limit: f64,
-        _: bool,
+        reduce_only: bool,
     ) -> Result<String, DexError> {
         let now = (self.clock)();
-        Ok(self.b().place_ioc(now, side, qty, limit))
+        Ok(self.b().place_ioc(now, side, qty, limit, reduce_only))
     }
 }
 
@@ -530,7 +583,7 @@ mod tests {
     #[test]
     fn a_print_at_our_price_eats_the_queue_first_then_fills_us_at_p() {
         let mut b = book(zero());
-        let id = b.place_post_only(10, Side::Buy, 3.0, 99.9);
+        let id = b.place_post_only(10, Side::Buy, 3.0, 99.9, false);
         b.flush(10);
         b.on_trade(20, 99.9, 3.0, Side::Sell); // queue 5 → 2
         assert_eq!(filled(&b, &id), 0.0);
@@ -547,7 +600,7 @@ mod tests {
     #[test]
     fn a_trade_through_fills_the_prints_full_size_and_clears_the_queue() {
         let mut b = book(zero());
-        let id = b.place_post_only(10, Side::Buy, 10.0, 99.9);
+        let id = b.place_post_only(10, Side::Buy, 10.0, 99.9, false);
         b.flush(10);
         b.on_trade(20, 99.8, 6.0, Side::Sell); // through our bid
         assert!((filled(&b, &id) - 6.0).abs() < 1e-12);
@@ -562,10 +615,10 @@ mod tests {
     #[test]
     fn queue_position_follows_the_displayed_levels() {
         let mut b = book(zero());
-        let improve = b.place_post_only(1, Side::Buy, 1.0, 99.95); // inside the best
-        let depth = b.place_post_only(1, Side::Buy, 1.0, 99.8); // a depth level
-        let gap = b.place_post_only(1, Side::Buy, 1.0, 99.85); // empty, between levels
-        let beyond = b.place_post_only(1, Side::Buy, 1.0, 99.0); // past the levels
+        let improve = b.place_post_only(1, Side::Buy, 1.0, 99.95, false); // inside the best
+        let depth = b.place_post_only(1, Side::Buy, 1.0, 99.8, false); // a depth level
+        let gap = b.place_post_only(1, Side::Buy, 1.0, 99.85, false); // empty, between levels
+        let beyond = b.place_post_only(1, Side::Buy, 1.0, 99.0, false); // past the levels
         b.flush(1);
         let q = |id: &str| b.live[id].queue_ahead;
         assert_eq!(q(&improve), 0.0);
@@ -577,7 +630,7 @@ mod tests {
     #[test]
     fn size_decreases_never_advance_the_queue() {
         let mut b = book(zero());
-        let id = b.place_post_only(1, Side::Buy, 1.0, 99.9);
+        let id = b.place_post_only(1, Side::Buy, 1.0, 99.9, false);
         b.flush(1);
         b.on_book(2, vec![lv(99.9, 1.0)], vec![lv(100.1, 4.0)]); // 5 → 1 displayed
         assert_eq!(b.live[&id].queue_ahead, 5.0);
@@ -586,7 +639,7 @@ mod tests {
     #[test]
     fn latency_and_the_same_millisecond_rule() {
         let mut b = book(PaperParams::lighter_standard()); // live at +350 ms
-        let id = b.place_post_only(1_000, Side::Buy, 1.0, 99.95);
+        let id = b.place_post_only(1_000, Side::Buy, 1.0, 99.95, false);
         b.on_trade(1_349, 99.95, 5.0, Side::Sell);
         assert_eq!(filled(&b, &id), 0.0, "not live yet");
         b.on_trade(1_350, 99.95, 5.0, Side::Sell);
@@ -602,7 +655,7 @@ mod tests {
     #[test]
     fn a_cancelled_order_fills_until_its_removal_time_and_is_then_recorded() {
         let mut b = book(PaperParams::lighter_standard()); // cancel removes at +450 ms
-        let id = b.place_post_only(0, Side::Buy, 2.0, 99.95);
+        let id = b.place_post_only(0, Side::Buy, 2.0, 99.95, false);
         b.flush(400);
         b.cancel(1_000, &id);
         b.on_trade(1_450, 99.95, 1.0, Side::Sell); // same ms as the removal: still fills
@@ -621,7 +674,7 @@ mod tests {
         p.d_ms = 150;
         p.place_ms = 500;
         let mut b = book(p);
-        let id = b.place_post_only(0, Side::Buy, 1.0, 99.95);
+        let id = b.place_post_only(0, Side::Buy, 1.0, 99.95, false);
         b.cancel(0, &id);
         b.flush(200);
         assert!(b.canceled_ids().contains(&id));
@@ -635,7 +688,7 @@ mod tests {
     #[test]
     fn a_crossing_post_only_is_rejected() {
         let mut b = book(zero());
-        let id = b.place_post_only(1, Side::Buy, 1.0, 100.1); // at the ask
+        let id = b.place_post_only(1, Side::Buy, 1.0, 100.1, false); // at the ask
         b.flush(1);
         assert!(!b.open_ids().contains(&id));
         assert!(b.canceled_ids().contains(&id));
@@ -651,7 +704,7 @@ mod tests {
             vec![lv(99.9, 5.0)],
             vec![lv(100.1, 1.0), lv(100.2, 1.0), lv(100.6, 9.0)],
         );
-        let id = b.place_ioc(1, Side::Buy, 3.0, 100.5);
+        let id = b.place_ioc(1, Side::Buy, 3.0, 100.5, false);
         b.flush(1);
         assert!(
             (filled(&b, &id) - 2.0).abs() < 1e-12,
@@ -665,7 +718,7 @@ mod tests {
     fn an_invalid_book_neither_activates_nor_fills() {
         let mut b = book(zero());
         b.set_valid(1, false);
-        let id = b.place_post_only(2, Side::Buy, 1.0, 99.95);
+        let id = b.place_post_only(2, Side::Buy, 1.0, 99.95, false);
         b.flush(2);
         assert!(!b.open_ids().contains(&id));
         b.set_valid(3, true);
@@ -740,5 +793,41 @@ mod tests {
             .all(|f| f.role == Role::Maker && f.price == 99.9));
         let fee: f64 = o.fills.iter().map(|f| f.fee_usd.unwrap()).sum();
         assert!((fee - 2.0 * 99.9 * 0.4e-4).abs() < 1e-9);
+    }
+
+    /// Codex on #376: reduce-only never trades past flat, maker or IOC.
+    #[test]
+    fn reduce_only_orders_never_cross_zero() {
+        let mut b = book(zero());
+        b.place_ioc(1, Side::Buy, 1.0, 100.5, false); // long 1.0
+        b.flush(1);
+        assert!((b.position() - 1.0).abs() < 1e-12);
+        b.on_book(2, vec![lv(99.9, 10.0)], vec![lv(100.1, 4.0)]);
+        let ioc = b.place_ioc(3, Side::Sell, 3.0, 99.0, true);
+        b.flush(3);
+        assert!(
+            (filled(&b, &ioc) - 1.0).abs() < 1e-12,
+            "only the 1.0 is closed"
+        );
+        assert!(b.position().abs() < 1e-12);
+        // From flat, a reduce-only maker sell is cancelled instead of filling.
+        let mk = b.place_post_only(4, Side::Sell, 2.0, 100.2, true);
+        b.flush(4);
+        b.on_trade(5, 100.3, 5.0, Side::Buy); // through our ask
+        assert_eq!(filled(&b, &mk), 0.0);
+        assert!(b.canceled_ids().contains(&mk));
+        assert!(b.position().abs() < 1e-12);
+    }
+
+    #[test]
+    fn paper_fills_carry_paper_provenance() {
+        let mut b = book(zero());
+        b.place_ioc(1, Side::Buy, 1.0, 100.5, false);
+        b.flush(1);
+        assert!(!b.fills().is_empty());
+        assert!(b
+            .fills()
+            .iter()
+            .all(|f| f.price_source == PriceSource::Paper));
     }
 }
