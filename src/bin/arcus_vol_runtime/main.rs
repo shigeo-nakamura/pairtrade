@@ -37,8 +37,9 @@ use ledger::{
 use logic::{
     dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position,
     may_disarm_dms, plan_inputs, plan_quotes, position_check, position_gate_after, quote_action,
-    reconcile_cleared, send_gated, shock, shutdown_steps, tick_plan, BatchSink, PlanState,
-    PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
+    read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan,
+    BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
+    ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -62,6 +63,9 @@ const MARKOUT_MAX_LATE_MS: u64 = 60_000;
 /// Shutdown keeps polling incomplete fill records this long before
 /// spilling the rest to pending_fills.jsonl (pre-G2, Codex P1 4146269818).
 const SHUTDOWN_HARVEST_BUDGET: Duration = Duration::from_secs(30);
+/// Minimum time the final shutdown spill read gets, even when the harvest
+/// used up the budget.
+const SPILL_READ_FLOOR: Duration = Duration::from_secs(5);
 
 fn init_logger() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -116,6 +120,9 @@ struct Runtime {
     pending_path: PathBuf,
     /// Trade ids still unresolved in pending_fills.jsonl (status.json).
     pending_unresolved: Vec<String>,
+    /// Connector fill records the last harvest saw but couldn't book and
+    /// clear: the fallback for a stalled shutdown spill read.
+    unbooked_seen: Vec<dex_connector::FilledOrder>,
     last_pending_warn_ms: u64,
     kill_path: PathBuf,
     halt_path: PathBuf,
@@ -545,6 +552,8 @@ impl Runtime {
                 return;
             }
         };
+        let snapshot = rows.clone();
+        let mut cleared: HashSet<String> = HashSet::new();
         let mut all_booked = true;
         for f in rows {
             // Only a confirmed rejected / zero-size record is cleared; an
@@ -567,6 +576,7 @@ impl Runtime {
                     log::warn!("[ARCUS_VOL] fill {} rejected/empty; cleared", f.trade_id);
                     self.incomplete_since.remove(&f.trade_id);
                     self.clear_fill(&market, &f.trade_id).await;
+                    cleared.insert(f.trade_id.clone());
                     continue;
                 }
                 ledger::FillRecordAction::Pending => {
@@ -666,11 +676,16 @@ impl Runtime {
             };
             if may_forget_fill(&booking, persisted) {
                 self.clear_fill(&market, &f.trade_id).await;
+                cleared.insert(f.trade_id.clone());
             } else {
                 all_booked = false;
             }
         }
         self.fills_synced = all_booked;
+        self.unbooked_seen = snapshot
+            .into_iter()
+            .filter(|r| !cleared.contains(&r.trade_id))
+            .collect();
     }
 
     async fn clear_fill(&self, market: &str, trade_id: &str) {
@@ -855,17 +870,25 @@ impl Runtime {
     /// At shutdown, write every fill record the connector still holds (i.e.
     /// not yet booked and cleared) to `pending_fills.jsonl`, durably, so a
     /// restart can't lose it (pre-G2, Codex P1 4146269818).
-    async fn spill_unbooked(&mut self, now: u64) {
+    async fn spill_unbooked(&mut self, now: u64, limit: Duration) {
         let market = self.cfg.market.clone();
-        let rows = match self.dex.get_filled_orders(&market).await {
-            Ok(r) => r.orders,
-            Err(e) => {
-                log::error!(
-                    "[ARCUS_VOL] SHUTDOWN: cannot read unbooked fills ({e}); reconcile the venue fills by hand"
-                );
-                return;
-            }
-        };
+        // Bounded (pre-G2, Codex P2 4152541379): a stalled venue can't hang
+        // the shutdown; then the harvest's unbooked records are spilled.
+        let read = read_within(self.dex.get_filled_orders(&market), limit)
+            .await
+            .map(|r| r.map(|r| r.orders));
+        match &read {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => log::error!(
+                "[ARCUS_VOL] SHUTDOWN: unbooked-fill read failed ({e}); spilling the {} record(s) the harvest saw",
+                self.unbooked_seen.len()
+            ),
+            None => log::error!(
+                "[ARCUS_VOL] SHUTDOWN: unbooked-fill read timed out after {limit:?}; spilling the {} record(s) the harvest saw",
+                self.unbooked_seen.len()
+            ),
+        }
+        let rows = spill_rows(read, std::mem::take(&mut self.unbooked_seen));
         if rows.is_empty() {
             return;
         }
@@ -1577,6 +1600,7 @@ impl Runtime {
                     // At least 3 polls, then keep polling (bounded) while any
                     // record is still incomplete (pre-G2, Codex P1 4146269818);
                     // whatever is left is spilled to pending_fills.jsonl.
+                    let harvest_started = std::time::Instant::now();
                     let harvest = async {
                         let mut polls = 0;
                         loop {
@@ -1594,7 +1618,12 @@ impl Runtime {
                     {
                         log::warn!("[ARCUS_VOL] shutdown fill harvest budget used up");
                     }
-                    self.spill_unbooked(now_ms()).await;
+                    // The spill read gets what's left of the budget (at
+                    // least a short floor), then persist / DMS run regardless.
+                    let left = SHUTDOWN_HARVEST_BUDGET
+                        .saturating_sub(harvest_started.elapsed())
+                        .max(SPILL_READ_FLOOR);
+                    self.spill_unbooked(now_ms(), left).await;
                 }
                 ShutdownStep::Persist => {
                     self.virt.clear();
@@ -1737,6 +1766,7 @@ async fn main() -> Result<()> {
         fills_path,
         pending_path: cfg.state_dir.join("pending_fills.jsonl"),
         pending_unresolved: Vec::new(),
+        unbooked_seen: Vec::new(),
         last_pending_warn_ms: 0,
         kill_path: cfg.state_dir.join("KILL_SWITCH"),
         halt_path: cfg.state_dir.join("HALT"),

@@ -394,6 +394,28 @@ pub fn market_position(
         })
 }
 
+/// Await `fut` for at most `limit`; `None` on timeout (pre-G2, Codex P2
+/// 4152541379: the final shutdown spill read must not hang the shutdown).
+pub async fn read_within<T, E>(
+    fut: impl std::future::Future<Output = Result<T, E>>,
+    limit: std::time::Duration,
+) -> Option<Result<T, E>> {
+    tokio::time::timeout(limit, fut).await.ok()
+}
+
+/// What to spill at shutdown: the fresh read when it came back, else the
+/// unbooked records the bounded harvest already saw (never nothing just
+/// because the venue stalled).
+pub fn spill_rows<E>(
+    read: Option<Result<Vec<dex_connector::FilledOrder>, E>>,
+    seen: Vec<dex_connector::FilledOrder>,
+) -> Vec<dex_connector::FilledOrder> {
+    match read {
+        Some(Ok(rows)) => rows,
+        Some(Err(_)) | None => seen,
+    }
+}
+
 /// Outcome of comparing the ledger with the venue position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PosCheck {
@@ -790,6 +812,40 @@ mod tests {
         // A symbol that only shares a prefix is not ours.
         let positions = vec![snap("BTCDOM-USD", "1", 1)];
         assert_eq!(market_position(&positions, "BTC-USD").0, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_spill_read_falls_back_to_the_harvested_records() {
+        // pre-G2, Codex P2 4152541379: a venue read that never returns is
+        // cut off within the budget, and the records the harvest already
+        // saw are spilled instead.
+        let rec = |id: &str| dex_connector::FilledOrder {
+            trade_id: id.into(),
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let read = read_within(
+            std::future::pending::<Result<Vec<dex_connector::FilledOrder>, String>>(),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(read.is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        let out = spill_rows(read, vec![rec("t1"), rec("t2")]);
+        assert_eq!(
+            out.iter().map(|r| r.trade_id.as_str()).collect::<Vec<_>>(),
+            ["t1", "t2"]
+        );
+        // A read that returns in time is authoritative.
+        let read = read_within(
+            async { Ok::<_, String>(vec![rec("t3")]) },
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(spill_rows(read, vec![rec("t1")])[0].trade_id, "t3");
+        // A failed read also falls back.
+        let read: Option<Result<Vec<_>, String>> = Some(Err("down".into()));
+        assert_eq!(spill_rows(read, vec![rec("t1")])[0].trade_id, "t1");
     }
 
     #[test]

@@ -98,6 +98,10 @@ pub struct Ledger {
     pub day_realized: Decimal,
     pub day_fees: Decimal,
     pub day_start_unrealized: Decimal,
+    /// The mark the current day was rolled at (`day_start_unrealized`'s
+    /// price); `None` before the first rollover / in older state.
+    #[serde(default)]
+    pub day_start_mark: Option<Decimal>,
     pub day_volume: Decimal,
     pub day_maker_volume: Decimal,
     pub day_taker_volume: Decimal,
@@ -197,7 +201,18 @@ impl Ledger {
         now_ms: u64,
         scope: DayScope,
     ) -> Decimal {
+        // A late prior-day fill changes today's starting position: rebase the
+        // day-start unrealized by the position's before/after value at the
+        // rollover mark, so booking it doesn't move today's daily_net (pre-G2,
+        // Codex P1 4152541373). Without a recorded mark, the fill price
+        // (unrealized 0 at entry) is the neutral fallback.
+        let rebase_mark =
+            (scope == DayScope::CumulativeOnly).then(|| self.day_start_mark.unwrap_or(px));
+        let before = rebase_mark.map(|m| self.position.unrealized(m));
         let realized = self.position.apply(buy, qty, px, now_ms);
+        if let (Some(m), Some(b)) = (rebase_mark, before) {
+            self.day_start_unrealized += self.position.unrealized(m) - b;
+        }
         let notional = qty * px;
         let today = scope == DayScope::Current;
         self.cum_realized += realized;
@@ -241,6 +256,7 @@ impl Ledger {
         self.day_maker_volume = Decimal::ZERO;
         self.day_taker_volume = Decimal::ZERO;
         self.day_start_unrealized = self.position.unrealized(mark);
+        self.day_start_mark = Some(mark);
         self.day_halt = false;
         Rollover::Rolled
     }
@@ -1803,6 +1819,12 @@ mod tests {
         // Shutdown spills whatever the harvest couldn't book (4146269818).
         let shutdown = main_fn_body("shutdown");
         assert!(before(&shutdown, "harvest_fills(", "spill_unbooked("));
+        // The final spill read is bounded and falls back (4152541379).
+        assert!(shutdown.contains("self.spill_unbooked(now_ms(), left)"));
+        let spill = main_fn_body("spill_unbooked");
+        assert!(spill.contains("read_within(") && spill.contains("spill_rows("));
+        let harvest = main_fn_body("harvest_fills");
+        assert!(harvest.contains("self.unbooked_seen ="));
     }
 
     #[test]
@@ -2694,6 +2716,53 @@ mod tests {
         let (owed, missing) = late_markouts(&f, 1_000_000, 1_000_000 + 70_000, 60_000);
         assert_eq!(owed.unwrap().horizons, vec![30, 60]);
         assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn a_late_prior_day_fill_does_not_move_todays_daily_net() {
+        use std::str::FromStr;
+        // pre-G2, Codex P1 4152541373: spilled buy at 100, resolved after the
+        // day rolled at a 110 mark → daily_net unchanged by the booking.
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let mut l = Ledger::new("live", "2026-09-30");
+        assert_eq!(l.rollover("2026-10-01", Some(d("110"))), Rollover::Rolled);
+        assert_eq!(l.daily_net(d("110")), Decimal::ZERO);
+        l.record_fill_scoped(
+            true,
+            d("1"),
+            d("100"),
+            d("0"),
+            true,
+            1,
+            DayScope::CumulativeOnly,
+        );
+        assert_eq!(
+            l.daily_net(d("110")),
+            Decimal::ZERO,
+            "booking the late fill moved daily_net"
+        );
+        // Today's later moves still count: mark 112 → +2.
+        assert_eq!(l.daily_net(d("112")), d("2"));
+        // A late fill that closes part of a carried position, too.
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.record_fill(true, d("2"), d("100"), d("0"), true, 1);
+        l.rollover("2026-10-01", Some(d("110")));
+        let net0 = l.daily_net(d("110"));
+        l.record_fill_scoped(
+            false,
+            d("1"),
+            d("105"),
+            d("0"),
+            false,
+            2,
+            DayScope::CumulativeOnly,
+        );
+        assert_eq!(l.daily_net(d("110")), net0);
+        assert_eq!(
+            l.day_realized,
+            Decimal::ZERO,
+            "the late realized stays out of today"
+        );
     }
 
     #[test]
