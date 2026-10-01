@@ -39,13 +39,17 @@ permissions:
   contents: read
 
 env:
+  # Artifact bucket region. The bull-holder host is the Tokyo debot-main
+  # instance since bot-strategy#1100 (Frankfurt retired), so SSM calls use
+  # SSM_REGION.
   AWS_REGION: eu-central-1
+  SSM_REGION: ap-northeast-1
   INSTALL_DIR: /opt/debot-bull-holder
   LIGHTER_GO_REF: v1.0.2
   AL2023_IMAGE: public.ecr.aws/amazonlinux/amazonlinux:2023
   RUST_TOOLCHAIN: 1.94.1
   # S3 keys below deliberately stay under the "debot/" prefix: the
-  # Frankfurt instance role (EC2-SSM, inline policy
+  # instance role (EC2-SSM, shared by every host; inline policy
   # EC2-SSM-DebotDashboard-Access) only allows s3:GetObject/PutObject on
   # debot/*, debot-extended/*, debot-mm-extended/*, debot-xvenue-arb/*,
   # slow-mm/*, deploy/*, stock-signal-bot/* -- a new top-level prefix
@@ -288,7 +292,10 @@ jobs:
       - name: Deploy via SSM (no service start)
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET || vars.S3_BUCKET }}
-          INSTANCE_ID: ${{ secrets.INSTANCE_ID || vars.INSTANCE_ID }}
+          # Same Tokyo host ci.yml's deploy-robinhood-lighter job targets; the
+          # environment-wide INSTANCE_ID still names Frankfurt for ci.yml /
+          # deploy-configs.yml until that host is terminated (#1100 step 4).
+          INSTANCE_ID: ${{ vars.ROBINHOOD_LIGHTER_INSTANCE_ID }}
           BINARY_SHA256: ${{ needs.build.outputs.binary_sha256 }}
           LIBSIGNER_SHA256: ${{ needs.build.outputs.libsigner_sha256 }}
         run: |
@@ -323,7 +330,8 @@ jobs:
           JSON
           sed -i "s|__INSTALL_DIR__|${INSTALL_DIR}|g; s|__S3_BUCKET__|${S3_BUCKET}|g; s|__BINARY_SHA256__|${BINARY_SHA256}|g; s|__LIBSIGNER_SHA256__|${LIBSIGNER_SHA256}|g" /tmp/ssm-params.json
 
-          COMMAND_ID=$(aws ssm send-command \
+          test -n "${INSTANCE_ID}"
+          COMMAND_ID=$(aws ssm send-command --region "${SSM_REGION}" \
             --instance-ids "${INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
             --comment "Deploy debot bull-holder" \
@@ -337,16 +345,16 @@ jobs:
           POLL_INTERVAL_SECS=30
           deadline=$(( $(date +%s) + SSM_DEPLOY_TIMEOUT_SECS ))
           while :; do
-            STATUS=$(aws ssm get-command-invocation \
+            STATUS=$(aws ssm get-command-invocation --region "${SSM_REGION}" \
               --command-id "${COMMAND_ID}" \
               --instance-id "${INSTANCE_ID}" \
               --query "Status" --output text 2>/dev/null || echo "Pending")
             case "${STATUS}" in
               Success)
-                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+                aws ssm get-command-invocation --region "${SSM_REGION}" --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
                 exit 0 ;;
               Cancelled|TimedOut|Failed)
-                aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
+                aws ssm get-command-invocation --region "${SSM_REGION}" --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text
                 echo "##[error]SSM command finished with status ${STATUS}"
                 exit 1 ;;
               Pending|InProgress|Delayed)
@@ -355,7 +363,7 @@ jobs:
                 echo "Unexpected SSM status: ${STATUS}" ;;
             esac
             if [ $(date +%s) -ge ${deadline} ]; then
-              aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text || true
+              aws ssm get-command-invocation --region "${SSM_REGION}" --command-id "${COMMAND_ID}" --instance-id "${INSTANCE_ID}" --output text || true
               echo "##[error]Deploy polling timed out after ${SSM_DEPLOY_TIMEOUT_SECS}s (last status: ${STATUS})"
               exit 1
             fi
