@@ -10,6 +10,13 @@ use std::str::FromStr;
 /// `ARCUS_VOL_LIVE_CONFIRM` must equal this for any live order.
 pub const LIVE_CONFIRM_TOKEN: &str = "1093-G2";
 
+/// Smallest re-peg band with an offset. The venue rounds a resting price
+/// away from the touch by up to one tick, so a band narrower than the tick
+/// (in bp of price) would see every placed quote as off target and requote
+/// it each tick. 1 bp is far above the BTC tick (~0.012 bp); on a market
+/// whose tick is 1 bp of price or more the band must be set above the tick.
+pub const MIN_REPEG_BAND_BPS: Decimal = Decimal::ONE;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub market: String,
@@ -50,7 +57,8 @@ pub struct Config {
     pub quote_offset_bps: Decimal,
     /// With an offset, keep a resting quote while its distance from the
     /// touch stays within offset ± this many bp; re-peg only outside.
-    /// Must be > 0 and < the offset. Ignored at offset 0.
+    /// Must be >= 1 (`MIN_REPEG_BAND_BPS`) and < the offset. Ignored at
+    /// offset 0.
     pub repeg_band_bps: Decimal,
     pub state_dir: PathBuf,
     pub dry_run: bool,
@@ -186,10 +194,10 @@ impl Config {
         self.validate_presence()
     }
 
-    /// Presence-quoting parameters. With an offset the band must be > 0 (a
-    /// zero band re-pegs on every tick of the touch: no "consistent" quote,
-    /// only cancel/place churn) and smaller than the offset (a quote that is
-    /// kept can never sit at or through the touch).
+    /// Presence-quoting parameters. With an offset the band must be at least
+    /// `MIN_REPEG_BAND_BPS` (a zero or sub-tick band re-pegs on every tick:
+    /// no "consistent" quote, only cancel/place churn) and smaller than the
+    /// offset (a quote that is kept can never sit at or through the touch).
     fn validate_presence(&self) -> Result<()> {
         let hundred = Decimal::ONE_HUNDRED;
         if self.quote_offset_bps < Decimal::ZERO || self.quote_offset_bps > hundred {
@@ -205,11 +213,11 @@ impl Config {
             );
         }
         if self.quote_offset_bps > Decimal::ZERO
-            && (self.repeg_band_bps <= Decimal::ZERO
+            && (self.repeg_band_bps < MIN_REPEG_BAND_BPS
                 || self.repeg_band_bps >= self.quote_offset_bps)
         {
             bail!(
-                "with ARCUS_VOL_QUOTE_OFFSET_BPS={} ARCUS_VOL_REPEG_BAND_BPS must be > 0 and < the offset (got {})",
+                "with ARCUS_VOL_QUOTE_OFFSET_BPS={} ARCUS_VOL_REPEG_BAND_BPS must be >= {MIN_REPEG_BAND_BPS} and < the offset (got {})",
                 self.quote_offset_bps,
                 self.repeg_band_bps
             );
@@ -344,10 +352,15 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert!(cfg.presence().on());
         // Band 0 with an offset is refused (review #4): it would re-peg on
-        // every tick of the touch.
-        cfg.repeg_band_bps = Decimal::ZERO;
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("REPEG_BAND_BPS"), "{err}");
+        // every tick of the touch. So is any band under 1 bp (review 3 #3):
+        // narrower than the venue's rounding it would churn the same way.
+        for bad in ["0", "0.01", "0.99"] {
+            cfg.repeg_band_bps = d(bad);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("REPEG_BAND_BPS"), "band {bad}: {err}");
+        }
+        cfg.repeg_band_bps = d("1");
+        assert!(cfg.validate().is_ok());
         // Band == offset or above is refused (a kept quote could reach the
         // touch); so is a negative band.
         for bad in ["5", "7", "-1"] {

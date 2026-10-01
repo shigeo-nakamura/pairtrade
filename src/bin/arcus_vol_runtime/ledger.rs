@@ -1792,6 +1792,21 @@ mod tests {
     }
 
     #[test]
+    fn the_paper_tick_read_is_awaited_before_the_plan_is_decided() {
+        // bot-strategy#1093 presence quoting, review 3 #4: the best-effort
+        // tick read sits with the tick's other awaited reads, so nothing is
+        // awaited between the fresh-clock plan decision and `paper_quote`.
+        let tick = main_fn_body("tick");
+        let read = "self.refresh_paper_tick(now).await";
+        assert!(before(&tick, read, "decide on a fresh clock"));
+        assert!(before(&tick, "decide on a fresh clock", "tick_plan("));
+        assert!(before(&tick, "tick_plan(", "self.paper_quote("));
+        // …and that is its only call site.
+        let main = include_str!("main.rs");
+        assert_eq!(main.matches(".refresh_paper_tick(").count(), 1);
+    }
+
+    #[test]
     fn every_booking_path_waits_for_a_durable_rollover() {
         // pre-G2, Codex 4146113066 / 4146548930: the live harvest (tick,
         // startup, shutdown), the paper flatten IOC and the pending-fill

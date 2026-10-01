@@ -106,6 +106,20 @@ pub fn dist_bps(side: QSide, px: Decimal, touch: Decimal) -> Decimal {
     }
 }
 
+/// A resting quote's two distances for `status.json`, in bp: from its side's
+/// peg reference (the price the band decision uses, i.e. excluding our own
+/// quote; `None` when only our quote is displayed), and from the raw touch.
+pub fn quote_dists(side: QSide, px: Decimal, t: &Touches) -> (Option<Decimal>, Decimal) {
+    let (raw, peg) = match side {
+        QSide::Bid => (t.bid, t.peg_bid),
+        QSide::Ask => (t.ask, t.peg_ask),
+    };
+    (
+        peg.map(|touch| dist_bps(side, px, touch)),
+        dist_bps(side, px, raw),
+    )
+}
+
 /// Book levels to read per side. Paper presence quotes join the queue
 /// displayed at a deep price, so the sim needs that level in the snapshot
 /// (100 = the venue's maximum); everything else needs only the top.
@@ -119,9 +133,16 @@ pub fn book_depth(dry_run: bool, presence_on: bool) -> usize {
 
 /// Whether the paper sim should (re-)read the venue's price tick now. Only
 /// DRY_RUN presence quoting ever reads one (to put a virtual quote on a real
-/// price level); live never does, the connector rounds its orders.
-pub fn paper_tick_due(dry_run: bool, presence_on: bool, now_ms: u64, next_read_ms: u64) -> bool {
-    dry_run && presence_on && now_ms >= next_read_ms
+/// price level); live never does, the connector rounds its orders. Never
+/// during a 429 backoff.
+pub fn paper_tick_due(
+    dry_run: bool,
+    presence_on: bool,
+    now_ms: u64,
+    next_read_ms: u64,
+    backoff_until_ms: u64,
+) -> bool {
+    dry_run && presence_on && now_ms >= next_read_ms && now_ms >= backoff_until_ms
 }
 
 /// The best price on one side of the book that is NOT our own resting quote
@@ -198,10 +219,11 @@ pub enum PricePlan {
     /// Quote at `px`; a resting price is compared with it per `tol`.
     At { px: Decimal, tol: PriceTol },
     /// No price can be formed this tick (presence quoting: only our own
-    /// quote is displayed on the side): a resting quote keeps its price and
-    /// nothing new is placed.
+    /// quote is displayed on the side): nothing is placed. A resting quote
+    /// of the right size stays; one whose size is off is cancelled and
+    /// comes back when the side is priced again.
     Unpriced,
-    /// Presence quoting while the book is crossed: as `Unpriced`, but
+    /// Presence quoting while the book is crossed: as `Unpriced`, and
     /// nothing says which side of a crossed book is the stale one, so a
     /// resting quote is kept only while it is still at least `min_bps`
     /// behind `near`, the book top nearer to it (the lower of the two for a
@@ -495,10 +517,11 @@ impl PriceTol {
 /// cancelled, whatever else is unknown. Otherwise a resting quote is kept
 /// while its price is on target and its open size is within 1% of the
 /// target, and requoted (cancel + place while `MODIFY_ENABLED` is off) when
-/// either is off. With no price this tick (`Unpriced` / `Crossed`) the price
-/// cannot be judged: it counts as on target, a size requote re-places at
-/// the resting price, and nothing new is placed; in a crossed book a quote
-/// that is no longer far enough behind both book tops is cancelled.
+/// either is off. With no price this tick (`Unpriced` / `Crossed`) NOTHING
+/// is ever placed: the book cannot be trusted to price an order. The price
+/// counts as on target, a quote whose size is off is cancelled (it comes
+/// back once the side is priced again), and in a crossed book a quote that
+/// is no longer far enough behind both book tops is cancelled too.
 pub fn quote_action(resting: Option<&Resting>, plan: &SidePlan) -> QuoteAction {
     let side = plan.side;
     let Some(qty) = plan.qty else {
@@ -513,26 +536,77 @@ pub fn quote_action(resting: Option<&Resting>, plan: &SidePlan) -> QuoteAction {
             PricePlan::Unpriced | PricePlan::Crossed { .. } => QuoteAction::Keep,
         };
     };
-    let (px, price_ok) = match plan.price {
-        PricePlan::At { px, tol } => (px, tol.holds(side, r.px, px)),
-        PricePlan::Unpriced => (r.px, true),
-        PricePlan::Crossed { near, min_bps } => {
-            if dist_bps(side, r.px, near) < min_bps {
-                return QuoteAction::Replace(None);
-            }
-            (r.px, true)
-        }
-    };
     let open = r.qty - r.filled;
     let size_off = (open - qty).abs() > qty / Decimal::ONE_HUNDRED;
-    if price_ok && !size_off {
-        return QuoteAction::Keep;
-    }
+    let px = match plan.price {
+        PricePlan::At { px, tol } => {
+            if tol.holds(side, r.px, px) && !size_off {
+                return QuoteAction::Keep;
+            }
+            px
+        }
+        PricePlan::Unpriced => return unpriced_action(size_off),
+        PricePlan::Crossed { near, min_bps } => {
+            return unpriced_action(size_off || dist_bps(side, r.px, near) < min_bps);
+        }
+    };
     let target = QuoteTarget { side, px, qty };
     if MODIFY_ENABLED && r.filled.is_zero() {
         QuoteAction::Modify(target)
     } else {
         QuoteAction::Replace(Some(target))
+    }
+}
+
+/// A resting quote on a side with no price: keep it, or cancel it. Never a
+/// new order.
+fn unpriced_action(cancel: bool) -> QuoteAction {
+    if cancel {
+        QuoteAction::Replace(None)
+    } else {
+        QuoteAction::Keep
+    }
+}
+
+/// What the quote section of a tick may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotePass {
+    /// Place, requote and cancel.
+    Full,
+    /// A 429 backoff is running: cancels only (`cancel_only`).
+    CancelOnly,
+}
+
+/// Whether the tick plans quotes at all, and how. `Quote` is the full pass.
+/// While waiting out a 429 backoff, presence quoting still runs the plan
+/// for its cancels (a suppressed side, a crossed book come too close): a
+/// quote that must go is never left resting because of a rate limit.
+/// At-touch quoting leaves its quotes as they are while waiting, as before.
+pub fn quote_pass(plan: &TickPlan, presence_on: bool) -> Option<QuotePass> {
+    match plan {
+        TickPlan::Quote => Some(QuotePass::Full),
+        TickPlan::Wait if presence_on => Some(QuotePass::CancelOnly),
+        _ => None,
+    }
+}
+
+impl QuotePass {
+    /// The action this pass actually executes for a planned `action`.
+    pub fn apply(self, action: QuoteAction) -> QuoteAction {
+        match self {
+            QuotePass::Full => action,
+            QuotePass::CancelOnly => cancel_only(action),
+        }
+    }
+}
+
+/// The cancel-only form of an action: nothing is placed or modified. A
+/// quote that would be requoted is off target, so it is cancelled; it is
+/// placed again by the first full pass after the backoff.
+fn cancel_only(action: QuoteAction) -> QuoteAction {
+    match action {
+        QuoteAction::Keep | QuoteAction::Place(_) => QuoteAction::Keep,
+        QuoteAction::Modify(_) | QuoteAction::Replace(_) => QuoteAction::Replace(None),
     }
 }
 
@@ -1709,11 +1783,14 @@ mod tests {
     fn only_the_paper_sim_ever_reads_a_tick() {
         // Review 2 A: live needs no tick (and so cannot be gated or delayed
         // by reading one); the paper sim reads it when due.
-        assert!(paper_tick_due(true, true, 1_000, 1_000));
-        assert!(paper_tick_due(true, true, 1_001, 1_000));
-        assert!(!paper_tick_due(true, true, 999, 1_000));
-        assert!(!paper_tick_due(false, true, 5_000, 1_000));
-        assert!(!paper_tick_due(true, false, 5_000, 1_000));
+        assert!(paper_tick_due(true, true, 1_000, 1_000, 0));
+        assert!(paper_tick_due(true, true, 1_001, 1_000, 0));
+        assert!(!paper_tick_due(true, true, 999, 1_000, 0));
+        assert!(!paper_tick_due(false, true, 5_000, 1_000, 0));
+        assert!(!paper_tick_due(true, false, 5_000, 1_000, 0));
+        // Never during a 429 backoff; again once it is over.
+        assert!(!paper_tick_due(true, true, 5_000, 1_000, 5_001));
+        assert!(paper_tick_due(true, true, 5_000, 1_000, 5_000));
         // And no tick state can pull quotes: a healthy live state quotes.
         assert_eq!(
             tick_plan(&plan_inputs(&live_state(), 2_000)),
@@ -1812,15 +1889,17 @@ mod tests {
         assert_eq!(quote_action(Some(&r), &bid), QuoteAction::Keep);
         // Nothing resting and no price → nothing is placed.
         assert_eq!(quote_action(None, &bid), QuoteAction::Keep);
-        // Size off by more than 1% → requote, at the resting price.
+        // Size off by more than 1% → cancel only (review 3 #1): with no
+        // price nothing is ever placed, not even at the resting price.
         let big = resting("83396.6", "0.012");
+        assert_eq!(quote_action(Some(&big), &bid), QuoteAction::Replace(None));
+        let partly = Resting {
+            filled: d("0.003"),
+            ..resting("83396.6", "0.00599")
+        };
         assert_eq!(
-            quote_action(Some(&big), &bid),
-            QuoteAction::Replace(Some(QuoteTarget {
-                side: QSide::Bid,
-                px: d("83396.6"),
-                qty: bid.qty.unwrap(),
-            }))
+            quote_action(Some(&partly), &bid),
+            QuoteAction::Replace(None)
         );
         // Within 1% → still kept.
         let near = resting("83396.6", "0.00603");
@@ -1854,17 +1933,20 @@ mod tests {
         // Nothing is placed into a crossed book.
         assert_eq!(quote_action(None, &bid), QuoteAction::Keep);
         assert_eq!(quote_action(None, &ask), QuoteAction::Keep);
-        // Still subject to rule B: a size requote goes to the resting price…
-        let fat = resting("83396.6", "0.012");
+        // A partial fill during the crossed book (review 3 #1): the open
+        // size is off, the quote is CANCELLED and no new order goes into a
+        // book that cannot be trusted; same for any other size mismatch.
+        let partly = Resting {
+            filled: d("0.003"),
+            ..rb.clone()
+        };
         assert_eq!(
-            quote_action(Some(&fat), &bid),
-            QuoteAction::Replace(Some(QuoteTarget {
-                side: QSide::Bid,
-                px: d("83396.6"),
-                qty: d("0.00599"),
-            }))
+            quote_action(Some(&partly), &bid),
+            QuoteAction::Replace(None)
         );
-        // …and a suppressed side is cancelled.
+        let fat = resting("83480.3", "0.012");
+        assert_eq!(quote_action(Some(&fat), &ask), QuoteAction::Replace(None));
+        // A suppressed side is cancelled.
         let (bid, ask) = plan_quotes(&crossed, d("0.03"), &p);
         assert_eq!(quote_action(Some(&rb), &bid), QuoteAction::Replace(None));
         // The exit side (an AT-touch quote) is cancelled in a crossed book,
@@ -2123,6 +2205,104 @@ mod tests {
         assert_eq!(
             crate::sim::join(QSide::Bid, px, d("0.006"), &levels, 1).queue_ahead,
             d("1.25")
+        );
+    }
+
+    #[test]
+    fn a_backoff_still_cancels_in_presence_mode_but_never_places() {
+        // Review 3 #2. Which pass the quote section runs.
+        assert_eq!(quote_pass(&TickPlan::Quote, true), Some(QuotePass::Full));
+        assert_eq!(quote_pass(&TickPlan::Quote, false), Some(QuotePass::Full));
+        assert_eq!(
+            quote_pass(&TickPlan::Wait, true),
+            Some(QuotePass::CancelOnly)
+        );
+        // At-touch quoting leaves its quotes alone while waiting, as before.
+        assert_eq!(quote_pass(&TickPlan::Wait, false), None);
+        assert_eq!(quote_pass(&TickPlan::PullQuotes("halt"), true), None);
+        assert_eq!(
+            quote_pass(&TickPlan::Flatten(FlattenReason::MaxHold), true),
+            None
+        );
+        // The cancel-only form: cancels stay, a requote becomes a cancel,
+        // nothing is placed or modified.
+        let t = QuoteTarget {
+            side: QSide::Ask,
+            px: d("83480.3"),
+            qty: d("0.00599"),
+        };
+        assert_eq!(cancel_only(QuoteAction::Keep), QuoteAction::Keep);
+        assert_eq!(
+            cancel_only(QuoteAction::Place(t.clone())),
+            QuoteAction::Keep
+        );
+        assert_eq!(
+            cancel_only(QuoteAction::Replace(None)),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            cancel_only(QuoteAction::Replace(Some(t.clone()))),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            cancel_only(QuoteAction::Modify(t)),
+            QuoteAction::Replace(None)
+        );
+        // End to end: the frozen-ask book during a backoff. The ask that the
+        // live bid has come too close to is cancelled; the bid stays; the
+        // empty side gets nothing.
+        let p = presence_params();
+        let (bid, ask) = plan_quotes(&at("83892", "83868.8"), Decimal::ZERO, &p);
+        let ask_q = resting("83902.8", "0.00596");
+        let bid_q = resting("83813.4", "0.00596");
+        assert_eq!(
+            cancel_only(quote_action(Some(&ask_q), &ask)),
+            QuoteAction::Replace(None)
+        );
+        assert_eq!(
+            cancel_only(quote_action(Some(&bid_q), &bid)),
+            QuoteAction::Keep
+        );
+        let (bid, _) = plan_quotes(&at("83438.4", "83438.5"), Decimal::ZERO, &p);
+        let place = quote_action(None, &bid);
+        assert!(matches!(place, QuoteAction::Place(_)));
+        assert_eq!(cancel_only(place.clone()), QuoteAction::Keep);
+        // What main executes: the full pass runs the action unchanged, the
+        // cancel-only pass its cancel-only form.
+        assert_eq!(QuotePass::Full.apply(place.clone()), place);
+        assert_eq!(QuotePass::CancelOnly.apply(place), QuoteAction::Keep);
+        let requote = QuoteAction::Replace(Some(bid.target().unwrap()));
+        assert_eq!(QuotePass::Full.apply(requote.clone()), requote);
+        assert_eq!(
+            QuotePass::CancelOnly.apply(requote),
+            QuoteAction::Replace(None)
+        );
+    }
+
+    #[test]
+    fn status_distances_use_the_band_reference_and_the_raw_touch() {
+        // Review 3 #5. Our bid 83396.6 is the best bid; the band is judged
+        // against the next level 83390.1 (−0.78 bp: through it), while the
+        // raw touch is our own price (0 bp).
+        let t = Touches {
+            bid: d("83396.6"),
+            ask: d("83438.5"),
+            peg_bid: Some(d("83390.1")),
+            peg_ask: Some(d("83438.5")),
+        };
+        let (peg, raw) = quote_dists(QSide::Bid, d("83396.6"), &t);
+        assert_eq!(peg, Some(dist_bps(QSide::Bid, d("83396.6"), d("83390.1"))));
+        assert!(peg.unwrap() < Decimal::ZERO);
+        assert_eq!(raw, Decimal::ZERO);
+        // Ask: no quote of ours at the top, both distances agree (5 bp).
+        let (peg, raw) = quote_dists(QSide::Ask, d("83480.3"), &t);
+        assert_eq!(peg, Some(raw));
+        assert!(raw > d("5") && raw < d("5.02"));
+        // Only our own quote displayed: no band reference, raw still there.
+        let alone = Touches { peg_bid: None, ..t };
+        assert_eq!(
+            quote_dists(QSide::Bid, d("83396.6"), &alone),
+            (None, Decimal::ZERO)
         );
     }
 
