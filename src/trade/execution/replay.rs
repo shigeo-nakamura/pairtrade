@@ -191,9 +191,22 @@ fn apply(book: &mut PaperBook, e: &TimedEv) {
     }
 }
 
-/// A book warmed with every event before `decision_ms`.
-fn warm_book(events: &[TimedEv], decision_ms: u64, params: PaperParams) -> (PaperBook, usize) {
+/// A book warmed with every event before `decision_ms`. A reduce-only
+/// intent starts from the opposite position of its size, so it has
+/// something to reduce (Codex on #377); otherwise the book starts flat.
+fn warm_book(
+    events: &[TimedEv],
+    intent: &ExecIntent,
+    decision_ms: u64,
+    params: PaperParams,
+) -> (PaperBook, usize) {
     let mut book = PaperBook::new(params);
+    if intent.reduce_only {
+        book.set_position(match intent.side {
+            Side::Buy => -intent.qty,
+            Side::Sell => intent.qty,
+        });
+    }
     let mut i = 0;
     while i < events.len() && events[i].ms < decision_ms {
         apply(&mut book, &events[i]);
@@ -210,7 +223,7 @@ pub fn replay_taker(
     decision_ms: u64,
     params: PaperParams,
 ) -> Vec<VenueFill> {
-    let (mut book, mut i) = warm_book(events, decision_ms, params);
+    let (mut book, mut i) = warm_book(events, intent, decision_ms, params);
     let b = intent.max_slip_bps.unwrap_or(f64::INFINITY) / 1e4;
     let limit = match intent.side {
         Side::Buy => intent.reference_price * (1.0 + b),
@@ -245,7 +258,7 @@ pub async fn replay_maker_first(
     timing: MakerFirstTiming,
     horizon_ms: u64,
 ) -> Result<ExecOutcome> {
-    let (book, i) = warm_book(events, decision_ms, params);
+    let (book, i) = warm_book(events, intent, decision_ms, params);
     let book = Arc::new(Mutex::new(book));
     let t0 = tokio::time::Instant::now();
     let clock: PaperClock = Arc::new(move || decision_ms + t0.elapsed().as_millis() as u64);
@@ -264,7 +277,20 @@ pub async fn replay_maker_first(
             let mut idx = 0;
             while idx < rest.len() {
                 let at = rest[idx].ms;
-                tokio::time::sleep_until(t0 + Duration::from_millis(at - decision_ms)).await;
+                // Advance scheduled effects (activations, cancels, IOCs) in
+                // 10 ms steps while waiting for the next tape event, so a
+                // long gap in the tape never stalls them (Codex on #377).
+                loop {
+                    let now = decision_ms + t0.elapsed().as_millis() as u64;
+                    if now >= at {
+                        break;
+                    }
+                    book.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .flush(now.saturating_sub(1));
+                    let step = (at - now).min(10);
+                    tokio::time::sleep(Duration::from_millis(step)).await;
+                }
                 let mut b = book.lock().unwrap_or_else(|p| p.into_inner());
                 while idx < rest.len() && rest[idx].ms == at {
                     apply(&mut b, &rest[idx]);
@@ -492,5 +518,57 @@ mod tests {
         )
         .unwrap();
         assert!((c + 10.0).abs() < 1e-9, "maker earns the half-spread: {c}");
+    }
+
+    /// Codex on #377: a reduce-only close replays from the opposite
+    /// position, so the taker baseline (and maker-first) can fill it.
+    #[test]
+    fn a_reduce_only_intent_replays_from_the_position_it_closes() {
+        let mut i = intent();
+        i.side = Side::Sell;
+        i.reduce_only = true;
+        let f = replay_taker(&tape(), &i, 1_000, PaperParams::lighter_standard());
+        let q: f64 = f.iter().map(|f| f.qty).sum();
+        // The bid shows 1.0, so the IOC closes 1.0 (it would be 0 from flat).
+        assert!((q - 1.0).abs() < 1e-12, "{q}");
+    }
+
+    /// Codex on #377: with the next tape event far away, scheduled effects
+    /// (the cancel at the window end, the taker IOC) must still apply.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_effects_advance_across_a_tape_gap() {
+        let tape = parse_market(
+            lines(&[
+                r#"{"k":"b","m":1,"t":0,"x":0,"bb":99.9,"bq":1,"ba":100.1,"aq":5,"snap":1}"#,
+                r#"{"k":"t","m":1,"t":120000,"x":120000,"id":9,"p":100.0,"q":1,"mka":true,"ty":"trade"}"#,
+            ]),
+            1,
+        );
+        let mut i = intent();
+        i.style = ExecStyle::MakerFirst(MakerFirstParams {
+            maker_window_ms: 2_000,
+            requote_bps: 5.0,
+        });
+        let o = replay_maker_first(
+            &tape,
+            &i,
+            1_000,
+            PaperParams::lighter_standard(),
+            MakerFirstTiming {
+                poll: Duration::from_millis(100),
+                cancel_confirm_polls: 10,
+                settle_polls: 10,
+                ioc_fill_polls: 10,
+            },
+            200_000,
+        )
+        .await
+        .unwrap();
+        assert!(o.unresolved.is_empty(), "{:?}", o.unresolved);
+        assert!(
+            (o.filled_qty - 2.0).abs() < 1e-12,
+            "the taker remainder filled at the ask"
+        );
+        assert!(o.fills.iter().all(|f| f.role == Role::Taker));
     }
 }

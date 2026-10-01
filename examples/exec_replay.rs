@@ -183,9 +183,12 @@ fn main() -> Result<()> {
             skipped += 1;
             continue;
         };
-        // The tape must cover the decision and the maker window.
-        let covered = ev.first().is_some_and(|e| e.ms < ts)
-            && ev.last().is_some_and(|e| e.ms > ts + a.maker_window_ms);
+        // The tape must cover the decision and the whole execution horizon
+        // (maker window + cancel/settle/IOC), not just the maker window,
+        // or the tail would run against a frozen book (Codex on #377).
+        let horizon = a.maker_window_ms + 120_000;
+        let covered =
+            ev.first().is_some_and(|e| e.ms < ts) && ev.last().is_some_and(|e| e.ms > ts + horizon);
         if !covered {
             skipped += 1;
             continue;
@@ -210,7 +213,6 @@ fn main() -> Result<()> {
             .enable_time()
             .start_paused(true)
             .build()?;
-        let horizon = a.maker_window_ms + 120_000;
         let mk = rt.block_on(replay_maker_first(ev, &intent, ts, params, timing, horizon))?;
         let m_rows: Vec<(f64, f64, Option<f64>)> = mk
             .fills
