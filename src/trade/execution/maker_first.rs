@@ -6,19 +6,31 @@
 //! small view of a venue, so it can be tested without a real connector.
 //! [`DexVenue`] adapts any `DexConnector` to it.
 //!
+//! **The venue position is the ground truth for how much has filled.**
+//! Fill records are eventually consistent: they can trail an order leaving
+//! the book, and an IOC that met several counterparties can surface one
+//! trade at a time. Before any new send (re-quote, taker remainder) and
+//! before an IOC counts as settled, the booked fills must agree with the
+//! position change since the start. Otherwise the executor waits, and if
+//! they still disagree it stops with the work **unresolved** (Codex on
+//! pairtrade#374). This assumes the executor is the only thing moving this
+//! account's position in the symbol while it runs: a dedicated MM
+//! sub-account, or a book runtime that owns the symbol.
+//!
 //! Safety rules (#1099 design invariants):
-//! - A fill that lands while a cancel is in flight is still booked: fills are
-//!   harvested by order id after every cancel, not only while resting.
-//! - An order whose cancel cannot be confirmed (still listed open after the
-//!   confirm polls) is **unresolved**. Nothing more is sent: no re-quote and
-//!   no taker remainder. The caller reconciles it before trading the symbol
-//!   again.
-//! - The taker remainder is sent only with a guaranteed bound
-//!   (`max_slip_bps = Some(b)`), at an absolute limit `reference · (1 ± b)`,
-//!   and only while the touch is within that bound. Otherwise the remainder
-//!   is left unfilled.
-//! - An IOC whose fills never become visible is unresolved too: a zero-fill
-//!   IOC cannot be told apart from a delayed fill record.
+//! - Fills are harvested by order id after every cancel, so a fill that
+//!   lands while a cancel is in flight is still booked.
+//! - A send whose error does not prove it never reached the venue (anything
+//!   but a local refusal, a 429, an explicit venue rejection, or a permanent
+//!   error) is **unresolved**: the order may be live with an unknown id.
+//! - Once anything is unresolved, nothing more is sent (no re-quote, no
+//!   taker), and the caller reconciles before trading the symbol again.
+//! - The taker remainder needs a guaranteed bound (`max_slip_bps = Some(b)`):
+//!   it is sent at the absolute limit `reference · (1 ± b)`, and only while
+//!   the current touch is within that bound.
+//! - An IOC whose fill never shows in agreeing records and position is
+//!   unresolved, because a zero-fill IOC cannot be told apart from a delayed
+//!   record.
 //! - Never arms a dead-man switch (account-wide on Lighter, stops included).
 //! - Fees the venue does not report stay `None`.
 
@@ -50,6 +62,8 @@ pub struct VenueFill {
 pub trait OrderVenue: Send + Sync {
     /// Best bid and best ask.
     async fn touch(&self, symbol: &str) -> Result<(f64, f64), DexError>;
+    /// Signed position (base units; long > 0).
+    async fn position(&self, symbol: &str) -> Result<f64, DexError>;
     /// A post-only limit order; returns its order id.
     async fn place_post_only(
         &self,
@@ -73,13 +87,29 @@ pub trait OrderVenue: Send + Sync {
     ) -> Result<String, DexError>;
 }
 
+/// Whether a failed send provably never reached the venue (safe to retry or
+/// to skip). Anything else may have been accepted with an id we never saw.
+pub fn send_definitely_not_placed(e: &DexError) -> bool {
+    matches!(
+        e,
+        DexError::InvalidInput { .. }
+            | DexError::RateLimited { .. }
+            | DexError::ServerResponse(_)
+            | DexError::Permanent(_)
+            | DexError::ApiKeyRegistrationRequired
+            | DexError::UpcomingMaintenance
+    )
+}
+
 /// Polling cadence and bounded waits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MakerFirstTiming {
     pub poll: Duration,
     /// Polls after a cancel before an order still listed open is unresolved.
     pub cancel_confirm_polls: u32,
-    /// Polls for an IOC's fills to become visible.
+    /// Polls for fill records and position to agree before a new send.
+    pub settle_polls: u32,
+    /// Polls for an IOC's fills to settle.
     pub ioc_fill_polls: u32,
 }
 
@@ -88,22 +118,15 @@ impl Default for MakerFirstTiming {
         Self {
             poll: Duration::from_millis(500),
             cancel_confirm_polls: 10,
+            settle_polls: 10,
             ioc_fill_polls: 10,
         }
     }
 }
 
-/// Smallest quantity treated as "something left".
-const QTY_EPS: f64 = 1e-12;
-
 pub struct MakerFirstExecutor<'a, V: OrderVenue + ?Sized> {
     pub venue: &'a V,
     pub timing: MakerFirstTiming,
-}
-
-/// Adverse move of `price` vs `reference` for `side`, in bps.
-fn adverse_bps(side: Side, price: f64, reference: f64) -> f64 {
-    slippage_bps(side, price, reference)
 }
 
 struct Book {
@@ -136,43 +159,112 @@ impl Book {
     }
 }
 
+/// Per-run state.
+struct Run<'i> {
+    intent: &'i ExecIntent,
+    pos0: f64,
+    eps: f64,
+    ids: HashMap<String, Role>,
+    book: Book,
+    unresolved: Vec<String>,
+    last_pos: Option<f64>,
+}
+
+impl Run<'_> {
+    fn dir(&self) -> f64 {
+        match self.intent.side {
+            Side::Buy => 1.0,
+            Side::Sell => -1.0,
+        }
+    }
+    /// Quantity filled according to the position.
+    fn pos_filled(&self, pos: f64) -> f64 {
+        self.dir() * (pos - self.pos0)
+    }
+    fn agrees(&self, pos: f64) -> bool {
+        (self.pos_filled(pos) - self.book.filled).abs() <= self.eps
+    }
+}
+
 impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
-    async fn harvest(&self, intent: &ExecIntent, book: &mut Book, ids: &HashMap<String, Role>) {
-        match self.venue.fills(&intent.symbol).await {
-            Ok(fills) => book.harvest(intent, &fills, ids),
-            Err(e) => log::warn!("[MAKER_FIRST] {}: fills unreadable: {e:?}", intent.symbol),
+    async fn harvest(&self, run: &mut Run<'_>) {
+        match self.venue.fills(&run.intent.symbol).await {
+            Ok(fills) => {
+                let (intent, ids) = (run.intent, &run.ids);
+                run.book.harvest(intent, &fills, ids);
+            }
+            Err(e) => log::warn!(
+                "[MAKER_FIRST] {}: fills unreadable: {e:?}",
+                run.intent.symbol
+            ),
         }
     }
 
-    /// Cancel `id` and wait until it is no longer listed open, booking any
-    /// fill that lands meanwhile. `false` = could not confirm (unresolved).
-    async fn cancel_and_confirm(
-        &self,
-        intent: &ExecIntent,
-        id: &str,
-        book: &mut Book,
-        ids: &HashMap<String, Role>,
-    ) -> bool {
-        if let Err(e) = self.venue.cancel(&intent.symbol, id).await {
-            log::warn!("[MAKER_FIRST] {}: cancel {id} failed: {e:?}", intent.symbol);
+    async fn read_position(&self, run: &mut Run<'_>) -> Option<f64> {
+        match self.venue.position(&run.intent.symbol).await {
+            Ok(p) => {
+                run.last_pos = Some(p);
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "[MAKER_FIRST] {}: position unreadable: {e:?}",
+                    run.intent.symbol
+                );
+                None
+            }
         }
-        for _ in 0..=self.timing.cancel_confirm_polls {
-            self.harvest(intent, book, ids).await;
-            match self.venue.open_order_ids(&intent.symbol).await {
-                Ok(open) if !open.contains(id) => {
-                    // A fill can trail the removal: one more harvest.
-                    self.harvest(intent, book, ids).await;
+    }
+
+    /// Wait until the booked fills agree with the position change. `false`
+    /// = they never did (records or position lagging beyond the wait).
+    async fn settle(&self, run: &mut Run<'_>) -> bool {
+        for i in 0..=self.timing.settle_polls {
+            self.harvest(run).await;
+            if let Some(p) = self.read_position(run).await {
+                if run.agrees(p) {
                     return true;
                 }
+            }
+            if i < self.timing.settle_polls {
+                tokio::time::sleep(self.timing.poll).await;
+            }
+        }
+        false
+    }
+
+    /// Cancel `id` and wait until it is no longer listed open, harvesting
+    /// meanwhile. `false` = still listed after the confirm polls.
+    async fn cancel_and_confirm(&self, run: &mut Run<'_>, id: &str) -> bool {
+        if let Err(e) = self.venue.cancel(&run.intent.symbol, id).await {
+            log::warn!(
+                "[MAKER_FIRST] {}: cancel {id} failed: {e:?}",
+                run.intent.symbol
+            );
+        }
+        for _ in 0..=self.timing.cancel_confirm_polls {
+            self.harvest(run).await;
+            match self.venue.open_order_ids(&run.intent.symbol).await {
+                Ok(open) if !open.contains(id) => return true,
                 Ok(_) => {}
                 Err(e) => log::warn!(
                     "[MAKER_FIRST] {}: open orders unreadable: {e:?}",
-                    intent.symbol
+                    run.intent.symbol
                 ),
             }
             tokio::time::sleep(self.timing.poll).await;
         }
         false
+    }
+
+    /// Order gone → settle, or mark unresolved. `true` = settled.
+    async fn after_gone(&self, run: &mut Run<'_>, id: &str) -> bool {
+        if self.settle(run).await {
+            true
+        } else {
+            run.unresolved.push(id.to_string());
+            false
+        }
     }
 
     pub async fn execute(&self, intent: &ExecIntent) -> Result<ExecOutcome> {
@@ -182,31 +274,47 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         if !(intent.qty > 0.0 && intent.reference_price > 0.0) {
             bail!("intent needs a positive qty and reference price");
         }
+        // The baseline position must be known before anything is sent.
+        let pos0 = self.venue.position(&intent.symbol).await?;
+        let mut run = Run {
+            intent,
+            pos0,
+            eps: intent.qty * 1e-9 + 1e-12,
+            ids: HashMap::new(),
+            book: Book {
+                rows: Vec::new(),
+                seen: HashSet::new(),
+                filled: 0.0,
+            },
+            unresolved: Vec::new(),
+            last_pos: Some(pos0),
+        };
         let started = tokio::time::Instant::now();
         let maker_end = started + Duration::from_millis(params.maker_window_ms);
-        let mut ids: HashMap<String, Role> = HashMap::new();
-        let mut book = Book {
-            rows: Vec::new(),
-            seen: HashSet::new(),
-            filled: 0.0,
-        };
-        let mut unresolved: Vec<String> = Vec::new();
         let mut resting: Option<(String, f64)> = None;
         let mut drifted = false;
 
         // ---- maker phase
-        while tokio::time::Instant::now() < maker_end {
-            self.harvest(intent, &mut book, &ids).await;
-            let remaining = intent.qty - book.filled;
-            if remaining <= QTY_EPS {
+        while tokio::time::Instant::now() < maker_end && run.unresolved.is_empty() {
+            self.harvest(&mut run).await;
+            // Size from whichever of records / position shows more filled.
+            let pos_filled = match self.read_position(&mut run).await {
+                Some(p) => run.pos_filled(p),
+                None => run.book.filled,
+            };
+            let remaining = intent.qty - run.book.filled.max(pos_filled);
+            if remaining <= run.eps {
                 break;
             }
             // Did the resting order leave the book (filled, expired, rejected)?
             if let Some((id, _)) = &resting {
                 if let Ok(open) = self.venue.open_order_ids(&intent.symbol).await {
                     if !open.contains(id) {
-                        self.harvest(intent, &mut book, &ids).await;
+                        let id = id.clone();
                         resting = None;
+                        if !self.after_gone(&mut run, &id).await {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -223,7 +331,7 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                 Side::Sell => ask,
             };
             if let Some(bound) = intent.max_slip_bps {
-                if adverse_bps(intent.side, target, intent.reference_price) > bound {
+                if slippage_bps(intent.side, target, intent.reference_price) > bound {
                     drifted = true;
                     break;
                 }
@@ -233,12 +341,14 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                     let moved = (target - px).abs() / px * 1e4;
                     if moved >= params.requote_bps {
                         let id = id.clone();
-                        if !self.cancel_and_confirm(intent, &id, &mut book, &ids).await {
-                            unresolved.push(id);
-                            resting = None;
+                        resting = None;
+                        if !self.cancel_and_confirm(&mut run, &id).await {
+                            run.unresolved.push(id);
                             break;
                         }
-                        resting = None;
+                        if !self.after_gone(&mut run, &id).await {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -254,14 +364,24 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                     .await
                 {
                     Ok(id) => {
-                        ids.insert(id.clone(), Role::Maker);
+                        run.ids.insert(id.clone(), Role::Maker);
                         resting = Some((id, target));
                     }
-                    // Post-only reject, 429, ...: try again next poll.
-                    Err(e) => log::info!(
+                    // Provably not placed (post-only reject, 429, ...): retry.
+                    Err(e) if send_definitely_not_placed(&e) => log::info!(
                         "[MAKER_FIRST] {}: post-only not placed: {e:?}",
                         intent.symbol
                     ),
+                    // May be live with an id we never saw: stop.
+                    Err(e) => {
+                        log::warn!(
+                            "[MAKER_FIRST] {}: post-only send ambiguous, stopping: {e:?}",
+                            intent.symbol
+                        );
+                        run.unresolved
+                            .push(format!("post_only:{}:ambiguous", intent.symbol));
+                        break;
+                    }
                 },
             }
             tokio::time::sleep(self.timing.poll).await;
@@ -269,65 +389,105 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
 
         // ---- leave the book
         if let Some((id, _)) = resting.take() {
-            if !self.cancel_and_confirm(intent, &id, &mut book, &ids).await {
-                unresolved.push(id);
+            if !self.cancel_and_confirm(&mut run, &id).await {
+                run.unresolved.push(id);
+            } else {
+                self.after_gone(&mut run, &id).await;
             }
         }
-        self.harvest(intent, &mut book, &ids).await;
+        if run.unresolved.is_empty() && !self.settle(&mut run).await {
+            run.unresolved
+                .push(format!("fills_unsettled:{}", intent.symbol));
+        }
 
         // ---- taker remainder
-        let remaining = intent.qty - book.filled;
-        if remaining > QTY_EPS && unresolved.is_empty() && !drifted {
+        let remaining = intent.qty - run.book.filled;
+        if remaining > run.eps && run.unresolved.is_empty() && !drifted {
             if let Some(bound) = intent.max_slip_bps {
-                let b = bound / 1e4;
-                let limit = match intent.side {
-                    Side::Buy => intent.reference_price * (1.0 + b),
-                    Side::Sell => intent.reference_price * (1.0 - b),
-                };
-                match self
-                    .venue
-                    .place_ioc(
-                        &intent.symbol,
-                        intent.side,
-                        remaining,
-                        limit,
-                        intent.reduce_only,
-                    )
-                    .await
-                {
-                    Ok(id) => {
-                        ids.insert(id.clone(), Role::Taker);
-                        let mut seen_fill = false;
-                        for _ in 0..=self.timing.ioc_fill_polls {
-                            let before = book.rows.len();
-                            self.harvest(intent, &mut book, &ids).await;
-                            if book.rows[before..]
-                                .iter()
-                                .any(|r| r.order_id.as_deref() == Some(id.as_str()))
-                            {
-                                seen_fill = true;
-                                break;
-                            }
-                            tokio::time::sleep(self.timing.poll).await;
-                        }
-                        if !seen_fill {
-                            unresolved.push(id);
-                        }
-                    }
-                    Err(e) => log::warn!(
-                        "[MAKER_FIRST] {}: taker remainder not sent: {e:?}",
-                        intent.symbol
-                    ),
-                }
+                self.take_remainder(&mut run, remaining, bound).await;
             }
         }
 
         Ok(ExecOutcome {
-            filled_qty: book.filled,
-            fills: book.rows,
-            position_after: None,
-            unresolved,
+            filled_qty: run.book.filled,
+            fills: run.book.rows,
+            position_after: run.last_pos,
+            unresolved: run.unresolved,
         })
+    }
+
+    async fn take_remainder(&self, run: &mut Run<'_>, remaining: f64, bound: f64) {
+        let intent = run.intent;
+        // The book may have moved during the cancel/settle waits: an IOC that
+        // cannot be marketable inside the bound is not sent at all.
+        let crossing = match self.venue.touch(&intent.symbol).await {
+            Ok((bid, ask)) if bid > 0.0 && ask > 0.0 => match intent.side {
+                Side::Buy => ask,
+                Side::Sell => bid,
+            },
+            _ => {
+                log::warn!(
+                    "[MAKER_FIRST] {}: no touch for the taker remainder",
+                    intent.symbol
+                );
+                return;
+            }
+        };
+        if slippage_bps(intent.side, crossing, intent.reference_price) > bound {
+            log::info!(
+                "[MAKER_FIRST] {}: touch {crossing} is outside the {bound} bp bound; remainder left unfilled",
+                intent.symbol
+            );
+            return;
+        }
+        let b = bound / 1e4;
+        let limit = match intent.side {
+            Side::Buy => intent.reference_price * (1.0 + b),
+            Side::Sell => intent.reference_price * (1.0 - b),
+        };
+        let id = match self
+            .venue
+            .place_ioc(
+                &intent.symbol,
+                intent.side,
+                remaining,
+                limit,
+                intent.reduce_only,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(e) if send_definitely_not_placed(&e) => {
+                log::warn!(
+                    "[MAKER_FIRST] {}: taker remainder not sent: {e:?}",
+                    intent.symbol
+                );
+                return;
+            }
+            Err(e) => {
+                log::warn!("[MAKER_FIRST] {}: IOC send ambiguous: {e:?}", intent.symbol);
+                run.unresolved
+                    .push(format!("ioc:{}:ambiguous", intent.symbol));
+                return;
+            }
+        };
+        run.ids.insert(id.clone(), Role::Taker);
+        let before = run.book.filled;
+        // Settled = some fill booked for it, records agreeing with the
+        // position, and the position unchanged since the previous poll (later
+        // slices of a multi-counterparty IOC still arriving otherwise).
+        let mut prev: Option<f64> = None;
+        for _ in 0..=self.timing.ioc_fill_polls {
+            self.harvest(run).await;
+            if let Some(p) = self.read_position(run).await {
+                if run.book.filled > before + run.eps && run.agrees(p) && prev == Some(p) {
+                    return;
+                }
+                prev = Some(p);
+            }
+            tokio::time::sleep(self.timing.poll).await;
+        }
+        run.unresolved.push(id);
     }
 }
 
@@ -369,6 +529,20 @@ impl<'a> OrderVenue for DexVenue<'a> {
             .and_then(|l| l.price.to_f64())
             .unwrap_or(0.0);
         Ok((bid, ask))
+    }
+
+    async fn position(&self, symbol: &str) -> Result<f64, DexError> {
+        let positions = self.dex.get_positions().await?;
+        Ok(positions
+            .iter()
+            .find(|p| p.symbol == symbol)
+            .and_then(|p| {
+                p.size
+                    .abs()
+                    .to_f64()
+                    .map(|s| s * f64::from(p.sign.signum()))
+            })
+            .unwrap_or(0.0))
     }
 
     async fn place_post_only(
@@ -455,7 +629,6 @@ impl<'a> OrderVenue for DexVenue<'a> {
         Ok(r.order_id)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +662,17 @@ mod tests {
         cancel_noop: bool,
         ioc_fills: bool,
         ioc_hidden: bool,
+        /// The IOC fills in two slices, the second visible later.
+        ioc_two_slices: bool,
+        /// Fill records become visible this many `fills()` calls after the
+        /// fill (the position moves at once).
+        record_delay: usize,
+        pending: Vec<(usize, VenueFill)>,
+        fills_calls: usize,
+        position: f64,
+        /// Error to return from the next post-only / IOC send.
+        post_only_err: Option<DexError>,
+        ioc_err: Option<DexError>,
         placements: Vec<(String, f64, f64)>,
         cancels: Vec<String>,
         iocs: Vec<(f64, f64)>,
@@ -512,20 +696,34 @@ mod tests {
         }
     }
 
+    /// A fill (all test intents buy): the position moves now, the record
+    /// shows after `record_delay` calls of `fills()`.
     fn push_fill(st: &mut MockState, id: &str, qty: f64, price: f64) {
+        push_fill_after(st, id, qty, price, st.record_delay);
+    }
+
+    fn push_fill_after(st: &mut MockState, id: &str, qty: f64, price: f64, delay: usize) {
         st.next_trade += 1;
         let trade_id = format!("t{}", st.next_trade);
-        st.fills.push(VenueFill {
-            order_id: id.to_string(),
-            trade_id,
-            qty,
-            price,
-            fee_usd: Some(0.0),
-        });
+        st.position += qty;
+        let due = st.fills_calls + delay;
+        st.pending.push((
+            due,
+            VenueFill {
+                order_id: id.to_string(),
+                trade_id,
+                qty,
+                price,
+                fee_usd: Some(0.0),
+            },
+        ));
     }
 
     #[async_trait]
     impl OrderVenue for MockVenue {
+        async fn position(&self, _: &str) -> Result<f64, DexError> {
+            Ok(self.s().position)
+        }
         async fn touch(&self, _: &str) -> Result<(f64, f64), DexError> {
             let mut st = self.s();
             if let Some(t) = st.touches.pop_front() {
@@ -542,6 +740,9 @@ mod tests {
             _: bool,
         ) -> Result<String, DexError> {
             let mut st = self.s();
+            if let Some(e) = st.post_only_err.take() {
+                return Err(e);
+            }
             if st.rate_limit_post_only > 0 {
                 st.rate_limit_post_only -= 1;
                 return Err(DexError::RateLimited { until_unix: 0 });
@@ -601,6 +802,13 @@ mod tests {
                     }
                 }
             }
+            st.fills_calls += 1;
+            let now = st.fills_calls;
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.pending)
+                .into_iter()
+                .partition(|(d, _)| *d <= now);
+            st.pending = later;
+            st.fills.extend(due.into_iter().map(|(_, f)| f));
             Ok(st.fills.clone())
         }
         async fn place_ioc(
@@ -612,12 +820,23 @@ mod tests {
             _: bool,
         ) -> Result<String, DexError> {
             let mut st = self.s();
+            if let Some(e) = st.ioc_err.take() {
+                return Err(e);
+            }
             st.next_id += 1;
             let id = format!("i{}", st.next_id);
             st.iocs.push((qty, limit));
-            if st.ioc_fills && !st.ioc_hidden {
+            if st.ioc_fills {
                 let px = st.last_touch.1.min(limit); // buy at the ask, capped
-                push_fill(&mut st, &id, qty, px);
+                if st.ioc_hidden {
+                    // The position moves; the record never shows.
+                    push_fill_after(&mut st, &id, qty, px, usize::MAX / 2);
+                } else if st.ioc_two_slices {
+                    push_fill_after(&mut st, &id, qty / 2.0, px, 0);
+                    push_fill_after(&mut st, &id, qty / 2.0, px, 3);
+                } else {
+                    push_fill(&mut st, &id, qty, px);
+                }
             }
             Ok(id)
         }
@@ -627,7 +846,8 @@ mod tests {
         MakerFirstTiming {
             poll: Duration::from_millis(100),
             cancel_confirm_polls: 3,
-            ioc_fill_polls: 3,
+            settle_polls: 5,
+            ioc_fill_polls: 8,
         }
     }
 
@@ -813,5 +1033,121 @@ mod tests {
         .execute(&i)
         .await
         .is_err());
+    }
+
+    /// Codex on #374: a fill whose record trails the order leaving the book
+    /// must be waited for before the remainder is sized, or the IOC overfills.
+    #[tokio::test(start_paused = true)]
+    async fn a_delayed_fill_record_is_awaited_before_sizing_the_taker() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.fill_on_cancel = Some(0.4);
+            s.record_delay = 3;
+            s.ioc_fills = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert!(
+            (v.s().iocs[0].0 - 0.6).abs() < 1e-12,
+            "IOC sized after the record landed"
+        );
+        assert!((o.filled_qty - 1.0).abs() < 1e-12, "{}", o.filled_qty);
+        assert!(o.unresolved.is_empty());
+        assert!((o.position_after.unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn records_that_never_catch_up_leave_it_unresolved_with_no_taker() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.fill_on_cancel = Some(0.4);
+            s.record_delay = 1_000;
+            s.ioc_fills = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert!(
+            v.s().iocs.is_empty(),
+            "no send while the position disagrees with the records"
+        );
+        assert!(!o.unresolved.is_empty());
+    }
+
+    /// Codex on #374: an IOC that fills in slices is settled only when every
+    /// slice is booked and agrees with the position.
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_slice_ioc_is_booked_in_full() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.ioc_fills = true;
+            s.ioc_two_slices = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        let taker: f64 = o
+            .fills
+            .iter()
+            .filter(|f| f.role == Role::Taker)
+            .map(|f| f.qty)
+            .sum();
+        assert!((taker - 1.0).abs() < 1e-12, "both slices: {taker}");
+        assert!(o.unresolved.is_empty());
+    }
+
+    /// Codex on #374: a send error that does not prove the order never
+    /// reached the venue stops everything as unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_post_only_error_stops_without_retry_or_taker() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.post_only_err = Some(DexError::Transient("timeout after send".into()));
+            s.ioc_fills = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 1_000)).await;
+        assert!(v.s().placements.is_empty(), "no retry");
+        assert!(v.s().iocs.is_empty(), "no taker");
+        assert_eq!(o.unresolved, vec!["post_only:BTC:ambiguous".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ambiguous_ioc_error_is_unresolved_not_a_clean_zero_fill() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.ioc_err = Some(DexError::Transient("connection reset".into()));
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert_eq!(o.unresolved, vec!["ioc:BTC:ambiguous".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_ioc_rejection_is_not_unresolved() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.ioc_err = Some(DexError::ServerResponse("rejected".into()));
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert!(o.unresolved.is_empty());
+        assert_eq!(o.filled_qty, 0.0);
+    }
+
+    /// Codex on #374: with no maker window (or a move during the final
+    /// cancel) the touch is re-read before the IOC; outside the bound it is
+    /// not sent, and nothing is left unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn the_touch_is_rechecked_before_the_taker_remainder() {
+        let v = MockVenue::new((101.0, 101.2)).with(|s| s.ioc_fills = true);
+        let o = run(&v, &buy(1.0, Some(50.0), 0)).await;
+        assert!(v.s().iocs.is_empty());
+        assert!(o.unresolved.is_empty());
+        assert_eq!(o.filled_qty, 0.0);
+    }
+
+    #[test]
+    fn only_provable_non_sends_are_retryable() {
+        assert!(send_definitely_not_placed(&DexError::RateLimited {
+            until_unix: 0
+        }));
+        assert!(send_definitely_not_placed(&DexError::ServerResponse(
+            "x".into()
+        )));
+        assert!(send_definitely_not_placed(&DexError::InvalidInput {
+            field: "f".into(),
+            value: "v".into()
+        }));
+        assert!(!send_definitely_not_placed(&DexError::Transient(
+            "x".into()
+        )));
+        assert!(!send_definitely_not_placed(&DexError::NoConnection));
     }
 }
