@@ -615,10 +615,17 @@ mod tests {
 
     #[test]
     fn a_cancel_before_going_live_never_rests() {
-        let mut b = book(PaperParams::lighter_premium()); // live and remove both at +150
+        // A slow placement (+650 ms) and a fast cancel (+150 ms): the removal
+        // is applied before the order would go live.
+        let mut p = zero();
+        p.d_ms = 150;
+        p.place_ms = 500;
+        let mut b = book(p);
         let id = b.place_post_only(0, Side::Buy, 1.0, 99.95);
         b.cancel(0, &id);
         b.flush(200);
+        assert!(b.canceled_ids().contains(&id));
+        b.flush(700);
         assert!(!b.open_ids().contains(&id));
         assert!(b.canceled_ids().contains(&id));
         b.on_trade(300, 99.95, 5.0, Side::Sell);
