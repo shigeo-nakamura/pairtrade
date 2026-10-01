@@ -165,15 +165,16 @@ pub fn outcome_from_fill_report(intent: &ExecIntent, report: &FillReport) -> Exe
 
 /// No-behaviour-change adapter over a book [`Executor`]: the book order runs
 /// exactly as `executor.execute(order)` would, and its [`FillReport`] is
-/// returned untouched next to the derived [`ExecOutcome`].
+/// returned untouched next to the derived [`ExecOutcome`]. The intent's
+/// slippage bound is the executor's own ([`Executor::slippage_bound_bps`]),
+/// never a separate value the execution path would ignore.
 pub struct BookTaker<'a, E: Executor + ?Sized> {
     pub executor: &'a E,
-    pub max_slip_bps: f64,
 }
 
 impl<'a, E: Executor + ?Sized> BookTaker<'a, E> {
     pub async fn execute(&self, order: &OrderIntent) -> Result<(FillReport, ExecOutcome)> {
-        let intent = ExecIntent::from_book(order, self.max_slip_bps);
+        let intent = ExecIntent::from_book(order, self.executor.slippage_bound_bps());
         if intent.style != ExecStyle::Taker {
             bail!("BookTaker only executes Taker intents");
         }
@@ -203,6 +204,22 @@ mod tests {
                 IntentKind::Open
             },
         }
+    }
+
+    /// Codex on #371: the intent must carry the bound the wrapped executor
+    /// really uses, not a separate number it ignores.
+    #[tokio::test]
+    async fn book_taker_reports_the_executors_own_slippage_bound() {
+        let paper = PaperExecutor::new(100.0, 2.0);
+        paper.set_price("BTC", 100.0).await;
+        let taker = BookTaker { executor: &paper };
+        let order = book_order(BookSide::Buy, 1.0, false);
+        assert_eq!(
+            ExecIntent::from_book(&order, taker.executor.slippage_bound_bps()).max_slip_bps,
+            100.0
+        );
+        let (_, outcome) = taker.execute(&order).await.unwrap();
+        assert!((outcome.fills[0].slippage_bps - 100.0).abs() < 1e-6);
     }
 
     #[test]
@@ -269,18 +286,17 @@ mod tests {
             let wrapped = PaperExecutor::new(10.0, 2.0);
             wrapped.set_price("BTC", 100.0).await;
             let expect = direct.execute(&order).await.unwrap();
-            let (got, outcome) = BookTaker {
-                executor: &wrapped,
-                max_slip_bps: 25.0,
-            }
-            .execute(&order)
-            .await
-            .unwrap();
+            let (got, outcome) = BookTaker { executor: &wrapped }
+                .execute(&order)
+                .await
+                .unwrap();
             assert_eq!(got, expect);
             assert_eq!(outcome.filled_qty, expect.filled_qty);
             assert_eq!(outcome.fills[0].fee_usd, expect.fee_usd);
-            // Paper fills at mid ± 10 bp: the derived cost sees exactly that.
+            // Paper fills at mid ± 10 bp: the derived cost sees exactly that,
+            // and it is within the executor's own bound.
             assert!((outcome.fills[0].slippage_bps - 10.0).abs() < 1e-6);
+            assert!(outcome.fills[0].slippage_bps <= wrapped.slippage_bound_bps() + 1e-9);
         }
     }
 }

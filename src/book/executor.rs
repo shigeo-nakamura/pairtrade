@@ -68,6 +68,12 @@ pub trait Executor: Send + Sync {
     /// longs pay), when the venue reports one.
     async fn funding_rate_hourly(&self, symbol: &str) -> Option<f64>;
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport>;
+    /// The slippage bound (bps vs the intent's `reference_price`) this
+    /// executor actually executes with. Paper: the slippage it always fills
+    /// at. Live: the drift-guard / IOC limit bound. Read-only; lets wrappers
+    /// report the real bound instead of a value the path ignores
+    /// (bot-strategy#1099, Codex on pairtrade#371).
+    fn slippage_bound_bps(&self) -> f64;
 }
 
 // ---------------------------------------------------------------- paper
@@ -174,6 +180,10 @@ impl PaperExecutor {
 impl Executor for PaperExecutor {
     fn is_paper(&self) -> bool {
         true
+    }
+
+    fn slippage_bound_bps(&self) -> f64 {
+        self.slippage_bps
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
@@ -609,6 +619,10 @@ fn price_decimal(v: f64, intent: &OrderIntent) -> Result<Decimal> {
 impl Executor for LiveExecutor {
     fn is_paper(&self) -> bool {
         false
+    }
+
+    fn slippage_bound_bps(&self) -> f64 {
+        f64::from(self.slippage_bps)
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
