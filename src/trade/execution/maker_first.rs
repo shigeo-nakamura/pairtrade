@@ -871,8 +871,9 @@ mod tests {
                 let px = o.price;
                 push_fill(&mut st, order_id, q, px);
             }
-            if !st.cancel_noop {
-                st.open.remove(order_id);
+            // Like a venue: cancelling an order that already left the book
+            // (fully filled) leaves no cancel record.
+            if !st.cancel_noop && st.open.remove(order_id) {
                 st.canceled.insert(order_id.to_string());
             }
             Ok(())
