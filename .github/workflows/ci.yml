@@ -261,8 +261,9 @@ jobs:
     # operator restarts manually after verifying the deployed sha.
     #
     # The BTC/ETH pairtrade `debot` binary and its Frankfurt deploy were
-    # removed with the pairtrade sunset (bot-strategy#937). Frankfurt now
-    # only hosts bull-holder (deploy-bull-holder.yml) and the dashboard.
+    # removed with the pairtrade sunset (bot-strategy#937). Frankfurt was
+    # retired in bot-strategy#1100; bull-holder and the dashboard run on the
+    # Tokyo host.
     #
     # Native ARM64 keeps the AL2023 artifact contract without full-system
     # QEMU. The 60-minute cap includes packaging and optional deployment,
