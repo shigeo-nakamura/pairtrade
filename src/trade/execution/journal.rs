@@ -101,11 +101,16 @@ impl JournalStore for FileJournal {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent() {
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-        }
+        // The rename is durable only once the directory is synced; a failure
+        // here must fail the save, so the send it guards never goes out
+        // (Codex on #378). A bare file name lives in ".".
+        let dir = match self.path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        std::fs::File::open(&dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("fsync journal dir {}", dir.display()))?;
         Ok(())
     }
 }
@@ -762,5 +767,21 @@ mod tests {
             path: dir.path().to_path_buf(),
         };
         assert!(unreadable.load().is_err());
+    }
+
+    /// Codex on #378: a bare file name syncs "." instead of silently
+    /// skipping the directory fsync.
+    #[test]
+    fn a_relative_journal_path_saves_and_syncs_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let f = FileJournal {
+            path: PathBuf::from("rel-journal.json"),
+        };
+        let r = ExecJournal::new(&f).pending("BTC", "buy", 1.0, 1.0, SendKind::Ioc);
+        std::env::set_current_dir(prev).unwrap();
+        r.unwrap();
+        assert!(dir.path().join("rel-journal.json").exists());
     }
 }
