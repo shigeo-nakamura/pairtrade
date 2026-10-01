@@ -18,14 +18,21 @@
 //! - A `Pending` entry (id unknown) means any open order on that symbol
 //!   could be it. Under the executor's single-writer assumption (it is the
 //!   only thing trading this account/symbol), every open order on the
-//!   symbol is cancelled and confirmed.
-//!   Such a send may also have filled with nothing left on the book, so the
-//!   symbol is reported for a position re-read.
+//!   symbol is cancelled and confirmed. The symbol is reported for a
+//!   position re-read (the send may have filled).
+//!   - An unknown **IOC** can never rest, so after the sweep it is cleared.
+//!   - An unknown **post-only** stays unresolved even after the sweep: an
+//!     empty open-orders view (e.g. a cache during a reconnect) is not proof
+//!     that it is not resting, and ids alone cannot match it (Codex on
+//!     #378). The operator checks the venue and calls
+//!     [`ExecJournal::acknowledge`].
 //! - Anything that cannot be confirmed stays in the journal and is
 //!   reported unresolved; the caller must not trade that symbol yet.
 //!
 //! Writes are atomic: write a temp file, fsync it, rename it over the
-//! journal, then fsync the directory.
+//! journal, then fsync the directory. Every load-mutate-save runs under one
+//! lock, so concurrent runs on different symbols never drop each other's
+//! entries (Codex on #378). One process owns a journal file.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -121,10 +128,33 @@ impl JournalStore for MemJournal {
 /// before it returns; a failed persist is an error, so the caller never
 /// sends an order the journal does not know about.
 pub struct ExecJournal<'a> {
-    pub store: &'a dyn JournalStore,
+    store: &'a dyn JournalStore,
+    /// Serializes every load-mutate-save.
+    lock: Mutex<()>,
 }
 
-impl ExecJournal<'_> {
+impl<'a> ExecJournal<'a> {
+    pub fn new(store: &'a dyn JournalStore) -> Self {
+        Self {
+            store,
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn mutate<T>(&self, f: impl FnOnce(&mut JournalState) -> T) -> Result<T> {
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut st = self.store.load()?;
+        let out = f(&mut st);
+        self.store.save(&st)?;
+        Ok(out)
+    }
+
+    /// The operator checked the venue: nothing of `symbol`'s unresolved
+    /// sends is still resting. Clears its entries.
+    pub fn acknowledge(&self, symbol: &str) -> Result<()> {
+        self.clear_symbol(symbol)
+    }
+
     /// Persist a pending send; returns its key.
     pub fn pending(
         &self,
@@ -134,54 +164,44 @@ impl ExecJournal<'_> {
         price: f64,
         kind: SendKind,
     ) -> Result<u64> {
-        let mut st = self.store.load()?;
-        let key = st.next_key;
-        st.next_key += 1;
-        st.entries.push(JournalEntry {
-            key,
-            symbol: symbol.to_string(),
-            side: side.to_string(),
-            qty,
-            price,
-            kind,
-            order_id: None,
-        });
-        self.store.save(&st)?;
-        Ok(key)
+        self.mutate(|st| {
+            let key = st.next_key;
+            st.next_key += 1;
+            st.entries.push(JournalEntry {
+                key,
+                symbol: symbol.to_string(),
+                side: side.to_string(),
+                qty,
+                price,
+                kind,
+                order_id: None,
+            });
+            key
+        })
     }
 
     /// The venue returned `id` for the pending send `key`.
     pub fn sent(&self, key: u64, id: &str) -> Result<()> {
-        let mut st = self.store.load()?;
-        if let Some(e) = st.entries.iter_mut().find(|e| e.key == key) {
-            e.order_id = Some(id.to_string());
-        }
-        self.store.save(&st)
+        self.mutate(|st| {
+            if let Some(e) = st.entries.iter_mut().find(|e| e.key == key) {
+                e.order_id = Some(id.to_string());
+            }
+        })
     }
 
     /// The send `key` provably never reached the venue, or its order is
     /// over on positive evidence.
     pub fn done(&self, key: u64) -> Result<()> {
-        let mut st = self.store.load()?;
-        st.entries.retain(|e| e.key != key);
-        self.store.save(&st)
-    }
-
-    /// Remove the entry for order `id` (over on positive evidence).
-    pub fn done_id(&self, id: &str) -> Result<()> {
-        let mut st = self.store.load()?;
-        st.entries.retain(|e| e.order_id.as_deref() != Some(id));
-        self.store.save(&st)
+        self.mutate(|st| st.entries.retain(|e| e.key != key))
     }
 
     /// A run ended with nothing unresolved: nothing it sent can still rest.
     pub fn clear_symbol(&self, symbol: &str) -> Result<()> {
-        let mut st = self.store.load()?;
-        st.entries.retain(|e| e.symbol != symbol);
-        self.store.save(&st)
+        self.mutate(|st| st.entries.retain(|e| e.symbol != symbol))
     }
 
     pub fn entries(&self) -> Result<Vec<JournalEntry>> {
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         Ok(self.store.load()?.entries)
     }
 }
@@ -261,6 +281,10 @@ pub async fn reconcile_leftovers(
         if has_unknown {
             report.position_recheck.push(symbol.clone());
         }
+        // An unknown post-only may rest unseen: never cleared by reconcile.
+        let unknown_post_only = entries
+            .iter()
+            .any(|e| e.order_id.is_none() && e.kind == SendKind::PostOnly);
         // Ids to settle: the known ones, plus (single-writer) every open
         // order on the symbol when some send's id is unknown.
         let mut ids: Vec<(String, f64)> = entries
@@ -291,6 +315,10 @@ pub async fn reconcile_leftovers(
             if open.contains(&id) {
                 if cancel_confirm(venue, &symbol, &id, polls, poll).await {
                     report.cancelled.push(id);
+                } else if filled_out(venue, &symbol, &id, qty).await {
+                    // It filled while the cancel was in flight: no cancel
+                    // record will come, the full fill is the evidence.
+                    report.cleared += 1;
                 } else {
                     report.unresolved.push(id);
                     symbol_ok = false;
@@ -305,6 +333,12 @@ pub async fn reconcile_leftovers(
                 report.unresolved.push(id);
                 symbol_ok = false;
             }
+        }
+        if unknown_post_only {
+            report
+                .unresolved
+                .push(format!("unknown_post_only:{symbol}"));
+            symbol_ok = false;
         }
         if symbol_ok {
             journal.clear_symbol(&symbol)?;
@@ -334,6 +368,8 @@ mod tests {
         canceled: Mutex<HashSet<String>>,
         fills: Mutex<Vec<VenueFill>>,
         cancel_works: bool,
+        /// The order fills (1.0) as the cancel lands: gone, no cancel record.
+        cancel_fills: bool,
         send_err: Option<fn() -> DexError>,
         sends: Mutex<u32>,
         /// Journal entries for the symbol seen at each send.
@@ -387,6 +423,17 @@ mod tests {
             self.send()
         }
         async fn cancel(&self, _: &str, id: &str) -> Result<(), DexError> {
+            if self.cancel_fills && self.open.lock().unwrap().remove(id) {
+                self.fills.lock().unwrap().push(VenueFill {
+                    order_id: id.to_string(),
+                    trade_id: format!("t-{id}"),
+                    qty: 1.0,
+                    price: 99.9,
+                    fee_usd: Some(0.0),
+                    price_source: PriceSource::Venue,
+                });
+                return Ok(());
+            }
             if self.cancel_works && self.open.lock().unwrap().remove(id) {
                 self.canceled.lock().unwrap().insert(id.to_string());
             }
@@ -425,6 +472,13 @@ mod tests {
         }
     }
 
+    fn ioc(key: u64, symbol: &str) -> JournalEntry {
+        JournalEntry {
+            kind: SendKind::Ioc,
+            ..entry(key, symbol, None, 1.0)
+        }
+    }
+
     fn store(entries: Vec<JournalEntry>) -> MemJournal {
         MemJournal(Mutex::new(JournalState {
             next_key: 100,
@@ -438,7 +492,7 @@ mod tests {
     async fn a_known_open_leftover_is_cancelled_and_cleared() {
         let v = Mock::with_open(&["a"]);
         let st = store(vec![entry(1, "BTC", Some("a"), 1.0)]);
-        let j = ExecJournal { store: &st };
+        let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
         assert_eq!(r.cancelled, vec!["a".to_string()]);
         assert!(r.unresolved.is_empty() && r.position_recheck.is_empty());
@@ -447,11 +501,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_unknown_send_cancels_every_open_order_on_its_symbol_only() {
-        // Single-writer: "x" may be the order whose id was never learned.
+    async fn an_unknown_ioc_sweeps_its_symbol_only_and_clears() {
+        // Single-writer: "x" may be ours; an IOC itself can never rest.
         let v = Mock::with_open(&["x"]);
-        let st = store(vec![entry(1, "BTC", None, 1.0)]);
-        let j = ExecJournal { store: &st };
+        let st = store(vec![ioc(1, "BTC")]);
+        let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
         assert_eq!(r.cancelled, vec!["x".to_string()]);
         assert_eq!(r.position_recheck, vec!["BTC".to_string()]);
@@ -459,12 +513,66 @@ mod tests {
         assert!(j.entries().unwrap().is_empty());
     }
 
+    /// Codex on #378: an empty open-orders view is not proof that an
+    /// unknown post-only is not resting.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_post_only_stays_unresolved_until_acknowledged() {
+        for open in [vec![], vec!["x"]] {
+            let v = Mock::with_open(&open);
+            let st = store(vec![entry(1, "BTC", None, 1.0)]);
+            let j = ExecJournal::new(&st);
+            let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
+            assert!(v.open.lock().unwrap().is_empty(), "visible ones swept");
+            assert!(r.unresolved.contains(&"unknown_post_only:BTC".to_string()));
+            assert_eq!(j.entries().unwrap().len(), 1, "kept for {open:?}");
+            j.acknowledge("BTC").unwrap();
+            assert!(j.entries().unwrap().is_empty());
+        }
+    }
+
+    /// Codex on #378: a full fill during the startup cancel is evidence.
+    #[tokio::test(start_paused = true)]
+    async fn a_leftover_that_fills_during_the_cancel_is_cleared() {
+        let mut v = Mock::with_open(&["a"]);
+        v.cancel_fills = true;
+        let st = store(vec![entry(1, "BTC", Some("a"), 1.0)]);
+        let j = ExecJournal::new(&st);
+        let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
+        assert!(r.unresolved.is_empty(), "{:?}", r.unresolved);
+        assert_eq!(r.cleared, 1);
+        assert!(j.entries().unwrap().is_empty());
+    }
+
+    /// Codex on #378: concurrent writers never drop each other's entries.
+    #[test]
+    fn concurrent_pending_writes_keep_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FileJournal {
+            path: dir.path().join("j.json"),
+        };
+        let j = ExecJournal::new(&f);
+        std::thread::scope(|sc| {
+            for t in 0..8 {
+                let j = &j;
+                sc.spawn(move || {
+                    for _ in 0..25 {
+                        j.pending(&format!("S{t}"), "buy", 1.0, 1.0, SendKind::Ioc)
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let st = f.load().unwrap();
+        assert_eq!(st.entries.len(), 200);
+        assert_eq!(st.next_key, 200);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_known_order_gone_without_evidence_stays_unresolved() {
         // Not open, no cancel record, no fills: a cache gap is not proof.
         let v = Mock::with_open(&[]);
         let st = store(vec![entry(1, "BTC", Some("a"), 1.0)]);
-        let j = ExecJournal { store: &st };
+        let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
         assert!(r.unresolved.contains(&"a".to_string()));
         assert!(r.unresolved.contains(&"BTC".to_string()));
@@ -483,7 +591,7 @@ mod tests {
             price_source: PriceSource::Venue,
         }];
         let st = store(vec![entry(1, "BTC", Some("a"), 1.0)]);
-        let j = ExecJournal { store: &st };
+        let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
         assert_eq!(r.cleared, 1);
         assert!(r.unresolved.is_empty());
@@ -500,7 +608,7 @@ mod tests {
             entry(1, "BTC", Some("a"), 1.0),
             entry(2, "ETH", Some("b"), 1.0),
         ]);
-        let j = ExecJournal { store: &st };
+        let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
         assert_eq!(r.unresolved, vec!["a".to_string(), "BTC".to_string()]);
         let left = j.entries().unwrap();
@@ -542,7 +650,7 @@ mod tests {
             cancel_works: true,
             ..Default::default()
         };
-        let j = ExecJournal { store: &*st };
+        let j = ExecJournal::new(&*st);
         let ex = MakerFirstExecutor {
             venue: &v,
             timing: timing(),
@@ -568,7 +676,7 @@ mod tests {
             cancel_works: true,
             ..Default::default()
         };
-        let j = ExecJournal { store: &*st };
+        let j = ExecJournal::new(&*st);
         let ex = MakerFirstExecutor {
             venue: &v,
             timing: timing(),
@@ -590,7 +698,7 @@ mod tests {
             cancel_works: true,
             ..Default::default()
         };
-        let j = ExecJournal { store: &*st };
+        let j = ExecJournal::new(&*st);
         let ex = MakerFirstExecutor {
             venue: &v,
             timing: timing(),
@@ -616,7 +724,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_journal_write_sends_nothing() {
         let v = Mock::with_open(&[]);
-        let j = ExecJournal { store: &Broken };
+        let j = ExecJournal::new(&Broken);
         let ex = MakerFirstExecutor {
             venue: &v,
             timing: timing(),
@@ -636,7 +744,7 @@ mod tests {
             path: dir.path().join("exec-journal.json"),
         };
         assert_eq!(f.load().unwrap(), JournalState::default());
-        let j = ExecJournal { store: &f };
+        let j = ExecJournal::new(&f);
         let k = j.pending("BTC", "buy", 1.0, 99.9, SendKind::Ioc).unwrap();
         j.sent(k, "o1").unwrap();
         let st = f.load().unwrap();
