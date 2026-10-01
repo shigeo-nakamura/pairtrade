@@ -92,12 +92,43 @@ pub enum Role {
     Taker,
 }
 
+/// Where a fill's price came from (Codex on #371: keep the provenance, so an
+/// estimate is never read as a venue-confirmed price).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceSource {
+    /// The venue's own fill record.
+    Venue,
+    /// Simulated by a paper executor (exact by construction).
+    Paper,
+    /// Not known from a fill record: e.g. the live book executor confirmed
+    /// the fill from the position delta and priced it at the send-time mid.
+    Estimate,
+}
+
+impl PriceSource {
+    /// Map a book `FillReport::fill_price_source`. Anything other than a
+    /// venue record or paper is an estimate.
+    pub fn from_book(source: &str) -> Self {
+        match source {
+            "venue_fills" => PriceSource::Venue,
+            "paper" => PriceSource::Paper,
+            _ => PriceSource::Estimate,
+        }
+    }
+
+    pub fn is_confirmed(self) -> bool {
+        self != PriceSource::Estimate
+    }
+}
+
 /// One execution, with its cost measured against the intent's reference.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillRow {
     pub order_id: Option<String>,
     pub role: Role,
     pub price: f64,
+    /// Provenance of `price` (and therefore of `slippage_bps`).
+    pub price_source: PriceSource,
     pub qty: f64,
     /// Venue fee in USD. `None` = real but unknown (never booked as 0).
     pub fee_usd: Option<f64>,
@@ -120,9 +151,13 @@ pub struct ExecOutcome {
 
 impl ExecOutcome {
     /// Total paid cost in USD: slippage plus fees. `None` when any fee is
-    /// unknown, so an unknown is never summed as zero.
+    /// unknown or any price is only an estimate, so neither an unknown fee
+    /// nor an estimated price is ever summed as if confirmed.
     pub fn cost_usd(&self) -> Option<f64> {
         self.fills.iter().try_fold(0.0, |acc, f| {
+            if !f.price_source.is_confirmed() {
+                return None;
+            }
             let slip = f.slippage_bps / 1e4 * f.arrival_mid * f.qty;
             f.fee_usd.map(|fee| acc + slip + fee)
         })
@@ -149,6 +184,7 @@ pub fn outcome_from_fill_report(intent: &ExecIntent, report: &FillReport) -> Exe
             order_id: report.order_id.clone(),
             role: Role::Taker,
             price: report.fill_price,
+            price_source: PriceSource::from_book(report.fill_price_source),
             qty: report.filled_qty,
             fee_usd: report.fee_usd,
             arrival_mid: intent.reference_price,
@@ -329,6 +365,25 @@ mod tests {
             .unwrap();
         // 50 bp of 100 * 1.5 = 0.75, plus the fee.
         assert!((c - 0.85).abs() < 1e-9, "{c}");
+
+        assert_eq!(f.price_source, PriceSource::Venue);
+
+        // Codex on #371: a position-delta fill priced at the send-time mid
+        // keeps its provenance, and its cost is unknown, not computed.
+        let mut est = known.clone();
+        est.fill_price_source = "mid_estimate";
+        let o = outcome_from_fill_report(&intent, &est);
+        assert_eq!(o.fills[0].price_source, PriceSource::Estimate);
+        assert_eq!(
+            o.cost_usd(),
+            None,
+            "an estimated price makes the cost unknown"
+        );
+        assert_eq!(PriceSource::from_book("paper"), PriceSource::Paper);
+        assert_eq!(
+            PriceSource::from_book("something_new"),
+            PriceSource::Estimate
+        );
 
         let mut none = report;
         none.filled_qty = 0.0;
