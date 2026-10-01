@@ -114,6 +114,9 @@ struct Runtime {
     /// Connector fill records still unbooked at the last shutdown (pre-G2,
     /// Codex P1 4146269818); resolved first at the next live start.
     pending_path: PathBuf,
+    /// Trade ids still unresolved in pending_fills.jsonl (status.json).
+    pending_unresolved: Vec<String>,
+    last_pending_warn_ms: u64,
     kill_path: PathBuf,
     halt_path: PathBuf,
     /// Live: our resting quotes as we believe they rest.
@@ -727,47 +730,126 @@ impl Runtime {
             }
         };
         if pending.is_empty() {
+            self.pending_unresolved.clear();
             return true;
         }
         if !self.ensure_rolled(now) {
             return false;
         }
+        let (mut done, mut unresolved) = (Vec::new(), Vec::new());
         for p in &pending {
             match ledger::resolve_pending(p, self.cfg.taker_fee_bps) {
                 ledger::PendingResolution::Book(fill) => {
-                    if let Err(e) = self.book(fill, now) {
+                    // At its own time and day, never the restart time
+                    // (pre-G2, Codex P1 4152482567).
+                    if let Err(e) = self.book_spilled(fill, p.fill_time_ms(), now) {
                         log::error!(
                             "[ARCUS_VOL] pending fill {} not written, will retry: {e}",
                             p.trade_id
                         );
                         return false;
                     }
+                    done.push(p.clone());
                 }
-                ledger::PendingResolution::Clear => {}
-                ledger::PendingResolution::Halt(reason) => {
-                    if self.ledger.halt_sticky(reason.clone(), self.last_mark) {
-                        log::error!("[ARCUS_VOL] STICKY HALT {reason}");
-                    }
-                }
+                ledger::PendingResolution::Clear => done.push(p.clone()),
+                ledger::PendingResolution::Halt(_) => unresolved.push(p.clone()),
             }
         }
         if let Err(e) = self.state_writer.write(&self.state_path, &self.ledger) {
             log::error!("[ARCUS_VOL] state write after pending fills failed, will retry: {e:#}");
             return false;
         }
-        let aside = self
+        // Only the resolved subset leaves the pending file; every unresolved
+        // record stays pending, durably (pre-G2, Codex P1 4152482577).
+        let archive = self
             .pending_path
-            .with_file_name(format!("pending_fills.resolved-{now}.jsonl"));
-        if let Err(e) = std::fs::rename(&self.pending_path, &aside) {
-            log::error!("[ARCUS_VOL] could not set pending_fills aside ({e}); will retry");
+            .with_file_name("pending_fills.resolved.jsonl");
+        if let Err(e) = ledger::settle_pending(&self.pending_path, &archive, &done, &unresolved) {
+            log::error!("[ARCUS_VOL] could not settle pending_fills ({e}); will retry");
             return false;
         }
-        log::warn!(
-            "[ARCUS_VOL] resolved {} pending fill record(s) from the last shutdown (kept as {})",
-            pending.len(),
-            aside.display()
+        if !done.is_empty() {
+            log::warn!(
+                "[ARCUS_VOL] resolved {} pending fill record(s) from the last shutdown (archived in {})",
+                done.len(),
+                archive.display()
+            );
+        }
+        self.pending_unresolved = unresolved.iter().map(|p| p.trade_id.clone()).collect();
+        if unresolved.is_empty() {
+            return true;
+        }
+        // Every unresolved id is named, in the sticky halt (when not already
+        // sticky), in the log and in status.json; quoting stays held (startup
+        // not reconciled) until the file is resolved.
+        let reason = format!(
+            "fill_incomplete: {} record(s) still incomplete in pending_fills.jsonl: {}",
+            unresolved.len(),
+            self.pending_unresolved.join(",")
         );
-        true
+        if self.ledger.halt_sticky(reason.clone(), self.last_mark) {
+            log::error!("[ARCUS_VOL] STICKY HALT {reason}");
+        } else if now.saturating_sub(self.last_pending_warn_ms) >= 60_000 {
+            self.last_pending_warn_ms = now;
+            log::error!("[ARCUS_VOL] {reason} (halt already set); resolve by hand");
+        }
+        false
+    }
+
+    /// Book a spilled fill at its own time (`fill_ts`), into today's counters
+    /// only if it happened today, else as a cumulative-only late adjustment;
+    /// horizons already too late are recorded missing (`restart`).
+    fn book_spilled(&mut self, fill: FillIn, fill_ts: u64, now: u64) -> std::io::Result<Booking> {
+        if self.journal_unsafe {
+            return Err(std::io::Error::other(
+                "journal unsafe: appends stopped until restart",
+            ));
+        }
+        let scope = ledger::day_scope(&self.ledger.day, fill_ts);
+        let path = self.fills_path.clone();
+        let outcome =
+            match ledger::book_fill_scoped(&mut self.ledger, &fill, fill_ts, now, scope, |row| {
+                append_synced(&path, row)
+            }) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.note_append_error(&e);
+                    return Err(e);
+                }
+            };
+        if outcome != Booking::AlreadyBooked {
+            log::warn!(
+                "[ARCUS_VOL] FILL (spilled, {scope:?}, ts {fill_ts}) {} {} {} @ {} fee {} inv {}",
+                if fill.maker { "maker" } else { "taker" },
+                if fill.buy { "buy" } else { "sell" },
+                fill.qty,
+                fill.px,
+                fill.fee.round_dp(4),
+                self.ledger.position.qty
+            );
+            let (owed, missing) = ledger::late_markouts(&fill, fill_ts, now, MARKOUT_MAX_LATE_MS);
+            if let Some(m) = owed {
+                self.pending_markouts.push(m);
+            }
+            for m in missing {
+                if let ledger::Markout::Missing {
+                    fill_id,
+                    horizon_s,
+                    reason,
+                } = m
+                {
+                    let row = json!({"kind": "markout_missing", "seq": self.ledger.take_seq(),
+                                     "ts_ms": now, "fill_id": fill_id,
+                                     "market": self.cfg.market, "horizon_s": horizon_s,
+                                     "reason": reason});
+                    if let Err(e) = append_synced(&self.fills_path, &row) {
+                        self.note_append_error(&e);
+                        log::warn!("[ARCUS_VOL] markout_missing append failed: {e}");
+                    }
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     /// At shutdown, write every fill record the connector still holds (i.e.
@@ -1427,6 +1509,7 @@ impl Runtime {
             "effective_cap_usd": self.cfg.effective_cap_usd().to_string(),
             "tape": {"ready": self.tape.ready, "gap_since_ms": self.tape.gap_since_ms},
             "plan": self.last_plan,
+            "pending_unresolved": self.pending_unresolved,
         });
         // status.json is informational (dashboards, humans): a plain atomic
         // replace without fsync is enough; state.json above is the durable one.
@@ -1653,6 +1736,8 @@ async fn main() -> Result<()> {
         status_path: cfg.state_dir.join("status.json"),
         fills_path,
         pending_path: cfg.state_dir.join("pending_fills.jsonl"),
+        pending_unresolved: Vec::new(),
+        last_pending_warn_ms: 0,
         kill_path: cfg.state_dir.join("KILL_SWITCH"),
         halt_path: cfg.state_dir.join("HALT"),
         resting: HashMap::new(),
