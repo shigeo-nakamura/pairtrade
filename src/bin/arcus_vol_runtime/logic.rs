@@ -342,6 +342,9 @@ pub struct PlanState {
     pub dms_secs: u64,
     pub startup_reconciled: bool,
     pub reconcile_pending: bool,
+    /// The periodic position check last returned Pending/Unread
+    /// (pre-G2, Codex P1 4146269811): same quote gate as a reconcile.
+    pub position_pending: bool,
     pub fills_synced: bool,
     pub tape_ready: bool,
     pub journal_unsafe: bool,
@@ -361,12 +364,55 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
         backoff: now_ms < s.backoff_until_ms,
         dms_armed: s.dry_run || dms_armed(s.dms_last_ok_ms, s.dms_last_failed, now_ms, s.dms_secs),
         startup_reconciled: s.dry_run || s.startup_reconciled,
-        reconcile_pending: !s.dry_run && s.reconcile_pending,
+        reconcile_pending: !s.dry_run && (s.reconcile_pending || s.position_pending),
         fills_synced: s.dry_run || s.fills_synced,
         tape_ready: !s.dry_run || s.tape_ready,
         journal_unsafe: s.journal_unsafe,
         rollover_pending: s.rollover_pending,
         flatten: s.flatten.clone(),
+    }
+}
+
+/// This runtime's position out of an account-wide `get_positions` read:
+/// only the configured market counts (a shared subaccount may hold other
+/// markets, e.g. NVDA-USD, which must never enter the ledger comparison,
+/// the cap, or a flatten). Signed qty and entry price; flat if absent.
+pub fn market_position(
+    positions: &[dex_connector::PositionSnapshot],
+    market: &str,
+) -> (Decimal, Option<Decimal>) {
+    let base = market.trim_end_matches("-USD").to_ascii_uppercase();
+    positions
+        .iter()
+        .find(|p| {
+            p.symbol
+                .trim_end_matches("-USD")
+                .eq_ignore_ascii_case(&base)
+        })
+        .map_or((Decimal::ZERO, None), |p| {
+            (p.size.abs() * Decimal::from(p.sign.signum()), p.entry_price)
+        })
+}
+
+/// Await `fut` for at most `limit`; `None` on timeout (pre-G2, Codex P2
+/// 4152541379: the final shutdown spill read must not hang the shutdown).
+pub async fn read_within<T, E>(
+    fut: impl std::future::Future<Output = Result<T, E>>,
+    limit: std::time::Duration,
+) -> Option<Result<T, E>> {
+    tokio::time::timeout(limit, fut).await.ok()
+}
+
+/// What to spill at shutdown: the fresh read when it came back, else the
+/// unbooked records the bounded harvest already saw (never nothing just
+/// because the venue stalled).
+pub fn spill_rows<E>(
+    read: Option<Result<Vec<dex_connector::FilledOrder>, E>>,
+    seen: Vec<dex_connector::FilledOrder>,
+) -> Vec<dex_connector::FilledOrder> {
+    match read {
+        Some(Ok(rows)) => rows,
+        Some(Err(_)) | None => seen,
     }
 }
 
@@ -420,6 +466,15 @@ pub fn position_check(
 /// then holds quoting). `Pending` (a fill in flight) and `Unread` keep it.
 pub fn reconcile_cleared(check: PosCheck) -> bool {
     matches!(check, PosCheck::InSync | PosCheck::Mismatch)
+}
+
+/// The periodic position check's quote gate (pre-G2, Codex P1 4146269811):
+/// the same rule as the reconcile path. While the venue shows exposure the
+/// ledger hasn't booked yet (Pending) or the read failed (Unread), no new
+/// quote goes out; it clears on InSync, or once the mismatch has escalated
+/// to the sticky position_mismatch halt (which then holds quoting itself).
+pub fn position_gate_after(check: PosCheck) -> bool {
+    !reconcile_cleared(check)
 }
 
 /// Prefix of the sticky-halt reason a position mismatch writes.
@@ -697,6 +752,100 @@ mod tests {
             fills_synced: true,
             ..PlanState::default()
         }
+    }
+
+    #[test]
+    fn a_pending_periodic_position_check_gates_quoting_until_in_sync() {
+        // pre-G2, Codex P1 4146269811: an acknowledged quote fill shows up in
+        // get_positions before get_filled_orders; the periodic check returns
+        // Pending and must hold new quotes, like the reconcile path does.
+        let now = 1_500;
+        let quoting = |check: PosCheck| {
+            let s = PlanState {
+                position_pending: position_gate_after(check),
+                ..live_state()
+            };
+            tick_plan(&plan_inputs(&s, now))
+        };
+        assert_eq!(
+            quoting(PosCheck::Pending),
+            TickPlan::PullQuotes("reconcile_pending")
+        );
+        assert_eq!(
+            quoting(PosCheck::Unread),
+            TickPlan::PullQuotes("reconcile_pending")
+        );
+        assert_eq!(quoting(PosCheck::InSync), TickPlan::Quote);
+        // An escalated mismatch clears this gate; the sticky halt holds quotes.
+        assert!(!position_gate_after(PosCheck::Mismatch));
+        // Paper mode has no venue position: never gated by it.
+        let dry = PlanState {
+            dry_run: true,
+            position_pending: true,
+            tape_ready: true,
+            ..live_state()
+        };
+        assert_eq!(tick_plan(&plan_inputs(&dry, now)), TickPlan::Quote);
+    }
+
+    #[test]
+    fn other_markets_on_a_shared_account_never_enter_the_position_check() {
+        use std::str::FromStr;
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let snap = |sym: &str, size: &str, sign: i32| dex_connector::PositionSnapshot {
+            symbol: sym.to_string(),
+            size: d(size),
+            sign,
+            entry_price: Some(d("100")),
+        };
+        // An NVDA-USD position (manual trading) next to a flat BTC book.
+        let positions = vec![snap("NVDA-USD", "4.43", -1)];
+        let (qty, _) = market_position(&positions, "BTC-USD");
+        assert_eq!(qty, Decimal::ZERO);
+        // So a flat BTC ledger is InSync: no mismatch, no halt, no flatten.
+        let (check, _) = position_check(Decimal::ZERO, Some(qty), true, None, 1_000, 5_000);
+        assert_eq!(check, PosCheck::InSync);
+        // With BTC present too, only BTC counts (sign applied).
+        let positions = vec![snap("NVDA-USD", "4.43", -1), snap("BTC-USD", "0.12", -1)];
+        assert_eq!(market_position(&positions, "BTC-USD").0, d("-0.12"));
+        assert_eq!(market_position(&positions, "BTC").0, d("-0.12"));
+        // A symbol that only shares a prefix is not ours.
+        let positions = vec![snap("BTCDOM-USD", "1", 1)];
+        assert_eq!(market_position(&positions, "BTC-USD").0, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_spill_read_falls_back_to_the_harvested_records() {
+        // pre-G2, Codex P2 4152541379: a venue read that never returns is
+        // cut off within the budget, and the records the harvest already
+        // saw are spilled instead.
+        let rec = |id: &str| dex_connector::FilledOrder {
+            trade_id: id.into(),
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let read = read_within(
+            std::future::pending::<Result<Vec<dex_connector::FilledOrder>, String>>(),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert!(read.is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        let out = spill_rows(read, vec![rec("t1"), rec("t2")]);
+        assert_eq!(
+            out.iter().map(|r| r.trade_id.as_str()).collect::<Vec<_>>(),
+            ["t1", "t2"]
+        );
+        // A read that returns in time is authoritative.
+        let read = read_within(
+            async { Ok::<_, String>(vec![rec("t3")]) },
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(spill_rows(read, vec![rec("t1")])[0].trade_id, "t3");
+        // A failed read also falls back.
+        let read: Option<Result<Vec<_>, String>> = Some(Err("down".into()));
+        assert_eq!(spill_rows(read, vec![rec("t1")])[0].trade_id, "t1");
     }
 
     #[test]

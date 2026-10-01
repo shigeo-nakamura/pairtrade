@@ -98,6 +98,10 @@ pub struct Ledger {
     pub day_realized: Decimal,
     pub day_fees: Decimal,
     pub day_start_unrealized: Decimal,
+    /// The mark the current day was rolled at (`day_start_unrealized`'s
+    /// price); `None` before the first rollover / in older state.
+    #[serde(default)]
+    pub day_start_mark: Option<Decimal>,
     pub day_volume: Decimal,
     pub day_maker_volume: Decimal,
     pub day_taker_volume: Decimal,
@@ -130,6 +134,34 @@ pub struct Ledger {
     pub last_booked_seq: Option<u64>,
 }
 
+/// Which day's counters a booking touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DayScope {
+    /// The ledger's current UTC day (the normal case).
+    Current,
+    /// A fill from a UTC day the ledger has already rolled past (a spilled
+    /// fill resolved after a restart across midnight): position and
+    /// cumulative counters only, a late adjustment.
+    CumulativeOnly,
+}
+
+/// The UTC day (YYYY-MM-DD) of an epoch-ms timestamp.
+pub fn utc_day_of(ts_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_ms as i64)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// Day scope of a fill timed `fill_ts_ms` against the ledger's day: a fill
+/// from before the ledger's day can only be a late cumulative adjustment.
+pub fn day_scope(ledger_day: &str, fill_ts_ms: u64) -> DayScope {
+    if utc_day_of(fill_ts_ms).as_str() < ledger_day {
+        DayScope::CumulativeOnly
+    } else {
+        DayScope::Current
+    }
+}
+
 /// How many booked trade ids state.json remembers.
 pub const BOOKED_IDS_CAP: usize = 20_000;
 
@@ -142,6 +174,7 @@ impl Ledger {
         }
     }
 
+    #[cfg(test)]
     pub fn record_fill(
         &mut self,
         buy: bool,
@@ -151,20 +184,55 @@ impl Ledger {
         maker: bool,
         now_ms: u64,
     ) -> Decimal {
+        self.record_fill_scoped(buy, qty, px, fee, maker, now_ms, DayScope::Current)
+    }
+
+    /// `record_fill`, where a fill from an already-rolled UTC day
+    /// (`CumulativeOnly`) moves the position and the cumulative counters but
+    /// never today's day_* counters (pre-G2, Codex P1 4152482567).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_fill_scoped(
+        &mut self,
+        buy: bool,
+        qty: Decimal,
+        px: Decimal,
+        fee: Decimal,
+        maker: bool,
+        now_ms: u64,
+        scope: DayScope,
+    ) -> Decimal {
+        // A late prior-day fill changes today's starting position: rebase the
+        // day-start unrealized by the position's before/after value at the
+        // rollover mark, so booking it doesn't move today's daily_net (pre-G2,
+        // Codex P1 4152541373). Without a recorded mark, the fill price
+        // (unrealized 0 at entry) is the neutral fallback.
+        let rebase_mark =
+            (scope == DayScope::CumulativeOnly).then(|| self.day_start_mark.unwrap_or(px));
+        let before = rebase_mark.map(|m| self.position.unrealized(m));
         let realized = self.position.apply(buy, qty, px, now_ms);
+        if let (Some(m), Some(b)) = (rebase_mark, before) {
+            self.day_start_unrealized += self.position.unrealized(m) - b;
+        }
         let notional = qty * px;
-        self.day_realized += realized;
+        let today = scope == DayScope::Current;
         self.cum_realized += realized;
-        self.day_fees += fee;
         self.cum_fees += fee;
-        self.day_volume += notional;
         self.cum_volume += notional;
+        if today {
+            self.day_realized += realized;
+            self.day_fees += fee;
+            self.day_volume += notional;
+        }
         if maker {
-            self.day_maker_volume += notional;
             self.cum_maker_volume += notional;
+            if today {
+                self.day_maker_volume += notional;
+            }
         } else {
-            self.day_taker_volume += notional;
             self.cum_taker_volume += notional;
+            if today {
+                self.day_taker_volume += notional;
+            }
         }
         self.fills += 1;
         realized
@@ -188,6 +256,7 @@ impl Ledger {
         self.day_maker_volume = Decimal::ZERO;
         self.day_taker_volume = Decimal::ZERO;
         self.day_start_unrealized = self.position.unrealized(mark);
+        self.day_start_mark = Some(mark);
         self.day_halt = false;
         Rollover::Rolled
     }
@@ -696,7 +765,7 @@ pub fn risk_check(
 }
 
 /// One fill to book (live from the connector, or simulated).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FillIn {
     pub trade_id: String,
     pub buy: bool,
@@ -795,6 +864,19 @@ pub fn book_fill_at(
     rx_ms: u64,
     append: impl FnOnce(&serde_json::Value) -> std::io::Result<()>,
 ) -> std::io::Result<Booking> {
+    book_fill_scoped(l, f, ts_ms, rx_ms, DayScope::Current, append)
+}
+
+/// `book_fill_at` with an explicit day scope; a `CumulativeOnly` row is
+/// marked `late_prior_day` so replay keeps it out of the day counters too.
+pub fn book_fill_scoped(
+    l: &mut Ledger,
+    f: &FillIn,
+    ts_ms: u64,
+    rx_ms: u64,
+    scope: DayScope,
+    append: impl FnOnce(&serde_json::Value) -> std::io::Result<()>,
+) -> std::io::Result<Booking> {
     if l.has_booked(&f.trade_id) {
         return Ok(Booking::AlreadyBooked);
     }
@@ -819,9 +901,10 @@ pub fn book_fill_at(
         "fill_id": f.trade_id,
         "fee_estimated": f.fee_estimated,
         "inventory": preview.qty.to_string(),
+        "late_prior_day": scope == DayScope::CumulativeOnly,
     });
     append(&row)?;
-    let booked = l.record_fill(f.buy, f.qty, f.px, f.fee, f.maker, ts_ms);
+    let booked = l.record_fill_scoped(f.buy, f.qty, f.px, f.fee, f.maker, ts_ms, scope);
     l.mark_booked(&f.trade_id, seq);
     Ok(Booking::Booked(booked))
 }
@@ -883,7 +966,12 @@ pub fn replay_fills<'a>(
             other => return Err(format!("fill {id}: side {other}")),
         };
         let maker = text("role")? == "maker";
-        l.record_fill(buy, dec("qty")?, dec("px")?, dec("fee")?, maker, ts);
+        let scope = if row.get("late_prior_day").and_then(|v| v.as_bool()) == Some(true) {
+            DayScope::CumulativeOnly
+        } else {
+            DayScope::Current
+        };
+        l.record_fill_scoped(buy, dec("qty")?, dec("px")?, dec("fee")?, maker, ts, scope);
         l.mark_booked(id, seq);
         booked += 1;
     }
@@ -962,10 +1050,214 @@ pub fn append_journal(
             )))),
         };
     }
-    if !existed {
-        sync_dir(dir.unwrap_or(std::path::Path::new(".")))?;
+    // The directory entry must be durable before the first row is reported
+    // durable. An empty file means no row has been yet, even if it exists:
+    // a failed first append (rolled back to 0 bytes) left it behind, so the
+    // next successful append still syncs the parent (pre-G2, Codex P2
+    // 4146418683).
+    if !existed || len_before == 0 {
+        if let Err(e) = sync_dir(dir.unwrap_or(std::path::Path::new("."))) {
+            // The row is written but not durably reachable: roll it back
+            // like a failed write, so a retry can't append it twice
+            // (pre-G2, Codex P2 4152482586).
+            return match truncate(&f, len_before).and_then(|_| f.sync_all()) {
+                Ok(()) => Err(e),
+                Err(rollback) => Err(std::io::Error::other(JournalUnsafe(format!(
+                    "directory sync failed ({e}) and truncating {} back to {len_before} bytes failed ({rollback})",
+                    path.display()
+                )))),
+            };
+        }
     }
     Ok(())
+}
+
+/// A connector fill record still unbooked when the runtime shut down
+/// (pre-G2, Codex P1 4146269818). The connector's fill cache dies with the
+/// process and its REST cursor starts at construction, so such a record
+/// would be gone after a restart: it is written durably to
+/// `pending_fills.jsonl` instead and resolved first at the next start.
+/// Never dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingFill {
+    pub trade_id: String,
+    pub order_id: String,
+    pub is_rejected: bool,
+    /// `None` when the venue hadn't reported the side yet.
+    pub buy: Option<bool>,
+    pub size: Option<Decimal>,
+    pub value: Option<Decimal>,
+    pub fee: Option<Decimal>,
+    /// Our own IOC (false) / quote (true) order, when known.
+    pub maker_hint: Option<bool>,
+    pub spilled_at_ms: u64,
+    /// The venue's fill time, when it reported one.
+    #[serde(default)]
+    pub fill_ts_ms: Option<u64>,
+}
+
+impl PendingFill {
+    pub fn from_record(
+        f: &dex_connector::FilledOrder,
+        maker_hint: Option<bool>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            trade_id: f.trade_id.clone(),
+            order_id: f.order_id.clone(),
+            is_rejected: f.is_rejected,
+            buy: f
+                .filled_side
+                .map(|s| matches!(s, dex_connector::OrderSide::Long)),
+            size: f.filled_size,
+            value: f.filled_value,
+            fee: f.filled_fee,
+            maker_hint,
+            spilled_at_ms: now_ms,
+            fill_ts_ms: f.filled_ts_ms.and_then(|t| u64::try_from(t).ok()),
+        }
+    }
+
+    /// When the fill happened, as best known: the venue's time, else the
+    /// spill time (it existed before the shutdown). Never the restart time
+    /// (pre-G2, Codex P1 4152482567).
+    pub fn fill_time_ms(&self) -> u64 {
+        self.fill_ts_ms.unwrap_or(self.spilled_at_ms)
+    }
+}
+
+/// The markouts a late-booked fill (timed `fill_ts_ms`, booked at `now_ms`)
+/// still owes, and the horizons already too late to price: those are
+/// `Missing` with reason `restart`, never priced at a later mid.
+pub fn late_markouts(
+    f: &FillIn,
+    fill_ts_ms: u64,
+    now_ms: u64,
+    max_late_ms: u64,
+) -> (Option<PendingMarkout>, Vec<Markout>) {
+    let mut owed = Vec::new();
+    let mut missing = Vec::new();
+    for h in MARKOUT_HORIZONS {
+        if now_ms > fill_ts_ms + h * 1_000 + max_late_ms {
+            missing.push(Markout::Missing {
+                fill_id: f.trade_id.clone(),
+                horizon_s: h,
+                reason: "restart".to_string(),
+            });
+        } else {
+            owed.push(h);
+        }
+    }
+    let pending = (!owed.is_empty()).then(|| PendingMarkout {
+        fill_id: f.trade_id.clone(),
+        ts_ms: fill_ts_ms,
+        px: f.px,
+        buy: f.buy,
+        horizons: owed,
+    });
+    (pending, missing)
+}
+
+/// Durably append every unbooked record (same rollback-safe journal append
+/// as fills.jsonl). An error means some record may not be on disk: the
+/// caller logs it loudly; the process is exiting anyway.
+pub fn spill_pending(path: &std::path::Path, pending: &[PendingFill]) -> std::io::Result<()> {
+    for p in pending {
+        let row = serde_json::to_value(p).map_err(std::io::Error::other)?;
+        append_synced(path, &row)?;
+    }
+    Ok(())
+}
+
+/// Read `pending_fills.jsonl` strictly: missing = nothing pending; any
+/// unparsable line is a startup error (never skipped: it may be a fill).
+pub fn read_pending(path: &std::path::Path) -> Result<Vec<PendingFill>, String> {
+    let Some(text) = read_journal(path).map_err(|e| format!("{}: {e}", path.display()))? else {
+        return Ok(Vec::new());
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+        .map(|(i, l)| {
+            serde_json::from_str(l).map_err(|e| format!("{} line {}: {e}", path.display(), i + 1))
+        })
+        .collect()
+}
+
+/// Rewrite the pending file after a resolution pass (pre-G2, Codex P1
+/// 4152482577): `done` (booked or cleared) are appended to `archive`, then
+/// the pending file is replaced durably by exactly the `unresolved` records
+/// (removed when none remain). An unresolved record therefore stays pending
+/// across every restart until it resolves; a crash between the two writes
+/// only leaves a done record pending, which dedupe makes harmless.
+pub fn settle_pending(
+    path: &std::path::Path,
+    archive: &std::path::Path,
+    done: &[PendingFill],
+    unresolved: &[PendingFill],
+) -> std::io::Result<()> {
+    if !done.is_empty() {
+        spill_pending(archive, done)?;
+    }
+    if unresolved.is_empty() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        return std::fs::File::open(dir)?.sync_all();
+    }
+    let mut body = String::new();
+    for p in unresolved {
+        body.push_str(&serde_json::to_string(p).map_err(std::io::Error::other)?);
+        body.push('\n');
+    }
+    persist_durable_str(path, &body)
+}
+
+/// How a spilled record is resolved at startup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingResolution {
+    /// Complete: book it (dedupe by trade id makes a repeat harmless). A
+    /// missing fee is the conservative taker estimate, marked.
+    Book(FillIn),
+    /// Confirmed rejected / zero-size.
+    Clear,
+    /// Still incomplete: it can't complete any more (the connector that held
+    /// it is gone), so a human must resolve it: sticky halt.
+    Halt(String),
+}
+
+pub fn resolve_pending(p: &PendingFill, taker_fee_bps: Decimal) -> PendingResolution {
+    if p.is_rejected || p.size.is_some_and(|q| q.is_zero()) {
+        return PendingResolution::Clear;
+    }
+    match (p.buy, p.size, p.value) {
+        (Some(buy), Some(qty), Some(value)) if qty > Decimal::ZERO => {
+            let (fee, fee_estimated) = match p.fee {
+                Some(f) => (f, false),
+                None => (value.abs() * taker_fee_bps / Decimal::from(10_000), true),
+            };
+            PendingResolution::Book(FillIn {
+                trade_id: p.trade_id.clone(),
+                buy,
+                qty,
+                px: value / qty,
+                fee,
+                maker: p.maker_hint.unwrap_or(fee <= Decimal::ZERO),
+                order_id: p.order_id.clone(),
+                fee_estimated,
+            })
+        }
+        _ => PendingResolution::Halt(format!(
+            "fill_incomplete: trade {} was still incomplete at the last shutdown (pending_fills.jsonl); resolve by hand",
+            p.trade_id
+        )),
+    }
 }
 
 /// What to do with one connector fill record (Codex P1, pairtrade#361).
@@ -1474,6 +1766,65 @@ mod tests {
             !main.contains("append_jsonl"),
             "use append_synced for fills.jsonl"
         );
+    }
+
+    /// The body of `fn <name>` in main.rs (up to the next method).
+    fn main_fn_body(name: &str) -> String {
+        let main = include_str!("main.rs");
+        let start = main
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found in main.rs"));
+        let rest = &main[start..];
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .into_iter()
+            .chain(rest[1..].find("\n    fn "))
+            .min()
+            .map_or(rest.len(), |i| i + 1);
+        rest[..end].to_string()
+    }
+
+    fn before(body: &str, first: &str, then: &str) -> bool {
+        match (body.find(first), body.find(then)) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn every_booking_path_waits_for_a_durable_rollover() {
+        // pre-G2, Codex 4146113066 / 4146548930: the live harvest (tick,
+        // startup, shutdown), the paper flatten IOC and the pending-fill
+        // resolution all book only after ensure_rolled.
+        let harvest = main_fn_body("harvest_fills");
+        assert!(
+            before(&harvest, "ensure_rolled(", "get_filled_orders"),
+            "harvest_fills must check the rollover before reading/booking fills"
+        );
+        let flatten = main_fn_body("paper_flatten");
+        assert!(
+            before(&flatten, "ensure_rolled(", "self.book(fill"),
+            "paper_flatten must check the rollover before booking its IOC"
+        );
+        let resolve = main_fn_body("resolve_pending_fills");
+        assert!(before(&resolve, "ensure_rolled(", "self.book_spilled("));
+        // Spilled fills book at their own time, never the restart `now`
+        // (4152482567), and only the resolved subset leaves the pending file
+        // (4152482577).
+        assert!(resolve.contains("self.book_spilled(fill, p.fill_time_ms(), now)"));
+        assert!(resolve.contains("settle_pending(") && !resolve.contains("fs::rename"));
+        // Startup resolves the last shutdown's leftovers before harvesting.
+        let startup = main_fn_body("startup_reconcile");
+        assert!(before(&startup, "resolve_pending_fills(", "live_fills("));
+        // Shutdown spills whatever the harvest couldn't book (4146269818).
+        let shutdown = main_fn_body("shutdown");
+        assert!(before(&shutdown, "harvest_fills(", "spill_unbooked("));
+        // The final spill read is bounded and falls back (4152541379).
+        assert!(shutdown.contains("self.spill_unbooked(now_ms(), left)"));
+        let spill = main_fn_body("spill_unbooked");
+        assert!(spill.contains("read_within(") && spill.contains("spill_rows("));
+        let harvest = main_fn_body("harvest_fills");
+        assert!(harvest.contains("self.unbooked_seen ="));
     }
 
     #[test]
@@ -2118,6 +2469,345 @@ mod tests {
             |_| { Err(std::io::Error::other("dir sync")) }
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_failed_first_append_still_dir_syncs_on_the_next_success() {
+        // pre-G2, Codex P2 4146418683: the first append creates the file but
+        // its write fails and is rolled back to 0 bytes; the retry sees the
+        // file as existing, yet must still fsync the directory entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        let err = append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            |_, _| Err(std::io::Error::other("ENOSPC")),
+            |f, l| f.set_len(l),
+            |_| Ok(()),
+        );
+        assert!(err.is_err());
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let mut synced = 0;
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| {
+                synced += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(synced, 1, "the retry must fsync the parent directory");
+        // Once a row is durable, later appends don't.
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 2}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| panic!("no dir sync once the file holds a row"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unbooked_fills_at_shutdown_are_spilled_and_resolved_never_dropped() {
+        use std::str::FromStr;
+        // pre-G2, Codex P1 4146269818.
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending_fills.jsonl");
+        let complete = dex_connector::FilledOrder {
+            trade_id: "t1".into(),
+            order_id: "o1".into(),
+            filled_side: Some(dex_connector::OrderSide::Short),
+            filled_size: Some(d("0.002")),
+            filled_value: Some(d("167.2")),
+            filled_fee: None,
+            ..Default::default()
+        };
+        let incomplete = dex_connector::FilledOrder {
+            trade_id: "t2".into(),
+            order_id: "o2".into(),
+            filled_size: Some(d("0.001")),
+            ..Default::default()
+        };
+        let rejected = dex_connector::FilledOrder {
+            trade_id: "t3".into(),
+            is_rejected: true,
+            ..Default::default()
+        };
+        let spilled: Vec<PendingFill> = [&complete, &incomplete, &rejected]
+            .iter()
+            .map(|f| PendingFill::from_record(f, Some(true), 9))
+            .collect();
+        spill_pending(&path, &spilled).unwrap();
+        let back = read_pending(&path).unwrap();
+        assert_eq!(back, spilled, "every unbooked record survives the restart");
+        let res: Vec<_> = back.iter().map(|p| resolve_pending(p, d("2.25"))).collect();
+        match &res[0] {
+            PendingResolution::Book(f) => {
+                assert!(!f.buy);
+                assert_eq!(f.qty, d("0.002"));
+                assert_eq!(f.px, d("83600"));
+                // Missing fee → conservative taker estimate, never zero.
+                assert_eq!(f.fee, d("0.03762"));
+                assert!(f.fee_estimated);
+                assert!(f.maker);
+            }
+            other => panic!("complete record must book, got {other:?}"),
+        }
+        assert!(matches!(&res[1], PendingResolution::Halt(r) if r.starts_with("fill_incomplete")));
+        assert_eq!(res[2], PendingResolution::Clear);
+        // A torn/garbled line is a startup error, never skipped.
+        std::fs::write(&path, "{\"trade_id\": \"t9\"\n").unwrap();
+        assert!(read_pending(&path).is_err());
+        // Missing file: nothing pending.
+        assert!(read_pending(&dir.path().join("none.jsonl"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unresolved_pending_fills_stay_pending_until_each_resolves() {
+        use std::str::FromStr;
+        // pre-G2, Codex P1 4152482577: two incomplete records with a sticky
+        // halt already set; both must survive a restart, and when one
+        // completes only that one leaves the pending file.
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending_fills.jsonl");
+        let archive = dir.path().join("pending_fills.resolved.jsonl");
+        let rec = |id: &str| PendingFill {
+            trade_id: id.into(),
+            order_id: "o".into(),
+            is_rejected: false,
+            buy: None,
+            size: Some(d("0.001")),
+            value: None,
+            fee: None,
+            maker_hint: None,
+            spilled_at_ms: 1,
+            fill_ts_ms: None,
+        };
+        spill_pending(&path, &[rec("t1"), rec("t2")]).unwrap();
+        let mut l = {
+            let mut x = Ledger::new("live", "2026-10-01");
+            x.market = "BTC-USD".into();
+            x
+        };
+        assert!(l.halt_sticky("some earlier reason".into(), None));
+        // Restart 1: both still incomplete → both stay, nothing archived.
+        let pending = read_pending(&path).unwrap();
+        let unresolved: Vec<_> = pending
+            .iter()
+            .filter(|p| matches!(resolve_pending(p, d("2.25")), PendingResolution::Halt(_)))
+            .cloned()
+            .collect();
+        assert_eq!(unresolved.len(), 2);
+        settle_pending(&path, &archive, &[], &unresolved).unwrap();
+        assert_eq!(read_pending(&path).unwrap(), unresolved);
+        assert!(!archive.exists());
+        // Restart 2: t1 completed (operator filled it in); t2 still not.
+        let mut t1 = rec("t1");
+        t1.buy = Some(true);
+        t1.value = Some(d("83.6"));
+        let pending = vec![t1.clone(), rec("t2")];
+        let (mut done, mut still) = (Vec::new(), Vec::new());
+        for p in &pending {
+            match resolve_pending(p, d("2.25")) {
+                PendingResolution::Book(f) => {
+                    book_fill_at(&mut l, &f, p.fill_time_ms(), 99, |_| Ok(())).unwrap();
+                    done.push(p.clone());
+                }
+                PendingResolution::Clear => done.push(p.clone()),
+                PendingResolution::Halt(_) => still.push(p.clone()),
+            }
+        }
+        settle_pending(&path, &archive, &done, &still).unwrap();
+        assert_eq!(
+            read_pending(&path).unwrap(),
+            vec![rec("t2")],
+            "t2 must stay pending"
+        );
+        assert_eq!(read_pending(&archive).unwrap(), vec![t1]);
+        assert!(l.has_booked("t1") && !l.has_booked("t2"));
+        // All resolved → the pending file goes away.
+        settle_pending(&path, &archive, &[rec("t2")], &[]).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_spilled_fill_is_booked_at_its_own_time_and_day() {
+        use std::str::FromStr;
+        // pre-G2, Codex P1 4152482567: spilled before midnight, resolved after
+        // the rollover → cumulative only, timed by its own time, and its
+        // markouts are missing (restart), never priced later.
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let mut p = PendingFill {
+            trade_id: "t1".into(),
+            order_id: "o".into(),
+            is_rejected: false,
+            buy: Some(true),
+            size: Some(d("0.001")),
+            value: Some(d("83.6")),
+            fee: Some(d("0")),
+            maker_hint: Some(true),
+            spilled_at_ms: 1_790_812_000_000, // 2026-09-30T23:46:40Z
+            fill_ts_ms: None,
+        };
+        assert_eq!(p.fill_time_ms(), p.spilled_at_ms);
+        p.fill_ts_ms = Some(1_790_811_990_000);
+        assert_eq!(p.fill_time_ms(), 1_790_811_990_000, "the venue time wins");
+        assert_eq!(utc_day_of(p.fill_time_ms()), "2026-09-30");
+        let mut l = {
+            let mut x = Ledger::new("live", "2026-10-01");
+            x.market = "BTC-USD".into();
+            x
+        };
+        let scope = day_scope(&l.day, p.fill_time_ms());
+        assert_eq!(scope, DayScope::CumulativeOnly);
+        let PendingResolution::Book(f) = resolve_pending(&p, d("2.25")) else {
+            panic!()
+        };
+        let mut row = None;
+        book_fill_scoped(
+            &mut l,
+            &f,
+            p.fill_time_ms(),
+            1_790_813_000_000,
+            scope,
+            |r| {
+                row = Some(r.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(l.day_volume, Decimal::ZERO, "never in today's counters");
+        assert_eq!(l.cum_volume, d("83.6"));
+        assert_eq!(l.position.opened_at_ms, Some(1_790_811_990_000));
+        let row = row.unwrap();
+        assert_eq!(row["ts_ms"], 1_790_811_990_000u64);
+        assert_eq!(row["late_prior_day"], true);
+        // Replay keeps it out of the day counters too.
+        let mut l2 = {
+            let mut x = Ledger::new("live", "2026-10-01");
+            x.market = "BTC-USD".into();
+            x
+        };
+        replay_fills(&mut l2, [&row]).unwrap();
+        assert_eq!(l2.day_volume, Decimal::ZERO);
+        assert_eq!(l2.cum_volume, d("83.6"));
+        // Same-day spill → today's counters.
+        assert_eq!(
+            day_scope("2026-10-01", 1_790_813_000_000),
+            DayScope::Current
+        );
+        // Markouts from the fill's time; all three far too late → missing.
+        let (owed, missing) = late_markouts(&f, p.fill_time_ms(), 1_790_813_000_000, 60_000);
+        assert!(owed.is_none());
+        assert_eq!(missing.len(), 3);
+        assert!(missing
+            .iter()
+            .all(|m| matches!(m, Markout::Missing { reason, .. } if reason == "restart")));
+        // A fresh one: only the expired horizons are missing.
+        let (owed, missing) = late_markouts(&f, 1_000_000, 1_000_000 + 70_000, 60_000);
+        assert_eq!(owed.unwrap().horizons, vec![30, 60]);
+        assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn a_late_prior_day_fill_does_not_move_todays_daily_net() {
+        use std::str::FromStr;
+        // pre-G2, Codex P1 4152541373: spilled buy at 100, resolved after the
+        // day rolled at a 110 mark → daily_net unchanged by the booking.
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let mut l = Ledger::new("live", "2026-09-30");
+        assert_eq!(l.rollover("2026-10-01", Some(d("110"))), Rollover::Rolled);
+        assert_eq!(l.daily_net(d("110")), Decimal::ZERO);
+        l.record_fill_scoped(
+            true,
+            d("1"),
+            d("100"),
+            d("0"),
+            true,
+            1,
+            DayScope::CumulativeOnly,
+        );
+        assert_eq!(
+            l.daily_net(d("110")),
+            Decimal::ZERO,
+            "booking the late fill moved daily_net"
+        );
+        // Today's later moves still count: mark 112 → +2.
+        assert_eq!(l.daily_net(d("112")), d("2"));
+        // A late fill that closes part of a carried position, too.
+        let mut l = Ledger::new("live", "2026-09-30");
+        l.record_fill(true, d("2"), d("100"), d("0"), true, 1);
+        l.rollover("2026-10-01", Some(d("110")));
+        let net0 = l.daily_net(d("110"));
+        l.record_fill_scoped(
+            false,
+            d("1"),
+            d("105"),
+            d("0"),
+            false,
+            2,
+            DayScope::CumulativeOnly,
+        );
+        assert_eq!(l.daily_net(d("110")), net0);
+        assert_eq!(
+            l.day_realized,
+            Decimal::ZERO,
+            "the late realized stays out of today"
+        );
+    }
+
+    #[test]
+    fn a_failed_dir_sync_rolls_the_row_back_so_a_retry_cannot_duplicate_it() {
+        // pre-G2, Codex P2 4152482586: an empty journal (left by a failed
+        // first append), the row write succeeds, the dir sync fails → the
+        // row is rolled back; the retry then leaves exactly one row.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fills.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        let err = append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| Err(std::io::Error::other("dir sync EIO")),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "row rolled back"
+        );
+        append_journal(
+            &path,
+            &serde_json::json!({"a": 1}),
+            write_all,
+            |f, l| f.set_len(l),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        // A rollback that fails too is JournalUnsafe.
+        let other = dir.path().join("other.jsonl");
+        std::fs::write(&other, b"").unwrap();
+        let err = append_journal(
+            &other,
+            &serde_json::json!({"b": 1}),
+            write_all,
+            |_, _| Err(std::io::Error::other("truncate failed")),
+            |_| Err(std::io::Error::other("dir sync EIO")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("truncating"), "{err}");
     }
 
     #[test]
