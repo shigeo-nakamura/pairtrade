@@ -39,6 +39,10 @@
 //!   unresolved, because a zero-fill IOC cannot be told apart from a delayed
 //!   record.
 //! - Never arms a dead-man switch (account-wide on Lighter, stops included).
+//! - With a journal ([`MakerFirstExecutor::execute_journaled`]), every send
+//!   is persisted **before** it goes out, so a crash leaves a record that
+//!   [`super::journal::reconcile_leftovers`] clears at the next start. A
+//!   journal write that fails stops the run before the send.
 //! - Fees the venue does not report stay `None`.
 
 use std::collections::{HashMap, HashSet};
@@ -53,6 +57,7 @@ use rust_decimal::Decimal;
 use super::intent::{
     slippage_bps, ExecIntent, ExecOutcome, ExecStyle, FillRow, PriceSource, Role, Side,
 };
+use super::journal::{ExecJournal, SendKind};
 
 /// One fill as the venue reports it, keyed by `trade_id`.
 #[derive(Debug, Clone, PartialEq)]
@@ -181,9 +186,58 @@ struct Run<'i> {
     last_pos: Option<f64>,
     /// Size each maker order was placed with.
     order_qty: HashMap<String, f64>,
+    journal: Option<&'i ExecJournal<'i>>,
+}
+
+fn side_str(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
 }
 
 impl Run<'_> {
+    /// Persist a send before it goes out. `Err` = the journal could not be
+    /// written: the run is marked unresolved and nothing is sent.
+    fn journal_pending(&mut self, qty: f64, price: f64, kind: SendKind) -> Result<Option<u64>, ()> {
+        let Some(j) = self.journal else {
+            return Ok(None);
+        };
+        let side = side_str(self.intent.side);
+        match j.pending(&self.intent.symbol, side, qty, price, kind) {
+            Ok(k) => Ok(Some(k)),
+            Err(e) => {
+                log::error!(
+                    "[MAKER_FIRST] {}: journal write failed, not sending: {e:?}",
+                    self.intent.symbol
+                );
+                self.unresolved
+                    .push(format!("journal_write_failed:{}", self.intent.symbol));
+                Err(())
+            }
+        }
+    }
+    /// The send `key` returned `id`, or (`None`) provably never reached the
+    /// venue. An ambiguous send keeps its pending entry.
+    fn journal_sent(&mut self, key: Option<u64>, id: Option<&str>) {
+        let (Some(j), Some(key)) = (self.journal, key) else {
+            return;
+        };
+        let r = match id {
+            Some(id) => j.sent(key, id),
+            None => j.done(key),
+        };
+        if let Err(e) = r {
+            // The entry stays pending: the next start treats the symbol as
+            // having an unknown send, which is the conservative reading.
+            log::error!(
+                "[MAKER_FIRST] {}: journal update failed: {e:?}",
+                self.intent.symbol
+            );
+            self.unresolved
+                .push(format!("journal_write_failed:{}", self.intent.symbol));
+        }
+    }
     fn filled_for(&self, id: &str) -> f64 {
         self.book
             .rows
@@ -322,6 +376,37 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
     }
 
     pub async fn execute(&self, intent: &ExecIntent) -> Result<ExecOutcome> {
+        self.run(intent, None).await
+    }
+
+    /// [`Self::execute`] with every send journaled (see the module doc).
+    /// Refuses to start while the journal still holds entries for the
+    /// symbol: the caller must run `reconcile_leftovers` first.
+    pub async fn execute_journaled(
+        &self,
+        intent: &ExecIntent,
+        journal: &ExecJournal<'_>,
+    ) -> Result<ExecOutcome> {
+        if journal.entries()?.iter().any(|e| e.symbol == intent.symbol) {
+            bail!(
+                "{}: journal holds leftovers; reconcile before trading",
+                intent.symbol
+            );
+        }
+        let out = self.run(intent, Some(journal)).await?;
+        // Nothing unresolved: every order this run sent is over on positive
+        // evidence, so none of its entries can still rest.
+        if out.unresolved.is_empty() {
+            journal.clear_symbol(&intent.symbol)?;
+        }
+        Ok(out)
+    }
+
+    async fn run(
+        &self,
+        intent: &ExecIntent,
+        journal: Option<&ExecJournal<'_>>,
+    ) -> Result<ExecOutcome> {
         let ExecStyle::MakerFirst(params) = &intent.style else {
             bail!("MakerFirstExecutor only executes MakerFirst intents");
         };
@@ -343,6 +428,7 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             unresolved: Vec::new(),
             last_pos: Some(pos0),
             order_qty: HashMap::new(),
+            journal,
         };
         let started = tokio::time::Instant::now();
         let maker_end = started + Duration::from_millis(params.maker_window_ms);
@@ -428,38 +514,47 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                         continue;
                     }
                 }
-                None => match self
-                    .venue
-                    .place_post_only(
-                        &intent.symbol,
-                        intent.side,
-                        remaining,
-                        target,
-                        intent.reduce_only,
-                    )
-                    .await
-                {
-                    Ok(id) => {
-                        run.ids.insert(id.clone(), Role::Maker);
-                        run.order_qty.insert(id.clone(), remaining);
-                        resting = Some((id, target));
-                    }
-                    // Provably not placed (post-only reject, 429, ...): retry.
-                    Err(e) if send_definitely_not_placed(&e) => log::info!(
-                        "[MAKER_FIRST] {}: post-only not placed: {e:?}",
-                        intent.symbol
-                    ),
-                    // May be live with an id we never saw: stop.
-                    Err(e) => {
-                        log::warn!(
-                            "[MAKER_FIRST] {}: post-only send ambiguous, stopping: {e:?}",
-                            intent.symbol
-                        );
-                        run.unresolved
-                            .push(format!("post_only:{}:ambiguous", intent.symbol));
+                None => {
+                    let Ok(key) = run.journal_pending(remaining, target, SendKind::PostOnly) else {
                         break;
+                    };
+                    match self
+                        .venue
+                        .place_post_only(
+                            &intent.symbol,
+                            intent.side,
+                            remaining,
+                            target,
+                            intent.reduce_only,
+                        )
+                        .await
+                    {
+                        Ok(id) => {
+                            run.journal_sent(key, Some(&id));
+                            run.ids.insert(id.clone(), Role::Maker);
+                            run.order_qty.insert(id.clone(), remaining);
+                            resting = Some((id, target));
+                        }
+                        // Provably not placed (post-only reject, 429, ...): retry.
+                        Err(e) if send_definitely_not_placed(&e) => {
+                            run.journal_sent(key, None);
+                            log::info!(
+                                "[MAKER_FIRST] {}: post-only not placed: {e:?}",
+                                intent.symbol
+                            )
+                        }
+                        // May be live with an id we never saw: stop.
+                        Err(e) => {
+                            log::warn!(
+                                "[MAKER_FIRST] {}: post-only send ambiguous, stopping: {e:?}",
+                                intent.symbol
+                            );
+                            run.unresolved
+                                .push(format!("post_only:{}:ambiguous", intent.symbol));
+                            break;
+                        }
                     }
-                },
+                }
             }
             tokio::time::sleep(self.timing.poll).await;
         }
@@ -522,6 +617,9 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             Side::Buy => intent.reference_price * (1.0 + b),
             Side::Sell => intent.reference_price * (1.0 - b),
         };
+        let Ok(key) = run.journal_pending(remaining, limit, SendKind::Ioc) else {
+            return;
+        };
         let id = match self
             .venue
             .place_ioc(
@@ -533,8 +631,12 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             )
             .await
         {
-            Ok(id) => id,
+            Ok(id) => {
+                run.journal_sent(key, Some(&id));
+                id
+            }
             Err(e) if send_definitely_not_placed(&e) => {
+                run.journal_sent(key, None);
                 log::warn!(
                     "[MAKER_FIRST] {}: taker remainder not sent: {e:?}",
                     intent.symbol
@@ -1321,6 +1423,7 @@ mod tests {
             unresolved: Vec::new(),
             last_pos: Some(0.0),
             order_qty: HashMap::new(),
+            journal: None,
         };
         push_fill(&mut v.s(), "m1", 0.4, 99.9);
         assert!(ex.settle(&mut run).await);
@@ -1376,6 +1479,7 @@ mod tests {
             unresolved: Vec::new(),
             last_pos: Some(0.0),
             order_qty: HashMap::new(),
+            journal: None,
         };
         push_fill(&mut v.s(), "m1", 0.4, 99.9);
         assert!(ex.settle(&mut run).await);
