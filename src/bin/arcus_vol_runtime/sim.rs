@@ -151,7 +151,11 @@ pub fn try_fill<E>(
     Ok(Some(next))
 }
 
-/// Join the back of the queue at `px` on `side` of the book.
+/// Join the back of the queue at `px` on `side` of the book: behind the
+/// size displayed at that price. A price with no level in `levels` joins
+/// with queue 0, which is exact for an empty price and optimistic if the
+/// level exists beyond the snapshot depth; presence mode therefore reads a
+/// 100-level book, and its paper fills are still only approximate.
 pub fn join(
     side: QSide,
     px: Decimal,

@@ -50,11 +50,13 @@ pub struct Config {
     pub quote_offset_bps: Decimal,
     /// With an offset, keep a resting quote while its distance from the
     /// touch stays within offset ± this many bp; re-peg only outside.
-    /// Must be < the offset. Ignored at offset 0.
+    /// Must be > 0 and < the offset. Ignored at offset 0.
     pub repeg_band_bps: Decimal,
-    /// Price tick the offset price is rounded to, away from the touch
-    /// (BTC-USD: 0.1). Only used when the offset is > 0.
-    pub price_tick: Decimal,
+    /// Optional coarser tick for offset prices. The venue's tick (read from
+    /// the connector) is the source of truth; this is used only when it is a
+    /// multiple of it, and otherwise presence mode does not quote
+    /// (`logic::usable_tick`). Unset = the venue tick.
+    pub price_tick: Option<Decimal>,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -131,7 +133,10 @@ impl Config {
             fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
             quote_offset_bps: dec(&p("QUOTE_OFFSET_BPS"), "0")?,
             repeg_band_bps: dec(&p("REPEG_BAND_BPS"), "0")?,
-            price_tick: dec(&p("PRICE_TICK"), "0.1")?,
+            price_tick: match var(&p("PRICE_TICK")) {
+                None => None,
+                Some(_) => Some(dec(&p("PRICE_TICK"), "0")?),
+            },
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -190,8 +195,10 @@ impl Config {
         self.validate_presence()
     }
 
-    /// Presence-quoting parameters. The band must be smaller than the
-    /// offset, so a quote that is kept can never sit at or through the touch.
+    /// Presence-quoting parameters. With an offset the band must be > 0 (a
+    /// zero band re-pegs on every tick of the touch: no "consistent" quote,
+    /// only cancel/place churn) and smaller than the offset (a quote that is
+    /// kept can never sit at or through the touch).
     fn validate_presence(&self) -> Result<()> {
         let hundred = Decimal::ONE_HUNDRED;
         if self.quote_offset_bps < Decimal::ZERO || self.quote_offset_bps > hundred {
@@ -206,20 +213,18 @@ impl Config {
                 self.repeg_band_bps
             );
         }
-        if self.quote_offset_bps > Decimal::ZERO {
-            if self.repeg_band_bps >= self.quote_offset_bps {
-                bail!(
-                    "ARCUS_VOL_REPEG_BAND_BPS ({}) must be < ARCUS_VOL_QUOTE_OFFSET_BPS ({})",
-                    self.repeg_band_bps,
-                    self.quote_offset_bps
-                );
-            }
-            if self.price_tick <= Decimal::ZERO {
-                bail!(
-                    "ARCUS_VOL_PRICE_TICK must be > 0 when quoting at an offset (got {})",
-                    self.price_tick
-                );
-            }
+        if self.quote_offset_bps > Decimal::ZERO
+            && (self.repeg_band_bps <= Decimal::ZERO
+                || self.repeg_band_bps >= self.quote_offset_bps)
+        {
+            bail!(
+                "with ARCUS_VOL_QUOTE_OFFSET_BPS={} ARCUS_VOL_REPEG_BAND_BPS must be > 0 and < the offset (got {})",
+                self.quote_offset_bps,
+                self.repeg_band_bps
+            );
+        }
+        if self.price_tick.is_some_and(|t| t <= Decimal::ZERO) {
+            bail!("ARCUS_VOL_PRICE_TICK, when set, must be > 0");
         }
         Ok(())
     }
@@ -234,6 +239,13 @@ impl Config {
     /// The cap quotes are sized against (see `cap_headroom`).
     pub fn quote_cap_usd(&self) -> Decimal {
         self.effective_cap_usd() * self.cap_headroom
+    }
+
+    pub fn presence(&self) -> crate::logic::Presence {
+        crate::logic::Presence {
+            offset_bps: self.quote_offset_bps,
+            band_bps: self.repeg_band_bps,
+        }
     }
 
     pub fn mode(&self) -> &'static str {
@@ -335,20 +347,25 @@ mod tests {
         // Defaults (offset 0): at the touch, any non-negative band is ignored.
         let mut cfg = test_config();
         assert!(cfg.validate().is_ok());
+        assert!(!cfg.presence().on());
         cfg.repeg_band_bps = d("3");
         assert!(cfg.validate().is_ok());
-        // Offset 5 with band 2 is fine; band == offset or above is refused
-        // (a kept quote could reach the touch).
+        // Offset 5 with band 2 is fine.
         cfg.quote_offset_bps = d("5");
         cfg.repeg_band_bps = d("2");
         assert!(cfg.validate().is_ok());
-        cfg.repeg_band_bps = d("5");
+        assert!(cfg.presence().on());
+        // Band 0 with an offset is refused (review #4): it would re-peg on
+        // every tick of the touch.
+        cfg.repeg_band_bps = Decimal::ZERO;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("REPEG_BAND_BPS"), "{err}");
-        cfg.repeg_band_bps = d("7");
-        assert!(cfg.validate().is_err());
-        cfg.repeg_band_bps = d("-1");
-        assert!(cfg.validate().is_err());
+        // Band == offset or above is refused (a kept quote could reach the
+        // touch); so is a negative band.
+        for bad in ["5", "7", "-1"] {
+            cfg.repeg_band_bps = d(bad);
+            assert!(cfg.validate().is_err(), "band {bad}");
+        }
         cfg.repeg_band_bps = d("2");
         // Offset range 0..=100.
         cfg.quote_offset_bps = d("100");
@@ -357,9 +374,12 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.quote_offset_bps = d("-0.1");
         assert!(cfg.validate().is_err());
-        // An offset needs a positive tick to round to.
+        // The optional tick override must be positive when set (whether it
+        // is a multiple of the venue tick is checked at runtime).
         cfg.quote_offset_bps = d("5");
-        cfg.price_tick = Decimal::ZERO;
+        cfg.price_tick = Some(d("0.5"));
+        assert!(cfg.validate().is_ok());
+        cfg.price_tick = Some(Decimal::ZERO);
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("PRICE_TICK"), "{err}");
     }
@@ -402,7 +422,7 @@ mod tests {
             fee_wait_secs: 30,
             quote_offset_bps: Decimal::ZERO,
             repeg_band_bps: Decimal::ZERO,
-            price_tick: Decimal::from_str("0.1").unwrap(),
+            price_tick: None,
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),
