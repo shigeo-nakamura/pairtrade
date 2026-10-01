@@ -791,6 +791,10 @@ mod tests {
             .fills
             .iter()
             .all(|f| f.role == Role::Maker && f.price == 99.9));
+        assert!(
+            o.fills.iter().all(|f| f.price_source == PriceSource::Paper),
+            "paper fills keep paper provenance through the executor"
+        );
         let fee: f64 = o.fills.iter().map(|f| f.fee_usd.unwrap()).sum();
         assert!((fee - 2.0 * 99.9 * 0.4e-4).abs() < 1e-9);
     }
