@@ -74,6 +74,11 @@ fn read_lines(path: &Path) -> Result<Vec<String>> {
             .stdout(Stdio::piped())
             .output()
             .with_context(|| format!("gzip -dc {}", path.display()))?;
+        // A truncated or corrupt file must fail, not replay its prefix as if
+        // it were complete (Codex on #377).
+        if !out.status.success() {
+            bail!("gzip -dc {} failed: {}", path.display(), out.status);
+        }
         Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::to_string)
@@ -159,7 +164,7 @@ fn main() -> Result<()> {
         None => Box::new(std::io::stdout()),
     };
     let (mut done, mut skipped) = (0usize, 0usize);
-    let (mut t_sum, mut m_sum, mut n_both) = (0.0, 0.0, 0usize);
+    let (mut t_sum, mut m_sum, mut n_both, mut incomplete) = (0.0, 0.0, 0usize, 0usize);
     for r in &intents {
         let i = &r["intent"];
         let (Some(sym), Some(qty), Some(refp), Some(ts)) = (
@@ -227,16 +232,28 @@ fn main() -> Result<()> {
             .sum();
         let t_cost = cost_bps(side, refp, &t_rows);
         let m_cost = cost_bps(side, refp, &m_rows);
-        if let (Some(t), Some(m)) = (t_cost, m_cost) {
-            t_sum += t;
-            m_sum += m;
-            n_both += 1;
+        // Compare only like with like: both executions completed the full
+        // quantity and nothing is unresolved. A partial fill's cost covers a
+        // different (often the cheapest) part of the order (Codex on #377).
+        let eps = qty * 1e-9 + 1e-12;
+        let t_filled: f64 = t_rows.iter().map(|r| r.1).sum();
+        let comparable = (t_filled - qty).abs() <= eps
+            && (mk.filled_qty - qty).abs() <= eps
+            && mk.unresolved.is_empty();
+        match (comparable, t_cost, m_cost) {
+            (true, Some(t), Some(m)) => {
+                t_sum += t;
+                m_sum += m;
+                n_both += 1;
+            }
+            _ => incomplete += 1,
         }
         writeln!(
             out,
             "{}",
             json!({
                 "ts_ms": ts, "symbol": sym, "side": i["side"], "qty": qty,
+                "comparable": comparable,
                 "reference_price": refp,
                 "taker": {"filled": t_rows.iter().map(|r| r.1).sum::<f64>(), "cost_bps": t_cost},
                 "maker_first": {
@@ -249,7 +266,7 @@ fn main() -> Result<()> {
         done += 1;
     }
     eprintln!(
-        "replayed {done}, skipped {skipped}; both filled {n_both}: mean taker {:.2} bp, mean maker-first {:.2} bp",
+        "replayed {done}, skipped {skipped}; comparable (both complete, none unresolved) {n_both}, incomplete {incomplete}: mean taker {:.2} bp, mean maker-first {:.2} bp",
         if n_both > 0 { t_sum / n_both as f64 } else { f64::NAN },
         if n_both > 0 { m_sum / n_both as f64 } else { f64::NAN },
     );
