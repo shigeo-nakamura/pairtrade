@@ -1190,4 +1190,38 @@ mod tests {
         assert!((v.s().iocs[0].0 - 0.6).abs() < 1e-12, "{:?}", v.s().iocs);
         assert!((o.filled_qty - 1.0).abs() < 1e-12, "{}", o.filled_qty);
     }
+
+    /// `settle` alone: with both views still at the baseline on the first
+    /// poll, it must not report agreement until the fill shows in both.
+    #[tokio::test(start_paused = true)]
+    async fn settle_waits_past_a_first_baseline_sample() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.position_delay = 2;
+            s.record_delay = 3;
+        });
+        let i = buy(1.0, Some(50.0), 250);
+        let ex = MakerFirstExecutor {
+            venue: &v,
+            timing: timing(),
+        };
+        let mut run = Run {
+            intent: &i,
+            pos0: 0.0,
+            eps: 1e-9,
+            ids: HashMap::from([("m1".to_string(), Role::Maker)]),
+            book: Book {
+                rows: Vec::new(),
+                seen: HashSet::new(),
+                filled: 0.0,
+            },
+            unresolved: Vec::new(),
+            last_pos: Some(0.0),
+        };
+        push_fill(&mut v.s(), "m1", 0.4, 99.9);
+        assert!(ex.settle(&mut run).await);
+        assert!(
+            (run.book.filled - 0.4).abs() < 1e-12,
+            "settled on the stale baseline"
+        );
+    }
 }
