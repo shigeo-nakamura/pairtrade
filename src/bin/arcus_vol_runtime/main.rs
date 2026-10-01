@@ -35,10 +35,10 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, may_disarm_dms,
-    plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, reconcile_cleared,
-    send_gated, shock, shutdown_steps, tick_plan, BatchSink, PlanState, PosCheck, QSide,
-    QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
+    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position,
+    may_disarm_dms, plan_inputs, plan_quotes, position_check, position_gate_after, quote_action,
+    reconcile_cleared, send_gated, shock, shutdown_steps, tick_plan, BatchSink, PlanState,
+    PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -678,22 +678,8 @@ impl Runtime {
 
     async fn venue_qty(&mut self) -> Option<(Decimal, Option<Decimal>)> {
         match self.dex.get_positions().await {
-            Ok(positions) => {
-                let base = self
-                    .cfg
-                    .market
-                    .trim_end_matches("-USD")
-                    .to_ascii_uppercase();
-                let hit = positions.into_iter().find(|p| {
-                    p.symbol
-                        .trim_end_matches("-USD")
-                        .eq_ignore_ascii_case(&base)
-                });
-                Some(match hit {
-                    Some(p) => (p.size.abs() * Decimal::from(p.sign.signum()), p.entry_price),
-                    None => (Decimal::ZERO, None),
-                })
-            }
+            // Only this runtime's market (logic::market_position).
+            Ok(positions) => Some(market_position(&positions, &self.cfg.market)),
             Err(e) => {
                 self.on_error("get_positions", &e);
                 None

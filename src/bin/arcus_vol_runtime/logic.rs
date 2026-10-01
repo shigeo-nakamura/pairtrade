@@ -373,6 +373,27 @@ pub fn plan_inputs(s: &PlanState, now_ms: u64) -> TickInputs {
     }
 }
 
+/// This runtime's position out of an account-wide `get_positions` read:
+/// only the configured market counts (a shared subaccount may hold other
+/// markets, e.g. NVDA-USD, which must never enter the ledger comparison,
+/// the cap, or a flatten). Signed qty and entry price; flat if absent.
+pub fn market_position(
+    positions: &[dex_connector::PositionSnapshot],
+    market: &str,
+) -> (Decimal, Option<Decimal>) {
+    let base = market.trim_end_matches("-USD").to_ascii_uppercase();
+    positions
+        .iter()
+        .find(|p| {
+            p.symbol
+                .trim_end_matches("-USD")
+                .eq_ignore_ascii_case(&base)
+        })
+        .map_or((Decimal::ZERO, None), |p| {
+            (p.size.abs() * Decimal::from(p.sign.signum()), p.entry_price)
+        })
+}
+
 /// Outcome of comparing the ledger with the venue position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PosCheck {
@@ -743,6 +764,32 @@ mod tests {
             ..live_state()
         };
         assert_eq!(tick_plan(&plan_inputs(&dry, now)), TickPlan::Quote);
+    }
+
+    #[test]
+    fn other_markets_on_a_shared_account_never_enter_the_position_check() {
+        use std::str::FromStr;
+        let d = |v: &str| Decimal::from_str(v).unwrap();
+        let snap = |sym: &str, size: &str, sign: i32| dex_connector::PositionSnapshot {
+            symbol: sym.to_string(),
+            size: d(size),
+            sign,
+            entry_price: Some(d("100")),
+        };
+        // An NVDA-USD position (manual trading) next to a flat BTC book.
+        let positions = vec![snap("NVDA-USD", "4.43", -1)];
+        let (qty, _) = market_position(&positions, "BTC-USD");
+        assert_eq!(qty, Decimal::ZERO);
+        // So a flat BTC ledger is InSync: no mismatch, no halt, no flatten.
+        let (check, _) = position_check(Decimal::ZERO, Some(qty), true, None, 1_000, 5_000);
+        assert_eq!(check, PosCheck::InSync);
+        // With BTC present too, only BTC counts (sign applied).
+        let positions = vec![snap("NVDA-USD", "4.43", -1), snap("BTC-USD", "0.12", -1)];
+        assert_eq!(market_position(&positions, "BTC-USD").0, d("-0.12"));
+        assert_eq!(market_position(&positions, "BTC").0, d("-0.12"));
+        // A symbol that only shares a prefix is not ours.
+        let positions = vec![snap("BTCDOM-USD", "1", 1)];
+        assert_eq!(market_position(&positions, "BTC-USD").0, Decimal::ZERO);
     }
 
     #[test]
