@@ -42,11 +42,46 @@ pub struct QuoteParams {
     pub cap_usd: Decimal,
     pub min_quote_usd: Decimal,
     pub qty_decimals: u32,
+    /// Presence quoting (bot-strategy#1093 option B): rest this many bp
+    /// behind the touch. 0 = at the touch.
+    pub offset_bps: Decimal,
+    /// Price tick the offset price is rounded to (away from the touch).
+    /// Unused at offset 0.
+    pub tick: Decimal,
 }
 
-/// Quotes at the touch. A side is dropped when inventory already sits at the
-/// skew on the side it would grow, and every quote is sized so its full fill
-/// keeps |inventory| within `cap_usd`. `inv_qty` is signed base.
+const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
+
+/// The quote price `offset_bps` behind `touch` on `side`, rounded AWAY from
+/// the touch to `tick` (bid down, ask up), so rounding can only make the
+/// quote more passive. Offset 0 returns the touch itself, unrounded.
+pub fn offset_px(side: QSide, touch: Decimal, offset_bps: Decimal, tick: Decimal) -> Decimal {
+    if offset_bps <= Decimal::ZERO || tick <= Decimal::ZERO {
+        return touch;
+    }
+    let frac = offset_bps / BPS;
+    match side {
+        QSide::Bid => ((touch * (Decimal::ONE - frac)) / tick).floor() * tick,
+        QSide::Ask => ((touch * (Decimal::ONE + frac)) / tick).ceil() * tick,
+    }
+}
+
+/// How far `px` rests behind `touch` on `side`, in bp of the touch
+/// (negative = through the touch).
+pub fn dist_bps(side: QSide, px: Decimal, touch: Decimal) -> Decimal {
+    if touch <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    match side {
+        QSide::Bid => (touch - px) / touch * BPS,
+        QSide::Ask => (px - touch) / touch * BPS,
+    }
+}
+
+/// Quotes at the touch, or `offset_bps` behind it (presence quoting). A side
+/// is dropped when inventory already sits at the skew on the side it would
+/// grow, and every quote is sized so its full fill keeps |inventory| within
+/// `cap_usd`. `inv_qty` is signed base.
 pub fn plan_quotes(
     best_bid: Decimal,
     best_ask: Decimal,
@@ -72,7 +107,7 @@ pub fn plan_quotes(
     } else {
         size(p.cap_usd - inv_usd).map(|qty| QuoteTarget {
             side: QSide::Bid,
-            px: best_bid,
+            px: offset_px(QSide::Bid, best_bid, p.offset_bps, p.tick),
             qty,
         })
     };
@@ -81,7 +116,7 @@ pub fn plan_quotes(
     } else {
         size(p.cap_usd + inv_usd).map(|qty| QuoteTarget {
             side: QSide::Ask,
-            px: best_ask,
+            px: offset_px(QSide::Ask, best_ask, p.offset_bps, p.tick),
             qty,
         })
     };
@@ -215,6 +250,53 @@ pub fn quote_action(resting: Option<&Resting>, target: Option<&QuoteTarget>) -> 
                 QuoteAction::Replace(Some(t.clone()))
             }
         }
+    }
+}
+
+/// Presence quoting (bot-strategy#1093 option B): quotes rest `offset_bps`
+/// behind the touch so they fill only on a sweep, and stay put while the
+/// touch moves within the band, so they rest for a long time ("quoting
+/// consistently") instead of being cancelled and re-placed every tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Peg {
+    pub offset_bps: Decimal,
+    /// Keep a resting quote while its distance from the touch stays within
+    /// `offset_bps ± band_bps`. Config guarantees `band_bps < offset_bps`,
+    /// so a kept quote can never be at or through the touch.
+    pub band_bps: Decimal,
+}
+
+/// `quote_action` for a pegged quote. With `offset_bps == 0` this is exactly
+/// `quote_action` (requote whenever the price differs). With an offset, a
+/// resting quote is KEPT while it is at the target price or its distance
+/// from `touch` (the best price on its own side) is inside the band, and the
+/// size is within 1%; it is re-pegged (cancel + place) only when it leaves
+/// the band or the size is off.
+pub fn quote_action_pegged(
+    resting: Option<&Resting>,
+    target: Option<&QuoteTarget>,
+    touch: Decimal,
+    peg: &Peg,
+) -> QuoteAction {
+    if peg.offset_bps <= Decimal::ZERO {
+        return quote_action(resting, target);
+    }
+    match (resting, target) {
+        (Some(r), Some(t)) => {
+            let open = r.qty - r.filled;
+            let size_off = (open - t.qty).abs() > t.qty / Decimal::ONE_HUNDRED;
+            let dist = dist_bps(t.side, r.px, touch);
+            let in_band =
+                dist >= peg.offset_bps - peg.band_bps && dist <= peg.offset_bps + peg.band_bps;
+            if (r.px == t.px || in_band) && !size_off {
+                QuoteAction::Keep
+            } else if MODIFY_ENABLED && r.filled.is_zero() {
+                QuoteAction::Modify(t.clone())
+            } else {
+                QuoteAction::Replace(Some(t.clone()))
+            }
+        }
+        _ => quote_action(resting, target),
     }
 }
 
@@ -603,6 +685,8 @@ mod tests {
             cap_usd: d("9500"),
             min_quote_usd: d("50"),
             qty_decimals: 5,
+            offset_bps: Decimal::ZERO,
+            tick: d("0.1"),
         }
     }
 
@@ -1262,6 +1346,191 @@ mod tests {
             }]
         );
         assert!(flatten_steps(Decimal::ZERO, true, true).is_empty());
+    }
+
+    #[test]
+    fn offset_price_rounds_away_from_the_touch() {
+        // Presence quoting (bot-strategy#1093 B). 83438.4 × 0.9995 =
+        // 83396.6808 → bid DOWN to 83396.6; 83438.5 × 1.0005 = 83480.21925
+        // → ask UP to 83480.3. Rounding only ever makes the quote more passive.
+        let tick = d("0.1");
+        assert_eq!(
+            offset_px(QSide::Bid, d("83438.4"), d("5"), tick),
+            d("83396.6")
+        );
+        assert_eq!(
+            offset_px(QSide::Ask, d("83438.5"), d("5"), tick),
+            d("83480.3")
+        );
+        // Already on the tick: not pushed a further tick away.
+        assert_eq!(offset_px(QSide::Bid, d("100000"), d("5"), tick), d("99950"));
+        assert_eq!(
+            offset_px(QSide::Ask, d("100000"), d("5"), tick),
+            d("100050")
+        );
+        // Offset 0 is the touch itself, untouched (today's behaviour).
+        assert_eq!(
+            offset_px(QSide::Bid, d("84600.13"), Decimal::ZERO, tick),
+            d("84600.13")
+        );
+        assert_eq!(
+            offset_px(QSide::Ask, d("84600.13"), Decimal::ZERO, tick),
+            d("84600.13")
+        );
+        // Distance is measured from the quote's own side of the touch.
+        assert!(dist_bps(QSide::Bid, d("83396.6"), d("83438.4")) > d("5"));
+        assert!(dist_bps(QSide::Bid, d("83396.6"), d("83438.4")) < d("5.02"));
+        assert!(dist_bps(QSide::Ask, d("83480.3"), d("83438.5")) > d("5"));
+        assert!(dist_bps(QSide::Ask, d("83438.4"), d("83438.5")) < Decimal::ZERO);
+
+        // plan_quotes applies it to both sides; offset 0 quotes the touch.
+        let mut p = params();
+        let (bid, ask) = plan_quotes(d("83438.4"), d("83438.5"), Decimal::ZERO, &p);
+        assert_eq!(bid.unwrap().px, d("83438.4"));
+        assert_eq!(ask.unwrap().px, d("83438.5"));
+        p.offset_bps = d("5");
+        let (bid, ask) = plan_quotes(d("83438.4"), d("83438.5"), Decimal::ZERO, &p);
+        assert_eq!(bid.unwrap().px, d("83396.6"));
+        assert_eq!(ask.unwrap().px, d("83480.3"));
+    }
+
+    #[test]
+    fn a_pegged_quote_is_kept_inside_the_band_and_repegged_outside() {
+        let peg = Peg {
+            offset_bps: d("5"),
+            band_bps: d("2"),
+        };
+        let tick = d("0.1");
+        let target = |side: QSide, touch: &str| QuoteTarget {
+            side,
+            px: offset_px(side, d(touch), peg.offset_bps, tick),
+            qty: d("0.024"),
+        };
+        let act = |r: &Resting, side: QSide, touch: &str| {
+            quote_action_pegged(Some(r), Some(&target(side, touch)), d(touch), &peg)
+        };
+        // Bid placed 5 bp below a 83438.4 touch.
+        let bid = Resting {
+            order_id: "b".into(),
+            px: d("83396.6"),
+            qty: d("0.024"),
+            filled: Decimal::ZERO,
+        };
+        assert_eq!(act(&bid, QSide::Bid, "83438.4"), QuoteAction::Keep);
+        // Touch moves AWAY (up): 5.9 bp is inside 3..7 → keep; 7.6 bp → re-peg.
+        assert_eq!(act(&bid, QSide::Bid, "83446"), QuoteAction::Keep);
+        assert_eq!(
+            act(&bid, QSide::Bid, "83460"),
+            QuoteAction::Replace(Some(target(QSide::Bid, "83460")))
+        );
+        // Touch moves TOWARD the quote (down): 3.4 bp → keep; 2.8 bp → re-peg
+        // back out to 5 bp, so a kept quote never reaches the touch.
+        assert_eq!(act(&bid, QSide::Bid, "83425"), QuoteAction::Keep);
+        assert_eq!(
+            act(&bid, QSide::Bid, "83420"),
+            QuoteAction::Replace(Some(target(QSide::Bid, "83420")))
+        );
+        // Ask placed 5 bp above a 83438.5 touch: mirror image.
+        let ask = Resting {
+            order_id: "a".into(),
+            px: d("83480.3"),
+            qty: d("0.024"),
+            filled: Decimal::ZERO,
+        };
+        assert_eq!(act(&ask, QSide::Ask, "83438.5"), QuoteAction::Keep);
+        assert_eq!(act(&ask, QSide::Ask, "83431"), QuoteAction::Keep); // away: 5.9 bp
+        assert_eq!(
+            act(&ask, QSide::Ask, "83417"),
+            QuoteAction::Replace(Some(target(QSide::Ask, "83417"))) // away: 7.6 bp
+        );
+        assert_eq!(act(&ask, QSide::Ask, "83452"), QuoteAction::Keep); // toward: 3.4 bp
+        assert_eq!(
+            act(&ask, QSide::Ask, "83457"),
+            QuoteAction::Replace(Some(target(QSide::Ask, "83457"))) // toward: 2.8 bp
+        );
+        // In the band but the size is off by more than 1% → re-peg.
+        let resized = QuoteTarget {
+            qty: d("0.02"),
+            ..target(QSide::Bid, "83446")
+        };
+        assert_eq!(
+            quote_action_pegged(Some(&bid), Some(&resized), d("83446"), &peg),
+            QuoteAction::Replace(Some(resized.clone()))
+        );
+        // The other arms are unchanged: place when nothing rests, cancel
+        // when the side is suppressed.
+        let t = target(QSide::Bid, "83438.4");
+        assert_eq!(
+            quote_action_pegged(None, Some(&t), d("83438.4"), &peg),
+            QuoteAction::Place(t)
+        );
+        assert_eq!(
+            quote_action_pegged(Some(&bid), None, d("83438.4"), &peg),
+            QuoteAction::Replace(None)
+        );
+        // Band 0: a fresh quote (rounded a hair past 5 bp) is still kept
+        // while the target price is the same, and re-pegged once it differs.
+        let exact = Peg {
+            offset_bps: d("5"),
+            band_bps: Decimal::ZERO,
+        };
+        let same = target(QSide::Bid, "83438.4");
+        assert_eq!(
+            quote_action_pegged(Some(&bid), Some(&same), d("83438.4"), &exact),
+            QuoteAction::Keep
+        );
+        let moved = target(QSide::Bid, "83439.4");
+        assert_eq!(
+            quote_action_pegged(Some(&bid), Some(&moved), d("83439.4"), &exact),
+            QuoteAction::Replace(Some(moved.clone()))
+        );
+    }
+
+    #[test]
+    fn offset_zero_reproduces_the_at_touch_requote_rule() {
+        // With offset 0 the band is ignored, whatever it is set to.
+        let peg = Peg {
+            offset_bps: Decimal::ZERO,
+            band_bps: d("5"),
+        };
+        let r = Resting {
+            order_id: "o".into(),
+            px: d("100.19"),
+            qty: d("1"),
+            filled: Decimal::ZERO,
+        };
+        let same = QuoteTarget {
+            side: QSide::Bid,
+            px: d("100.19"),
+            qty: d("1"),
+        };
+        // 1 bp from the touch: inside a ±5 band, but offset 0 must requote.
+        let moved = QuoteTarget {
+            px: d("100.2"),
+            ..same.clone()
+        };
+        let partly = Resting {
+            filled: d("0.4"),
+            ..r.clone()
+        };
+        let cases: [(Option<&Resting>, Option<&QuoteTarget>); 6] = [
+            (Some(&r), Some(&same)),
+            (Some(&r), Some(&moved)),
+            (Some(&partly), Some(&same)),
+            (Some(&r), None),
+            (None, Some(&same)),
+            (None, None),
+        ];
+        for (resting, target) in cases {
+            assert_eq!(
+                quote_action_pegged(resting, target, d("100.2"), &peg),
+                quote_action(resting, target)
+            );
+        }
+        assert_eq!(
+            quote_action_pegged(Some(&r), Some(&moved), d("100.2"), &peg),
+            QuoteAction::Replace(Some(moved.clone()))
+        );
     }
 
     #[test]

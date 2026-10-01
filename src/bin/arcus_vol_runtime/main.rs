@@ -13,6 +13,18 @@
 //!   and a dedicated non-zero `ARCUS_ACCOUNT_INDEX` (plus the usual
 //!   `ARCUS_ADDRESS` / `ARCUS_API_PRIVATE_KEY` + `ENCRYPTED_DATA_KEY`).
 //!
+//! Presence quoting (`ARCUS_VOL_QUOTE_OFFSET_BPS` > 0, bot-strategy#1093
+//! option B): quotes rest that many bp BEHIND the touch instead of at it,
+//! rounded away from the touch to `ARCUS_VOL_PRICE_TICK`, and are kept while
+//! the touch moves within `ARCUS_VOL_REPEG_BAND_BPS` of the offset (re-pegged
+//! by cancel + place only outside the band). At an offset a quote fills only
+//! when a sweep reaches it, so volume and adverse selection are near zero;
+//! the mode exists to test whether resting quotes alone ("quoting tight,
+//! deep, and consistently") earn Arcus market-making points. Skew, cap,
+//! max-hold flatten, stops and the DMS work exactly as at the touch.
+//! `status.json` shows `quote_offset_bps`, `repeg_band_bps` and each quote's
+//! `dist_bps` from the touch. Offset 0 (default) is the at-touch behaviour.
+//!
 //! Files in `ARCUS_VOL_STATE_DIR`: `state.json` (ledger, atomic), `status.json`
 //! (every tick), `fills.jsonl` (fills + later markout rows), and the
 //! sentinels `KILL_SWITCH` (cancel + flatten + halt while present) and `HALT`
@@ -35,11 +47,11 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position,
-    may_disarm_dms, plan_inputs, plan_quotes, position_check, position_gate_after, quote_action,
-    read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan,
-    BatchSink, PlanState, PosCheck, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
-    ShutdownStep, Step, TickPlan,
+    dist_bps, dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
+    market_position, may_disarm_dms, plan_inputs, plan_quotes, position_check, position_gate_after,
+    quote_action_pegged, read_within, reconcile_cleared, send_gated, shock, shutdown_steps,
+    spill_rows, tick_plan, BatchSink, Peg, PlanState, PosCheck, QSide, QuoteAction, QuoteParams,
+    QuoteTarget, Resting, ShutdownStep, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -195,6 +207,8 @@ impl Runtime {
             cap_usd: self.cfg.quote_cap_usd(),
             min_quote_usd: self.cfg.min_quote_usd,
             qty_decimals: self.cfg.qty_decimals,
+            offset_bps: self.cfg.quote_offset_bps,
+            tick: self.cfg.price_tick,
         }
     }
 
@@ -1476,13 +1490,24 @@ impl Runtime {
             self.ledger.position.qty,
             &self.quote_params(),
         );
-        let plan: Vec<(QSide, QuoteAction)> = [(QSide::Bid, bid), (QSide::Ask, ask)]
-            .into_iter()
-            .map(|(side, target)| {
-                let current = self.current_quote(side);
-                (side, quote_action(current.as_ref(), target.as_ref()))
-            })
-            .collect();
+        // Presence quoting (offset > 0): a quote is kept while it stays
+        // inside the band around the offset; at offset 0 this is the plain
+        // at-touch rule.
+        let peg = Peg {
+            offset_bps: self.cfg.quote_offset_bps,
+            band_bps: self.cfg.repeg_band_bps,
+        };
+        let plan: Vec<(QSide, QuoteAction)> =
+            [(QSide::Bid, bid, bid_px), (QSide::Ask, ask, ask_px)]
+                .into_iter()
+                .map(|(side, target, touch)| {
+                    let current = self.current_quote(side);
+                    (
+                        side,
+                        quote_action_pegged(current.as_ref(), target.as_ref(), touch, &peg),
+                    )
+                })
+                .collect();
         if self.cfg.dry_run {
             for (side, action) in plan {
                 self.paper_quote(side, action);
@@ -1500,8 +1525,15 @@ impl Runtime {
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
         let quote = |side: QSide| {
             self.current_quote(side).map(|r| {
+                // Distance of the resting quote from the touch on its own
+                // side (presence-quoting monitor); null without a book.
+                let dist = self.book.as_ref().map(|b| {
+                    let touch = if side == QSide::Bid { b.bid } else { b.ask };
+                    dist_bps(side, r.px, touch).round_dp(3).to_string()
+                });
                 json!({"px": r.px.to_string(), "qty": r.qty.to_string(),
-                       "filled": r.filled.to_string(), "order_id": r.order_id})
+                       "filled": r.filled.to_string(), "order_id": r.order_id,
+                       "dist_bps": dist})
             })
         };
         let l = &self.ledger;
@@ -1512,6 +1544,8 @@ impl Runtime {
             "market": self.cfg.market,
             "book": self.book.as_ref().map(|b| json!({"bid": b.bid.to_string(), "ask": b.ask.to_string()})),
             "quotes": {"bid": quote(QSide::Bid), "ask": quote(QSide::Ask)},
+            "quote_offset_bps": self.cfg.quote_offset_bps.to_string(),
+            "repeg_band_bps": self.cfg.repeg_band_bps.to_string(),
             "inventory": {"qty": l.position.qty.to_string(),
                           "usd": (l.position.qty * mark).round_dp(2).to_string(),
                           "avg_px": l.position.avg_px.round_dp(4).to_string(),
@@ -1703,6 +1737,16 @@ async fn main() -> Result<()> {
         cfg.cum_stop_usd,
         cfg.state_dir.display()
     );
+    if cfg.quote_offset_bps > Decimal::ZERO {
+        log::info!(
+            "[ARCUS_VOL] PRESENCE quoting: quotes rest {} bp behind the touch (tick {}), kept while within ±{} bp of that; fills only on sweeps",
+            cfg.quote_offset_bps,
+            cfg.price_tick,
+            cfg.repeg_band_bps
+        );
+    } else {
+        log::info!("[ARCUS_VOL] quoting at the touch (ARCUS_VOL_QUOTE_OFFSET_BPS=0)");
+    }
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create {}", cfg.state_dir.display()))?;
     // Before state.json is read or the venue touched (Codex P1, pairtrade#361).

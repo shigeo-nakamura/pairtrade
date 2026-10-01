@@ -43,6 +43,18 @@ pub struct Config {
     /// How long a live fill with no reported fee waits before it is booked
     /// at the taker fee (`fee_estimated`).
     pub fee_wait_secs: u64,
+    /// Presence quoting (bot-strategy#1093 option B): rest quotes this many
+    /// bp behind the touch (0 = at the touch, the default). At an offset a
+    /// quote fills only when a sweep reaches it, so volume is near zero;
+    /// the point is to test whether resting quotes alone earn MM points.
+    pub quote_offset_bps: Decimal,
+    /// With an offset, keep a resting quote while its distance from the
+    /// touch stays within offset ± this many bp; re-peg only outside.
+    /// Must be < the offset. Ignored at offset 0.
+    pub repeg_band_bps: Decimal,
+    /// Price tick the offset price is rounded to, away from the touch
+    /// (BTC-USD: 0.1). Only used when the offset is > 0.
+    pub price_tick: Decimal,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -117,6 +129,9 @@ impl Config {
             min_quote_usd: dec(&p("MIN_QUOTE_USD"), "50")?,
             flatten_slippage_bps: int(&p("FLATTEN_SLIPPAGE_BPS"), 20u32)?,
             fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
+            quote_offset_bps: dec(&p("QUOTE_OFFSET_BPS"), "0")?,
+            repeg_band_bps: dec(&p("REPEG_BAND_BPS"), "0")?,
+            price_tick: dec(&p("PRICE_TICK"), "0.1")?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -171,6 +186,40 @@ impl Config {
         }
         if self.dms_secs < 5 || self.dms_secs > 300 || self.dms_refresh_secs >= self.dms_secs {
             bail!("ARCUS_VOL_DMS_SECS must be 5..=300 and above DMS_REFRESH_SECS");
+        }
+        self.validate_presence()
+    }
+
+    /// Presence-quoting parameters. The band must be smaller than the
+    /// offset, so a quote that is kept can never sit at or through the touch.
+    fn validate_presence(&self) -> Result<()> {
+        let hundred = Decimal::ONE_HUNDRED;
+        if self.quote_offset_bps < Decimal::ZERO || self.quote_offset_bps > hundred {
+            bail!(
+                "ARCUS_VOL_QUOTE_OFFSET_BPS must be in 0..=100 (got {})",
+                self.quote_offset_bps
+            );
+        }
+        if self.repeg_band_bps < Decimal::ZERO {
+            bail!(
+                "ARCUS_VOL_REPEG_BAND_BPS must be >= 0 (got {})",
+                self.repeg_band_bps
+            );
+        }
+        if self.quote_offset_bps > Decimal::ZERO {
+            if self.repeg_band_bps >= self.quote_offset_bps {
+                bail!(
+                    "ARCUS_VOL_REPEG_BAND_BPS ({}) must be < ARCUS_VOL_QUOTE_OFFSET_BPS ({})",
+                    self.repeg_band_bps,
+                    self.quote_offset_bps
+                );
+            }
+            if self.price_tick <= Decimal::ZERO {
+                bail!(
+                    "ARCUS_VOL_PRICE_TICK must be > 0 when quoting at an offset (got {})",
+                    self.price_tick
+                );
+            }
         }
         Ok(())
     }
@@ -281,6 +330,41 @@ mod tests {
     }
 
     #[test]
+    fn presence_params_are_validated() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        // Defaults (offset 0): at the touch, any non-negative band is ignored.
+        let mut cfg = test_config();
+        assert!(cfg.validate().is_ok());
+        cfg.repeg_band_bps = d("3");
+        assert!(cfg.validate().is_ok());
+        // Offset 5 with band 2 is fine; band == offset or above is refused
+        // (a kept quote could reach the touch).
+        cfg.quote_offset_bps = d("5");
+        cfg.repeg_band_bps = d("2");
+        assert!(cfg.validate().is_ok());
+        cfg.repeg_band_bps = d("5");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("REPEG_BAND_BPS"), "{err}");
+        cfg.repeg_band_bps = d("7");
+        assert!(cfg.validate().is_err());
+        cfg.repeg_band_bps = d("-1");
+        assert!(cfg.validate().is_err());
+        cfg.repeg_band_bps = d("2");
+        // Offset range 0..=100.
+        cfg.quote_offset_bps = d("100");
+        assert!(cfg.validate().is_ok());
+        cfg.quote_offset_bps = d("100.5");
+        assert!(cfg.validate().is_err());
+        cfg.quote_offset_bps = d("-0.1");
+        assert!(cfg.validate().is_err());
+        // An offset needs a positive tick to round to.
+        cfg.quote_offset_bps = d("5");
+        cfg.price_tick = Decimal::ZERO;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("PRICE_TICK"), "{err}");
+    }
+
+    #[test]
     fn effective_cap_is_the_smaller_of_hard_cap_and_margin_times_leverage() {
         let mut cfg = test_config();
         assert_eq!(cfg.effective_cap_usd(), Decimal::from(10_000));
@@ -316,6 +400,9 @@ mod tests {
             min_quote_usd: Decimal::from(50),
             flatten_slippage_bps: 20,
             fee_wait_secs: 30,
+            quote_offset_bps: Decimal::ZERO,
+            repeg_band_bps: Decimal::ZERO,
+            price_tick: Decimal::from_str("0.1").unwrap(),
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),
