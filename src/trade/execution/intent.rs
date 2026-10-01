@@ -62,15 +62,17 @@ pub struct ExecIntent {
     pub reduce_only: bool,
     /// Hard completion bound for the whole intent (ms from start), if any.
     pub deadline_ms: Option<u64>,
-    /// Slippage bound vs `reference_price` for any taker part.
-    pub max_slip_bps: f64,
+    /// Worst-case slippage vs `reference_price` the execution path
+    /// guarantees for any taker part; `None` = no guaranteed bound (e.g. a
+    /// reduce-only close that may cross at the venue's own touch).
+    pub max_slip_bps: Option<f64>,
     pub style: ExecStyle,
 }
 
 impl ExecIntent {
     /// The equivalent intent for a book order (always `Taker`: the book
     /// runtime's live path is IOC-only today).
-    pub fn from_book(intent: &OrderIntent, max_slip_bps: f64) -> Self {
+    pub fn from_book(intent: &OrderIntent, max_slip_bps: Option<f64>) -> Self {
         Self {
             symbol: intent.symbol.clone(),
             side: intent.side.into(),
@@ -166,8 +168,9 @@ pub fn outcome_from_fill_report(intent: &ExecIntent, report: &FillReport) -> Exe
 /// No-behaviour-change adapter over a book [`Executor`]: the book order runs
 /// exactly as `executor.execute(order)` would, and its [`FillReport`] is
 /// returned untouched next to the derived [`ExecOutcome`]. The intent's
-/// slippage bound is the executor's own ([`Executor::slippage_bound_bps`]),
-/// never a separate value the execution path would ignore.
+/// slippage bound is the executor's own worst case
+/// ([`Executor::slippage_bound_bps`]), never a separate value the execution
+/// path would not enforce.
 pub struct BookTaker<'a, E: Executor + ?Sized> {
     pub executor: &'a E,
 }
@@ -175,7 +178,7 @@ pub struct BookTaker<'a, E: Executor + ?Sized> {
 impl<'a, E: Executor + ?Sized> BookTaker<'a, E> {
     /// The intent this adapter executes `order` as.
     pub fn intent_for(&self, order: &OrderIntent) -> ExecIntent {
-        ExecIntent::from_book(order, self.executor.slippage_bound_bps())
+        ExecIntent::from_book(order, self.executor.slippage_bound_bps(order.reduce_only))
     }
 
     pub async fn execute(&self, order: &OrderIntent) -> Result<(FillReport, ExecOutcome)> {
@@ -219,9 +222,63 @@ mod tests {
         paper.set_price("BTC", 100.0).await;
         let taker = BookTaker { executor: &paper };
         let order = book_order(BookSide::Buy, 1.0, false);
-        assert_eq!(taker.intent_for(&order).max_slip_bps, 100.0);
+        assert_eq!(taker.intent_for(&order).max_slip_bps, Some(100.0));
         let (_, outcome) = taker.execute(&order).await.unwrap();
         assert!((outcome.fills[0].slippage_bps - 100.0).abs() < 1e-6);
+    }
+
+    /// An executor whose bound depends on reduce_only, like the live one.
+    struct BoundOnly;
+
+    #[async_trait::async_trait]
+    impl Executor for BoundOnly {
+        fn is_paper(&self) -> bool {
+            false
+        }
+        fn slippage_bound_bps(&self, reduce_only: bool) -> Option<f64> {
+            (!reduce_only).then_some(201.0)
+        }
+        async fn prices(&self, _: &[String]) -> std::collections::HashMap<String, f64> {
+            unimplemented!()
+        }
+        async fn lot_meta(&self, _: &str) -> Result<crate::book::rebalance::LotMeta> {
+            unimplemented!()
+        }
+        async fn positions(
+            &self,
+        ) -> Result<std::collections::BTreeMap<String, crate::book::executor::VenuePosition>>
+        {
+            unimplemented!()
+        }
+        async fn equity(&self) -> Result<Option<f64>> {
+            unimplemented!()
+        }
+        async fn funding_rate_hourly(&self, _: &str) -> Option<f64> {
+            unimplemented!()
+        }
+        async fn execute(&self, _: &OrderIntent) -> Result<FillReport> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn intent_for_asks_the_executor_with_the_orders_reduce_only() {
+        let taker = BookTaker {
+            executor: &BoundOnly,
+        };
+        assert_eq!(
+            taker
+                .intent_for(&book_order(BookSide::Buy, 1.0, false))
+                .max_slip_bps,
+            Some(201.0)
+        );
+        assert_eq!(
+            taker
+                .intent_for(&book_order(BookSide::Sell, 1.0, true))
+                .max_slip_bps,
+            None,
+            "a reduce-only close has no guaranteed bound"
+        );
     }
 
     #[test]
@@ -234,7 +291,7 @@ mod tests {
 
     #[test]
     fn outcome_maps_one_taker_row_and_keeps_unknown_fees_unknown() {
-        let intent = ExecIntent::from_book(&book_order(BookSide::Sell, 2.0, false), 25.0);
+        let intent = ExecIntent::from_book(&book_order(BookSide::Sell, 2.0, false), Some(25.0));
         let report = FillReport {
             requested_qty: 2.0,
             filled_qty: 1.5,
@@ -298,7 +355,9 @@ mod tests {
             // Paper fills at mid ± 10 bp: the derived cost sees exactly that,
             // and it is within the executor's own bound.
             assert!((outcome.fills[0].slippage_bps - 10.0).abs() < 1e-6);
-            assert!(outcome.fills[0].slippage_bps <= wrapped.slippage_bound_bps() + 1e-9);
+            assert!(
+                outcome.fills[0].slippage_bps <= wrapped.slippage_bound_bps(false).unwrap() + 1e-9
+            );
         }
     }
 }
