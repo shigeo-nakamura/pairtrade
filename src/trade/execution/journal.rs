@@ -329,6 +329,16 @@ pub async fn reconcile_leftovers(
                     // It filled while the cancel was in flight: no cancel
                     // record will come, the full fill is the evidence.
                     report.cleared += 1;
+                } else if kind == Some(SendKind::Ioc)
+                    && venue
+                        .open_order_ids(&symbol)
+                        .await
+                        .is_ok_and(|o| !o.contains(&id))
+                {
+                    // A known IOC that left the book during the cancel (e.g.
+                    // after a partial fill) is over: it can never rest
+                    // (Codex on #378). Its fills show in the position re-read.
+                    report.cleared += 1;
                 } else {
                     report.unresolved.push(id);
                     symbol_ok = false;
@@ -843,6 +853,23 @@ mod tests {
         let v = Mock::with_open(&[]);
         let mut e = ioc(1, "BTC");
         e.order_id = Some("i1".into());
+        let st = store(vec![e]);
+        let j = ExecJournal::new(&st);
+        let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
+        assert!(r.unresolved.is_empty(), "{:?}", r.unresolved);
+        assert_eq!(r.position_recheck, vec!["BTC".to_string()]);
+        assert!(j.entries().unwrap().is_empty());
+    }
+
+    /// Codex on #378: a known IOC that leaves the book during the startup
+    /// cancel, partly filled and with no cancel record, is over.
+    #[tokio::test(start_paused = true)]
+    async fn a_known_ioc_leaving_during_the_cancel_is_cleared() {
+        let mut v = Mock::with_open(&["i1"]);
+        v.cancel_fills = true; // removes it with a 1.0 fill, no cancel record
+        let mut e = ioc(1, "BTC");
+        e.order_id = Some("i1".into());
+        e.qty = 3.0; // partly filled: 1.0 of 3.0
         let st = store(vec![e]);
         let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
