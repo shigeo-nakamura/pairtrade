@@ -173,8 +173,13 @@ pub struct BookTaker<'a, E: Executor + ?Sized> {
 }
 
 impl<'a, E: Executor + ?Sized> BookTaker<'a, E> {
+    /// The intent this adapter executes `order` as.
+    pub fn intent_for(&self, order: &OrderIntent) -> ExecIntent {
+        ExecIntent::from_book(order, self.executor.slippage_bound_bps())
+    }
+
     pub async fn execute(&self, order: &OrderIntent) -> Result<(FillReport, ExecOutcome)> {
-        let intent = ExecIntent::from_book(order, self.executor.slippage_bound_bps());
+        let intent = self.intent_for(order);
         if intent.style != ExecStyle::Taker {
             bail!("BookTaker only executes Taker intents");
         }
@@ -214,10 +219,7 @@ mod tests {
         paper.set_price("BTC", 100.0).await;
         let taker = BookTaker { executor: &paper };
         let order = book_order(BookSide::Buy, 1.0, false);
-        assert_eq!(
-            ExecIntent::from_book(&order, taker.executor.slippage_bound_bps()).max_slip_bps,
-            100.0
-        );
+        assert_eq!(taker.intent_for(&order).max_slip_bps, 100.0);
         let (_, outcome) = taker.execute(&order).await.unwrap();
         assert!((outcome.fills[0].slippage_bps - 100.0).abs() < 1e-6);
     }
