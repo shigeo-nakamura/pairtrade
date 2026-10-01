@@ -68,6 +68,12 @@ pub trait Executor: Send + Sync {
     /// longs pay), when the venue reports one.
     async fn funding_rate_hourly(&self, symbol: &str) -> Option<f64>;
     async fn execute(&self, intent: &OrderIntent) -> Result<FillReport>;
+    /// The worst-case slippage (bps vs the intent's `reference_price`) this
+    /// executor can produce for an order, or `None` when it guarantees no
+    /// bound. Read-only: it lets wrappers report the real guarantee instead
+    /// of a configured number the path does not enforce (bot-strategy#1099,
+    /// Codex on pairtrade#371).
+    fn slippage_bound_bps(&self, reduce_only: bool) -> Option<f64>;
 }
 
 // ---------------------------------------------------------------- paper
@@ -174,6 +180,13 @@ impl PaperExecutor {
 impl Executor for PaperExecutor {
     fn is_paper(&self) -> bool {
         true
+    }
+
+    /// Paper fills at `current mid ± slippage_bps` without checking the
+    /// current mid against the intent's reference, so a move after planning
+    /// is unbounded vs the reference: no guarantee (Codex on #371).
+    fn slippage_bound_bps(&self, _reduce_only: bool) -> Option<f64> {
+        None
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
@@ -379,6 +392,26 @@ fn send_price(
 /// Whether `mid` is still within `slippage_bps` of the price the intent
 /// was sized at, in the adverse direction for `side` (a favourable move
 /// never blocks).
+/// Worst-case slippage vs the reference for the live taker path. The bound
+/// compounds: the drift guard admits a send-time mid up to `b` adverse of the
+/// reference (`within_slippage`), and the IOC limit is `b` beyond that mid
+/// (`send_limit_price`), so a buy can fill at `ref·(1+b)²`, i.e. `2b + b²`.
+/// A sell is bounded by `2b − b²`, so the buy figure covers both. Reduce-only
+/// orders may fall back to a touch-relative send, and the opt-in venue
+/// protection fallback is an IOC with a 20% protection price: neither has a
+/// bound against the reference, so they report `None`.
+pub fn live_worst_case_slippage_bps(
+    slippage_bps: u32,
+    reduce_only: bool,
+    venue_protection_fallback: bool,
+) -> Option<f64> {
+    if reduce_only || venue_protection_fallback {
+        return None;
+    }
+    let b = f64::from(slippage_bps) / 10_000.0;
+    Some(((1.0 + b) * (1.0 + b) - 1.0) * 10_000.0)
+}
+
 pub fn within_slippage(reference: f64, mid: f64, side: Side, slippage_bps: u32) -> bool {
     if !(reference > 0.0 && mid > 0.0) {
         return false;
@@ -609,6 +642,14 @@ fn price_decimal(v: f64, intent: &OrderIntent) -> Result<Decimal> {
 impl Executor for LiveExecutor {
     fn is_paper(&self) -> bool {
         false
+    }
+
+    fn slippage_bound_bps(&self, reduce_only: bool) -> Option<f64> {
+        live_worst_case_slippage_bps(
+            self.slippage_bps,
+            reduce_only,
+            self.allow_venue_protection_fallback,
+        )
     }
 
     async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
@@ -1025,6 +1066,27 @@ mod tests {
             None,
             "a cleared rate must not keep charging marks/closes at a stale number"
         );
+    }
+
+    /// Codex on pairtrade#371: the live bound compounds. A buy planned at
+    /// 100 with 100 bp admits a send-time mid of 101 and then an IOC limit
+    /// of 101 * 1.01 = 102.01, i.e. 201 bp vs the reference, and the
+    /// reported worst case must cover exactly that. Reduce-only and the venue
+    /// protection fallback have no bound against the reference.
+    #[test]
+    fn live_worst_case_slippage_covers_the_compounded_path() {
+        let bound = live_worst_case_slippage_bps(100, false, false).unwrap();
+        assert!((bound - 201.0).abs() < 1e-9, "{bound}");
+        assert!(within_slippage(100.0, 101.0, Side::Buy, 100));
+        let limit = 101.0 * (1.0 + 100.0 / 10_000.0);
+        let realised = (limit - 100.0) / 100.0 * 10_000.0;
+        assert!(realised <= bound + 1e-9, "{realised} > {bound}");
+        // ...and a sell is bounded by the same (larger) figure.
+        assert!(within_slippage(100.0, 99.0, Side::Sell, 100));
+        let sell = (100.0 - 99.0 * (1.0 - 0.01)) / 100.0 * 10_000.0;
+        assert!(sell <= bound + 1e-9, "{sell}");
+        assert_eq!(live_worst_case_slippage_bps(100, true, false), None);
+        assert_eq!(live_worst_case_slippage_bps(100, false, true), None);
     }
 
     #[test]

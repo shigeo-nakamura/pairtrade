@@ -3703,6 +3703,9 @@ mod tests {
         fn is_paper(&self) -> bool {
             false
         }
+        fn slippage_bound_bps(&self, _reduce_only: bool) -> Option<f64> {
+            None
+        }
         async fn prices(&self, symbols: &[String]) -> HashMap<String, f64> {
             symbols
                 .iter()
