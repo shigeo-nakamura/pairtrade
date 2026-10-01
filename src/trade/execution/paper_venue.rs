@@ -475,6 +475,12 @@ impl PaperBook {
         self.fills.clone()
     }
 
+    /// Seed the starting position (e.g. so an isolated reduce-only intent
+    /// has something to reduce in a replay).
+    pub fn set_position(&mut self, position: f64) {
+        self.position = position;
+    }
+
     pub fn position(&self) -> f64 {
         self.position
     }
