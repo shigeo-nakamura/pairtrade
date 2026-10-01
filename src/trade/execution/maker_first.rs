@@ -17,6 +17,13 @@
 //! account's position in the symbol while it runs: a dedicated MM
 //! sub-account, or a book runtime that owns the symbol.
 //!
+//! **An order is over only on positive evidence**: it is absent from the
+//! open orders AND either listed among the cancelled orders or filled to its
+//! full size. One missing id in a cached open-orders view is not proof of
+//! absence (a WS cache can be empty during a reconnect, cf. bull_holder).
+//! Until there is evidence nothing new is sent, and without evidence
+//! within the confirm polls the order is unresolved (Codex on #374).
+//!
 //! Safety rules (#1099 design invariants):
 //! - Fills are harvested by order id after every cancel, so a fill that
 //!   lands while a cancel is in flight is still booked.
@@ -75,6 +82,8 @@ pub trait OrderVenue: Send + Sync {
     ) -> Result<String, DexError>;
     async fn cancel(&self, symbol: &str, order_id: &str) -> Result<(), DexError>;
     async fn open_order_ids(&self, symbol: &str) -> Result<HashSet<String>, DexError>;
+    /// Ids the venue reports as cancelled (positive terminal evidence).
+    async fn canceled_order_ids(&self, symbol: &str) -> Result<HashSet<String>, DexError>;
     async fn fills(&self, symbol: &str) -> Result<Vec<VenueFill>, DexError>;
     /// An IOC at an absolute limit; returns its order id.
     async fn place_ioc(
@@ -168,9 +177,19 @@ struct Run<'i> {
     book: Book,
     unresolved: Vec<String>,
     last_pos: Option<f64>,
+    /// Size each maker order was placed with.
+    order_qty: HashMap<String, f64>,
 }
 
 impl Run<'_> {
+    fn filled_for(&self, id: &str) -> f64 {
+        self.book
+            .rows
+            .iter()
+            .filter(|r| r.order_id.as_deref() == Some(id))
+            .map(|r| r.qty)
+            .sum()
+    }
     fn dir(&self) -> f64 {
         match self.intent.side {
             Side::Buy => 1.0,
@@ -240,8 +259,29 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         false
     }
 
-    /// Cancel `id` and wait until it is no longer listed open, harvesting
-    /// meanwhile. `false` = still listed after the confirm polls.
+    /// Positive evidence that `id` is over: absent from the open orders AND
+    /// (listed cancelled OR filled to its full size). `None` = a view was
+    /// unreadable.
+    async fn terminal(&self, run: &mut Run<'_>, id: &str) -> Option<bool> {
+        self.harvest(run).await;
+        let open = self.venue.open_order_ids(&run.intent.symbol).await.ok()?;
+        if open.contains(id) {
+            return Some(false);
+        }
+        let qty = run.order_qty.get(id).copied().unwrap_or(f64::INFINITY);
+        if run.filled_for(id) >= qty - run.eps {
+            return Some(true);
+        }
+        let canceled = self
+            .venue
+            .canceled_order_ids(&run.intent.symbol)
+            .await
+            .ok()?;
+        Some(canceled.contains(id))
+    }
+
+    /// Cancel `id` and wait for positive terminal evidence, harvesting
+    /// meanwhile. `false` = no evidence within the confirm polls.
     async fn cancel_and_confirm(&self, run: &mut Run<'_>, id: &str) -> bool {
         if let Err(e) = self.venue.cancel(&run.intent.symbol, id).await {
             log::warn!(
@@ -250,14 +290,8 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             );
         }
         for _ in 0..=self.timing.cancel_confirm_polls {
-            self.harvest(run).await;
-            match self.venue.open_order_ids(&run.intent.symbol).await {
-                Ok(open) if !open.contains(id) => return true,
-                Ok(_) => {}
-                Err(e) => log::warn!(
-                    "[MAKER_FIRST] {}: open orders unreadable: {e:?}",
-                    run.intent.symbol
-                ),
+            if self.terminal(run, id).await == Some(true) {
+                return true;
             }
             tokio::time::sleep(self.timing.poll).await;
         }
@@ -295,11 +329,15 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             },
             unresolved: Vec::new(),
             last_pos: Some(pos0),
+            order_qty: HashMap::new(),
         };
         let started = tokio::time::Instant::now();
         let maker_end = started + Duration::from_millis(params.maker_window_ms);
         let mut resting: Option<(String, f64)> = None;
         let mut drifted = false;
+        // Consecutive polls the resting order was missing from the open
+        // orders without terminal evidence.
+        let mut missing_polls: u32 = 0;
 
         // ---- maker phase
         while tokio::time::Instant::now() < maker_end && run.unresolved.is_empty() {
@@ -315,15 +353,33 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             }
             // Did the resting order leave the book (filled, expired, rejected)?
             if let Some((id, _)) = &resting {
-                if let Ok(open) = self.venue.open_order_ids(&intent.symbol).await {
-                    if !open.contains(id) {
-                        let id = id.clone();
-                        resting = None;
-                        if !self.after_gone(&mut run, &id).await {
-                            break;
-                        }
-                        continue;
+                let id = id.clone();
+                let listed = self
+                    .venue
+                    .open_order_ids(&intent.symbol)
+                    .await
+                    .map(|open| open.contains(&id))
+                    .unwrap_or(true);
+                if listed {
+                    missing_polls = 0;
+                } else if self.terminal(&mut run, &id).await == Some(true) {
+                    missing_polls = 0;
+                    resting = None;
+                    if !self.after_gone(&mut run, &id).await {
+                        break;
                     }
+                    continue;
+                } else {
+                    // Missing without evidence: a cache gap, not proof. Send
+                    // nothing new; give up after the confirm polls.
+                    missing_polls += 1;
+                    if missing_polls > self.timing.cancel_confirm_polls {
+                        run.unresolved.push(id);
+                        resting = None;
+                        break;
+                    }
+                    tokio::time::sleep(self.timing.poll).await;
+                    continue;
                 }
             }
             let (bid, ask) = match self.venue.touch(&intent.symbol).await {
@@ -372,6 +428,7 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                 {
                     Ok(id) => {
                         run.ids.insert(id.clone(), Role::Maker);
+                        run.order_qty.insert(id.clone(), remaining);
                         resting = Some((id, target));
                     }
                     // Provably not placed (post-only reject, 429, ...): retry.
@@ -590,6 +647,17 @@ impl<'a> OrderVenue for DexVenue<'a> {
             .collect())
     }
 
+    async fn canceled_order_ids(&self, symbol: &str) -> Result<HashSet<String>, DexError> {
+        Ok(self
+            .dex
+            .get_canceled_orders(symbol)
+            .await?
+            .orders
+            .into_iter()
+            .map(|o| o.order_id)
+            .collect())
+    }
+
     async fn fills(&self, symbol: &str) -> Result<Vec<VenueFill>, DexError> {
         Ok(self
             .dex
@@ -677,6 +745,10 @@ mod tests {
         pending: Vec<(usize, VenueFill)>,
         fills_calls: usize,
         position: f64,
+        canceled: HashSet<String>,
+        /// The open-orders view drops live orders (a cache gap): they are
+        /// neither cancelled nor filled.
+        open_omits_live: bool,
         /// The position view shows a fill this many `position()` calls late.
         position_delay: usize,
         position_pending: Vec<(usize, f64)>,
@@ -801,11 +873,19 @@ mod tests {
             }
             if !st.cancel_noop {
                 st.open.remove(order_id);
+                st.canceled.insert(order_id.to_string());
             }
             Ok(())
         }
         async fn open_order_ids(&self, _: &str) -> Result<HashSet<String>, DexError> {
-            Ok(self.s().open.clone())
+            let st = self.s();
+            if st.open_omits_live {
+                return Ok(HashSet::new());
+            }
+            Ok(st.open.clone())
+        }
+        async fn canceled_order_ids(&self, _: &str) -> Result<HashSet<String>, DexError> {
+            Ok(self.s().canceled.clone())
         }
         async fn fills(&self, _: &str) -> Result<Vec<VenueFill>, DexError> {
             let mut st = self.s();
@@ -1216,6 +1296,7 @@ mod tests {
             },
             unresolved: Vec::new(),
             last_pos: Some(0.0),
+            order_qty: HashMap::new(),
         };
         push_fill(&mut v.s(), "m1", 0.4, 99.9);
         assert!(ex.settle(&mut run).await);
@@ -1223,5 +1304,24 @@ mod tests {
             (run.book.filled - 0.4).abs() < 1e-12,
             "settled on the stale baseline"
         );
+    }
+
+    /// Codex on #374 (round 3): a live order missing from a cached
+    /// open-orders view is not over. Without cancel/fill evidence nothing new
+    /// is sent, and the order ends unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_order_missing_from_the_cache_is_not_treated_as_gone() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.open_omits_live = true;
+            s.ioc_fills = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 2_000)).await;
+        assert_eq!(
+            v.s().placements.len(),
+            1,
+            "no second maker while m1 may be live"
+        );
+        assert!(v.s().iocs.is_empty(), "no taker while m1 may be live");
+        assert_eq!(o.unresolved, vec!["m1".to_string()]);
     }
 }
