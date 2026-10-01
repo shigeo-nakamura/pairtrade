@@ -216,15 +216,22 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         }
     }
 
-    /// Wait until the booked fills agree with the position change. `false`
-    /// = they never did (records or position lagging beyond the wait).
+    /// Wait until the booked fills agree with the position change on two
+    /// consecutive polls with nothing changing in between. A single agreeing
+    /// sample is not enough: right after an order leaves the book, records
+    /// AND position can both still show the baseline (Codex on #374). `false`
+    /// = no stable agreement within the wait. A lag on both views longer than
+    /// one poll interval is not caught (known limitation, documented).
     async fn settle(&self, run: &mut Run<'_>) -> bool {
+        let mut prev: Option<(f64, f64)> = None;
         for i in 0..=self.timing.settle_polls {
             self.harvest(run).await;
             if let Some(p) = self.read_position(run).await {
-                if run.agrees(p) {
+                let sample = (run.book.filled, p);
+                if run.agrees(p) && prev == Some(sample) {
                     return true;
                 }
+                prev = Some(sample);
             }
             if i < self.timing.settle_polls {
                 tokio::time::sleep(self.timing.poll).await;
@@ -670,6 +677,10 @@ mod tests {
         pending: Vec<(usize, VenueFill)>,
         fills_calls: usize,
         position: f64,
+        /// The position view shows a fill this many `position()` calls late.
+        position_delay: usize,
+        position_pending: Vec<(usize, f64)>,
+        position_calls: usize,
         /// Error to return from the next post-only / IOC send.
         post_only_err: Option<DexError>,
         ioc_err: Option<DexError>,
@@ -705,7 +716,12 @@ mod tests {
     fn push_fill_after(st: &mut MockState, id: &str, qty: f64, price: f64, delay: usize) {
         st.next_trade += 1;
         let trade_id = format!("t{}", st.next_trade);
-        st.position += qty;
+        if st.position_delay == 0 {
+            st.position += qty;
+        } else {
+            let due = st.position_calls + st.position_delay;
+            st.position_pending.push((due, qty));
+        }
         let due = st.fills_calls + delay;
         st.pending.push((
             due,
@@ -722,7 +738,15 @@ mod tests {
     #[async_trait]
     impl OrderVenue for MockVenue {
         async fn position(&self, _: &str) -> Result<f64, DexError> {
-            Ok(self.s().position)
+            let mut st = self.s();
+            st.position_calls += 1;
+            let now = st.position_calls;
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.position_pending)
+                .into_iter()
+                .partition(|(d, _)| *d <= now);
+            st.position_pending = later;
+            st.position += due.into_iter().map(|(_, q)| q).sum::<f64>();
+            Ok(st.position)
         }
         async fn touch(&self, _: &str) -> Result<(f64, f64), DexError> {
             let mut st = self.s();
@@ -1149,5 +1173,21 @@ mod tests {
             "x".into()
         )));
         assert!(!send_definitely_not_placed(&DexError::NoConnection));
+    }
+
+    /// Codex on #374 (round 2): both views can still show the baseline when
+    /// the order leaves the book. One agreeing (0, 0) sample must not size
+    /// the remainder.
+    #[tokio::test(start_paused = true)]
+    async fn a_baseline_sample_on_both_lagging_views_does_not_settle() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.fill_on_cancel = Some(0.4);
+            s.position_delay = 1;
+            s.record_delay = 3;
+            s.ioc_fills = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert!((v.s().iocs[0].0 - 0.6).abs() < 1e-12, "{:?}", v.s().iocs);
+        assert!((o.filled_qty - 1.0).abs() < 1e-12, "{}", o.filled_qty);
     }
 }
