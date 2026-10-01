@@ -52,11 +52,6 @@ pub struct Config {
     /// touch stays within offset ± this many bp; re-peg only outside.
     /// Must be > 0 and < the offset. Ignored at offset 0.
     pub repeg_band_bps: Decimal,
-    /// Optional coarser tick for offset prices. The venue's tick (read from
-    /// the connector) is the source of truth; this is used only when it is a
-    /// multiple of it, and otherwise presence mode does not quote
-    /// (`logic::usable_tick`). Unset = the venue tick.
-    pub price_tick: Option<Decimal>,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -133,10 +128,6 @@ impl Config {
             fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
             quote_offset_bps: dec(&p("QUOTE_OFFSET_BPS"), "0")?,
             repeg_band_bps: dec(&p("REPEG_BAND_BPS"), "0")?,
-            price_tick: match var(&p("PRICE_TICK")) {
-                None => None,
-                Some(_) => Some(dec(&p("PRICE_TICK"), "0")?),
-            },
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -222,9 +213,6 @@ impl Config {
                 self.quote_offset_bps,
                 self.repeg_band_bps
             );
-        }
-        if self.price_tick.is_some_and(|t| t <= Decimal::ZERO) {
-            bail!("ARCUS_VOL_PRICE_TICK, when set, must be > 0");
         }
         Ok(())
     }
@@ -374,14 +362,6 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.quote_offset_bps = d("-0.1");
         assert!(cfg.validate().is_err());
-        // The optional tick override must be positive when set (whether it
-        // is a multiple of the venue tick is checked at runtime).
-        cfg.quote_offset_bps = d("5");
-        cfg.price_tick = Some(d("0.5"));
-        assert!(cfg.validate().is_ok());
-        cfg.price_tick = Some(Decimal::ZERO);
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("PRICE_TICK"), "{err}");
     }
 
     #[test]
@@ -422,7 +402,6 @@ mod tests {
             fee_wait_secs: 30,
             quote_offset_bps: Decimal::ZERO,
             repeg_band_bps: Decimal::ZERO,
-            price_tick: None,
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),

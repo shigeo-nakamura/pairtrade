@@ -151,6 +151,16 @@ pub fn try_fill<E>(
     Ok(Some(next))
 }
 
+/// The price a virtual quote rests at. Live, the connector rounds a resting
+/// price away from the touch to the venue tick; the sim does the same when
+/// the tick is known (`tick`, read best-effort), so a deep quote lands on a
+/// real price level and joins its displayed queue. Without a tick the
+/// unrounded price is used as it is: it matches no level, so the quote
+/// joins with queue 0 (optimistic), which is acceptable for paper only.
+pub fn paper_px(side: QSide, px: Decimal, tick: Option<Decimal>) -> Decimal {
+    crate::logic::round_away(side, px, tick).unwrap_or(px)
+}
+
 /// Join the back of the queue at `px` on `side` of the book: behind the
 /// size displayed at that price. A price with no level in `levels` joins
 /// with queue 0, which is exact for an empty price and optimistic if the
