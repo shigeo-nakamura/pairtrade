@@ -102,17 +102,27 @@ fn load_tape(dir: &Path, markets: &HashSet<i64>) -> Result<HashMap<i64, Vec<Stri
     files.sort();
     let mut per: HashMap<i64, Vec<String>> = markets.iter().map(|m| (*m, Vec::new())).collect();
     for f in files {
-        for line in read_lines(&f)? {
-            if line.contains("\"k\":\"c\"") {
+        let mut file_lines = read_lines(&f)?;
+        let plain = !f.extension().is_some_and(|e| e == "gz");
+        // The current hour's plain file may end in a row still being
+        // written: only that one trailing line may be incomplete.
+        if plain
+            && file_lines
+                .last()
+                .is_some_and(|l| serde_json::from_str::<Value>(l).is_err())
+        {
+            file_lines.pop();
+        }
+        for (n, line) in file_lines.into_iter().enumerate() {
+            let r = serde_json::from_str::<Value>(&line)
+                .with_context(|| format!("malformed tape row {}:{}", f.display(), n + 1))?;
+            if r.get("k").and_then(Value::as_str) == Some("c") {
                 for v in per.values_mut() {
                     v.push(line.clone());
                 }
                 continue;
             }
-            let Some(m) = serde_json::from_str::<Value>(&line)
-                .ok()
-                .and_then(|r| r.get("m").and_then(Value::as_i64))
-            else {
+            let Some(m) = r.get("m").and_then(Value::as_i64) else {
                 continue;
             };
             if let Some(v) = per.get_mut(&m) {
@@ -151,8 +161,8 @@ fn main() -> Result<()> {
     let tape = load_tape(&a.tape_dir, &wanted)?;
     let events: HashMap<i64, Vec<TimedEv>> = tape
         .into_iter()
-        .map(|(m, lines)| (m, parse_market(lines.into_iter(), m)))
-        .collect();
+        .map(|(m, lines)| Ok((m, parse_market(lines.into_iter(), m)?)))
+        .collect::<Result<_>>()?;
     let timing = MakerFirstTiming {
         poll: Duration::from_millis(500),
         cancel_confirm_polls: 20,

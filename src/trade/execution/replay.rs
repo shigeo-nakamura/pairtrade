@@ -70,8 +70,11 @@ fn merge(l1: Level, depth: &[Level], bid: bool) -> Vec<Level> {
     out
 }
 
-/// The ordered events of one market from tape lines.
-pub fn parse_market(lines: impl Iterator<Item = String>, market: i64) -> Vec<TimedEv> {
+/// The ordered events of one market from tape lines. A line that is not
+/// valid JSON is an error (Codex on #377): corrupted input must never pass
+/// for an absent event. Callers drop a still-being-written trailing line
+/// before this.
+pub fn parse_market(lines: impl Iterator<Item = String>, market: i64) -> Result<Vec<TimedEv>> {
     let mut out: Vec<(u64, u8, usize, TapeEv)> = Vec::new();
     let mut l1: Option<(Level, Level)> = None;
     let mut depth: (Vec<Level>, Vec<Level>) = (Vec::new(), Vec::new());
@@ -81,10 +84,10 @@ pub fn parse_market(lines: impl Iterator<Item = String>, market: i64) -> Vec<Tim
         seq += 1;
         out.push((ms, tie_rank(&ev), seq, ev));
     };
-    for line in lines {
-        let Ok(r) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
+    for (n, line) in lines.enumerate() {
+        let r = serde_json::from_str::<Value>(&line).map_err(|e| {
+            anyhow::anyhow!("malformed tape row {} for market {market}: {e}", n + 1)
+        })?;
         let k = r.get("k").and_then(Value::as_str).unwrap_or("");
         if k == "c" {
             let down = r.get("ev").and_then(Value::as_str) == Some("down");
@@ -178,9 +181,10 @@ pub fn parse_market(lines: impl Iterator<Item = String>, market: i64) -> Vec<Tim
         }
     }
     out.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-    out.into_iter()
+    Ok(out
+        .into_iter()
         .map(|(ms, _, _, ev)| TimedEv { ms, ev })
-        .collect()
+        .collect())
 }
 
 fn apply(book: &mut PaperBook, e: &TimedEv) {
@@ -379,7 +383,7 @@ mod tests {
                 r#"{"k":"c","c":0,"t":70,"ev":"down","ms":[7,9]}"#,
             ]),
             7,
-        );
+        ).unwrap();
         let kinds: Vec<(u64, &str)> = ev
             .iter()
             .map(|e| {
@@ -452,7 +456,7 @@ mod tests {
                 r#"{"k":"t","m":1,"t":2000,"x":2000,"id":1,"p":99.9,"q":3,"mka":false,"ty":"trade"}"#,
             ]),
             1,
-        )
+        ).unwrap()
     }
 
     fn intent() -> ExecIntent {
@@ -543,7 +547,7 @@ mod tests {
                 r#"{"k":"t","m":1,"t":120000,"x":120000,"id":9,"p":100.0,"q":1,"mka":true,"ty":"trade"}"#,
             ]),
             1,
-        );
+        ).unwrap();
         let mut i = intent();
         i.style = ExecStyle::MakerFirst(MakerFirstParams {
             maker_window_ms: 2_000,
@@ -570,5 +574,17 @@ mod tests {
             "the taker remainder filled at the ask"
         );
         assert!(o.fills.iter().all(|f| f.role == Role::Taker));
+    }
+
+    #[test]
+    fn a_malformed_row_is_an_error_not_a_missing_event() {
+        let r = parse_market(
+            lines(&[
+                r#"{"k":"b","m":1,"t":0,"x":0,"bb":99.9,"bq":1,"ba":100.1,"aq":5,"snap":1}"#,
+                r#"{"k":"t","m":1,"t":5,"x":5,"id":1,"p":99"#,
+            ]),
+            1,
+        );
+        assert!(r.is_err());
     }
 }
