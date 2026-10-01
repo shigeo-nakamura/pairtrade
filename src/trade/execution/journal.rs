@@ -200,7 +200,12 @@ impl<'a> ExecJournal<'a> {
         self.mutate(|st| st.entries.retain(|e| e.key != key))
     }
 
-    /// A run ended with nothing unresolved: nothing it sent can still rest.
+    /// A run ended with nothing unresolved: its own sends are all over.
+    pub fn done_keys(&self, keys: &[u64]) -> Result<()> {
+        self.mutate(|st| st.entries.retain(|e| !keys.contains(&e.key)))
+    }
+
+    /// Clear every entry of `symbol` (reconcile / operator acknowledge).
     pub fn clear_symbol(&self, symbol: &str) -> Result<()> {
         self.mutate(|st| st.entries.retain(|e| e.symbol != symbol))
     }
@@ -283,33 +288,33 @@ pub async fn reconcile_leftovers(
     for (symbol, entries) in by_symbol {
         let mut symbol_ok = true;
         let has_unknown = entries.iter().any(|e| e.order_id.is_none());
-        if has_unknown {
-            report.position_recheck.push(symbol.clone());
-        }
+        // Any leftover may have (partly) filled while we were down or while
+        // it is cancelled now: always re-read the position (Codex on #378).
+        report.position_recheck.push(symbol.clone());
         // An unknown post-only may rest unseen: never cleared by reconcile.
         let unknown_post_only = entries
             .iter()
             .any(|e| e.order_id.is_none() && e.kind == SendKind::PostOnly);
         // Ids to settle: the known ones, plus (single-writer) every open
         // order on the symbol when some send's id is unknown.
-        let mut ids: Vec<(String, f64)> = entries
+        let mut ids: Vec<(String, f64, Option<SendKind>)> = entries
             .iter()
-            .filter_map(|e| e.order_id.clone().map(|id| (id, e.qty)))
+            .filter_map(|e| e.order_id.clone().map(|id| (id, e.qty, Some(e.kind))))
             .collect();
         if has_unknown {
             match venue.open_order_ids(&symbol).await {
                 Ok(open) => {
-                    let known: HashSet<String> = ids.iter().map(|(i, _)| i.clone()).collect();
+                    let known: HashSet<String> = ids.iter().map(|(i, _, _)| i.clone()).collect();
                     ids.extend(
                         open.into_iter()
                             .filter(|i| !known.contains(i))
-                            .map(|i| (i, f64::INFINITY)),
+                            .map(|i| (i, f64::INFINITY, None)),
                     );
                 }
                 Err(_) => symbol_ok = false,
             }
         }
-        for (id, qty) in ids {
+        for (id, qty, kind) in ids {
             let open = match venue.open_order_ids(&symbol).await {
                 Ok(o) => o,
                 Err(_) => {
@@ -328,6 +333,13 @@ pub async fn reconcile_leftovers(
                     report.unresolved.push(id);
                     symbol_ok = false;
                 }
+                continue;
+            }
+            // A known IOC that is not open is over: it can never rest, and a
+            // venue need not record its unfilled remainder as cancelled
+            // (Codex on #378). Its fills show in the position re-read.
+            if kind == Some(SendKind::Ioc) {
+                report.cleared += 1;
                 continue;
             }
             // Not open: over only on evidence (cancel record or filled out).
@@ -380,6 +392,8 @@ mod tests {
         /// Journal entries for the symbol seen at each send.
         seen_at_send: Mutex<Vec<usize>>,
         journal: Option<Arc<MemJournal>>,
+        /// At a send, a concurrent run's entry for the same symbol appears.
+        inject_foreign: bool,
     }
 
     impl Mock {
@@ -392,6 +406,16 @@ mod tests {
         }
         fn send(&self) -> Result<String, DexError> {
             *self.sends.lock().unwrap() += 1;
+            if self.inject_foreign {
+                if let Some(j) = &self.journal {
+                    let mut st = j.load().unwrap();
+                    st.entries.push(JournalEntry {
+                        key: 9_999,
+                        ..entry(9_999, "BTC", None, 1.0)
+                    });
+                    j.save(&st).unwrap();
+                }
+            }
             if let Some(j) = &self.journal {
                 self.seen_at_send
                     .lock()
@@ -500,7 +524,9 @@ mod tests {
         let j = ExecJournal::new(&st);
         let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
         assert_eq!(r.cancelled, vec!["a".to_string()]);
-        assert!(r.unresolved.is_empty() && r.position_recheck.is_empty());
+        assert!(r.unresolved.is_empty());
+        // A known leftover may have partly filled: recheck (Codex on #378).
+        assert_eq!(r.position_recheck, vec!["BTC".to_string()]);
         assert!(j.entries().unwrap().is_empty());
         assert!(v.open.lock().unwrap().is_empty());
     }
@@ -783,5 +809,45 @@ mod tests {
         std::env::set_current_dir(prev).unwrap();
         r.unwrap();
         assert!(dir.path().join("rel-journal.json").exists());
+    }
+
+    /// Codex on #378: a clean run clears only its own keys, never a
+    /// concurrent same-symbol run's entry.
+    #[tokio::test(start_paused = true)]
+    async fn a_clean_run_keeps_a_concurrent_runs_entry() {
+        let st = Arc::new(MemJournal::default());
+        let v = Mock {
+            journal: Some(st.clone()),
+            cancel_works: true,
+            inject_foreign: true,
+            ..Default::default()
+        };
+        let j = ExecJournal::new(&*st);
+        let ex = MakerFirstExecutor {
+            venue: &v,
+            timing: timing(),
+        };
+        let mut i = intent();
+        i.max_slip_bps = None;
+        let o = ex.execute_journaled(&i, &j).await.unwrap();
+        assert!(o.unresolved.is_empty(), "{:?}", o.unresolved);
+        let left = j.entries().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].key, 9_999);
+    }
+
+    /// Codex on #378: a known IOC absent from the open orders is over even
+    /// with no cancel record and no covering fills.
+    #[tokio::test(start_paused = true)]
+    async fn a_known_ioc_not_open_is_cleared_with_a_recheck() {
+        let v = Mock::with_open(&[]);
+        let mut e = ioc(1, "BTC");
+        e.order_id = Some("i1".into());
+        let st = store(vec![e]);
+        let j = ExecJournal::new(&st);
+        let r = reconcile_leftovers(&v, &j, 5, POLL).await.unwrap();
+        assert!(r.unresolved.is_empty(), "{:?}", r.unresolved);
+        assert_eq!(r.position_recheck, vec!["BTC".to_string()]);
+        assert!(j.entries().unwrap().is_empty());
     }
 }

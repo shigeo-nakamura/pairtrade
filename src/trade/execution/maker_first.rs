@@ -187,6 +187,8 @@ struct Run<'i> {
     /// Size each maker order was placed with.
     order_qty: HashMap<String, f64>,
     journal: Option<&'i ExecJournal<'i>>,
+    /// Journal keys this run wrote (it clears only these).
+    journal_keys: Vec<u64>,
 }
 
 fn side_str(side: Side) -> &'static str {
@@ -205,7 +207,10 @@ impl Run<'_> {
         };
         let side = side_str(self.intent.side);
         match j.pending(&self.intent.symbol, side, qty, price, kind) {
-            Ok(k) => Ok(Some(k)),
+            Ok(k) => {
+                self.journal_keys.push(k);
+                Ok(Some(k))
+            }
             Err(e) => {
                 log::error!(
                     "[MAKER_FIRST] {}: journal write failed, not sending: {e:?}",
@@ -376,7 +381,7 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
     }
 
     pub async fn execute(&self, intent: &ExecIntent) -> Result<ExecOutcome> {
-        self.run(intent, None).await
+        Ok(self.run(intent, None).await?.0)
     }
 
     /// [`Self::execute`] with every send journaled (see the module doc).
@@ -393,11 +398,13 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                 intent.symbol
             );
         }
-        let out = self.run(intent, Some(journal)).await?;
+        let (out, keys) = self.run(intent, Some(journal)).await?;
         // Nothing unresolved: every order this run sent is over on positive
-        // evidence, so none of its entries can still rest.
+        // evidence, so none of its entries can still rest. Only this run's
+        // own keys are cleared: a concurrent run on the same symbol keeps
+        // its entries (Codex on #378).
         if out.unresolved.is_empty() {
-            journal.clear_symbol(&intent.symbol)?;
+            journal.done_keys(&keys)?;
         }
         Ok(out)
     }
@@ -406,7 +413,7 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         &self,
         intent: &ExecIntent,
         journal: Option<&ExecJournal<'_>>,
-    ) -> Result<ExecOutcome> {
+    ) -> Result<(ExecOutcome, Vec<u64>)> {
         let ExecStyle::MakerFirst(params) = &intent.style else {
             bail!("MakerFirstExecutor only executes MakerFirst intents");
         };
@@ -429,6 +436,7 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             last_pos: Some(pos0),
             order_qty: HashMap::new(),
             journal,
+            journal_keys: Vec::new(),
         };
         let started = tokio::time::Instant::now();
         let maker_end = started + Duration::from_millis(params.maker_window_ms);
@@ -580,12 +588,15 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
             }
         }
 
-        Ok(ExecOutcome {
-            filled_qty: run.book.filled,
-            fills: run.book.rows,
-            position_after: run.last_pos,
-            unresolved: run.unresolved,
-        })
+        Ok((
+            ExecOutcome {
+                filled_qty: run.book.filled,
+                fills: run.book.rows,
+                position_after: run.last_pos,
+                unresolved: run.unresolved,
+            },
+            run.journal_keys,
+        ))
     }
 
     async fn take_remainder(&self, run: &mut Run<'_>, remaining: f64, bound: f64) {
@@ -1424,6 +1435,7 @@ mod tests {
             last_pos: Some(0.0),
             order_qty: HashMap::new(),
             journal: None,
+            journal_keys: Vec::new(),
         };
         push_fill(&mut v.s(), "m1", 0.4, 99.9);
         assert!(ex.settle(&mut run).await);
@@ -1480,6 +1492,7 @@ mod tests {
             last_pos: Some(0.0),
             order_qty: HashMap::new(),
             journal: None,
+            journal_keys: Vec::new(),
         };
         push_fill(&mut v.s(), "m1", 0.4, 99.9);
         assert!(ex.settle(&mut run).await);
