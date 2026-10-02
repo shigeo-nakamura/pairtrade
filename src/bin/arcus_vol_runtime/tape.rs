@@ -237,8 +237,13 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
     let mut backoff = Duration::from_secs(1);
     let mut dedupe = Dedupe::new(20_000);
     loop {
-        match tokio_tungstenite::connect_async(url.as_str()).await {
-            Ok((mut ws, _)) => {
+        // Not `connect_async`: it tries the resolved addresses one by one
+        // with no timeout, so a dead IPv6 route (the venue resolves IPv6
+        // first) held this connect for ~4.5 min, live 2026-10-01
+        // (bot-strategy#1093). `connect_ws` races the addresses and bounds
+        // every stage.
+        match dex_connector::ws_connect::connect_ws(url.as_str()).await {
+            Ok(mut ws) => {
                 let sub =
                     serde_json::json!({"type": "subscribe", "channel": "trades", "id": market});
                 let mut up = false;
