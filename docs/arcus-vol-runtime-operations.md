@@ -62,14 +62,20 @@ decrypts the host's `ENCRYPTED_DATA_KEY` (from `live.env`, else
 `/opt/debot/scripts/debot_secrets_common.env`) through KMS in **eu-central-1**
 (the hosts' shared data key; this is debot-utils' default region, so leave
 `AWS_REGION` unset), encrypts the 32 key bytes with AES-256-CBC under a
-random IV, verifies the roundtrip, and rewrites `live.env` atomically
-(previous file kept as `live.env.plain.bak`, mode 600 — delete it once the
-service has started). The output is byte-identical to
+random IV, verifies the roundtrip, and rewrites `live.env` atomically. No
+plaintext copy is kept by default; `--keep-plain-backup` leaves the previous
+file as `live.env.plain.bak` (mode 600) for a manual rollback — delete it
+once the service has started. The output is byte-identical to
 `scripts/encrypt.py <data-key> 0x<hex>`; the runtime decrypts it with
 `debot_utils::decrypt_data_with_kms(.., output_as_hex = true)`.
 
-The launcher refuses to start unless `live.env` is mode 600, complete, and
-`ARCUS_ACCOUNT_INDEX=0`. A plain `ARCUS_PLAIN_API_PRIVATE_KEY` starts only
+Both files are parsed (never sourced) against an allow-list: `live.env` may
+only carry `ARCUS_ADDRESS`, `ARCUS_API_KEY`, `ARCUS_ACCOUNT_INDEX`,
+`ARCUS_API_PRIVATE_KEY`, `ENCRYPTED_DATA_KEY`, `ARCUS_PLAIN_API_PRIVATE_KEY`;
+`config.env` only the keys in the example file. Anything else (an endpoint
+override, a second account index) refuses the start, and the account index
+is re-checked after both files are loaded. The launcher refuses to start
+unless `live.env` is mode 600, complete, and `ARCUS_ACCOUNT_INDEX=0`. A plain `ARCUS_PLAIN_API_PRIVATE_KEY` starts only
 with `ALLOW_PLAIN_KEY=1` in `config.env` (testing); the launcher never
 exports a plain and an encrypted key together (the config loader would
 prefer the plain one).

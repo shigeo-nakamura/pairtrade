@@ -12,21 +12,22 @@
 # Checks the roundtrip (openssl dec -> lowercase hex == input) BEFORE writing.
 # Writes live.env atomically (mode 600 root): keeps ARCUS_ADDRESS / ARCUS_API_KEY /
 #        ARCUS_ACCOUNT_INDEX and every other line, adds ARCUS_API_PRIVATE_KEY=<cipher>
-#        and ENCRYPTED_DATA_KEY=<value>, drops the plain-key line. The previous file
-#        is kept as live.env.plain.bak (600) unless --no-backup.
+#        and ENCRYPTED_DATA_KEY=<value>, drops the plain-key line. No plaintext copy
+#        is kept (the roundtrip check runs before the write); --keep-plain-backup
+#        keeps the previous file as live.env.plain.bak (600) for a manual rollback.
 # Prints only status lines -- never a key, a ciphertext, or the data key.
 #
-#   sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh [--dry-run] [--no-backup]
+#   sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh [--dry-run] [--keep-plain-backup]
 #
 # The KMS key lives in eu-central-1 (the hosts' shared data key); AWS_REGION
 # defaults to that here exactly as debot-utils does at decrypt time.
 set -euo pipefail
 
-DRY_RUN=0; BACKUP=1
+DRY_RUN=0; BACKUP=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run) DRY_RUN=1 ;;
-        --no-backup) BACKUP=0 ;;
+        --keep-plain-backup) BACKUP=1 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -107,7 +108,7 @@ rt_hex="$(od -An -tx1 -v "$work/rt.bin" | tr -d ' \n')"
 say "roundtrip verified (AES-256-CBC, IV-prefixed, 64-byte blob)"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    say "dry-run: would rewrite $LIVE_ENV: drop ARCUS_PLAIN_API_PRIVATE_KEY, add ARCUS_API_PRIVATE_KEY and ENCRYPTED_DATA_KEY$( [ "$BACKUP" -eq 1 ] && echo ", keep $LIVE_ENV.plain.bak")"
+    say "dry-run: would rewrite $LIVE_ENV: drop ARCUS_PLAIN_API_PRIVATE_KEY, add ARCUS_API_PRIVATE_KEY and ENCRYPTED_DATA_KEY$( [ "$BACKUP" -eq 1 ] && echo ", keep $LIVE_ENV.plain.bak" || echo ", no plaintext copy kept")"
     exit 0
 fi
 
@@ -135,4 +136,4 @@ fi
 owner="$(stat -c %U:%G "$LIVE_ENV")"
 install -m 600 -o "${owner%%:*}" -g "${owner##*:}" "$new" "$LIVE_ENV.tmp"
 mv -f "$LIVE_ENV.tmp" "$LIVE_ENV"
-say "wrote $LIVE_ENV (mode 600, owner $owner): ARCUS_API_PRIVATE_KEY + ENCRYPTED_DATA_KEY, plain key removed$( [ "$BACKUP" -eq 1 ] && echo "; previous file kept as live.env.plain.bak (600) -- delete it once the service has started with the encrypted key")"
+say "wrote $LIVE_ENV (mode 600, owner $owner): ARCUS_API_PRIVATE_KEY + ENCRYPTED_DATA_KEY, plain key removed$( [ "$BACKUP" -eq 1 ] && echo "; previous file kept as live.env.plain.bak (600) -- delete it once the service has started with the encrypted key" || echo "; no plaintext copy kept")"

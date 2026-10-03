@@ -55,9 +55,10 @@ grep -q "wrote $T/etc/live.env" <<< "$OUT" || fail "no write line"
 [ "$(val ARCUS_ADDRESS)" = 0xA2C7 ] && [ "$(val ARCUS_API_KEY)" = pub ] && [ "$(val ARCUS_ACCOUNT_INDEX)" = 0 ] || fail "other lines not kept"
 [ "$(val ENCRYPTED_DATA_KEY)" = "$EDK_B64" ] || fail "ENCRYPTED_DATA_KEY not added"
 CIPHER="$(val ARCUS_API_PRIVATE_KEY)"; [ -n "$CIPHER" ] || fail "ARCUS_API_PRIVATE_KEY not added"
-[ -f "$T/etc/live.env.plain.bak" ] && [ "$(stat -c %a "$T/etc/live.env.plain.bak")" = 600 ] && grep -q "ARCUS_PLAIN_API_PRIVATE_KEY=" "$T/etc/live.env.plain.bak" || fail "backup missing or wrong"
+[ ! -e "$T/etc/live.env.plain.bak" ] || fail "default run must not keep a plaintext backup"
+! grep -rq "$KEY_HEX" "$T/etc" || fail "plain key still present somewhere under etc/"
 grep -q -- "--ciphertext-blob fileb://" "$T/aws.calls" && grep -q -- "--region eu-central-1" "$T/aws.calls" || fail "kms call shape: $(cat "$T/aws.calls")"
-ok "encrypts, rewrites live.env, keeps the other lines, backs up, leaks nothing"
+ok "encrypts, rewrites live.env, keeps the other lines, keeps no plaintext copy, leaks nothing"
 
 # 2. byte layout + independent decrypt
 printf '%s' "$CIPHER" | base64 -d > "$T/blob.bin"
@@ -118,16 +119,17 @@ before="$(sha256sum "$T/etc/live.env")"; run
 [ "$RC" -eq 0 ] && grep -q "already carries ARCUS_API_PRIVATE_KEY" <<< "$OUT" && [ "$before" = "$(sha256sum "$T/etc/live.env")" ] || fail "second run must be a no-op"
 ok "second run is a no-op"
 
-# 5. EDK in live.env wins over secrets_common; --dry-run writes nothing; --no-backup
-rm -f "$T/etc/live.env.plain.bak"
+# 5. EDK in live.env wins over secrets_common; --dry-run writes nothing; --keep-plain-backup opt-in
 printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=pub\nARCUS_PLAIN_API_PRIVATE_KEY=%s\nENCRYPTED_DATA_KEY=%s\nARCUS_ACCOUNT_INDEX=0\n' "$KEY_HEX" "$EDK_B64" > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"
 rm -f "$T/opt/debot_secrets_common.env"
 before="$(sha256sum "$T/etc/live.env")"; run --dry-run
 [ "$RC" -eq 0 ] && grep -q "dry-run: would rewrite" <<< "$OUT" && [ "$before" = "$(sha256sum "$T/etc/live.env")" ] || fail "dry-run must not write"
 grep -q "ENCRYPTED_DATA_KEY from $T/etc/live.env" <<< "$OUT" || fail "EDK source should be live.env"
-run --no-backup
-[ "$RC" -eq 0 ] && [ ! -f "$T/etc/live.env.plain.bak" ] && [ -n "$(val ARCUS_API_PRIVATE_KEY)" ] && [ "$(grep -c '^ENCRYPTED_DATA_KEY=' "$T/etc/live.env")" -eq 1 ] || fail "--no-backup run"
-ok "dry-run writes nothing; EDK from live.env; --no-backup leaves no backup; one ENCRYPTED_DATA_KEY line"
+run --keep-plain-backup
+[ "$RC" -eq 0 ] && [ -n "$(val ARCUS_API_PRIVATE_KEY)" ] && [ "$(grep -c '^ENCRYPTED_DATA_KEY=' "$T/etc/live.env")" -eq 1 ] || fail "--keep-plain-backup run"
+[ -f "$T/etc/live.env.plain.bak" ] && [ "$(stat -c %a "$T/etc/live.env.plain.bak")" = 600 ] && grep -q "ARCUS_PLAIN_API_PRIVATE_KEY=$KEY_HEX" "$T/etc/live.env.plain.bak" || fail "--keep-plain-backup must leave live.env.plain.bak (600)"
+rm -f "$T/etc/live.env.plain.bak"
+ok "dry-run writes nothing; EDK from live.env; --keep-plain-backup is the only way to keep a plaintext copy; one ENCRYPTED_DATA_KEY line"
 
 # 6. refusals: not 64-hex (message names only that), data key not 32 bytes, mode, missing EDK
 printf 'export ENCRYPTED_DATA_KEY="%s"\n' "$EDK_B64" > "$T/opt/debot_secrets_common.env"

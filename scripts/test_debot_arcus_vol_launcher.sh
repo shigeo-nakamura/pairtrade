@@ -137,8 +137,16 @@ printf 'MARKET=QQQ-USD\nCLIP_MAX_USD=2500; touch %s/pwned\n' "$T" > "$T/etc/conf
 [ "$RC" -eq 1 ] && grep -q "REFUSED: $T/etc/config.env line 2: unexpected characters" <<< "$OUT" && [ ! -e "$T/pwned" ] || fail "shell metacharacters in config.env must refuse without executing"
 printf 'MARKET=QQQ-USD\n$(touch %s/pwned2)\n' "$T" > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "expected KEY=VALUE" <<< "$OUT" && [ ! -e "$T/pwned2" ] || fail "non KEY=VALUE lines must refuse without executing"
+# allow-lists: config.env cannot move the account or redirect the venue; live.env cannot carry endpoints
+printf 'MARKET=QQQ-USD\nARCUS_ACCOUNT_INDEX=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "REFUSED: $T/etc/config.env line 2: key ARCUS_ACCOUNT_INDEX is not accepted here" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "config.env must not set ARCUS_ACCOUNT_INDEX"
+printf 'ARCUS_WEBSOCKET_ENDPOINT=wss://evil.example/ws\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "key ARCUS_WEBSOCKET_ENDPOINT is not accepted here" <<< "$OUT" || fail "config.env must refuse unknown keys"
 rm -f "$T/etc/config.env"
-ok "config.env overrides are applied, validated, and never executed"
+printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nARCUS_ACCOUNT_INDEX=0\nARCUS_REST_ENDPOINT=https://evil.example\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
+[ "$RC" -eq 1 ] && grep -q "live.env line 5: key ARCUS_REST_ENDPOINT is not accepted here" <<< "$OUT" || fail "live.env must refuse endpoint keys"
+write_live 600 0
+ok "config.env overrides are applied, validated, never executed, and allow-listed (no account / endpoint keys)"
 
 # 7. sentinels: KILL_SWITCH / HALT -> exit 0 without starting (no restart loop)
 venue "$FLAT" "$NO_ORDERS" "$(acct 5557 5377)"
@@ -172,7 +180,7 @@ write_live 600 0 "ARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA=="; mv "$T/etc/secrets_co
 mv "$T/etc/sc.bak" "$T/etc/secrets_common.env"
 printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nENCRYPTED_DATA_KEY=bGl2ZS1lbnYtZWRr\nARCUS_ACCOUNT_INDEX=0\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
 [ "$RC" -eq 0 ] && [ "$(envval ENCRYPTED_DATA_KEY)" = "bGl2ZS1lbnYtZWRr" ] || fail "ENCRYPTED_DATA_KEY in live.env must win over secrets_common"
-write_live 600 0 "ARCUS_API_KEY_ONLY=1"; run
+write_live 600 0 "# no signing key line"; run
 [ "$RC" -eq 1 ] && grep -q "no signing key in" <<< "$OUT" || fail "no key at all must refuse"
 write_live 600 0
 ok "signing key: encrypted by default, plain only with ALLOW_PLAIN_KEY=1, never both"

@@ -51,17 +51,25 @@ hold() { echo "[debot-arcus-vol] NOT STARTING: $*" >&2; exit 0; }
 # Both env files are read as plain KEY=VALUE lines and exported -- never
 # sourced, so a stray shell metacharacter in a value is a refusal, not a
 # command. Blank lines and `#` comments are allowed.
-# load_kv FILE [ONLY_KEY]: with ONLY_KEY, every other key in the file is ignored
-# (the shared debot_secrets_common.env must contribute nothing but the data key).
+# load_kv FILE MODE KEYS...: MODE `allow` = every key must be one of KEYS (an
+# unknown key refuses the start: config.env must not be able to redirect the
+# venue or move the account the preflight checked); MODE `only` = keys outside
+# KEYS are ignored (the shared debot_secrets_common.env contributes nothing but
+# the data key).
 load_kv() {
-    local file="$1" only="${2:-}" line key value n=0
+    local file="$1" mode="$2" line key value n=0
+    shift 2
+    local allowed=" $* "
     while IFS= read -r line || [ -n "$line" ]; do
         n=$((n + 1))
         line="${line%$'\r'}"
         [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
         [[ "$line" =~ ^(export[[:space:]]+)?([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "$file line $n: expected KEY=VALUE"
         key="${BASH_REMATCH[2]}"; value="${BASH_REMATCH[3]}"
-        [ -z "$only" ] || [ "$key" = "$only" ] || continue
+        if [[ "$allowed" != *" $key "* ]]; then
+            [ "$mode" = only ] && continue
+            die "$file line $n: key $key is not accepted here (allowed: ${allowed% })"
+        fi
         # debot_secrets_common.env writes `export KEY="value"`: strip one pair of quotes.
         if [[ "$value" =~ ^\"(.*)\"$ ]]; then value="${BASH_REMATCH[1]}"; fi
         [[ "$value" =~ ^[A-Za-z0-9_./:+=,-]*$ ]] || die "$file line $n: unexpected characters in the value of $key"
@@ -72,12 +80,11 @@ load_kv() {
 # ---- credentials -----------------------------------------------------------
 [ -f "$LIVE_ENV" ] || die "missing $LIVE_ENV (create it from /opt/debot/scripts/debot-arcus-vol.env.example, mode 600)"
 [ "$(stat -c %a "$LIVE_ENV")" = "600" ] || die "$LIVE_ENV must be mode 600 (is $(stat -c %a "$LIVE_ENV"))"
-load_kv "$LIVE_ENV"
+load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_PLAIN_API_PRIVATE_KEY ARCUS_API_PRIVATE_KEY ENCRYPTED_DATA_KEY
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
-[ "${ARCUS_ACCOUNT_INDEX:-}" = "0" ] || die "this launcher is for subaccount 0 (ARCUS_ACCOUNT_INDEX='${ARCUS_ACCOUNT_INDEX:-}')"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV"
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -95,7 +102,7 @@ ALLOW_PLAIN_KEY="${ALLOW_PLAIN_KEY:-0}"
 if [ -n "${ARCUS_API_PRIVATE_KEY:-}" ]; then
     if [ -z "${ENCRYPTED_DATA_KEY:-}" ]; then
         [ -f "$SECRETS_COMMON" ] || die "ARCUS_API_PRIVATE_KEY is set but ENCRYPTED_DATA_KEY is neither in $LIVE_ENV nor available from $SECRETS_COMMON"
-        load_kv "$SECRETS_COMMON" ENCRYPTED_DATA_KEY
+        load_kv "$SECRETS_COMMON" only ENCRYPTED_DATA_KEY
         [ -n "${ENCRYPTED_DATA_KEY:-}" ] || die "ENCRYPTED_DATA_KEY not found in $SECRETS_COMMON"
     fi
     [[ "$ENCRYPTED_DATA_KEY" =~ ^[A-Za-z0-9+/=]+$ ]] || die "ENCRYPTED_DATA_KEY does not look like base64"
@@ -123,8 +130,12 @@ mkdir -p "$STATE_DIR" "$LOCK_DIR"
 [ -e "$STATE_DIR/HALT" ] && hold "sticky HALT present in $STATE_DIR; read the journal, then remove it by hand"
 
 # ---- venue: flat and no open orders in this market -------------------------
+# Checked after EVERY file is loaded: the runtime starts on the account the
+# preflight looked at, and that account is subaccount 0 (hard requirement).
+ACCOUNT_INDEX="${ARCUS_ACCOUNT_INDEX:-}"
+[ "$ACCOUNT_INDEX" = "0" ] || die "this launcher is for subaccount 0 (ARCUS_ACCOUNT_INDEX='$ACCOUNT_INDEX')"
 addr="$(echo "$ARCUS_ADDRESS" | tr 'A-Z' 'a-z')"
-fetch() { curl -4 -sf --max-time 20 "$API_BASE/v1/$1?address=$addr&accountIndex=0${2:+&$2}"; }
+fetch() { curl -4 -sf --max-time 20 "$API_BASE/v1/$1?address=$addr&accountIndex=$ACCOUNT_INDEX${2:+&$2}"; }
 pos="$(fetch positions "market=$MARKET")" || die "position read failed ($API_BASE)"
 ord="$(fetch openOrders "market=$MARKET")" || die "open-orders read failed ($API_BASE)"
 python3 - "$pos" "$ord" "$MARKET" <<'PY' || exit 1
@@ -135,10 +146,10 @@ mk = sys.argv[3]
 rows = p.values() if isinstance(p, dict) else p
 open_pos = [v for v in rows if v.get("marketDisplayName") == mk and float(v.get("size") or 0) != 0]
 if open_pos:
-    sys.exit("[debot-arcus-vol] REFUSED: %s position open on subaccount 0: %s" % (mk, open_pos))
+    sys.exit("[debot-arcus-vol] REFUSED: %s position open on this subaccount: %s" % (mk, open_pos))
 open_ord = [x for x in o if x.get("marketDisplayName") in (None, mk)]
 if open_ord:
-    sys.exit("[debot-arcus-vol] REFUSED: %d open %s order(s) on subaccount 0; cancel them first" % (len(open_ord), mk))
+    sys.exit("[debot-arcus-vol] REFUSED: %d open %s order(s) on this subaccount; cancel them first" % (len(open_ord), mk))
 print("[debot-arcus-vol] venue check: %s flat, no open %s orders" % (mk, mk))
 PY
 
