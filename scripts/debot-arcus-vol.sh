@@ -1,0 +1,151 @@
+#!/bin/bash
+# Launch wrapper for the Arcus Perps presence / volume runtime
+# (arcus_vol_runtime, bot-strategy#1093), run by debot-arcus-vol.service on
+# the Tokyo debot-main host. Operator-started: CI deploys the binary and this
+# file but never starts the unit.
+#
+# What it does before exec'ing the runtime:
+#   1. reads /etc/debot-arcus-vol/live.env   (Arcus API credentials, mode 600)
+#      and   /etc/debot-arcus-vol/config.env (market / sizing / stops; optional,
+#      every value has a default below) as plain KEY=VALUE lines -- not sourced;
+#   2. refuses to start while a KILL_SWITCH or sticky HALT sentinel sits in the
+#      state dir (exit 0, so Restart=on-failure does not loop -- the operator
+#      removes the file after reading the log);
+#   3. checks on the venue (public REST, IPv4) that the market is flat and has
+#      no open orders on this subaccount;
+#   4. sizes the quotes from the account's FREE collateral at start:
+#         clip = min(CLIP_MAX_USD, free * leverage / 2 * 0.9, rounded down to $100)
+#         inventory cap = 2 clips, margin = cap / leverage
+#      (free collateral, not equity: other positions on this cross account use
+#      margin that is not ours);
+#   5. execs the binary so systemd supervises the runtime directly: SIGTERM ->
+#      the runtime's own cancel-all + fill harvest + dead-man's-switch disarm
+#      (TimeoutStopSec in the unit leaves room for that).
+#
+# Operator quick reference (STATE_DIR, default /var/lib/debot-arcus-vol/state):
+#   touch KILL_SWITCH   runtime pulls quotes, flattens, halts; remove before
+#                       the next start
+#   HALT                written by the runtime on a sticky halt (cumulative
+#                       stop etc.); read the journal, then remove it by hand
+#   status.json         live status (plan, quotes, inventory, pnl)
+#   journalctl -u debot-arcus-vol -f | grep -E '\[ARCUS_VOL\]|WARN|ERROR'
+
+set -euo pipefail
+
+ETC_DIR="${DEBOT_ARCUS_VOL_ETC_DIR:-/etc/debot-arcus-vol}"
+BIN="${DEBOT_ARCUS_VOL_BIN:-/opt/debot-arcus-vol/bin/arcus_vol_runtime}"
+API_BASE="${DEBOT_ARCUS_VOL_API_BASE:-https://api.arcus.xyz}"
+LIVE_ENV="$ETC_DIR/live.env"
+CONFIG_ENV="$ETC_DIR/config.env"
+
+log() { echo "[debot-arcus-vol] $*"; }
+die() { echo "[debot-arcus-vol] REFUSED: $*" >&2; exit 1; }
+# A deliberate stop (sentinel present) is not a failure: exit 0 so systemd's
+# Restart=on-failure leaves the unit stopped instead of retrying every minute.
+hold() { echo "[debot-arcus-vol] NOT STARTING: $*" >&2; exit 0; }
+# Both env files are read as plain KEY=VALUE lines and exported -- never
+# sourced, so a stray shell metacharacter in a value is a refusal, not a
+# command. Blank lines and `#` comments are allowed.
+load_kv() {
+    local file="$1" line key value n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^(export[[:space:]]+)?([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "$file line $n: expected KEY=VALUE"
+        key="${BASH_REMATCH[2]}"; value="${BASH_REMATCH[3]}"
+        [[ "$value" =~ ^[A-Za-z0-9_./:+=,-]*$ ]] || die "$file line $n: unexpected characters in the value of $key"
+        export "$key=$value"
+    done < "$file"
+}
+
+# ---- credentials -----------------------------------------------------------
+[ -f "$LIVE_ENV" ] || die "missing $LIVE_ENV (create it from /opt/debot/scripts/debot-arcus-vol.env.example, mode 600)"
+[ "$(stat -c %a "$LIVE_ENV")" = "600" ] || die "$LIVE_ENV must be mode 600 (is $(stat -c %a "$LIVE_ENV"))"
+load_kv "$LIVE_ENV"
+[ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] && [ -n "${ARCUS_PLAIN_API_PRIVATE_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY / ARCUS_PLAIN_API_PRIVATE_KEY)"
+[ "${ARCUS_ACCOUNT_INDEX:-}" = "0" ] || die "this launcher is for subaccount 0 (ARCUS_ACCOUNT_INDEX='${ARCUS_ACCOUNT_INDEX:-}')"
+
+# ---- configuration (every value has a default) ----------------------------
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV"
+MARKET="${MARKET:-SPY-USD}"
+CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
+QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
+REPEG_BAND_BPS="${REPEG_BAND_BPS:-2}"
+DAILY_STOP_USD="${DAILY_STOP_USD:-5}"
+CUM_STOP_USD="${CUM_STOP_USD:-21}"
+LEVERAGE="${LEVERAGE:-5}"
+STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus-vol/state}"
+LOCK_DIR="${LOCK_DIR:-/var/lib/debot-arcus-vol/locks}"
+
+case "$MARKET" in *-USD) ;; *) die "MARKET must look like SPY-USD (got '$MARKET')" ;; esac
+for v in CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE; do
+    [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
+done
+[[ "$LEVERAGE" =~ ^[0-9]+$ ]] && [ "$LEVERAGE" -ge 1 ] || die "LEVERAGE must be a whole number >= 1"
+
+[ -x "$BIN" ] || die "binary missing or not executable: $BIN"
+if ldd "$BIN" 2>/dev/null | grep -q 'not found'; then die "unresolved shared libraries: $(ldd "$BIN" | grep 'not found' | tr '\n' ' ')"; fi
+
+mkdir -p "$STATE_DIR" "$LOCK_DIR"
+[ -e "$STATE_DIR/KILL_SWITCH" ] && hold "KILL_SWITCH present in $STATE_DIR; remove it to start"
+[ -e "$STATE_DIR/HALT" ] && hold "sticky HALT present in $STATE_DIR; read the journal, then remove it by hand"
+
+# ---- venue: flat and no open orders in this market -------------------------
+addr="$(echo "$ARCUS_ADDRESS" | tr 'A-Z' 'a-z')"
+fetch() { curl -4 -sf --max-time 20 "$API_BASE/v1/$1?address=$addr&accountIndex=0${2:+&$2}"; }
+pos="$(fetch positions "market=$MARKET")" || die "position read failed ($API_BASE)"
+ord="$(fetch openOrders "market=$MARKET")" || die "open-orders read failed ($API_BASE)"
+python3 - "$pos" "$ord" "$MARKET" <<'PY' || exit 1
+import json, sys
+p = json.loads(sys.argv[1]).get("positions") or {}
+o = json.loads(sys.argv[2]).get("orders") or []
+mk = sys.argv[3]
+rows = p.values() if isinstance(p, dict) else p
+open_pos = [v for v in rows if v.get("marketDisplayName") == mk and float(v.get("size") or 0) != 0]
+if open_pos:
+    sys.exit("[debot-arcus-vol] REFUSED: %s position open on subaccount 0: %s" % (mk, open_pos))
+open_ord = [x for x in o if x.get("marketDisplayName") in (None, mk)]
+if open_ord:
+    sys.exit("[debot-arcus-vol] REFUSED: %d open %s order(s) on subaccount 0; cancel them first" % (len(open_ord), mk))
+print("[debot-arcus-vol] venue check: %s flat, no open %s orders" % (mk, mk))
+PY
+
+# ---- sizing from free collateral ------------------------------------------
+acct="$(fetch account)" || die "account read failed ($API_BASE)"
+read -r MARGIN CLIP CAP FREE <<< "$(python3 - "$acct" "$CLIP_MAX_USD" "$LEVERAGE" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+clip_max = int(float(sys.argv[2]))
+lev = int(sys.argv[3])
+free = min(float(d["equity"]), float(d["freeCollateral"]))
+by_margin = int(free * lev / 2 * 0.9 / 100) * 100   # per side, rounded down to $100
+clip = min(clip_max, by_margin)
+cap = 2 * clip
+margin = cap // lev
+print(margin, clip, cap, int(free))
+PY
+)"
+[ "${CLIP:-0}" -ge 500 ] || die "free collateral too small for presence quoting (free \$$FREE, clip \$$CLIP)"
+
+log "sizing: market $MARKET, clip \$$CLIP per side (max \$$CLIP_MAX_USD), inventory cap \$$CAP, margin \$$MARGIN at ${LEVERAGE}x (free collateral \$$FREE); presence offset ${QUOTE_OFFSET_BPS} bp +/- ${REPEG_BAND_BPS} bp; daily stop \$$DAILY_STOP_USD, cumulative stop \$$CUM_STOP_USD; state $STATE_DIR"
+
+# Everything from here on is the runtime's own process (systemd sees its pid).
+export ARCUS_VOL_DRY_RUN=false
+export ARCUS_VOL_LIVE_CONFIRM=1093-G2
+export ARCUS_VOL_ALLOW_ACCOUNT0=I-understand-shared-account
+export ARCUS_VOL_STATE_DIR="$STATE_DIR"
+export ARCUS_VOL_LOCK_DIR="$LOCK_DIR"
+export ARCUS_VOL_MARKET="$MARKET"
+export ARCUS_VOL_CLIP_USD="$CLIP"
+export ARCUS_VOL_SKEW_USD="$CLIP"
+export ARCUS_VOL_HARD_CAP_USD="$CAP"
+export ARCUS_VOL_MARGIN_USD="$MARGIN"
+export ARCUS_VOL_LEVERAGE="$LEVERAGE"
+export ARCUS_VOL_QUOTE_OFFSET_BPS="$QUOTE_OFFSET_BPS"
+export ARCUS_VOL_REPEG_BAND_BPS="$REPEG_BAND_BPS"
+export ARCUS_VOL_DAILY_STOP_USD="$DAILY_STOP_USD"
+export ARCUS_VOL_CUM_STOP_USD="$CUM_STOP_USD"
+export ARCUS_WS_PRIVATE=1
+export RUST_LOG="${RUST_LOG:-info}"
+exec "$BIN"

@@ -1,0 +1,33 @@
+[Unit]
+Description="debot-arcus-vol (bot-strategy#1093 Arcus Perps presence/volume runtime, operator-started)"
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Leading '-' (see debot-bull-holder.service): systemd applies WorkingDirectory
+# BEFORE ExecStart, so on a fresh host an un-prefixed path would CHDIR-fail the
+# unit before the deploy created the directory.
+WorkingDirectory=-/opt/debot-arcus-vol
+# The launcher checks credentials, sentinels, the venue (flat, no open orders)
+# and sizes the quotes from free collateral, then execs the runtime, so the
+# runtime itself is the main process.
+ExecStart=/bin/bash /opt/debot/scripts/debot-arcus-vol.sh
+# A crash is retried, slowly: the venue's dead man's switch (30 s) has already
+# cancelled the quotes by then, and the runtime's startup reconcile cancels /
+# adopts whatever is left. A deliberate stop (KILL_SWITCH / HALT sentinel) makes
+# the launcher exit 0, which on-failure does not retry.
+Restart=on-failure
+RestartSec=60
+StartLimitIntervalSec=900
+StartLimitBurst=3
+TimeoutStartSec=120
+# SIGTERM -> the runtime's cancel-all, final fill harvest, state persist, and
+# dead-man's-switch disarm; give it room before SIGKILL.
+TimeoutStopSec=120
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
