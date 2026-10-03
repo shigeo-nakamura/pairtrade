@@ -143,6 +143,7 @@ jobs:
             /bin/bash -lc "set -euo pipefail; if ldd /artifacts/arcus_vol_runtime | grep -q not.found; then ldd /artifacts/arcus_vol_runtime; exit 1; fi; ldd /artifacts/arcus_vol_runtime"
 
           bash -n debot/scripts/debot-arcus-vol.sh
+          bash -n debot/scripts/arcus_vol_encrypt_key.sh
           mkdir -p dist
           install -m 0755 "${BINARY}" dist/arcus_vol_runtime
           test "$(stat -c %a dist/arcus_vol_runtime)" = 755
@@ -198,6 +199,7 @@ jobs:
             dist/arcus_vol_runtime.sha256
             dist/manifest.json
             debot/scripts/debot-arcus-vol.sh
+            debot/scripts/arcus_vol_encrypt_key.sh
             debot/scripts/debot-arcus-vol.env.example
             debot/deploy/debot-arcus-vol.service
 
@@ -232,6 +234,7 @@ jobs:
           # Self-contained deploy: ship the launcher + example env + unit too.
           # The REAL credentials env file is never touched by this workflow.
           aws s3 cp debot/scripts/debot-arcus-vol.sh "s3://${S3_BUCKET}/debot/scripts/debot-arcus-vol.sh"
+          aws s3 cp debot/scripts/arcus_vol_encrypt_key.sh "s3://${S3_BUCKET}/debot/scripts/arcus_vol_encrypt_key.sh"
           aws s3 cp debot/scripts/debot-arcus-vol.env.example "s3://${S3_BUCKET}/debot/scripts/debot-arcus-vol.env.example"
           aws s3 cp debot/deploy/debot-arcus-vol.service "s3://${S3_BUCKET}/deploy/debot-arcus-vol.service"
 
@@ -262,11 +265,14 @@ jobs:
               "if ldd __INSTALL_DIR__/bin/arcus_vol_runtime | grep -q 'not found'; then echo 'binary does not link on this host:'; ldd __INSTALL_DIR__/bin/arcus_vol_runtime; exit 1; fi",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-arcus-vol.sh /tmp/debot-arcus-vol.sh",
               "sudo install -o root -g root -m 0755 /tmp/debot-arcus-vol.sh /opt/debot/scripts/debot-arcus-vol.sh",
+              "aws s3 cp s3://__S3_BUCKET__/debot/scripts/arcus_vol_encrypt_key.sh /tmp/arcus_vol_encrypt_key.sh",
+              "sudo install -o root -g root -m 0755 /tmp/arcus_vol_encrypt_key.sh /opt/debot/scripts/arcus_vol_encrypt_key.sh",
+              "rm -f /tmp/arcus_vol_encrypt_key.sh",
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-arcus-vol.env.example /tmp/debot-arcus-vol.env.example",
               "sudo install -o root -g root -m 0644 /tmp/debot-arcus-vol.env.example /opt/debot/scripts/debot-arcus-vol.env.example",
               "rm -f /tmp/debot-arcus-vol.sh /tmp/debot-arcus-vol.env.example",
               "/bin/bash -lc 'set -e; svc=debot-arcus-vol; aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo install -o root -g root -m 0644 /tmp/$svc.service /etc/systemd/system/$svc.service; sudo systemctl daemon-reload; fi; rm -f /tmp/$svc.service; sudo systemctl enable $svc.service >/dev/null 2>&1 || true'",
-              "sudo test -f /etc/debot-arcus-vol/live.env || echo 'NOTE: /etc/debot-arcus-vol/live.env does not exist yet -- the operator must create it (mode 600) from /opt/debot/scripts/debot-arcus-vol.env.example with the real Arcus API credentials before starting the service (bot-strategy#1093).'",
+              "sudo test -f /etc/debot-arcus-vol/live.env || echo 'NOTE: /etc/debot-arcus-vol/live.env does not exist yet -- the operator must create it (mode 600) from /opt/debot/scripts/debot-arcus-vol.env.example, then run sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh to encrypt the signing key, before starting the service (bot-strategy#1093).'",
               "sudo test -f /etc/debot-arcus-vol/config.env || echo 'NOTE: /etc/debot-arcus-vol/config.env does not exist yet -- the launcher falls back to its defaults (SPY-USD, $2,500 per side, 5 bp +/- 2 bp, daily stop $5, cumulative stop $21).'",
               "systemctl is-active debot-arcus-vol.service || true"
             ]

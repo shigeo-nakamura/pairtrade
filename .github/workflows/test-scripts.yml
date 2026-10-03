@@ -36,6 +36,10 @@ jobs:
         run: bash scripts/test_install_lighter_core_points_snapshot.sh
       - name: Run Arcus volume runtime launcher tests (bot-strategy#1093)
         run: bash scripts/test_debot_arcus_vol_launcher.sh
+      - name: Run Arcus volume runtime key-encryption tests (bot-strategy#1093)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          bash scripts/test_arcus_vol_encrypt_key.sh
       - name: Install Engine B Phase 0 test dependency
         run: python3 -m pip install -r scripts/engine_b_phase0_requirements.txt
       - name: Run Engine B Phase 0 observer tests

@@ -7,7 +7,11 @@
 # What it does before exec'ing the runtime:
 #   1. reads /etc/debot-arcus-vol/live.env   (Arcus API credentials, mode 600)
 #      and   /etc/debot-arcus-vol/config.env (market / sizing / stops; optional,
-#      every value has a default below) as plain KEY=VALUE lines -- not sourced;
+#      every value has a default below) as plain KEY=VALUE lines -- not sourced.
+#      The signing key is ARCUS_API_PRIVATE_KEY, KMS-encrypted under the host's
+#      ENCRYPTED_DATA_KEY (live.env or /opt/debot/scripts/debot_secrets_common.env),
+#      produced by /opt/debot/scripts/arcus_vol_encrypt_key.sh. A plain key
+#      (ARCUS_PLAIN_API_PRIVATE_KEY) starts only with ALLOW_PLAIN_KEY=1 in config.env;
 #   2. refuses to start while a KILL_SWITCH or sticky HALT sentinel sits in the
 #      state dir (exit 0, so Restart=on-failure does not loop -- the operator
 #      removes the file after reading the log);
@@ -33,6 +37,7 @@
 set -euo pipefail
 
 ETC_DIR="${DEBOT_ARCUS_VOL_ETC_DIR:-/etc/debot-arcus-vol}"
+SECRETS_COMMON="${DEBOT_ARCUS_VOL_SECRETS_COMMON:-/opt/debot/scripts/debot_secrets_common.env}"
 BIN="${DEBOT_ARCUS_VOL_BIN:-/opt/debot-arcus-vol/bin/arcus_vol_runtime}"
 API_BASE="${DEBOT_ARCUS_VOL_API_BASE:-https://api.arcus.xyz}"
 LIVE_ENV="$ETC_DIR/live.env"
@@ -46,14 +51,19 @@ hold() { echo "[debot-arcus-vol] NOT STARTING: $*" >&2; exit 0; }
 # Both env files are read as plain KEY=VALUE lines and exported -- never
 # sourced, so a stray shell metacharacter in a value is a refusal, not a
 # command. Blank lines and `#` comments are allowed.
+# load_kv FILE [ONLY_KEY]: with ONLY_KEY, every other key in the file is ignored
+# (the shared debot_secrets_common.env must contribute nothing but the data key).
 load_kv() {
-    local file="$1" line key value n=0
+    local file="$1" only="${2:-}" line key value n=0
     while IFS= read -r line || [ -n "$line" ]; do
         n=$((n + 1))
         line="${line%$'\r'}"
         [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
         [[ "$line" =~ ^(export[[:space:]]+)?([A-Z][A-Z0-9_]*)=(.*)$ ]] || die "$file line $n: expected KEY=VALUE"
         key="${BASH_REMATCH[2]}"; value="${BASH_REMATCH[3]}"
+        [ -z "$only" ] || [ "$key" = "$only" ] || continue
+        # debot_secrets_common.env writes `export KEY="value"`: strip one pair of quotes.
+        if [[ "$value" =~ ^\"(.*)\"$ ]]; then value="${BASH_REMATCH[1]}"; fi
         [[ "$value" =~ ^[A-Za-z0-9_./:+=,-]*$ ]] || die "$file line $n: unexpected characters in the value of $key"
         export "$key=$value"
     done < "$file"
@@ -63,7 +73,7 @@ load_kv() {
 [ -f "$LIVE_ENV" ] || die "missing $LIVE_ENV (create it from /opt/debot/scripts/debot-arcus-vol.env.example, mode 600)"
 [ "$(stat -c %a "$LIVE_ENV")" = "600" ] || die "$LIVE_ENV must be mode 600 (is $(stat -c %a "$LIVE_ENV"))"
 load_kv "$LIVE_ENV"
-[ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] && [ -n "${ARCUS_PLAIN_API_PRIVATE_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY / ARCUS_PLAIN_API_PRIVATE_KEY)"
+[ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 [ "${ARCUS_ACCOUNT_INDEX:-}" = "0" ] || die "this launcher is for subaccount 0 (ARCUS_ACCOUNT_INDEX='${ARCUS_ACCOUNT_INDEX:-}')"
 
 # ---- configuration (every value has a default) ----------------------------
@@ -77,6 +87,27 @@ CUM_STOP_USD="${CUM_STOP_USD:-21}"
 LEVERAGE="${LEVERAGE:-5}"
 STATE_DIR="${STATE_DIR:-/var/lib/debot-arcus-vol/state}"
 LOCK_DIR="${LOCK_DIR:-/var/lib/debot-arcus-vol/locks}"
+ALLOW_PLAIN_KEY="${ALLOW_PLAIN_KEY:-0}"
+
+# ---- signing key: encrypted (production) or plain (testing, opt-in) --------
+# pairtrade's Arcus config loader prefers a PLAIN key whenever one is set, so
+# the launcher never exports both: the encrypted path drops the plain variable.
+if [ -n "${ARCUS_API_PRIVATE_KEY:-}" ]; then
+    if [ -z "${ENCRYPTED_DATA_KEY:-}" ]; then
+        [ -f "$SECRETS_COMMON" ] || die "ARCUS_API_PRIVATE_KEY is set but ENCRYPTED_DATA_KEY is neither in $LIVE_ENV nor available from $SECRETS_COMMON"
+        load_kv "$SECRETS_COMMON" ENCRYPTED_DATA_KEY
+        [ -n "${ENCRYPTED_DATA_KEY:-}" ] || die "ENCRYPTED_DATA_KEY not found in $SECRETS_COMMON"
+    fi
+    [[ "$ENCRYPTED_DATA_KEY" =~ ^[A-Za-z0-9+/=]+$ ]] || die "ENCRYPTED_DATA_KEY does not look like base64"
+    unset ARCUS_PLAIN_API_PRIVATE_KEY
+    KEY_MODE="encrypted (ARCUS_API_PRIVATE_KEY under the host data key)"
+elif [ -n "${ARCUS_PLAIN_API_PRIVATE_KEY:-}" ]; then
+    [ "$ALLOW_PLAIN_KEY" = "1" ] || die "live.env carries a PLAIN signing key; encrypt it with: sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh (or set ALLOW_PLAIN_KEY=1 in $CONFIG_ENV for testing only)"
+    unset ENCRYPTED_DATA_KEY ARCUS_API_PRIVATE_KEY
+    KEY_MODE="PLAIN (ALLOW_PLAIN_KEY=1, testing only)"
+else
+    die "no signing key in $LIVE_ENV (ARCUS_API_PRIVATE_KEY, or ARCUS_PLAIN_API_PRIVATE_KEY with ALLOW_PLAIN_KEY=1)"
+fi
 
 case "$MARKET" in *-USD) ;; *) die "MARKET must look like SPY-USD (got '$MARKET')" ;; esac
 for v in CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE; do
@@ -128,6 +159,7 @@ PY
 )"
 [ "${CLIP:-0}" -ge 500 ] || die "free collateral too small for presence quoting (free \$$FREE, clip \$$CLIP)"
 
+log "signing key: $KEY_MODE"
 log "sizing: market $MARKET, clip \$$CLIP per side (max \$$CLIP_MAX_USD), inventory cap \$$CAP, margin \$$MARGIN at ${LEVERAGE}x (free collateral \$$FREE); presence offset ${QUOTE_OFFSET_BPS} bp +/- ${REPEG_BAND_BPS} bp; daily stop \$$DAILY_STOP_USD, cumulative stop \$$CUM_STOP_USD; state $STATE_DIR"
 
 # Everything from here on is the runtime's own process (systemd sees its pid).

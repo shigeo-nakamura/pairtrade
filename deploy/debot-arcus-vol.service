@@ -2,6 +2,9 @@
 Description="debot-arcus-vol (bot-strategy#1093 Arcus Perps presence/volume runtime, operator-started)"
 After=network-online.target
 Wants=network-online.target
+# Rate limit for Restart= below (a [Unit] setting since systemd 230).
+StartLimitIntervalSec=900
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -19,8 +22,6 @@ ExecStart=/bin/bash /opt/debot/scripts/debot-arcus-vol.sh
 # the launcher exit 0, which on-failure does not retry.
 Restart=on-failure
 RestartSec=60
-StartLimitIntervalSec=900
-StartLimitBurst=3
 TimeoutStartSec=120
 # SIGTERM -> the runtime's cancel-all, final fill harvest, state persist, and
 # dead-man's-switch disarm; give it room before SIGKILL.

@@ -27,6 +27,7 @@ ap-northeast-1, aarch64 AL2023) has a stable IPv4 path.
 | `/var/lib/debot-arcus-vol/state/` | `state.json` `status.json` `fills.jsonl` `KILL_SWITCH` `HALT` |
 | `/var/lib/debot-arcus-vol/locks/` | per-account runtime lock |
 | `/opt/debot/scripts/debot-arcus-vol.sh` | launcher (`scripts/`) |
+| `/opt/debot/scripts/arcus_vol_encrypt_key.sh` | one-shot: encrypt the signing key in `live.env` under the host data key (`scripts/`) |
 | `/opt/debot/scripts/debot-arcus-vol.env.example` | both env files' keys with defaults (`scripts/`) |
 | `/etc/systemd/system/debot-arcus-vol.service` | unit (`deploy/`) |
 
@@ -52,11 +53,26 @@ never overwrites either env file.
 sudo mkdir -p -m 700 /etc/debot-arcus-vol
 sudo install -m 600 /dev/null /etc/debot-arcus-vol/live.env
 sudo vi /etc/debot-arcus-vol/live.env        # ARCUS_ADDRESS / ARCUS_API_KEY / ARCUS_PLAIN_API_PRIVATE_KEY / ARCUS_ACCOUNT_INDEX=0
+sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh   # plain key -> ARCUS_API_PRIVATE_KEY (KMS-encrypted) + ENCRYPTED_DATA_KEY
 sudo install -m 644 /opt/debot/scripts/debot-arcus-vol.env.example /etc/debot-arcus-vol/config.env  # then keep only the config.env block
 ```
 
+`arcus_vol_encrypt_key.sh` (bash + openssl + aws-cli, no python packages)
+decrypts the host's `ENCRYPTED_DATA_KEY` (from `live.env`, else
+`/opt/debot/scripts/debot_secrets_common.env`) through KMS in **eu-central-1**
+(the hosts' shared data key; this is debot-utils' default region, so leave
+`AWS_REGION` unset), encrypts the 32 key bytes with AES-256-CBC under a
+random IV, verifies the roundtrip, and rewrites `live.env` atomically
+(previous file kept as `live.env.plain.bak`, mode 600 — delete it once the
+service has started). The output is byte-identical to
+`scripts/encrypt.py <data-key> 0x<hex>`; the runtime decrypts it with
+`debot_utils::decrypt_data_with_kms(.., output_as_hex = true)`.
+
 The launcher refuses to start unless `live.env` is mode 600, complete, and
-`ARCUS_ACCOUNT_INDEX=0`.
+`ARCUS_ACCOUNT_INDEX=0`. A plain `ARCUS_PLAIN_API_PRIVATE_KEY` starts only
+with `ALLOW_PLAIN_KEY=1` in `config.env` (testing); the launcher never
+exports a plain and an encrypted key together (the config loader would
+prefer the plain one).
 
 ## Start / stop (operator only — CI never does this)
 

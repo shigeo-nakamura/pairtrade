@@ -45,15 +45,18 @@ acct() { printf '{"equity":"%s","freeCollateral":"%s"}' "$1" "$2"; }
 mkdir -p "$T/bin" "$T/etc" "$T/state"
 cat > "$T/bin/arcus_vol_runtime" <<'SH'
 #!/usr/bin/env bash
-env | grep -E '^(ARCUS_|RUST_LOG)' | sort > "$FAKE_ENV_OUT"
+env | grep -E '^(ARCUS_|RUST_LOG|ENCRYPTED_DATA_KEY)' | sort > "$FAKE_ENV_OUT"
 echo "FAKE RUNTIME STARTED"
 SH
 chmod 755 "$T/bin/arcus_vol_runtime"
-write_live() { # mode account-index
-    printf 'ARCUS_ADDRESS=0xA2C78E14DFD5586444CE4FE28FC4E36308A066D6\nARCUS_API_KEY=fake\nARCUS_PLAIN_API_PRIVATE_KEY=fake\nARCUS_ACCOUNT_INDEX=%s\n' "$2" > "$T/etc/live.env"
+EDK="ZmFrZS1lbmNyeXB0ZWQtZGF0YS1rZXk="
+write_live() { # mode account-index [key-line]
+    printf 'ARCUS_ADDRESS=0xA2C78E14DFD5586444CE4FE28FC4E36308A066D6\nARCUS_API_KEY=fake\n%s\nARCUS_ACCOUNT_INDEX=%s\n' "${3:-ARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==}" "$2" > "$T/etc/live.env"
     chmod "$1" "$T/etc/live.env"
 }
 write_live 600 0
+# the host's shared file uses `export KEY="value"`
+printf 'export ENCRYPTED_DATA_KEY="%s"\nexport RUST_LOG_IGNORED="debug"\n' "$EDK" > "$T/etc/secrets_common.env"
 rm -f "$T/etc/config.env"
 
 run() { # -> stdout+stderr in $OUT, exit code in $RC
@@ -61,7 +64,7 @@ run() { # -> stdout+stderr in $OUT, exit code in $RC
     rm -f "$FAKE_ENV_OUT"
     set +e
     OUT="$(DEBOT_ARCUS_VOL_ETC_DIR="$T/etc" DEBOT_ARCUS_VOL_BIN="$T/bin/arcus_vol_runtime" \
-        DEBOT_ARCUS_VOL_API_BASE="http://127.0.0.1:$PORT" STATE_DIR="$T/state" LOCK_DIR="$T/locks" \
+        DEBOT_ARCUS_VOL_API_BASE="http://127.0.0.1:$PORT" DEBOT_ARCUS_VOL_SECRETS_COMMON="$T/etc/secrets_common.env" STATE_DIR="$T/state" LOCK_DIR="$T/locks" \
         bash "$LAUNCHER" 2>&1)"
     RC=$?
     set -e
@@ -86,6 +89,11 @@ for kv in ARCUS_VOL_DRY_RUN=false ARCUS_VOL_LIVE_CONFIRM=1093-G2 ARCUS_VOL_ALLOW
     grep -qxF "$kv" "$T/env.out" || fail "runtime env missing $kv (got: $(grep "^${kv%%=*}=" "$T/env.out" || echo none))"
 done
 [ "$(envval ARCUS_ADDRESS)" = "0xA2C78E14DFD5586444CE4FE28FC4E36308A066D6" ] || fail "credentials not exported"
+[ "$(envval ARCUS_API_PRIVATE_KEY)" = "Y2lwaGVydGV4dA==" ] || fail "encrypted key not exported"
+[ "$(envval ENCRYPTED_DATA_KEY)" = "$EDK" ] || fail "ENCRYPTED_DATA_KEY not taken from secrets_common (quoted export form)"
+! grep -q "^ARCUS_PLAIN_API_PRIVATE_KEY=" "$T/env.out" || fail "plain key variable must not reach the runtime on the encrypted path"
+! grep -q "^RUST_LOG_IGNORED=" "$T/env.out" && [ "$(envval RUST_LOG)" = info ] || fail "secrets_common must not override RUST_LOG defaults"
+grep -q "signing key: encrypted" <<< "$OUT" || fail "key mode line"
 [ -d "$T/locks" ] || fail "lock dir not created"
 ok "defaults: sizing, presence, stops and credentials reach the runtime"
 
@@ -152,6 +160,22 @@ rm "$T/etc/live.env"; run
 [ "$RC" -eq 1 ] && grep -q "missing $T/etc/live.env" <<< "$OUT" || fail "missing live.env must refuse"
 write_live 600 0
 ok "credential file checks"
+
+# 8b. signing-key modes
+write_live 600 0 "ARCUS_PLAIN_API_PRIVATE_KEY=deadbeef"; run
+[ "$RC" -eq 1 ] && grep -q "REFUSED: live.env carries a PLAIN signing key; encrypt it with: sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "plain key without ALLOW_PLAIN_KEY must refuse"
+printf 'ALLOW_PLAIN_KEY=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && [ "$(envval ARCUS_PLAIN_API_PRIVATE_KEY)" = deadbeef ] && ! grep -q "^ENCRYPTED_DATA_KEY=" "$T/env.out" && grep -q "signing key: PLAIN (ALLOW_PLAIN_KEY=1" <<< "$OUT" || fail "plain key with ALLOW_PLAIN_KEY=1 must start without the encrypted variables"
+rm "$T/etc/config.env"
+write_live 600 0 "ARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA=="; mv "$T/etc/secrets_common.env" "$T/etc/sc.bak"; run
+[ "$RC" -eq 1 ] && grep -q "ENCRYPTED_DATA_KEY is neither in" <<< "$OUT" || fail "encrypted key without any ENCRYPTED_DATA_KEY must refuse"
+mv "$T/etc/sc.bak" "$T/etc/secrets_common.env"
+printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nENCRYPTED_DATA_KEY=bGl2ZS1lbnYtZWRr\nARCUS_ACCOUNT_INDEX=0\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
+[ "$RC" -eq 0 ] && [ "$(envval ENCRYPTED_DATA_KEY)" = "bGl2ZS1lbnYtZWRr" ] || fail "ENCRYPTED_DATA_KEY in live.env must win over secrets_common"
+write_live 600 0 "ARCUS_API_KEY_ONLY=1"; run
+[ "$RC" -eq 1 ] && grep -q "no signing key in" <<< "$OUT" || fail "no key at all must refuse"
+write_live 600 0
+ok "signing key: encrypted by default, plain only with ALLOW_PLAIN_KEY=1, never both"
 
 # 9. venue unreachable -> refused (no start on a blind venue)
 venue "$FLAT" "$NO_ORDERS" "$(acct 5557 5377)"
