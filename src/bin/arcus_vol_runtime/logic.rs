@@ -401,25 +401,28 @@ pub fn is_dust(
 
 /// The max-hold clock across dust. A same-side fill on top of dust is not a
 /// fresh open for `Position::apply`, so the grown position would inherit
-/// the dust's age and be taker-flattened at once. The runtime remembers
-/// "was dust" OUTSIDE the persisted ledger (no state write per tick, Codex
-/// P1 pairtrade#381) and restarts the clock once, on the tick the
-/// inventory stops being dust while still open. Returns the new "was dust"
-/// flag and the clock to use.
+/// the dust's age and be taker-flattened at once. The runtime remembers the
+/// dust QUANTITY outside the persisted ledger (no state write per tick,
+/// Codex P1 pairtrade#381) and restarts the clock once, on the first
+/// non-dust tick whose quantity differs from it, i.e. after a fill. A
+/// position that leaves dust only because the mark moved (the notional rule)
+/// keeps its clock, so price oscillation around the threshold can never
+/// postpone max-hold (Codex P2 pairtrade#381). Returns the dust quantity to
+/// remember and the clock to use.
 pub fn dust_hold_clock(
-    was_dust: bool,
+    dust_qty: Option<Decimal>,
     dust: bool,
     inv_qty: Decimal,
     opened_at_ms: Option<u64>,
     now_ms: u64,
-) -> (bool, Option<u64>) {
+) -> (Option<Decimal>, Option<u64>) {
     if dust {
-        return (true, opened_at_ms);
+        return (Some(inv_qty), opened_at_ms);
     }
-    if was_dust && !inv_qty.is_zero() {
-        return (false, Some(now_ms));
+    match dust_qty {
+        Some(q) if q != inv_qty && !inv_qty.is_zero() => (None, Some(now_ms)),
+        _ => (None, opened_at_ms),
     }
-    (false, opened_at_ms)
 }
 
 /// Whether the startup flatten stays pending: a startup position that is
@@ -1277,12 +1280,12 @@ mod tests {
             avg_px: px,
             opened_at_ms: Some(0),
         };
-        let mut was_dust = false;
+        let mut dust_qty = None;
         for t in [1_000u64, 30_600_000] {
             let dust = is_dust(pos.qty, Some(px), min_qty, min_usd);
             assert!(dust);
-            let (w, clock) = dust_hold_clock(was_dust, dust, pos.qty, pos.opened_at_ms, t);
-            was_dust = w;
+            let (q, clock) = dust_hold_clock(dust_qty, dust, pos.qty, pos.opened_at_ms, t);
+            dust_qty = q;
             // While dust nothing changes in the ledger (no state write).
             assert_eq!(clock, Some(0));
             pos.opened_at_ms = clock;
@@ -1294,8 +1297,8 @@ mod tests {
         let t = fill + 400;
         let dust = is_dust(pos.qty, Some(px), min_qty, min_usd);
         assert!(!dust);
-        let (w, clock) = dust_hold_clock(was_dust, dust, pos.qty, pos.opened_at_ms, t);
-        assert!(!w);
+        let (q, clock) = dust_hold_clock(dust_qty, dust, pos.qty, pos.opened_at_ms, t);
+        assert_eq!(q, None);
         assert_eq!(clock, Some(t));
         pos.opened_at_ms = clock;
         let fr = |now: u64| {
@@ -1318,13 +1321,13 @@ mod tests {
         assert_eq!(fr(t + 300_001), Some(FlattenReason::MaxHold));
         // The clock is restarted once only: later ticks keep it.
         assert_eq!(
-            dust_hold_clock(false, false, pos.qty, pos.opened_at_ms, t + 5_000),
-            (false, Some(t))
+            dust_hold_clock(None, false, pos.qty, pos.opened_at_ms, t + 5_000),
+            (None, Some(t))
         );
         // Dust worked out to flat: nothing to restart.
         assert_eq!(
-            dust_hold_clock(true, false, Decimal::ZERO, None, 9),
-            (false, None)
+            dust_hold_clock(Some(d("-0.00046")), false, Decimal::ZERO, None, 9),
+            (None, None)
         );
         // Without the restart the grown position would flatten immediately.
         let mut stale = Position {
@@ -1340,6 +1343,45 @@ mod tests {
                 cap,
                 stale.opened_at_ms,
                 t + 1_000,
+                300,
+                None,
+                false,
+                false
+            ),
+            Some(FlattenReason::MaxHold)
+        );
+    }
+
+    #[test]
+    fn a_mark_move_out_of_dust_keeps_the_hold_clock() {
+        // Codex P2 pairtrade#381: 0.0064 SPY is dust at 770 ($4.93 < $5)
+        // and not at 790 ($5.06) with no fill in between. Oscillating
+        // around the threshold must never restart max-hold.
+        let (min_qty, min_usd, cap) = (d("0.001"), d("5"), d("5000"));
+        let qty = d("0.0064");
+        let opened = Some(1_000u64);
+        let mut dust_qty = None;
+        let mut clock = opened;
+        for (i, px) in ["770", "790", "770", "790", "770", "790"]
+            .iter()
+            .enumerate()
+        {
+            let now = 100_000 * (i as u64 + 1);
+            let dust = is_dust(qty, Some(d(px)), min_qty, min_usd);
+            assert_eq!(dust, *px == "770");
+            let (q, c) = dust_hold_clock(dust_qty, dust, qty, clock, now);
+            dust_qty = q;
+            clock = c;
+            assert_eq!(clock, opened, "no fill, no restart (px {px})");
+        }
+        // Max-hold still fires from the original open, out of dust.
+        assert_eq!(
+            flatten_reason(
+                qty,
+                Some(d("790")),
+                cap,
+                clock,
+                301_001,
                 300,
                 None,
                 false,

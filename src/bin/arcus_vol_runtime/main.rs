@@ -191,8 +191,9 @@ struct Runtime {
     startup_flatten: bool,
     /// Rate limit for the dust warning (one line per 10 min).
     dust_logged_until_ms: u64,
-    /// Inventory was dust on the last tick (runtime only, never persisted).
-    was_dust: bool,
+    /// The inventory while it was last dust (runtime only, never persisted):
+    /// the max-hold clock restarts only once a fill changes it.
+    dust_qty: Option<Decimal>,
     flatten_inflight_until_ms: u64,
     pending_markouts: Vec<PendingMarkout>,
     quote_ids: HashSet<String>,
@@ -1508,14 +1509,14 @@ impl Runtime {
             );
             self.dust_logged_until_ms = now + 600_000;
         }
-        let (was_dust, clock) = dust_hold_clock(
-            self.was_dust,
+        let (dust_qty, clock) = dust_hold_clock(
+            self.dust_qty,
             dust,
             self.ledger.position.qty,
             self.ledger.position.opened_at_ms,
             now,
         );
-        self.was_dust = was_dust;
+        self.dust_qty = dust_qty;
         if clock != self.ledger.position.opened_at_ms {
             self.ledger.position.opened_at_ms = clock;
         }
@@ -1963,7 +1964,7 @@ async fn main() -> Result<()> {
         position_pending: false,
         startup_flatten: false,
         dust_logged_until_ms: 0,
-        was_dust: false,
+        dust_qty: None,
         flatten_inflight_until_ms: 0,
         pending_markouts: Vec::new(),
         quote_ids: HashSet::new(),
