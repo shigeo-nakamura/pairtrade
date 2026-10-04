@@ -7996,6 +7996,27 @@ mod tests {
         ) -> Result<Vec<dex_connector::BatchOrderResult>, dex_connector::DexError> {
             unimplemented!("the test drives latest_price directly")
         }
+
+        /// No trait default (bot-strategy#536): the stub states it cannot
+        /// reconcile, so an unknown outcome stays unresolved (fail closed).
+        async fn reconcile_order(
+            &self,
+            _symbol: &str,
+            _client_order_id: &str,
+        ) -> Result<dex_connector::OrderReconcile, dex_connector::DexError> {
+            Err(dex_connector::DexError::Permanent(
+                "StubConnector stub: reconcile_order not supported".to_string(),
+            ))
+        }
+
+        async fn resend_order(
+            &self,
+            _permit: dex_connector::ResendPermit,
+        ) -> Result<dex_connector::CreateOrderResponse, dex_connector::DexError> {
+            Err(dex_connector::DexError::Permanent(
+                "StubConnector stub: resend_order not supported".to_string(),
+            ))
+        }
     }
 
     struct Harness {

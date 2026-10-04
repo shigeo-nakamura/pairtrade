@@ -800,6 +800,13 @@ struct UncertainOrder {
     #[serde(default)]
     instance: String,
     order_id: Option<String>,
+    /// The client order id of an ambiguous submission
+    /// (`DexError::unknown_outcome_client_order_id`, dex-connector v4.7.43 /
+    /// bot-strategy#1116): the key `reconcile_order` settles it by. `None`
+    /// for entries persisted before this field existed or for venues whose
+    /// error carries none.
+    #[serde(default)]
+    client_order_id: Option<String>,
     /// Requested size (base units).
     qty: f64,
     /// The leg's signed venue position right before the order.
@@ -1595,6 +1602,50 @@ fn points_account_index(long_venue: Option<VenueKind>, raw: Option<String>) -> O
     raw.and_then(|v| v.trim().parse().ok())
 }
 
+/// Does a `reconcile_order` verdict settle an ambiguous submission? Only
+/// the venue's own word does: `Found` (the order exists -- open, filled or
+/// cancelled; the position read says what it did) or `NotPlaced` (it never
+/// existed; the resend permit it carries is dropped here on purpose -- the
+/// holder re-hedges from the position, it never replays an order).
+/// `Pending` and a failed read are no evidence (bot-strategy#1116).
+fn reconcile_settles(verdict: &Result<dex_connector::OrderReconcile, DexError>) -> bool {
+    matches!(
+        verdict,
+        Ok(dex_connector::OrderReconcile::Found(_))
+            | Ok(dex_connector::OrderReconcile::NotPlaced(_))
+    )
+}
+
+fn describe_reconcile(verdict: &Result<dex_connector::OrderReconcile, DexError>) -> String {
+    match verdict {
+        Ok(dex_connector::OrderReconcile::Found(o)) => {
+            format!("Found(status={}, open={})", o.status, o.open)
+        }
+        Ok(dex_connector::OrderReconcile::NotPlaced(_)) => "NotPlaced (permit dropped)".to_string(),
+        Ok(dex_connector::OrderReconcile::Pending(why)) => format!("Pending({why})"),
+        Err(e) => format!("Err({e})"),
+    }
+}
+
+/// The client order id an ambiguous submission names, kept on the
+/// `UncertainOrder` so the venue can be asked about it later.
+fn ambiguous_client_id(e: &DexError) -> Option<String> {
+    e.unknown_outcome_client_order_id().map(str::to_string)
+}
+
+/// Terminal evidence for an ambiguous submission, from the venue's own
+/// word: one `reconcile_order` call by client order id. Never resends --
+/// a `NotPlaced` permit is dropped here; the holder re-hedges from the
+/// position on its next tick, as it always has (bot-strategy#1116).
+async fn ambiguous_submission_evidence(dex: &dyn DexConnector, sym: &str, cid: &str) -> bool {
+    let verdict = dex.reconcile_order(sym, cid).await;
+    log::info!(
+        "[UNCERTAIN] {sym} client_order_id={cid} reconcile_order -> {}",
+        describe_reconcile(&verdict)
+    );
+    reconcile_settles(&verdict)
+}
+
 /// What to do with an uncertain order this tick.
 #[derive(Debug, Clone, PartialEq)]
 enum UncertainAction {
@@ -1609,7 +1660,9 @@ enum UncertainAction {
 
 /// An uncertain order is released ONLY on terminal evidence (its own
 /// fills / cancel agreeing with the position on Arcus; on Lighter, whose
-/// IOC is final on ack, a known order id that is no longer open). Time alone
+/// IOC is final on ack, a known order id that is no longer open; for an
+/// ambiguous submission, the venue's `reconcile_order` verdict by client
+/// order id -- `reconcile_settles`). Time alone
 /// never releases it: absence from the open orders proves nothing while the
 /// venue's fill feed may lag. An order sent on another venue / instance than
 /// the leg is configured for now cannot be checked here at all.
@@ -2535,15 +2588,23 @@ impl Engine {
         };
         let resp = match sent {
             Ok(r) => r,
-            Err(DexError::ReconciliationRequired { detail, .. }) => {
+            Err(e @ DexError::ReconciliationRequired { .. }) => {
                 // The venue may have taken it: never re-send before the
-                // position says what happened.
+                // position says what happened. The client order id (when the
+                // connector names one) lets `reconcile_uncertain` ask the
+                // venue directly instead of waiting out the grace.
+                let client_order_id = ambiguous_client_id(&e);
+                let detail = match &e {
+                    DexError::ReconciliationRequired { detail, .. } => detail.clone(),
+                    _ => unreachable!(),
+                };
                 let reason = format!("submission ambiguous: {detail}");
                 self.mark_uncertain(
                     symbol,
                     order.leg,
                     exchange,
                     None,
+                    client_order_id,
                     qty,
                     before,
                     book_mark,
@@ -2577,6 +2638,7 @@ impl Engine {
                         order.leg,
                         exchange,
                         Some(order_id.clone()),
+                        None,
                         qty,
                         before,
                         book_mark,
@@ -2654,6 +2716,7 @@ impl Engine {
         leg: Leg,
         exchange: VenueKind,
         order_id: Option<String>,
+        client_order_id: Option<String>,
         qty: f64,
         before_qty: f64,
         mark: f64,
@@ -2669,6 +2732,7 @@ impl Engine {
             exchange: exchange.dex_name().to_string(),
             instance: self.venue(leg).instance.clone(),
             order_id,
+            client_order_id,
             qty,
             before_qty,
             mark,
@@ -3477,8 +3541,19 @@ impl Engine {
                     (Some(id), _) => {
                         terminal = !open_orders.orders.iter().any(|o| &o.order_id == id);
                     }
-                    // No order id (an ambiguous submission): no evidence.
-                    (None, _) => {}
+                    // No order id (an ambiguous submission): ask the venue by
+                    // the client order id, when the connector gave one
+                    // (dex-connector v4.7.43 / bot-strategy#1116). Found or
+                    // NotPlaced is the venue's own word and settles it with
+                    // the position read above; Pending / Err is no evidence.
+                    // The holder never resends: a NotPlaced permit is dropped
+                    // and the next tick re-hedges from the position as before.
+                    (None, _) => {
+                        if let Some(cid) = &u.client_order_id {
+                            let dex = self.venue(u.leg).dex.clone();
+                            terminal = ambiguous_submission_evidence(&*dex, &sym, cid).await;
+                        }
+                    }
                 }
             }
             match uncertain_action(
@@ -4670,6 +4745,7 @@ mod tests {
                 exchange: "arcus".into(),
                 instance: "arcus".into(),
                 order_id: Some("o1".into()),
+                client_order_id: None,
                 qty: 0.1,
                 before_qty: -0.4,
                 mark: 0.0,
@@ -6435,6 +6511,7 @@ mod tests {
             exchange: exchange.into(),
             instance: instance.into(),
             order_id: Some("o1".into()),
+            client_order_id: None,
             qty: 0.1,
             before_qty: 0.0,
             mark: 100.0,
@@ -6608,6 +6685,7 @@ mod tests {
                 exchange: "lighter".into(),
                 instance: "rh".into(),
                 order_id: None,
+                client_order_id: Some("1790000000123".into()),
                 qty: 0.2,
                 before_qty: 0.5,
                 mark: 0.0,
@@ -6621,8 +6699,12 @@ mod tests {
         // an entry persisted before the `roll` flag existed loads as a planner order
         let mut e = serde_json::to_value(&st.uncertain["BTC"]).unwrap();
         e.as_object_mut().unwrap().remove("roll");
+        // ... and one from before `client_order_id` loads without it: it can
+        // then only be settled by the grace / RISK_ACK path.
+        e.as_object_mut().unwrap().remove("client_order_id");
         let old_entry: UncertainOrder = serde_json::from_value(e).unwrap();
         assert!(!old_entry.roll);
+        assert!(old_entry.client_order_id.is_none());
     }
 
     #[test]
@@ -6812,5 +6894,423 @@ mod tests {
         assert!(rs.in_flight.is_empty());
         assert_eq!(rs.week_volume_usd, 1_000.0);
         assert_eq!(roll_in_flight_total(&rs), (0.0, 0.0));
+    }
+
+    /// Only the venue's own word settles an ambiguous submission: Found
+    /// (whatever its status) or NotPlaced. Pending and a failed read keep
+    /// it uncertain, so the grace -> Escalate backstop still applies.
+    #[test]
+    fn only_found_or_not_placed_settle_an_ambiguous_submission() {
+        use dex_connector::{OrderReconcile, ReconciledOrder, ResendPermit};
+        let found = |status: &str, open: bool| {
+            Ok(OrderReconcile::Found(ReconciledOrder {
+                client_order_id: "1".into(),
+                exchange_order_id: Some("9".into()),
+                status: status.into(),
+                open,
+                filled_size: None,
+            }))
+        };
+        assert!(reconcile_settles(&found("filled", false)));
+        assert!(reconcile_settles(&found("canceled-expired", false)));
+        assert!(reconcile_settles(&found("open", true)));
+        assert!(reconcile_settles(&Ok(OrderReconcile::NotPlaced(
+            ResendPermit::new_for_test_double("1", "BTC")
+        ))));
+        assert!(!reconcile_settles(&Ok(OrderReconcile::Pending(
+            "nonce not yet consumed".into()
+        ))));
+        assert!(!reconcile_settles(&Err(DexError::Transient(
+            "read failed".into()
+        ))));
+        assert!(!reconcile_settles(&Err(DexError::Permanent(
+            "reconcile_order not supported".into()
+        ))));
+    }
+
+    /// With the venue's word the symbol is released inside the grace; without
+    /// it the existing grace -> Escalate path is unchanged.
+    #[test]
+    fn reconcile_verdict_feeds_uncertain_action() {
+        let u = UncertainOrder {
+            leg: Leg::Long,
+            exchange: "lighter".into(),
+            instance: "rh".into(),
+            order_id: None,
+            client_order_id: Some("42".into()),
+            qty: 0.2,
+            before_qty: 0.5,
+            mark: 0.0,
+            sent_at: 100,
+            reason: "submission ambiguous".into(),
+            roll: false,
+        };
+        // Found / NotPlaced -> terminal evidence -> Release, well inside the grace.
+        assert_eq!(
+            uncertain_action(&u, "lighter", "rh", true, 110, 60),
+            UncertainAction::Release
+        );
+        // Pending -> no evidence -> Keep inside the grace, Escalate after it.
+        assert_eq!(
+            uncertain_action(&u, "lighter", "rh", false, 110, 60),
+            UncertainAction::Keep
+        );
+        assert!(matches!(
+            uncertain_action(&u, "lighter", "rh", false, 161, 60),
+            UncertainAction::Escalate(_)
+        ));
+    }
+
+    /// A connector whose only live method is `reconcile_order`, answering
+    /// from a script; everything else is unreachable from the seam, and
+    /// `resend_order` panics because the holder must never call it.
+    struct ReconcileDex {
+        verdict: Box<dyn Fn() -> Result<dex_connector::OrderReconcile, DexError> + Send + Sync>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DexConnector for ReconcileDex {
+        async fn start(&self) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn stop(&self) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn restart(&self, _max_retries: i32) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn set_leverage(&self, _symbol: &str, _leverage: u32) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_ticker(
+            &self,
+            _symbol: &str,
+            _test_price: Option<rust_decimal::Decimal>,
+        ) -> Result<dex_connector::TickerResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_filled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::FilledOrdersResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_canceled_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::CanceledOrdersResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_open_orders(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::OpenOrdersResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_balance(
+            &self,
+            _symbol: Option<&str>,
+        ) -> Result<dex_connector::BalanceResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_combined_balance(
+            &self,
+        ) -> Result<dex_connector::CombinedBalanceResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_positions(&self) -> Result<Vec<dex_connector::PositionSnapshot>, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_funding_payments(
+            &self,
+            _since_secs: i64,
+        ) -> Result<Vec<dex_connector::FundingPayment>, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_last_trades(
+            &self,
+            _symbol: &str,
+        ) -> Result<dex_connector::LastTradesResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn get_order_book(
+            &self,
+            _symbol: &str,
+            _depth: usize,
+        ) -> Result<dex_connector::OrderBookSnapshot, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn clear_filled_order(&self, _symbol: &str, _trade_id: &str) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn clear_all_filled_orders(&self) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn clear_canceled_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+        ) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn clear_all_canceled_orders(&self) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn create_order(
+            &self,
+            _symbol: &str,
+            _size: rust_decimal::Decimal,
+            _side: dex_connector::OrderSide,
+            _price: Option<rust_decimal::Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn create_advanced_trigger_order(
+            &self,
+            _symbol: &str,
+            _size: rust_decimal::Decimal,
+            _side: dex_connector::OrderSide,
+            _trigger_px: rust_decimal::Decimal,
+            _limit_px: Option<rust_decimal::Decimal>,
+            _order_style: dex_connector::TriggerOrderStyle,
+            _slippage_bps: Option<u32>,
+            _tpsl: dex_connector::TpSl,
+            _reduce_only: bool,
+            _expiry_secs: Option<u64>,
+        ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn create_order_taker_ioc(
+            &self,
+            _symbol: &str,
+            _size: rust_decimal::Decimal,
+            _side: dex_connector::OrderSide,
+            _slippage_bps: u32,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn create_order_taker_ioc_at(
+            &self,
+            _symbol: &str,
+            _size: rust_decimal::Decimal,
+            _side: dex_connector::OrderSide,
+            _limit_price: rust_decimal::Decimal,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn modify_order(
+            &self,
+            _symbol: &str,
+            _order_id: &str,
+            _side: dex_connector::OrderSide,
+            _target_total_size: rust_decimal::Decimal,
+            _open_remaining_size: rust_decimal::Decimal,
+            _price: Option<rust_decimal::Decimal>,
+            _spread: Option<i64>,
+            _reduce_only: bool,
+        ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn cancel_order(&self, _symbol: &str, _order_id: &str) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn cancel_all_orders(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn cancel_orders(
+            &self,
+            _symbol: Option<String>,
+            _order_ids: Vec<String>,
+        ) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn close_all_positions(&self, _symbol: Option<String>) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn clear_last_trades(&self, _symbol: &str) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn is_upcoming_maintenance(&self, _hours_ahead: i64) -> bool {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn sign_evm_65b(&self, _message: &str) -> Result<String, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn sign_evm_65b_with_eip191(&self, _message: &str) -> Result<String, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        fn subscribe_price_updates(
+            &self,
+        ) -> Result<tokio::sync::broadcast::Receiver<dex_connector::PriceUpdate>, DexError>
+        {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn subscribe_symbols(&self, _symbols: &[String]) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn schedule_cancel(&self, _timeout_secs: Option<u64>) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn create_orders_batch(
+            &self,
+            _orders: Vec<dex_connector::BatchOrderRequest>,
+        ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn modify_orders_batch(
+            &self,
+            _modifies: Vec<dex_connector::BatchModifyRequest>,
+        ) -> Result<Vec<dex_connector::BatchOrderResult>, DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
+        async fn reconcile_order(
+            &self,
+            _symbol: &str,
+            _client_order_id: &str,
+        ) -> Result<dex_connector::OrderReconcile, DexError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("reconcile_order {_symbol} {_client_order_id}"));
+            (self.verdict)()
+        }
+
+        async fn resend_order(
+            &self,
+            _permit: dex_connector::ResendPermit,
+        ) -> Result<dex_connector::CreateOrderResponse, DexError> {
+            self.calls.lock().unwrap().push("resend_order".to_string());
+            panic!("the holder must never resend an order")
+        }
+    }
+
+    fn reconcile_dex(
+        verdict: impl Fn() -> Result<dex_connector::OrderReconcile, DexError> + Send + Sync + 'static,
+    ) -> ReconcileDex {
+        ReconcileDex {
+            verdict: Box::new(verdict),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn found(status: &'static str, open: bool) -> Result<dex_connector::OrderReconcile, DexError> {
+        Ok(dex_connector::OrderReconcile::Found(
+            dex_connector::ReconciledOrder {
+                client_order_id: "4242".into(),
+                exchange_order_id: Some("9".into()),
+                status: status.into(),
+                open,
+                filled_size: None,
+            },
+        ))
+    }
+
+    /// bot-strategy#1116: the venue's own word -- Found (any status) or
+    /// NotPlaced -- is terminal evidence for an ambiguous submission;
+    /// Pending and a failed read are not. One reconcile call per check, and
+    /// a NotPlaced permit is dropped: the holder never resends.
+    #[tokio::test]
+    async fn ambiguous_submission_is_settled_only_by_found_or_not_placed() {
+        for (verdict, expect) in [
+            (found("filled", false), true),
+            (found("canceled-expired", false), true),
+            (found("open", true), true),
+            (
+                Ok(dex_connector::OrderReconcile::NotPlaced(
+                    dex_connector::ResendPermit::new_for_test_double("4242", "BTC"),
+                )),
+                true,
+            ),
+            (
+                Ok(dex_connector::OrderReconcile::Pending(
+                    "nonce not yet consumed".into(),
+                )),
+                false,
+            ),
+            (Err(DexError::Transient("read failed".into())), false),
+            (
+                Err(DexError::Permanent("reconcile_order not supported".into())),
+                false,
+            ),
+        ] {
+            let desc = describe_reconcile(&verdict);
+            let v = std::sync::Arc::new(std::sync::Mutex::new(Some(verdict)));
+            let dex = reconcile_dex(move || v.lock().unwrap().take().expect("one call"));
+            assert_eq!(
+                ambiguous_submission_evidence(&dex, "BTC", "4242").await,
+                expect,
+                "{desc}"
+            );
+            assert_eq!(
+                *dex.calls.lock().unwrap(),
+                vec!["reconcile_order BTC 4242".to_string()],
+                "exactly one reconcile, never a resend ({desc})"
+            );
+        }
+    }
+
+    /// The client order id travels from the connector's error into the
+    /// uncertain entry; an error without one leaves the entry on the grace /
+    /// RISK_ACK path.
+    #[test]
+    fn ambiguous_submission_keeps_the_client_order_id() {
+        let e = DexError::ReconciliationRequired {
+            action: "lighter sendTx create_order client_order_id=1790000000123 market_id=1".into(),
+            nonce: 7,
+            detail: "HTTP request failed: timeout".into(),
+        };
+        assert_eq!(ambiguous_client_id(&e), Some("1790000000123".to_string()));
+        let bare = DexError::ReconciliationRequired {
+            action: "arcus POST /v1/placeOrder".into(),
+            nonce: 0,
+            detail: "5xx".into(),
+        };
+        assert_eq!(ambiguous_client_id(&bare), None);
+        assert_eq!(
+            ambiguous_client_id(&DexError::Transient("timeout".into())),
+            None
+        );
     }
 }
