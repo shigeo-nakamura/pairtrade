@@ -798,6 +798,42 @@ impl DexConnector for DexConnectorBox {
         self.report_batch_rate_limit("modify_orders_batch", &detail, &result);
         result
     }
+
+    // bot-strategy#1116 (dex-connector v4.7.43): explicit forwards, since
+    // neither method has a trait default and a missing override here would
+    // be a compile error rather than the silent fallback of #536 -- but the
+    // rate-limit reporting below is this wrapper's job either way.
+    async fn reconcile_order(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<dex_connector::OrderReconcile, DexError> {
+        let result = self.inner.reconcile_order(symbol, client_order_id).await;
+        if let Err(e) = &result {
+            self.report_rate_limit(
+                "reconcile_order",
+                &format!("{symbol} client_order_id={client_order_id}"),
+                e,
+            );
+        }
+        result
+    }
+
+    async fn resend_order(
+        &self,
+        permit: dex_connector::ResendPermit,
+    ) -> Result<CreateOrderResponse, DexError> {
+        let detail = format!(
+            "{} client_order_id={}",
+            permit.symbol(),
+            permit.client_order_id()
+        );
+        let result = self.inner.resend_order(permit).await;
+        if let Err(e) = &result {
+            self.report_rate_limit("resend_order", &detail, e);
+        }
+        result
+    }
 }
 
 #[cfg(test)]
