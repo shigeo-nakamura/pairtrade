@@ -960,6 +960,13 @@ impl BookEngine {
     /// remembered mark (state written before this field) starts its clock
     /// now at its entry price. A symbol that prices again is un-retired.
     async fn retire_dead_paper_legs(&mut self, now: i64, prices: &HashMap<String, f64>) {
+        // Only held legs carry a mark clock: a leg closed by an ordinary
+        // rebalance must not leave its old timestamp behind for a later
+        // reopening to inherit (Codex P2, pairtrade#384).
+        let positions = &self.state.positions;
+        self.state
+            .last_marks
+            .retain(|s, _| positions.contains_key(s));
         for (sym, px) in prices {
             if self.state.positions.contains_key(sym) {
                 self.state.last_marks.insert(sym.clone(), (now, *px));
@@ -1485,7 +1492,16 @@ impl BookEngine {
         // bound. A symbol it refuses rejects the whole signal, as an
         // unknown symbol does in `fixed` mode; one that cannot be admitted
         // *yet* rejects this tick and is retried inside the window.
-        let symbols: Vec<String> = sig.weights.keys().cloned().collect();
+        // A retired (dead-mark) symbol is left out of the plan anyway, so it
+        // must not reject the signal at admission either -- a delisted
+        // market is exactly what retires a leg (paper only; the set is
+        // empty live; Codex P2, pairtrade#384).
+        let symbols: Vec<String> = sig
+            .weights
+            .keys()
+            .filter(|s| !self.state.dead_symbols.contains_key(*s))
+            .cloned()
+            .collect();
         // Every symbol, tracked ones included: being subscribed does not
         // make a market still listed.
         if let Some((symbol, err)) = self.admit(now, &symbols, true).await.into_iter().next() {
@@ -2993,6 +3009,39 @@ mod tests {
         exec.set_price("DOT", 4.0).await;
         engine.tick(d2.timestamp() + 5).await.unwrap();
         assert!(engine.state.dead_symbols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_closed_legs_old_mark_is_not_inherited_by_a_later_reopening() {
+        // Codex P2 pairtrade#384: a DOT leg closed by an ordinary rebalance
+        // left its mark behind; reopened ten days later with its quotes
+        // dropping right after, the new leg must start a fresh clock, not
+        // be retired as if unpriced since the old position.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.mark_on_date_change = false;
+        let t0 = ts("2026-09-06T12:00:00Z").timestamp();
+        // The closed leg's leftover mark.
+        engine.state.last_marks.insert("DOT".into(), (t0, 4.0));
+        let t1 = t0 + 10 * 86_400;
+        engine.tick(t1).await.unwrap();
+        assert!(
+            !engine.state.last_marks.contains_key("DOT"),
+            "pruned: not held"
+        );
+        // Reopened at t1; its quotes vanish right after.
+        engine.state.apply_fill("DOT", -10.0, 4.0, t1);
+        exec.clear_observations().await;
+        exec.set_price("BTC", 100_000.0).await;
+        engine.tick(t1 + 60).await.unwrap();
+        assert!(
+            engine.state.positions.contains_key("DOT"),
+            "a fresh leg is not retired on an inherited old mark"
+        );
+        assert!(engine.state.dead_symbols.is_empty());
+        assert_eq!(engine.state.last_marks["DOT"].0, t1 + 60);
     }
 
     #[test]
@@ -4722,6 +4771,31 @@ mod tests {
         assert!(engine.state.positions["BTC"].qty > 0.0);
         // Admitted once; the decision did not ask again.
         assert_eq!(venue.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retired_dead_mark_symbol_does_not_reject_the_signal_at_admission() {
+        // Codex P2 pairtrade#384: in venue_listed mode a delisted symbol is
+        // refused at admission before the plan's dead-symbol filter, so a
+        // signal still naming a retired leg would reject the whole
+        // rebalance.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec![]).await;
+        venue.delisted.lock().unwrap().push("ARB");
+        engine.state.dead_symbols.insert("ARB".into(), 1);
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(
+            dir.path(),
+            "2026-09-06",
+            d,
+            &[("BTC", -0.3), ("ETH", 0.2), ("ARB", 0.1)],
+        );
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_ne!(rec.outcome, DecisionOutcome::Rejected, "{rec:?}");
+        assert!(!engine.state.positions.contains_key("ARB"));
+        assert!(engine.state.positions["ETH"].qty > 0.0);
     }
 
     #[tokio::test]
