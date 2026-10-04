@@ -74,6 +74,10 @@ pub trait Executor: Send + Sync {
     /// of a configured number the path does not enforce (bot-strategy#1099,
     /// Codex on pairtrade#371).
     fn slippage_bound_bps(&self, reduce_only: bool) -> Option<f64>;
+    /// Paper only: forget `symbol`'s simulated position (the engine
+    /// retired the leg after its mark went dead, bot-strategy#937). A
+    /// no-op on a real venue.
+    async fn retire_paper_position(&self, _symbol: &str) {}
 }
 
 // ---------------------------------------------------------------- paper
@@ -214,6 +218,10 @@ impl Executor for PaperExecutor {
 
     async fn equity(&self) -> Result<Option<f64>> {
         Ok(None)
+    }
+
+    async fn retire_paper_position(&self, symbol: &str) {
+        self.positions.lock().await.remove(symbol);
     }
 
     async fn funding_rate_hourly(&self, symbol: &str) -> Option<f64> {

@@ -460,6 +460,16 @@ async fn main() -> Result<()> {
     };
 
     let mut engine = BookEngine::new(cfg.clone(), scheduler, exec.clone(), signals, status)?;
+    // Paper only (bot-strategy#937): retire a held leg whose mark has been
+    // absent this long (a delisted market); 0 disables.
+    if let Some(v) = std::env::var("BOOK_DEAD_MARK_SECS")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        engine.dead_mark_secs = v
+            .parse()
+            .with_context(|| format!("BOOK_DEAD_MARK_SECS={v} is not an integer"))?;
+    }
     if cfg.universe.mode == UniverseMode::VenueListed {
         engine.set_symbol_feed(Arc::new(ConnectorSymbolFeed {
             connector: connector.clone(),

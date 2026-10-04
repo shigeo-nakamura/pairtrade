@@ -188,6 +188,16 @@ pub struct BookState {
     pub trades_won: u64,
     #[serde(default)]
     pub max_drawdown_usd: f64,
+    /// Paper only: the last fresh mark (unix secs, price) seen for each
+    /// held leg. Persisted so the age of a mark that stopped arriving
+    /// (a delisted / halted market) survives a restart (bot-strategy#937).
+    #[serde(default)]
+    pub last_marks: BTreeMap<String, (i64, f64)>,
+    /// Paper only: symbols whose held leg was retired because its mark was
+    /// absent longer than the dead-mark threshold (unix secs retired).
+    /// Kept out of new targets until a fresh mark reappears.
+    #[serde(default)]
+    pub dead_symbols: BTreeMap<String, i64>,
 }
 
 impl BookState {
@@ -212,6 +222,8 @@ impl BookState {
             trades_closed: 0,
             trades_won: 0,
             max_drawdown_usd: 0.0,
+            last_marks: BTreeMap::new(),
+            dead_symbols: BTreeMap::new(),
         }
     }
 
