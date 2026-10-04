@@ -2646,6 +2646,15 @@ mod tests {
             }),
             ErrorEffect::Other
         );
+        // Only the connector's own pre-flight rejection (InvalidInput) means
+        // dust; the same words in a venue/transport error are not trusted
+        // (the order may have been sent).
+        assert_eq!(
+            classify_error(&DexError::Transient(
+                "below Arcus minimum (gateway echoed)".into()
+            )),
+            ErrorEffect::Other
+        );
         assert_eq!(
             classify_error(&DexError::Permanent("POST_ONLY order would cross".into())),
             ErrorEffect::Quiet
