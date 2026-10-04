@@ -129,16 +129,21 @@ mkdir -p "$STATE_DIR" "$LOCK_DIR"
 [ -e "$STATE_DIR/KILL_SWITCH" ] && hold "KILL_SWITCH present in $STATE_DIR; remove it to start"
 [ -e "$STATE_DIR/HALT" ] && hold "sticky HALT present in $STATE_DIR; read the journal, then remove it by hand"
 
-# ---- venue: flat and no open orders in this market -------------------------
+# ---- venue: flat (or dust) and no open orders in this market ---------------
 # Checked after EVERY file is loaded: the runtime starts on the account the
 # preflight looked at, and that account is subaccount 0 (hard requirement).
+# A position the venue itself would not accept as an order (below its
+# minOrderSize or minOrderNotional at the mark) is DUST: nothing can flatten
+# it, the runtime adopts and carries it (bot-strategy#1093), so it must not
+# keep the service from starting. Anything above the venue minimum refuses.
 ACCOUNT_INDEX="${ARCUS_ACCOUNT_INDEX:-}"
 [ "$ACCOUNT_INDEX" = "0" ] || die "this launcher is for subaccount 0 (ARCUS_ACCOUNT_INDEX='$ACCOUNT_INDEX')"
 addr="$(echo "$ARCUS_ADDRESS" | tr 'A-Z' 'a-z')"
 fetch() { curl -4 -sf --max-time 20 "$API_BASE/v1/$1?address=$addr&accountIndex=$ACCOUNT_INDEX${2:+&$2}"; }
 pos="$(fetch positions "market=$MARKET")" || die "position read failed ($API_BASE)"
 ord="$(fetch openOrders "market=$MARKET")" || die "open-orders read failed ($API_BASE)"
-python3 - "$pos" "$ord" "$MARKET" <<'PY' || exit 1
+mkts="$(curl -4 -sf --max-time 20 "$API_BASE/v1/markets")" || die "markets read failed ($API_BASE); cannot judge a residual position, not starting blind"
+python3 - "$pos" "$ord" "$MARKET" "$mkts" <<'PY' || exit 1
 import json, sys
 p = json.loads(sys.argv[1]).get("positions") or {}
 o = json.loads(sys.argv[2]).get("orders") or []
@@ -146,11 +151,29 @@ mk = sys.argv[3]
 rows = p.values() if isinstance(p, dict) else p
 open_pos = [v for v in rows if v.get("marketDisplayName") == mk and float(v.get("size") or 0) != 0]
 if open_pos:
-    sys.exit("[debot-arcus-vol] REFUSED: %s position open on this subaccount: %s" % (mk, open_pos))
+    ms = json.loads(sys.argv[4])
+    ms = ms.get("markets") if isinstance(ms, dict) else ms
+    info = next((m for m in ms or [] if m.get("marketDisplayName") == mk), None)
+    if info is None:
+        sys.exit("[debot-arcus-vol] REFUSED: %s position open and %s not found in /v1/markets; cannot judge it" % (mk, mk))
+    mark = float(info.get("markPrice") or info.get("oraclePrice") or 0)
+    min_size = float(info.get("minOrderSize") or 0)
+    min_notional = float(info.get("minOrderNotional") or 0)
+    if mark <= 0 or (min_size <= 0 and min_notional <= 0):
+        sys.exit("[debot-arcus-vol] REFUSED: %s position open and /v1/markets gives no mark/minimums to judge it" % mk)
+    size = sum(abs(float(v.get("size") or 0)) for v in open_pos)
+    notional = size * mark
+    if size < min_size or notional < min_notional:
+        print("[debot-arcus-vol] venue check: %s dust position %s (~$%.2f) carried, below venue minimum (size %s / notional %s)"
+              % (mk, open_pos[0].get("size"), notional, min_size, min_notional))
+    else:
+        sys.exit("[debot-arcus-vol] REFUSED: %s position open on this subaccount (%s, ~$%.2f, above the venue minimum): %s"
+                 % (mk, open_pos[0].get("size"), notional, open_pos))
 open_ord = [x for x in o if x.get("marketDisplayName") in (None, mk)]
 if open_ord:
     sys.exit("[debot-arcus-vol] REFUSED: %d open %s order(s) on this subaccount; cancel them first" % (len(open_ord), mk))
-print("[debot-arcus-vol] venue check: %s flat, no open %s orders" % (mk, mk))
+if not open_pos:
+    print("[debot-arcus-vol] venue check: %s flat, no open %s orders" % (mk, mk))
 PY
 
 # ---- sizing from free collateral ------------------------------------------

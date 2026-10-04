@@ -36,7 +36,9 @@ venue() { # positions-json open-orders-json account-json
     printf '%s' "$1" > "$T/venue/positions.json"
     printf '%s' "$2" > "$T/venue/openOrders.json"
     printf '%s' "$3" > "$T/venue/account.json"
+    printf '%s' "$MARKETS" > "$T/venue/markets.json"
 }
+MARKETS='{"markets":[{"marketDisplayName":"SPY-USD","markPrice":"770.5","minOrderSize":"0.001","minOrderNotional":"5"}]}'
 FLAT='{"positions":{},"total":0}'
 NO_ORDERS='{"orders":[],"total":0}'
 acct() { printf '{"equity":"%s","freeCollateral":"%s"}' "$1" "$2"; }
@@ -111,10 +113,31 @@ ok "refuses when free collateral cannot carry a USD 500 clip"
 
 # 4. position open in the market -> refused; a position in another market is fine
 venue '{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"1.2","side":"LONG"}},"total":1}' "$NO_ORDERS" "$(acct 5557 5377)"; run
-[ "$RC" -eq 1 ] && grep -q "REFUSED: SPY-USD position open" <<< "$OUT" || fail "open SPY position must refuse"
+[ "$RC" -eq 1 ] && grep -q "REFUSED: SPY-USD position open" <<< "$OUT" && grep -q "above the venue minimum" <<< "$OUT" || fail "open SPY position must refuse"
 venue '{"positions":{"6":{"marketDisplayName":"HYPE-USD","size":"100","side":"LONG"}},"total":1}' "$NO_ORDERS" "$(acct 5557 4500)"; run
 [ "$RC" -eq 0 ] || fail "a HYPE position must not block SPY"
 ok "venue flat check is per market"
+
+# 4b. dust position (bot-strategy#1093 live residual -0.00046 SPY = $0.35) -> carried, starts
+DUST='{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"-0.00046","side":"SHORT"}},"total":1}'
+venue "$DUST" "$NO_ORDERS" "$(acct 5557 5377)"; run
+[ "$RC" -eq 0 ] && grep -q "dust position -0.00046 (~\$0.35) carried" <<< "$OUT" && [ -f "$T/env.out" ] || fail "dust position must be carried: $OUT"
+# above minOrderSize but below the $5 notional floor is still dust
+venue '{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"0.005","side":"LONG"}},"total":1}' "$NO_ORDERS" "$(acct 5557 5377)"; run
+[ "$RC" -eq 0 ] && grep -q "dust position 0.005" <<< "$OUT" || fail "below-notional position must be carried"
+# just above both minimums -> refused
+venue '{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"0.007","side":"LONG"}},"total":1}' "$NO_ORDERS" "$(acct 5557 5377)"; run
+[ "$RC" -eq 1 ] && grep -q "above the venue minimum" <<< "$OUT" || fail "0.007 SPY (~\$5.39) must refuse"
+# dust still needs the orders check: a dust position plus an open order refuses
+venue "$DUST" '{"orders":[{"marketDisplayName":"SPY-USD","side":"BUY","price":"700","remainingSize":"1"}],"total":1}' "$(acct 5557 5377)"; run
+[ "$RC" -eq 1 ] && grep -q "open SPY-USD order" <<< "$OUT" || fail "dust + open order must refuse"
+# markets endpoint missing -> refuse with a clear line, never start blind
+venue "$DUST" "$NO_ORDERS" "$(acct 5557 5377)"; rm "$T/venue/markets.json"; run
+[ "$RC" -eq 1 ] && grep -q "REFUSED: markets read failed" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "missing markets must refuse"
+# market row missing from /v1/markets -> refuse
+venue "$DUST" "$NO_ORDERS" "$(acct 5557 5377)"; printf '{"markets":[]}' > "$T/venue/markets.json"; run
+[ "$RC" -eq 1 ] && grep -q "not found in /v1/markets" <<< "$OUT" || fail "unknown market row must refuse"
+ok "a dust position below the venue minimum is carried; anything above refuses; never judged blind"
 
 # 5. open order in the market -> refused
 venue "$FLAT" '{"orders":[{"marketDisplayName":"SPY-USD","side":"BUY","price":"700","remainingSize":"1"}],"total":1}' "$(acct 5557 5377)"; run
