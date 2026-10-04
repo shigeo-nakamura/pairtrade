@@ -326,11 +326,17 @@ impl Runtime {
                     dust_usd: self.cfg.dust_usd,
                 };
                 if min != self.venue_min {
-                    log::info!(
-                        "[ARCUS_VOL] venue minimum for {market}: size {:?}, step decimals {:?} (dust below it)",
-                        min.min_order_qty,
-                        min.size_decimals
-                    );
+                    // The notional floor moves with the price: INFO once, then
+                    // debug (the status file shows the current threshold).
+                    if self.venue_min.min_order_qty.is_none() {
+                        log::info!(
+                            "[ARCUS_VOL] venue minimum for {market}: size {:?}, step decimals {:?} (dust below it)",
+                            min.min_order_qty,
+                            min.size_decimals
+                        );
+                    } else {
+                        log::debug!("[ARCUS_VOL] venue minimum for {market}: {min:?}");
+                    }
                     self.venue_min = min;
                 }
             }
@@ -1729,7 +1735,8 @@ impl Runtime {
                           "avg_px": l.position.avg_px.round_dp(4).to_string(),
                           "opened_at_ms": l.position.opened_at_ms,
                           "hold_since_ms": self.hold_since_ms,
-                          "dust": !l.position.qty.is_zero() && self.inventory_is_dust(Some(mark))},
+                          "dust": !l.position.qty.is_zero() && self.inventory_is_dust(Some(mark)),
+                          "venue_min_qty": self.venue_min.min_order_qty.map(|m| m.to_string())},
             "pnl": {"daily_net": l.daily_net(mark).round_dp(4).to_string(),
                     "cum_net": l.cum_net(mark).round_dp(4).to_string(),
                     "cum_realized": l.cum_realized.round_dp(4).to_string(),
