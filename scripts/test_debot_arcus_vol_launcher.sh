@@ -128,6 +128,12 @@ venue '{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"0.005","side":"L
 # just above both minimums -> refused
 venue '{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"0.007","side":"LONG"}},"total":1}' "$NO_ORDERS" "$(acct 5557 5377)"; run
 [ "$RC" -eq 1 ] && grep -q "above the venue minimum" <<< "$OUT" || fail "0.007 SPY (~\$5.39) must refuse"
+# a market whose minOrderSize dominates the notional floor: 0.0004 BTC (~$34) is dust by SIZE only
+MARKETS_SAVE="$MARKETS"
+MARKETS='{"markets":[{"marketDisplayName":"SPY-USD","markPrice":"85000","minOrderSize":"0.0005","minOrderNotional":"5"}]}'
+venue '{"positions":{"5":{"marketDisplayName":"SPY-USD","size":"0.0004","side":"LONG"}},"total":1}' "$NO_ORDERS" "$(acct 5557 5377)"; run
+[ "$RC" -eq 0 ] && grep -q "dust position 0.0004" <<< "$OUT" || fail "below-minOrderSize position must be carried"
+MARKETS="$MARKETS_SAVE"
 # dust still needs the orders check: a dust position plus an open order refuses
 venue "$DUST" '{"orders":[{"marketDisplayName":"SPY-USD","side":"BUY","price":"700","remainingSize":"1"}],"total":1}' "$(acct 5557 5377)"; run
 [ "$RC" -eq 1 ] && grep -q "open SPY-USD order" <<< "$OUT" || fail "dust + open order must refuse"
