@@ -81,8 +81,8 @@ use logic::{
     fresh_mark, is_dust, market_position, may_disarm_dms, own_displayed, paper_tick_due,
     plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, quote_dists,
     quote_pass, read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows,
-    tick_plan, touches, BatchSink, PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams,
-    QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
+    startup_latch_after, tick_plan, touches, BatchSink, PlanState, PosCheck, PricePlan, QSide,
+    QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -191,6 +191,8 @@ struct Runtime {
     startup_flatten: bool,
     /// Rate limit for the dust warning (one line per 10 min).
     dust_logged_until_ms: u64,
+    /// Inventory was dust on the last tick (runtime only, never persisted).
+    was_dust: bool,
     flatten_inflight_until_ms: u64,
     pending_markouts: Vec<PendingMarkout>,
     quote_ids: HashSet<String>,
@@ -1506,8 +1508,23 @@ impl Runtime {
             );
             self.dust_logged_until_ms = now + 600_000;
         }
-        self.ledger.position.opened_at_ms =
-            dust_hold_clock(dust, self.ledger.position.opened_at_ms, now);
+        let (was_dust, clock) = dust_hold_clock(
+            self.was_dust,
+            dust,
+            self.ledger.position.qty,
+            self.ledger.position.opened_at_ms,
+            now,
+        );
+        self.was_dust = was_dust;
+        if clock != self.ledger.position.opened_at_ms {
+            self.ledger.position.opened_at_ms = clock;
+        }
+        // Startup dust can never be flattened: drop the latch so a later,
+        // grown position is not flattened as Startup (Codex P2).
+        let startup = startup_latch_after(startup, dust);
+        if !startup {
+            self.startup_flatten = false;
+        }
         let flatten = flatten_reason(
             self.ledger.position.qty,
             mid,
@@ -1946,6 +1963,7 @@ async fn main() -> Result<()> {
         position_pending: false,
         startup_flatten: false,
         dust_logged_until_ms: 0,
+        was_dust: false,
         flatten_inflight_until_ms: 0,
         pending_markouts: Vec::new(),
         quote_ids: HashSet::new(),

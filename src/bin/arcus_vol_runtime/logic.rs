@@ -399,16 +399,34 @@ pub fn is_dust(
     qty < min_order_qty || mark.is_some_and(|m| m > Decimal::ZERO && qty * m < min_order_usd)
 }
 
-/// The max-hold clock while inventory is dust: kept at `now`, so a fill that
-/// grows the dust on the same side (which `Position::apply` does not treat
-/// as a fresh open) starts a full `max_hold_secs` instead of inheriting the
-/// dust's age and being taker-flattened at once. Otherwise unchanged.
-pub fn dust_hold_clock(dust: bool, opened_at_ms: Option<u64>, now_ms: u64) -> Option<u64> {
+/// The max-hold clock across dust. A same-side fill on top of dust is not a
+/// fresh open for `Position::apply`, so the grown position would inherit
+/// the dust's age and be taker-flattened at once. The runtime remembers
+/// "was dust" OUTSIDE the persisted ledger (no state write per tick, Codex
+/// P1 pairtrade#381) and restarts the clock once, on the tick the
+/// inventory stops being dust while still open. Returns the new "was dust"
+/// flag and the clock to use.
+pub fn dust_hold_clock(
+    was_dust: bool,
+    dust: bool,
+    inv_qty: Decimal,
+    opened_at_ms: Option<u64>,
+    now_ms: u64,
+) -> (bool, Option<u64>) {
     if dust {
-        Some(now_ms)
-    } else {
-        opened_at_ms
+        return (true, opened_at_ms);
     }
+    if was_dust && !inv_qty.is_zero() {
+        return (false, Some(now_ms));
+    }
+    (false, opened_at_ms)
+}
+
+/// Whether the startup flatten stays pending: a startup position that is
+/// dust can never be flattened, so the latch is cleared rather than kept
+/// for a later, grown position (Codex P2 pairtrade#381).
+pub fn startup_latch_after(startup: bool, dust: bool) -> bool {
+    startup && !dust
 }
 
 /// Flatten when inventory reaches the effective cap, has been open longer
@@ -1253,19 +1271,33 @@ mod tests {
         use crate::ledger::Position;
         let (min_qty, min_usd, cap) = (d("0.001"), d("5"), d("5000"));
         let px = d("770.6");
-        // Dust left at t=0 (10-03 22:55Z), the runtime ticks for 8.5 h.
+        // Dust left at t=0 (10-03 22:55Z); the runtime ticks for 8.5 h.
         let mut pos = Position {
             qty: d("-0.00046"),
             avg_px: px,
             opened_at_ms: Some(0),
         };
-        let t_tick = 30_600_000;
+        let mut was_dust = false;
+        for t in [1_000u64, 30_600_000] {
+            let dust = is_dust(pos.qty, Some(px), min_qty, min_usd);
+            assert!(dust);
+            let (w, clock) = dust_hold_clock(was_dust, dust, pos.qty, pos.opened_at_ms, t);
+            was_dust = w;
+            // While dust nothing changes in the ledger (no state write).
+            assert_eq!(clock, Some(0));
+            pos.opened_at_ms = clock;
+        }
+        // A maker sell on the same side; the next tick sees a real position.
+        let fill = 30_600_500;
+        pos.apply(false, d("3.24483"), px, fill);
+        assert_eq!(pos.opened_at_ms, Some(0), "apply keeps the dust's age");
+        let t = fill + 400;
         let dust = is_dust(pos.qty, Some(px), min_qty, min_usd);
-        assert!(dust);
-        pos.opened_at_ms = dust_hold_clock(dust, pos.opened_at_ms, t_tick);
-        // A maker sell on the same side half a second later.
-        pos.apply(false, d("3.24483"), px, t_tick + 500);
-        assert!(!is_dust(pos.qty, Some(px), min_qty, min_usd));
+        assert!(!dust);
+        let (w, clock) = dust_hold_clock(was_dust, dust, pos.qty, pos.opened_at_ms, t);
+        assert!(!w);
+        assert_eq!(clock, Some(t));
+        pos.opened_at_ms = clock;
         let fr = |now: u64| {
             flatten_reason(
                 pos.qty,
@@ -1280,24 +1312,34 @@ mod tests {
             )
         };
         // Not flattened at once (the dust's 8.5 h age is not inherited) ...
-        assert_eq!(fr(t_tick + 1_000), None);
-        assert_eq!(fr(t_tick + 300_000), None);
-        // ... but max-hold still applies from the fill.
-        assert_eq!(fr(t_tick + 300_001), Some(FlattenReason::MaxHold));
-        // Without the clock refresh the same fill would flatten immediately.
+        assert_eq!(fr(t + 1_000), None);
+        assert_eq!(fr(t + 300_000), None);
+        // ... but max-hold still applies from (just after) the fill.
+        assert_eq!(fr(t + 300_001), Some(FlattenReason::MaxHold));
+        // The clock is restarted once only: later ticks keep it.
+        assert_eq!(
+            dust_hold_clock(false, false, pos.qty, pos.opened_at_ms, t + 5_000),
+            (false, Some(t))
+        );
+        // Dust worked out to flat: nothing to restart.
+        assert_eq!(
+            dust_hold_clock(true, false, Decimal::ZERO, None, 9),
+            (false, None)
+        );
+        // Without the restart the grown position would flatten immediately.
         let mut stale = Position {
             qty: d("-0.00046"),
             avg_px: px,
             opened_at_ms: Some(0),
         };
-        stale.apply(false, d("3.24483"), px, t_tick + 500);
+        stale.apply(false, d("3.24483"), px, fill);
         assert_eq!(
             flatten_reason(
                 stale.qty,
                 Some(px),
                 cap,
                 stale.opened_at_ms,
-                t_tick + 1_000,
+                t + 1_000,
                 300,
                 None,
                 false,
@@ -1305,9 +1347,16 @@ mod tests {
             ),
             Some(FlattenReason::MaxHold)
         );
-        // Not dust: the clock is untouched.
-        assert_eq!(dust_hold_clock(false, Some(7), 99), Some(7));
-        assert_eq!(dust_hold_clock(false, None, 99), None);
+    }
+
+    #[test]
+    fn startup_dust_clears_the_startup_flatten_latch() {
+        // Codex P2 pairtrade#381: a restart that reconciles dust must not
+        // keep the startup latch, or the first fill that grows the dust
+        // would be flattened as Startup at once.
+        assert!(!startup_latch_after(true, true));
+        assert!(startup_latch_after(true, false));
+        assert!(!startup_latch_after(false, false));
     }
 
     #[test]
