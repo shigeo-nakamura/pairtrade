@@ -1,7 +1,7 @@
 //! Pure decision logic: what to quote, when to flatten and in which order,
 //! book shocks. The async loop in `main.rs` only wires these to IO.
 
-use dex_connector::{OrderBookLevel, OrderSide};
+use dex_connector::{DexError, OrderBookLevel, OrderSide};
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::VecDeque;
 
@@ -426,6 +426,48 @@ fn exit_quote(inv_qty: Decimal, mid: Decimal, p: &QuoteParams) -> Option<(QSide,
         QSide::Bid
     };
     Some((side, qty))
+}
+
+/// What a connector error means for the runtime's state, independent of
+/// whether it is logged (Codex P2 on pairtrade#382: a log throttle must never
+/// swallow the classification).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrorEffect {
+    /// 429: no new placement until this unix second (ms).
+    Backoff { until_ms: u64 },
+    /// The venue state is uncertain: reconcile before quoting again.
+    Reconcile,
+    /// A flatten IOC the venue rejected as below its minimum order: the
+    /// inventory is dust (bot-strategy#1093), no retry.
+    BelowMinimum,
+    /// Expected noise (post-only would cross): debug only.
+    Quiet,
+    /// Anything else: warn.
+    Other,
+}
+
+/// Classify a connector error. Pure: the caller applies the effect to its
+/// state and decides what to log.
+pub fn classify_error(err: &DexError) -> ErrorEffect {
+    match err {
+        DexError::RateLimited { until_unix } => ErrorEffect::Backoff {
+            until_ms: (*until_unix).max(0) as u64 * 1_000,
+        },
+        DexError::ReconciliationRequired { .. } => ErrorEffect::Reconcile,
+        other => {
+            let text = other.to_string();
+            let lower = text.to_ascii_lowercase();
+            if matches!(other, DexError::InvalidInput { .. })
+                && lower.contains("below arcus minimum")
+            {
+                ErrorEffect::BelowMinimum
+            } else if text.contains("POST_ONLY") || lower.contains("would cross") {
+                ErrorEffect::Quiet
+            } else {
+                ErrorEffect::Other
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2566,6 +2608,48 @@ mod tests {
                 dust_usd: d("5"),
             },
         }
+    }
+
+    #[test]
+    fn connector_errors_classify_independently_of_logging() {
+        assert_eq!(
+            classify_error(&DexError::RateLimited {
+                until_unix: 1_790_000_000
+            }),
+            ErrorEffect::Backoff {
+                until_ms: 1_790_000_000_000
+            }
+        );
+        assert_eq!(
+            classify_error(&DexError::RateLimited { until_unix: -5 }),
+            ErrorEffect::Backoff { until_ms: 0 }
+        );
+        assert!(matches!(
+            classify_error(&DexError::ReconciliationRequired {
+                action: "x".into(),
+                nonce: 1,
+                detail: "y".into()
+            }),
+            ErrorEffect::Reconcile
+        ));
+        assert_eq!(
+            classify_error(&DexError::InvalidInput {
+                field: "size".into(),
+                value: "0.00046 (rounded 0.00046) below Arcus minimum for SPY-USD".into()
+            }),
+            ErrorEffect::BelowMinimum
+        );
+        assert_eq!(
+            classify_error(&DexError::InvalidInput {
+                field: "price".into(),
+                value: "negative".into()
+            }),
+            ErrorEffect::Other
+        );
+        assert_eq!(
+            classify_error(&DexError::Permanent("POST_ONLY order would cross".into())),
+            ErrorEffect::Quiet
+        );
     }
 
     #[test]

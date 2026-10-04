@@ -77,12 +77,12 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    book_depth, dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
-    market_position, may_disarm_dms, own_displayed, plan_inputs, plan_quotes, position_check,
-    position_gate_after, quote_action, quote_dists, quote_pass, read_within, reconcile_cleared,
-    send_gated, shock, shutdown_steps, spill_rows, tick_plan, ticker_read_due, touches, BatchSink,
-    PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
-    ShutdownStep, SidePlan, Step, TickPlan, VenueMin,
+    book_depth, classify_error, dms_armed, flatten_halt_label, flatten_reason, flatten_steps,
+    fresh_mark, market_position, may_disarm_dms, own_displayed, plan_inputs, plan_quotes,
+    position_check, position_gate_after, quote_action, quote_dists, quote_pass, read_within,
+    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan, ticker_read_due,
+    touches, BatchSink, ErrorEffect, PlanState, PosCheck, PricePlan, QSide, QuoteAction,
+    QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan, VenueMin,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -358,22 +358,36 @@ impl Runtime {
     /// reconcile on an ambiguous outcome, stays quiet on the expected
     /// post-only rejects.
     fn on_error(&mut self, ctx: &str, err: &DexError) {
-        match err {
-            DexError::RateLimited { until_unix } => {
-                self.backoff_until_ms = (*until_unix).max(0) as u64 * 1_000;
-                log::warn!("[ARCUS_VOL] {ctx}: rate limited until unix {until_unix}");
+        let effect = self.apply_error(err);
+        self.log_error(ctx, err, &effect);
+    }
+
+    /// The state side of an error, applied on EVERY failure (never behind a
+    /// log throttle, Codex P2 on pairtrade#382).
+    fn apply_error(&mut self, err: &DexError) -> ErrorEffect {
+        let effect = classify_error(err);
+        match effect {
+            ErrorEffect::Backoff { until_ms } => self.backoff_until_ms = until_ms,
+            ErrorEffect::Reconcile => self.need_reconcile = true,
+            ErrorEffect::BelowMinimum | ErrorEffect::Quiet | ErrorEffect::Other => {}
+        }
+        effect
+    }
+
+    fn log_error(&self, ctx: &str, err: &DexError, effect: &ErrorEffect) {
+        match effect {
+            ErrorEffect::Backoff { until_ms } => {
+                log::warn!(
+                    "[ARCUS_VOL] {ctx}: rate limited until unix {}",
+                    until_ms / 1_000
+                )
             }
-            DexError::ReconciliationRequired { .. } => {
-                self.need_reconcile = true;
-                log::warn!("[ARCUS_VOL] {ctx}: {err} → reconcile before quoting again");
+            ErrorEffect::Reconcile => {
+                log::warn!("[ARCUS_VOL] {ctx}: {err} → reconcile before quoting again")
             }
-            other => {
-                let text = other.to_string();
-                if text.contains("POST_ONLY") || text.to_ascii_lowercase().contains("would cross") {
-                    log::debug!("[ARCUS_VOL] {ctx}: {text}");
-                } else {
-                    log::warn!("[ARCUS_VOL] {ctx}: {text}");
-                }
+            ErrorEffect::Quiet => log::debug!("[ARCUS_VOL] {ctx}: {err}"),
+            ErrorEffect::BelowMinimum | ErrorEffect::Other => {
+                log::warn!("[ARCUS_VOL] {ctx}: {err}")
             }
         }
     }
@@ -1217,22 +1231,24 @@ impl Runtime {
     /// flat, no retry (bot-strategy#1093: the retry loop ran 11,383 times).
     /// Anything else keeps the retry, warned at most once a minute.
     fn on_flatten_error(&mut self, now: u64, qty: Decimal, err: &DexError) {
-        let text = err.to_string();
-        let below_min = matches!(err, DexError::InvalidInput { .. })
-            && text.to_ascii_lowercase().contains("below arcus minimum");
-        if below_min {
+        // State first, on every failure: backoff / reconcile flags never
+        // wait for the log throttle (Codex P2 on pairtrade#382).
+        let effect = self.apply_error(err);
+        if effect == ErrorEffect::BelowMinimum {
             let inv = self.ledger.position.qty;
             if inv.abs() == qty {
                 self.forced_dust_qty = Some(inv);
                 log::warn!(
-                    "[ARCUS_VOL] flatten of {inv} rejected as below the venue minimum: carried as dust (no retry): {text}"
+                    "[ARCUS_VOL] flatten of {inv} rejected as below the venue minimum: carried as dust (no retry): {err}"
                 );
                 return;
             }
         }
+        // Only the LOG is throttled to once a minute (the IOC is retried
+        // every 3 s and would otherwise repeat the same line).
         if now.saturating_sub(self.last_flatten_warn_ms) >= 60_000 {
             self.last_flatten_warn_ms = now;
-            self.on_error("flatten IOC", err);
+            self.log_error("flatten IOC", err, &effect);
         }
     }
 

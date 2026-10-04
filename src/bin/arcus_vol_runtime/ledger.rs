@@ -1852,9 +1852,16 @@ mod tests {
         assert!(flatten.contains("self.on_flatten_error(now, qty, &e)"));
         assert!(!flatten.contains("self.on_error(\"flatten IOC\""));
         let on_err = main_fn_body("on_flatten_error");
+        // State is applied FIRST, unconditionally; only the log line sits
+        // behind the once-a-minute throttle (Codex P2 on pairtrade#382).
         assert!(before(
             &on_err,
-            "below arcus minimum",
+            "let effect = self.apply_error(err);",
+            "ErrorEffect::BelowMinimum"
+        ));
+        assert!(before(
+            &on_err,
+            "ErrorEffect::BelowMinimum",
             "self.forced_dust_qty = Some(inv)"
         ));
         assert!(before(
@@ -1863,8 +1870,17 @@ mod tests {
             "return;"
         ));
         assert!(
-            on_err.contains(">= 60_000"),
-            "other flatten failures warn at most once a minute"
+            before(&on_err, ">= 60_000", "self.log_error("),
+            "only the log is throttled"
+        );
+        assert!(
+            !on_err.contains("self.on_error("),
+            "no classification behind the throttle"
+        );
+        let apply = main_fn_body("apply_error");
+        assert!(
+            apply.contains("self.backoff_until_ms = until_ms")
+                && apply.contains("self.need_reconcile = true")
         );
 
         let is_dust = main_fn_body("inventory_is_dust");
