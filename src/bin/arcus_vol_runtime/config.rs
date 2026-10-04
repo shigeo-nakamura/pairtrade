@@ -46,6 +46,11 @@ pub struct Config {
     pub maker_fee_bps: Decimal,
     pub qty_decimals: u32,
     pub min_quote_usd: Decimal,
+    /// Inventory below this notional is DUST while the venue minimum is not
+    /// yet known from the ticker (bot-strategy#1093 dust fix): it cannot be
+    /// flattened or quoted out, so it is carried as if flat. Arcus's
+    /// documented order floor is $5.
+    pub dust_usd: Decimal,
     pub flatten_slippage_bps: u32,
     /// How long a live fill with no reported fee waits before it is booked
     /// at the taker fee (`fee_estimated`).
@@ -132,6 +137,7 @@ impl Config {
             maker_fee_bps: dec(&p("MAKER_FEE_BPS"), "0")?,
             qty_decimals: int(&p("QTY_DECIMALS"), 5u32)?,
             min_quote_usd: dec(&p("MIN_QUOTE_USD"), "50")?,
+            dust_usd: dec(&p("DUST_USD"), "5")?,
             flatten_slippage_bps: int(&p("FLATTEN_SLIPPAGE_BPS"), 20u32)?,
             fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
             quote_offset_bps: dec(&p("QUOTE_OFFSET_BPS"), "0")?,
@@ -174,6 +180,7 @@ impl Config {
             ("HARD_CAP_USD", self.hard_cap_usd),
             ("MARGIN_USD", self.margin_usd),
             ("DAILY_STOP_USD", self.daily_stop_usd),
+            ("DUST_USD", self.dust_usd),
             ("CUM_STOP_USD", self.cum_stop_usd),
             ("SHOCK_BPS", self.shock_bps),
         ];
@@ -411,6 +418,7 @@ mod tests {
             maker_fee_bps: Decimal::ZERO,
             qty_decimals: 5,
             min_quote_usd: Decimal::from(50),
+            dust_usd: Decimal::from(5),
             flatten_slippage_bps: 20,
             fee_wait_secs: 30,
             quote_offset_bps: Decimal::ZERO,

@@ -64,6 +64,50 @@ pub struct QuoteParams {
     pub min_quote_usd: Decimal,
     pub qty_decimals: u32,
     pub presence: Presence,
+    /// Venue minimums (bot-strategy#1093 dust fix): the smallest base size the
+    /// venue accepts at the current price (its `minOrderSize` raised to the
+    /// `minOrderNotional` floor, as the connector's ticker reports it) and
+    /// its size step in decimals. `None` until the first ticker read; then
+    /// `dust_usd` is the only dust test and sizes round to `qty_decimals`.
+    pub venue_min: VenueMin,
+}
+
+/// What the venue will still accept as an order: inventory below it is DUST
+/// — it cannot be flattened (the venue rejects the order) and cannot be
+/// quoted out, so it is carried as if flat until a later fill absorbs it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VenueMin {
+    /// Smallest base quantity accepted (incl. the notional floor), if known.
+    pub min_order_qty: Option<Decimal>,
+    /// The venue's size step, in decimals, if known.
+    pub size_decimals: Option<u32>,
+    /// Notional below which inventory is dust when the venue minimum is not
+    /// known (the venue's documented floor is $5).
+    pub dust_usd: Decimal,
+}
+
+impl VenueMin {
+    /// Dust: nothing (zero), or less than the venue would accept as an
+    /// order. With the venue minimum known that minimum decides (it already
+    /// includes the notional floor at the current price); otherwise the
+    /// notional fallback does.
+    pub fn is_dust(&self, qty: Decimal, px: Decimal) -> bool {
+        let qty = qty.abs();
+        if qty.is_zero() {
+            return true;
+        }
+        match self.min_order_qty.filter(|m| *m > Decimal::ZERO) {
+            Some(min) => qty < min,
+            None => qty * px.max(Decimal::ZERO) < self.dust_usd,
+        }
+    }
+
+    /// Decimals a venue-bound size is rounded to: the venue's own step when
+    /// known (finer than the runtime's quoting decimals on Arcus RWA
+    /// markets: 7 vs 5), else the runtime's.
+    pub fn size_decimals_or(&self, fallback: u32) -> u32 {
+        self.size_decimals.unwrap_or(fallback)
+    }
 }
 
 const BPS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
@@ -131,18 +175,12 @@ pub fn book_depth(dry_run: bool, presence_on: bool) -> usize {
     }
 }
 
-/// Whether the paper sim should (re-)read the venue's price tick now. Only
-/// DRY_RUN presence quoting ever reads one (to put a virtual quote on a real
-/// price level); live never does, the connector rounds its orders. Never
-/// during a 429 backoff.
-pub fn paper_tick_due(
-    dry_run: bool,
-    presence_on: bool,
-    now_ms: u64,
-    next_read_ms: u64,
-    backoff_until_ms: u64,
-) -> bool {
-    dry_run && presence_on && now_ms >= next_read_ms && now_ms >= backoff_until_ms
+/// Whether the periodic venue ticker read is due now (every mode: it carries
+/// the venue's order minimums, the dust threshold; in DRY_RUN presence
+/// quoting also the price tick for the paper sim). Never during a 429
+/// backoff.
+pub fn ticker_read_due(now_ms: u64, next_read_ms: u64, backoff_until_ms: u64) -> bool {
+    now_ms >= next_read_ms && now_ms >= backoff_until_ms
 }
 
 /// The best price on one side of the book that is NOT our own resting quote
@@ -266,8 +304,9 @@ impl SidePlan {
 /// book is crossed (the feed does that for a few ticks at a time, and for
 /// longer when one side of it freezes) it has no price either, and a
 /// resting offset quote stays only while it is still `offset − band` behind
-/// BOTH book tops (`PricePlan::Crossed`). Inventory too small to quote
-/// (< `min_quote_usd`) has no exit side and is left to max-hold.
+/// BOTH book tops (`PricePlan::Crossed`). Dust inventory (below what the
+/// venue accepts as an order, `VenueMin::is_dust`) has no exit side and is
+/// carried as if flat.
 pub fn plan_quotes(t: &Touches, inv_qty: Decimal, p: &QuoteParams) -> (SidePlan, SidePlan) {
     let presence = p.presence;
     let crossed = t.ask <= t.bid;
@@ -297,8 +336,13 @@ pub fn plan_quotes(t: &Touches, inv_qty: Decimal, p: &QuoteParams) -> (SidePlan,
         };
         let exit_qty = exit.filter(|(s, _)| *s == side).map(|(_, q)| q);
         if !presence.on() || exit_qty.is_some() {
-            // At the touch. Crossed here means presence mode's exit side.
-            let qty = qty.map(|q| exit_qty.map_or(q, |e| q.min(e)));
+            // At the touch. Crossed here means presence mode's exit side,
+            // whose size is the exit size itself (`exit_quote`), never the
+            // clip at the current mid: that is how a 3.24483 short was
+            // worked out with a 3.24437 bid and left 0.00046 of dust that
+            // the venue would not let us flatten (bot-strategy#1093, live
+            // 2026-10-03 22:55Z).
+            let qty = exit_qty.or(qty);
             let (qty, price) = if crossed {
                 (None, PricePlan::Unpriced)
             } else {
@@ -345,20 +389,35 @@ pub fn plan_quotes(t: &Touches, inv_qty: Decimal, p: &QuoteParams) -> (SidePlan,
 }
 
 /// Presence mode only: the side that works existing inventory out AT the
-/// touch, and how much (the inventory, rounded down to the size step). The
-/// side that reduces a non-zero inventory exits at the touch, so a sweep
-/// fill is worked out as a maker instead of waiting for max-hold and paying
-/// taker. `None` when presence is off, flat, or the inventory is too small
-/// to quote (< `min_quote_usd`): then both sides rest at the offset. Only
+/// touch, and how much. The side that reduces a non-zero inventory exits at
+/// the touch, so a sweep fill is worked out as a maker instead of waiting
+/// for max-hold and paying taker. `None` when presence is off, or the
+/// inventory is dust (`VenueMin::is_dust`, which covers flat): then both
+/// sides rest at the offset.
+///
+/// Size (bot-strategy#1093 dust fix): the WHOLE inventory, rounded towards
+/// zero to the venue's size step, whenever the inventory is at most a clip
+/// or exceeds a clip only by dust; only an inventory more than a clip (plus
+/// dust) above the clip is worked out a clip at a time. Sizing the exit from
+/// the clip at the current mid (the previous rule) left the entry/exit
+/// price difference as unflattenable dust. Only
 /// `plan_quotes` decides this.
 fn exit_quote(inv_qty: Decimal, mid: Decimal, p: &QuoteParams) -> Option<(QSide, Decimal)> {
-    if !p.presence.on() || inv_qty.is_zero() {
+    if !p.presence.on() || p.venue_min.is_dust(inv_qty, mid) {
         return None;
     }
-    let qty = inv_qty
+    let step = p.venue_min.size_decimals_or(p.qty_decimals);
+    let inv = inv_qty
         .abs()
-        .round_dp_with_strategy(p.qty_decimals, RoundingStrategy::ToZero);
-    if qty * mid < p.min_quote_usd {
+        .round_dp_with_strategy(step, RoundingStrategy::ToZero);
+    let clip_qty = (p.clip_usd / mid).round_dp_with_strategy(step, RoundingStrategy::ToZero);
+    let excess = inv - clip_qty;
+    let qty = if excess <= Decimal::ZERO || p.venue_min.is_dust(excess, mid) {
+        inv
+    } else {
+        clip_qty
+    };
+    if p.venue_min.is_dust(qty, mid) {
         return None;
     }
     let side = if inv_qty > Decimal::ZERO {
@@ -378,7 +437,10 @@ pub enum FlattenReason {
 }
 
 /// Flatten when inventory reaches the effective cap, has been open longer
-/// than `max_hold_secs`, or a halt is in force.
+/// than `max_hold_secs`, or a halt is in force. Never for `dust`: the venue
+/// would reject the order (bot-strategy#1093: 11,383 rejected IOCs for
+/// 0.00046 SPY in ten hours, quotes pulled the whole time), so dust is
+/// carried as if flat and absorbed by the next fill.
 ///
 /// Startup, halt (incl. KILL_SWITCH) and max-hold need no book: side and
 /// size come from the position, and the live IOC prices off the connector's
@@ -393,8 +455,9 @@ pub fn flatten_reason(
     max_hold_secs: u64,
     halt: Option<&str>,
     startup: bool,
+    dust: bool,
 ) -> Option<FlattenReason> {
-    if inv_qty.is_zero() {
+    if inv_qty.is_zero() || dust {
         return None;
     }
     if startup {
@@ -996,6 +1059,11 @@ mod tests {
             min_quote_usd: d("50"),
             qty_decimals: 5,
             presence: Presence::default(),
+            venue_min: VenueMin {
+                min_order_qty: None,
+                size_decimals: None,
+                dust_usd: d("5"),
+            },
         }
     }
 
@@ -1088,7 +1156,7 @@ mod tests {
         let cap = d("10000");
         let m = Some(d("83642.95"));
         let fr = |inv: &str, mid: Option<Decimal>, now: u64, halt: Option<&str>, startup: bool| {
-            flatten_reason(d(inv), mid, cap, Some(0), now, 300, halt, startup)
+            flatten_reason(d(inv), mid, cap, Some(0), now, 300, halt, startup, false)
         };
         assert_eq!(fr("0", m, 1_000_000, Some("kill"), true), None);
         assert_eq!(
@@ -1111,7 +1179,17 @@ mod tests {
     fn halt_kill_startup_and_max_hold_flatten_without_a_book() {
         let cap = d("10000");
         let fr = |now: u64, halt: Option<&str>, startup: bool| {
-            flatten_reason(d("-0.12"), None, cap, Some(0), now, 300, halt, startup)
+            flatten_reason(
+                d("-0.12"),
+                None,
+                cap,
+                Some(0),
+                now,
+                300,
+                halt,
+                startup,
+                false,
+            )
         };
         assert_eq!(
             fr(1_000, Some("kill_switch"), false),
@@ -1780,17 +1858,16 @@ mod tests {
     }
 
     #[test]
-    fn only_the_paper_sim_ever_reads_a_tick() {
-        // Review 2 A: live needs no tick (and so cannot be gated or delayed
-        // by reading one); the paper sim reads it when due.
-        assert!(paper_tick_due(true, true, 1_000, 1_000, 0));
-        assert!(paper_tick_due(true, true, 1_001, 1_000, 0));
-        assert!(!paper_tick_due(true, true, 999, 1_000, 0));
-        assert!(!paper_tick_due(false, true, 5_000, 1_000, 0));
-        assert!(!paper_tick_due(true, false, 5_000, 1_000, 0));
+    fn the_ticker_read_is_periodic_and_never_during_a_backoff() {
+        // Review 2 A: no tick state can gate or delay quoting (see below);
+        // the ticker read itself (dust threshold in every mode, paper tick in
+        // DRY_RUN) is simply due when its clock says so, bot-strategy#1093.
+        assert!(ticker_read_due(1_000, 1_000, 0));
+        assert!(ticker_read_due(1_001, 1_000, 0));
+        assert!(!ticker_read_due(999, 1_000, 0));
         // Never during a 429 backoff; again once it is over.
-        assert!(!paper_tick_due(true, true, 5_000, 1_000, 5_001));
-        assert!(paper_tick_due(true, true, 5_000, 1_000, 5_000));
+        assert!(!ticker_read_due(5_000, 1_000, 5_001));
+        assert!(ticker_read_due(5_000, 1_000, 5_000));
         // And no tick state can pull quotes: a healthy live state quotes.
         assert_eq!(
             tick_plan(&plan_inputs(&live_state(), 2_000)),
@@ -2128,13 +2205,24 @@ mod tests {
         assert_eq!(bid.price, priced(bb, PriceTol::Exact));
         assert_eq!(bid.qty, Some(d("0.004")));
         assert_eq!(ask.price, priced(d("83480.21925"), band(ba)));
-        // Inventory above one clip: the exit quote is still at most a clip.
+        // Inventory more than a clip (plus dust) above a clip: the exit quote
+        // is still at most a clip ($500 / mid, rounded down).
         let (_, ask) = plan_quotes(&book, d("0.02"), &p);
         assert_eq!(ask.price, priced(ba, PriceTol::Exact));
-        assert_eq!(ask.qty, Some(d("0.00599"))); // $500 / mid, rounded down
-                                                 // Dust below min_quote_usd ($50) cannot be worked as a maker: no
-                                                 // exit side, the ask stays at the offset (max-hold deals with it).
+        assert_eq!(ask.qty, Some(d("0.00599")));
+        // Inventory a hair above a clip: the WHOLE inventory exits (the excess
+        // 0.00001 = $0.83 is dust the venue would not take on its own).
+        let (_, ask) = plan_quotes(&book, d("0.006"), &p);
+        assert_eq!(ask.qty, Some(d("0.006")));
+        // Inventory below min_quote_usd ($50) but not dust ($16.7 ≥ the $5
+        // venue floor) is still worked out as a maker at the touch rather
+        // than left to max-hold and a taker IOC (bot-strategy#1093 dust fix).
         let (_, ask) = plan_quotes(&book, d("0.0002"), &p);
+        assert_eq!(ask.price, priced(ba, PriceTol::Exact));
+        assert_eq!(ask.qty, Some(d("0.0002")));
+        // Dust (0.00005 × 83438 = $4.17 < $5): no exit side, the ask stays at
+        // the offset; the dust is carried as if flat.
+        let (_, ask) = plan_quotes(&book, d("0.00005"), &p);
         assert_eq!(ask.price, priced(d("83480.21925"), band(ba)));
         // Flat: both sides at the offset.
         let (bid, ask) = plan_quotes(&book, Decimal::ZERO, &p);
@@ -2457,5 +2545,130 @@ mod tests {
         assert!(book_stale(None, 10_000, 5));
         assert!(!book_stale(Some(5_000), 10_000, 5));
         assert!(book_stale(Some(4_999), 10_000, 5));
+    }
+
+    /// bot-strategy#1093 live 2026-10-03 22:55Z (SPY-USD, presence 2 bp, clip
+    /// $2,500): a 3.24483 short was worked out with a bid sized from the clip
+    /// at the exit mid (2500 / 770.56 = 3.24437), leaving 0.00046 of dust
+    /// that the venue (min 0.001) refused to flatten — 11,383 rejected IOCs,
+    /// quotes pulled for ten hours.
+    fn spy_params() -> QuoteParams {
+        QuoteParams {
+            clip_usd: d("2500"),
+            skew_usd: d("2500"),
+            cap_usd: d("4750"),
+            min_quote_usd: d("50"),
+            qty_decimals: 5,
+            presence: presence("2", "1"),
+            venue_min: VenueMin {
+                min_order_qty: Some(d("0.001")),
+                size_decimals: Some(7),
+                dust_usd: d("5"),
+            },
+        }
+    }
+
+    #[test]
+    fn the_exit_covers_the_whole_inventory_even_when_the_mid_moved() {
+        let p = spy_params();
+        // Entry sized at mid 770.455 (clip = 3.24483, the live ask at 770.62
+        // sat 2 bp above); the exit is planned at mid 770.56, where a clip is
+        // only 3.24437. The bid must be 3.24483.
+        let entry_mid = d("770.455");
+        let entry_qty =
+            (p.clip_usd / entry_mid).round_dp_with_strategy(5, RoundingStrategy::ToZero);
+        assert_eq!(entry_qty, d("3.24483"));
+        let (bid, _) = plan_quotes(&at("770.555", "770.565"), -entry_qty, &p);
+        assert_eq!(bid.price, priced(d("770.555"), PriceTol::Exact));
+        assert_eq!(bid.qty, Some(d("3.24483")));
+        // Carried dust plus a fresh fill: the exit covers both (venue step).
+        let (bid, _) = plan_quotes(&at("770.555", "770.565"), d("-3.2452900"), &p);
+        assert_eq!(bid.qty, Some(d("3.24529")));
+        // Two clips short: a clip at a time, on the venue's 7-decimal step.
+        let (bid, _) = plan_quotes(&at("770.555", "770.565"), d("-6.5"), &p);
+        assert_eq!(bid.qty, Some(d("3.2443936")));
+    }
+
+    #[test]
+    fn dust_inventory_neither_flattens_nor_blocks_quoting() {
+        let p = spy_params();
+        let mid = d("770.5");
+        // The live residual: below the venue's 0.001 minimum.
+        assert!(p.venue_min.is_dust(d("-0.00046"), mid));
+        assert!(!p.venue_min.is_dust(d("-0.001"), mid));
+        assert!(p.venue_min.is_dust(Decimal::ZERO, mid));
+        // Without the venue minimum the $5 notional fallback decides.
+        let unknown = VenueMin {
+            min_order_qty: None,
+            size_decimals: None,
+            dust_usd: d("5"),
+        };
+        assert!(unknown.is_dust(d("-0.00046"), mid)); // $0.35
+        assert!(!unknown.is_dust(d("0.007"), mid)); // $5.39
+                                                    // No flatten for dust, whatever else is true (max-hold long past,
+                                                    // halt in force, startup).
+        for (halt, startup) in [(None, false), (Some("daily_stop"), false), (None, true)] {
+            assert_eq!(
+                flatten_reason(
+                    d("-0.00046"),
+                    Some(mid),
+                    d("5000"),
+                    Some(0),
+                    10_000_000,
+                    300,
+                    halt,
+                    startup,
+                    true
+                ),
+                None
+            );
+        }
+        // The same inventory flagged non-dust (venue minimum unknown and a
+        // higher-priced market) does flatten on max-hold.
+        assert_eq!(
+            flatten_reason(
+                d("-0.00046"),
+                Some(mid),
+                d("5000"),
+                Some(0),
+                10_000_000,
+                300,
+                None,
+                false,
+                false
+            ),
+            Some(FlattenReason::MaxHold)
+        );
+        // Both sides quote at the offset as if flat.
+        let (bid, ask) = plan_quotes(&at("770.49", "770.51"), d("-0.00046"), &p);
+        assert_eq!(
+            bid.price,
+            priced(
+                offset_px(QSide::Bid, d("770.49"), d("2")),
+                PriceTol::Band {
+                    touch: d("770.49"),
+                    offset_bps: d("2"),
+                    band_bps: d("1"),
+                }
+            )
+        );
+        assert_eq!(
+            ask.price,
+            priced(
+                offset_px(QSide::Ask, d("770.51"), d("2")),
+                PriceTol::Band {
+                    touch: d("770.51"),
+                    offset_bps: d("2"),
+                    band_bps: d("1"),
+                }
+            )
+        );
+        assert!(bid.qty.is_some() && ask.qty.is_some());
+        // Dust is in sync with itself on the venue (the position check never
+        // sees a mismatch for a carried residual).
+        assert_eq!(
+            position_check(d("-0.00046"), Some(d("-0.00046")), true, None, 1_000, 5_000).0,
+            PosCheck::InSync
+        );
     }
 }

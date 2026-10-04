@@ -78,11 +78,11 @@ use ledger::{
 };
 use logic::{
     book_depth, dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
-    market_position, may_disarm_dms, own_displayed, paper_tick_due, plan_inputs, plan_quotes,
-    position_check, position_gate_after, quote_action, quote_dists, quote_pass, read_within,
-    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan, touches,
-    BatchSink, PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget,
-    Resting, ShutdownStep, SidePlan, Step, TickPlan,
+    market_position, may_disarm_dms, own_displayed, plan_inputs, plan_quotes, position_check,
+    position_gate_after, quote_action, quote_dists, quote_pass, read_within, reconcile_cleared,
+    send_gated, shock, shutdown_steps, spill_rows, tick_plan, ticker_read_due, touches, BatchSink,
+    PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting,
+    ShutdownStep, SidePlan, Step, TickPlan, VenueMin,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -227,9 +227,20 @@ struct Runtime {
     last_summary_ms: u64,
     last_book_warn_ms: u64,
     /// DRY_RUN presence quoting: the venue's price tick, read best-effort
-    /// for the paper sim only (`refresh_paper_tick`). Live never needs one.
+    /// for the paper sim only (`refresh_venue_meta`). Live never needs one.
     paper_tick: Option<Decimal>,
+    /// The venue's order minimums from the same ticker read, in every mode:
+    /// inventory below them is dust (bot-strategy#1093 dust fix).
+    venue_min: VenueMin,
     next_tick_read_ms: u64,
+    /// When the inventory last became more than dust (ms); drives MAX_HOLD
+    /// instead of the ledger's `opened_at_ms`, so a fill landing on carried
+    /// dust starts a fresh hold instead of inheriting the dust's age.
+    hold_since_ms: Option<u64>,
+    /// A flatten IOC the venue rejected as below its minimum, for this exact
+    /// inventory: treated as dust until the inventory changes (no retry).
+    forced_dust_qty: Option<Decimal>,
+    last_flatten_warn_ms: u64,
     last_peg_warn_ms: u64,
     sim_seq: u64,
     /// Process start (ms): the per-run part of simulated ids.
@@ -251,6 +262,33 @@ impl Runtime {
             min_quote_usd: self.cfg.min_quote_usd,
             qty_decimals: self.cfg.qty_decimals,
             presence: self.cfg.presence(),
+            venue_min: self.venue_min,
+        }
+    }
+
+    /// The price dust is judged at: the live mid, else the last mark, else
+    /// the position's own average entry (never zero for an open position).
+    fn dust_px(&self, mid: Option<Decimal>) -> Decimal {
+        mid.or(self.last_mark)
+            .filter(|p| *p > Decimal::ZERO)
+            .unwrap_or(self.ledger.position.avg_px)
+    }
+
+    /// Dust (bot-strategy#1093): inventory the venue would not accept as an
+    /// order — by its reported minimums, or because it already rejected a
+    /// flatten of exactly this quantity. Carried as if flat.
+    fn inventory_is_dust(&self, mid: Option<Decimal>) -> bool {
+        let qty = self.ledger.position.qty;
+        self.venue_min.is_dust(qty, self.dust_px(mid)) || self.forced_dust_qty == Some(qty)
+    }
+
+    /// Keep `hold_since_ms` in step with the inventory: cleared while flat or
+    /// dust, set when the inventory becomes more than dust.
+    fn track_hold(&mut self, now: u64, mid: Option<Decimal>) {
+        if self.inventory_is_dust(mid) {
+            self.hold_since_ms = None;
+        } else if self.hold_since_ms.is_none() {
+            self.hold_since_ms = Some(now);
         }
     }
 
@@ -262,14 +300,12 @@ impl Runtime {
     /// `paper_quote`), never during a 429 backoff, is bounded by
     /// `TICK_READ_TIMEOUT`, and a failed read goes through `on_error` (so a
     /// 429 backs off) and is retried later.
-    async fn refresh_paper_tick(&mut self, now: u64) {
-        if !paper_tick_due(
-            self.cfg.dry_run,
-            self.cfg.presence().on(),
-            now,
-            self.next_tick_read_ms,
-            self.backoff_until_ms,
-        ) {
+    /// One best-effort ticker read per `TICK_REFRESH_MS`, in every mode: the
+    /// venue's order minimums (dust threshold and size step, bot-strategy#1093
+    /// dust fix) and, for the paper sim, its price tick. Never gates quoting
+    /// (the dust test falls back to `ARCUS_VOL_DUST_USD` until it lands).
+    async fn refresh_venue_meta(&mut self, now: u64) {
+        if !ticker_read_due(now, self.next_tick_read_ms, self.backoff_until_ms) {
             return;
         }
         self.next_tick_read_ms = now + TICK_RETRY_MS;
@@ -277,16 +313,29 @@ impl Runtime {
         let read = tokio::time::timeout(TICK_READ_TIMEOUT, self.dex.get_ticker(&market, None));
         match read.await {
             Ok(Ok(ticker)) => {
+                self.next_tick_read_ms = now + TICK_REFRESH_MS;
                 if let Some(tick) = ticker.min_tick.filter(|t| *t > Decimal::ZERO) {
-                    if self.paper_tick != Some(tick) {
+                    if self.cfg.dry_run && self.paper_tick != Some(tick) {
                         log::info!("[ARCUS_VOL] paper tick for {market} = {tick}");
                     }
                     self.paper_tick = Some(tick);
-                    self.next_tick_read_ms = now + TICK_REFRESH_MS;
+                }
+                let min = VenueMin {
+                    min_order_qty: ticker.min_order.filter(|m| *m > Decimal::ZERO),
+                    size_decimals: ticker.size_decimals,
+                    dust_usd: self.cfg.dust_usd,
+                };
+                if min != self.venue_min {
+                    log::info!(
+                        "[ARCUS_VOL] venue minimum for {market}: size {:?}, step decimals {:?} (dust below it)",
+                        min.min_order_qty,
+                        min.size_decimals
+                    );
+                    self.venue_min = min;
                 }
             }
-            Ok(Err(e)) => self.on_error("paper tick", &e),
-            Err(_) => log::warn!("[ARCUS_VOL] paper tick read timed out"),
+            Ok(Err(e)) => self.on_error("venue ticker", &e),
+            Err(_) => log::warn!("[ARCUS_VOL] venue ticker read timed out"),
         }
     }
 
@@ -1034,14 +1083,18 @@ impl Runtime {
             }
         }
         self.startup_reconciled = true;
-        self.startup_flatten = !self.ledger.position.qty.is_zero();
-        if self.startup_flatten {
-            log::warn!(
-                "[ARCUS_VOL] startup inventory {} → flatten before quoting",
-                self.ledger.position.qty
+        let qty = self.ledger.position.qty;
+        if qty.is_zero() {
+            log::info!("[ARCUS_VOL] startup position reconciled: flat");
+        } else if self.inventory_is_dust(None) {
+            // Below the venue minimum: nothing can flatten it (bot-strategy#1093
+            // dust fix); carry it and quote, the next fill absorbs it.
+            log::info!(
+                "[ARCUS_VOL] startup position reconciled: dust {qty} (below the venue minimum), carried"
             );
         } else {
-            log::info!("[ARCUS_VOL] startup position reconciled: flat");
+            self.startup_flatten = true;
+            log::warn!("[ARCUS_VOL] startup inventory {qty} → flatten before quoting");
         }
     }
 
@@ -1142,7 +1195,7 @@ impl Runtime {
                         Ok(resp) => {
                             self.ioc_ids.insert(resp.order_id);
                         }
-                        Err(e) => self.on_error("flatten IOC", &e),
+                        Err(e) => self.on_flatten_error(now, qty, &e),
                     }
                     // Let the fill arrive (and the position poll catch up)
                     // before a retry; reduce-only bounds any overlap anyway.
@@ -1150,6 +1203,30 @@ impl Runtime {
                     self.last_position_ms = 0;
                 }
             }
+        }
+    }
+
+    /// A failed flatten IOC. Rejected as below the venue minimum (the venue
+    /// will never take it): the inventory is dust from now on, carried as if
+    /// flat, no retry (bot-strategy#1093: the retry loop ran 11,383 times).
+    /// Anything else keeps the retry, warned at most once a minute.
+    fn on_flatten_error(&mut self, now: u64, qty: Decimal, err: &DexError) {
+        let text = err.to_string();
+        let below_min = matches!(err, DexError::InvalidInput { .. })
+            && text.to_ascii_lowercase().contains("below arcus minimum");
+        if below_min {
+            let inv = self.ledger.position.qty;
+            if inv.abs() == qty {
+                self.forced_dust_qty = Some(inv);
+                log::warn!(
+                    "[ARCUS_VOL] flatten of {inv} rejected as below the venue minimum: carried as dust (no retry): {text}"
+                );
+                return;
+            }
+        }
+        if now.saturating_sub(self.last_flatten_warn_ms) >= 60_000 {
+            self.last_flatten_warn_ms = now;
+            self.on_error("flatten IOC", err);
         }
     }
 
@@ -1399,7 +1476,7 @@ impl Runtime {
                 self.last_position_ms = now;
             }
         }
-        self.refresh_paper_tick(now).await;
+        self.refresh_venue_meta(now).await;
         // Every awaited call of the tick is done: decide on a fresh clock
         // (Codex P1, pairtrade#361).
         let now = now_ms();
@@ -1480,7 +1557,9 @@ impl Runtime {
         // Startup / halt / kill / max-hold flatten need no book; only the
         // cap check uses the mid (Codex P1, pairtrade#361).
         let halt_label = self.halt.as_ref().map(Halt::label);
-        let startup = self.startup_flatten && !self.ledger.position.qty.is_zero();
+        self.track_hold(now, mid);
+        let dust = self.inventory_is_dust(mid);
+        let startup = self.startup_flatten && !self.ledger.position.qty.is_zero() && !dust;
         if !startup {
             self.startup_flatten = false;
         }
@@ -1488,11 +1567,12 @@ impl Runtime {
             self.ledger.position.qty,
             mid,
             self.cfg.effective_cap_usd(),
-            self.ledger.position.opened_at_ms,
+            self.hold_since_ms,
             now,
             self.cfg.max_hold_secs,
             flatten_halt_label(halt_label.as_deref()),
             startup,
+            dust,
         );
         if shock(
             &self.mid_hist,
@@ -1647,7 +1727,9 @@ impl Runtime {
             "inventory": {"qty": l.position.qty.to_string(),
                           "usd": (l.position.qty * mark).round_dp(2).to_string(),
                           "avg_px": l.position.avg_px.round_dp(4).to_string(),
-                          "opened_at_ms": l.position.opened_at_ms},
+                          "opened_at_ms": l.position.opened_at_ms,
+                          "hold_since_ms": self.hold_since_ms,
+                          "dust": !l.position.qty.is_zero() && self.inventory_is_dust(Some(mark))},
             "pnl": {"daily_net": l.daily_net(mark).round_dp(4).to_string(),
                     "cum_net": l.cum_net(mark).round_dp(4).to_string(),
                     "cum_realized": l.cum_realized.round_dp(4).to_string(),
@@ -1945,7 +2027,15 @@ async fn main() -> Result<()> {
         last_summary_ms: 0,
         last_book_warn_ms: 0,
         paper_tick: None,
+        venue_min: VenueMin {
+            min_order_qty: None,
+            size_decimals: None,
+            dust_usd: cfg.dust_usd,
+        },
         next_tick_read_ms: 0,
+        hold_since_ms: None,
+        forced_dust_qty: None,
+        last_flatten_warn_ms: 0,
         last_peg_warn_ms: 0,
         sim_seq: 0,
         run_id: now_ms(),
