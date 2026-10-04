@@ -986,7 +986,15 @@ impl BookEngine {
             if !mark_is_dead(ts, now, self.dead_mark_secs) || !px.is_finite() || px <= 0.0 {
                 continue;
             }
+            // Settle (or, without a rate, freeze into the symbol's
+            // pending carry) the leg's funding through now at the retained
+            // mark before the close removes it, as every other close does
+            // (Codex P1, pairtrade#384).
+            let rate = self.exec.funding_rate_hourly(&sym).await;
+            self.accrue_funding(&sym, now, px, rate);
+            let trades_closed_before = self.state.trades_closed;
             let realized = self.state.apply_fill(&sym, -qty, px, now);
+            let leg_closed = self.state.trades_closed != trades_closed_before;
             self.state.last_marks.remove(&sym);
             self.state.dead_symbols.insert(sym.clone(), now);
             self.exec.retire_paper_position(&sym).await;
@@ -995,12 +1003,24 @@ impl BookEngine {
                 now - ts,
                 self.dead_mark_secs
             );
-            self.ledger.write(
-                now,
-                "dead_mark_close",
-                None,
-                json!({ "symbol": sym, "qty": qty, "price": px, "mark_age_secs": now - ts, "realized_usd": realized }),
-            );
+            let row = json!({
+                "symbol": sym,
+                "closed_qty": -qty,
+                "fill_price": px,
+                "fill_price_source": "dead_mark",
+                "estimated": true,
+                "mark_age_secs": now - ts,
+                "realized_usd": realized,
+                "fee_usd": 0.0,
+                "fee_known": true,
+                "paper": true,
+            });
+            self.ledger.write(now, "dead_mark_close", None, row.clone());
+            // A completed leg must show up in pnl.jsonl like any other
+            // close (Codex P2, pairtrade#384).
+            if leg_closed {
+                self.pnl.write(now, "exit", None, row);
+            }
         }
     }
 
@@ -2904,9 +2924,11 @@ mod tests {
         engine.tick(d.timestamp() + 5).await.unwrap();
         assert_eq!(engine.state.last_marks["DOT"], (d.timestamp() + 5, 4.0));
 
-        // DOT stops pricing; BTC keeps marking.
+        // DOT stops pricing; BTC keeps marking. DOT's last funding rate
+        // is still known, so its exposure up to the retirement settles.
         exec.clear_observations().await;
         exec.set_price("BTC", 100_000.0).await;
+        exec.set_funding_rate_hourly("DOT", 0.0001).await;
 
         // Briefly stale (1 h, below the 24 h default): still held and
         // still blocking opens, exactly as before.
@@ -2919,6 +2941,7 @@ mod tests {
         assert!(engine.state.dead_symbols.is_empty());
 
         // Nine days without a mark: retired at its last observed price.
+        let funding_before = engine.state.cum_funding_est_usd;
         let realized_before = engine.state.cum_realized_usd;
         let closed_before = engine.state.trades_closed;
         let t9 = d.timestamp() + 9 * 86_400;
@@ -2927,8 +2950,23 @@ mod tests {
         assert!(!exec.positions().await.unwrap().contains_key("DOT"));
         assert_eq!(engine.state.dead_symbols.get("DOT"), Some(&t9));
         assert_eq!(engine.state.trades_closed, closed_before + 1);
+        let pnl_rows: Vec<serde_json::Value> = std::fs::read_to_string(&cfg.paths.pnl)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(pnl_rows.iter().any(|r| r["event"] == "exit"
+            && r["symbol"] == "DOT"
+            && r["fill_price_source"] == "dead_mark"));
         // Closed at 4.0, the entry: nothing realized, nothing invented.
         assert!((engine.state.cum_realized_usd - realized_before).abs() < 1e-9);
+        // Its funding was settled through the retirement (a short pays
+        // nothing at a positive rate: it receives), not dropped.
+        assert!(
+            engine.state.cum_funding_est_usd > funding_before,
+            "short DOT receives funding for the held days"
+        );
+        assert!(!engine.state.pending_funding_qty_hours.contains_key("DOT"));
         assert!(engine.equity_ready, "opens are no longer blocked");
         assert!(engine.opens_allowed());
 
