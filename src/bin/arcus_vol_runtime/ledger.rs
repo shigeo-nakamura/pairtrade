@@ -1808,6 +1808,80 @@ mod tests {
     }
 
     #[test]
+    fn dust_is_carried_on_every_runtime_path() {
+        // bot-strategy#1093 dust fix (live 2026-10-03: 0.00046 SPY below the
+        // venue minimum, 11,383 rejected flatten IOCs, quotes pulled 10 h).
+        // The tick decides flatten from the dust-aware hold clock, startup
+        // adopts dust instead of flattening it, a below-minimum rejection
+        // marks the inventory as dust at once instead of retrying.
+        let tick = main_fn_body("tick");
+        assert!(before(
+            &tick,
+            "self.track_hold(now, mid)",
+            "flatten_reason("
+        ));
+        assert!(before(
+            &tick,
+            "let dust = self.inventory_is_dust(mid)",
+            "flatten_reason("
+        ));
+        let call = &tick[tick.find("flatten_reason(").unwrap()..];
+        let call = &call[..call.find(");").unwrap()];
+        assert!(
+            call.contains("self.hold_since_ms"),
+            "max-hold runs from hold_since_ms"
+        );
+        assert!(
+            !call.contains("opened_at_ms"),
+            "not from the ledger's opened_at_ms"
+        );
+        assert!(
+            call.trim_end().ends_with("dust,"),
+            "dust is the last argument"
+        );
+        assert!(tick.contains("&& !dust;"), "startup flatten skips dust");
+
+        let startup = main_fn_body("startup_reconcile");
+        assert!(before(
+            &startup,
+            "self.inventory_is_dust(None)",
+            "self.startup_flatten = true"
+        ));
+
+        let flatten = main_fn_body("live_flatten");
+        assert!(flatten.contains("self.on_flatten_error(now, qty, &e)"));
+        assert!(!flatten.contains("self.on_error(\"flatten IOC\""));
+        let on_err = main_fn_body("on_flatten_error");
+        assert!(before(
+            &on_err,
+            "below arcus minimum",
+            "self.forced_dust_qty = Some(inv)"
+        ));
+        assert!(before(
+            &on_err,
+            "self.forced_dust_qty = Some(inv)",
+            "return;"
+        ));
+        assert!(
+            on_err.contains(">= 60_000"),
+            "other flatten failures warn at most once a minute"
+        );
+
+        let is_dust = main_fn_body("inventory_is_dust");
+        assert!(is_dust.contains("self.forced_dust_qty == Some(qty)"));
+        let hold = main_fn_body("track_hold");
+        assert!(before(
+            &hold,
+            "if self.inventory_is_dust(mid)",
+            "self.hold_since_ms = None"
+        ));
+        // The ticker read (venue minimums) is no longer DRY_RUN-only.
+        let meta = main_fn_body("refresh_venue_meta");
+        assert!(!meta.contains("dry_run)") && meta.contains("ticker_read_due(now,"));
+        assert!(meta.contains("min_order_qty: ticker.min_order"));
+    }
+
+    #[test]
     fn every_booking_path_waits_for_a_durable_rollover() {
         // pre-G2, Codex 4146113066 / 4146548930: the live harvest (tick,
         // startup, shutdown), the paper flatten IOC and the pending-fill
