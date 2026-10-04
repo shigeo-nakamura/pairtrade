@@ -77,12 +77,12 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    book_depth, dms_armed, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
-    market_position, may_disarm_dms, own_displayed, paper_tick_due, plan_inputs, plan_quotes,
-    position_check, position_gate_after, quote_action, quote_dists, quote_pass, read_within,
-    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan, touches,
-    BatchSink, PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget,
-    Resting, ShutdownStep, SidePlan, Step, TickPlan,
+    book_depth, dms_armed, dust_hold_clock, flatten_halt_label, flatten_reason, flatten_steps,
+    fresh_mark, is_dust, market_position, may_disarm_dms, own_displayed, paper_tick_due,
+    plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, quote_dists,
+    quote_pass, read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows,
+    tick_plan, touches, BatchSink, PlanState, PosCheck, PricePlan, QSide, QuoteAction, QuoteParams,
+    QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -189,6 +189,8 @@ struct Runtime {
     /// no new quotes, re-checked every tick (pre-G2, Codex P1 4146269811).
     position_pending: bool,
     startup_flatten: bool,
+    /// Rate limit for the dust warning (one line per 10 min).
+    dust_logged_until_ms: u64,
     flatten_inflight_until_ms: u64,
     pending_markouts: Vec<PendingMarkout>,
     quote_ids: HashSet<String>,
@@ -1484,6 +1486,28 @@ impl Runtime {
         if !startup {
             self.startup_flatten = false;
         }
+        // Dust (below the venue minimum) is never flattened: every IOC for
+        // it is rejected. Priced at the mid, else the entry.
+        let mark = mid.or_else(|| {
+            (self.ledger.position.avg_px > Decimal::ZERO).then_some(self.ledger.position.avg_px)
+        });
+        let dust = is_dust(
+            self.ledger.position.qty,
+            mark,
+            self.cfg.min_order_qty,
+            self.cfg.min_order_usd,
+        );
+        if dust && now >= self.dust_logged_until_ms {
+            log::warn!(
+                "[ARCUS_VOL] inventory {} is below the venue minimum (qty {} / ${}): dust, not flattened",
+                self.ledger.position.qty,
+                self.cfg.min_order_qty,
+                self.cfg.min_order_usd
+            );
+            self.dust_logged_until_ms = now + 600_000;
+        }
+        self.ledger.position.opened_at_ms =
+            dust_hold_clock(dust, self.ledger.position.opened_at_ms, now);
         let flatten = flatten_reason(
             self.ledger.position.qty,
             mid,
@@ -1493,6 +1517,7 @@ impl Runtime {
             self.cfg.max_hold_secs,
             flatten_halt_label(halt_label.as_deref()),
             startup,
+            dust,
         );
         if shock(
             &self.mid_hist,
@@ -1920,6 +1945,7 @@ async fn main() -> Result<()> {
         need_reconcile: false,
         position_pending: false,
         startup_flatten: false,
+        dust_logged_until_ms: 0,
         flatten_inflight_until_ms: 0,
         pending_markouts: Vec::new(),
         quote_ids: HashSet::new(),

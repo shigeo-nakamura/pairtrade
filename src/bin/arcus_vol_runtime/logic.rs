@@ -377,8 +377,43 @@ pub enum FlattenReason {
     Startup,
 }
 
+/// Inventory too small for the venue to accept a closing order: below the
+/// minimum order size, or (priced at `mark`) below the minimum order
+/// notional. Such a residual can only come from fills whose sizes do not
+/// net out (10-03, SPY-USD: maker sell 3.24483 vs buys summing 3.24437 left
+/// -0.00046 ≈ $0.35); every flatten IOC for it is rejected
+/// ("below Arcus minimum"), so flattening it is pointless and, retried
+/// every tick, held quoting off for 8.5 h. It is left in the ledger (the
+/// position check still compares it with the venue) and is absorbed by the
+/// next fill. Without a mark only the size rule applies.
+pub fn is_dust(
+    inv_qty: Decimal,
+    mark: Option<Decimal>,
+    min_order_qty: Decimal,
+    min_order_usd: Decimal,
+) -> bool {
+    if inv_qty.is_zero() {
+        return false;
+    }
+    let qty = inv_qty.abs();
+    qty < min_order_qty || mark.is_some_and(|m| m > Decimal::ZERO && qty * m < min_order_usd)
+}
+
+/// The max-hold clock while inventory is dust: kept at `now`, so a fill that
+/// grows the dust on the same side (which `Position::apply` does not treat
+/// as a fresh open) starts a full `max_hold_secs` instead of inheriting the
+/// dust's age and being taker-flattened at once. Otherwise unchanged.
+pub fn dust_hold_clock(dust: bool, opened_at_ms: Option<u64>, now_ms: u64) -> Option<u64> {
+    if dust {
+        Some(now_ms)
+    } else {
+        opened_at_ms
+    }
+}
+
 /// Flatten when inventory reaches the effective cap, has been open longer
-/// than `max_hold_secs`, or a halt is in force.
+/// than `max_hold_secs`, or a halt is in force. Never for dust (`is_dust`):
+/// the venue rejects any order that small, so there is nothing to send.
 ///
 /// Startup, halt (incl. KILL_SWITCH) and max-hold need no book: side and
 /// size come from the position, and the live IOC prices off the connector's
@@ -393,8 +428,9 @@ pub fn flatten_reason(
     max_hold_secs: u64,
     halt: Option<&str>,
     startup: bool,
+    dust: bool,
 ) -> Option<FlattenReason> {
-    if inv_qty.is_zero() {
+    if inv_qty.is_zero() || dust {
         return None;
     }
     if startup {
@@ -1088,7 +1124,7 @@ mod tests {
         let cap = d("10000");
         let m = Some(d("83642.95"));
         let fr = |inv: &str, mid: Option<Decimal>, now: u64, halt: Option<&str>, startup: bool| {
-            flatten_reason(d(inv), mid, cap, Some(0), now, 300, halt, startup)
+            flatten_reason(d(inv), mid, cap, Some(0), now, 300, halt, startup, false)
         };
         assert_eq!(fr("0", m, 1_000_000, Some("kill"), true), None);
         assert_eq!(
@@ -1111,7 +1147,17 @@ mod tests {
     fn halt_kill_startup_and_max_hold_flatten_without_a_book() {
         let cap = d("10000");
         let fr = |now: u64, halt: Option<&str>, startup: bool| {
-            flatten_reason(d("-0.12"), None, cap, Some(0), now, 300, halt, startup)
+            flatten_reason(
+                d("-0.12"),
+                None,
+                cap,
+                Some(0),
+                now,
+                300,
+                halt,
+                startup,
+                false,
+            )
         };
         assert_eq!(
             fr(1_000, Some("kill_switch"), false),
@@ -1133,6 +1179,135 @@ mod tests {
             plan,
             TickPlan::Flatten(FlattenReason::Halt("kill_switch".into()))
         );
+    }
+
+    #[test]
+    fn dust_below_the_venue_minimum_is_never_flattened() {
+        // 10-03 Tokyo SPY-USD: sells/buys that do not net out exactly left
+        // -0.00046 (≈ $0.35 at 770). The venue minimum is 0.001 / $5.
+        let (min_qty, min_usd) = (d("0.001"), d("5"));
+        let spy = Some(d("770.56"));
+        let left = d("-3.24483") + d("0.4990254") + d("1.5") + d("1.2453446");
+        assert_eq!(left, d("-0.0004600"));
+        assert!(is_dust(left, spy, min_qty, min_usd));
+        // Below the size minimum even without a mark.
+        assert!(is_dust(left, None, min_qty, min_usd));
+        // Above the size minimum but below the $5 notional.
+        assert!(is_dust(d("0.0049"), spy, min_qty, min_usd));
+        assert!(!is_dust(d("0.0049"), None, min_qty, min_usd));
+        // A real position, and flat, are not dust.
+        assert!(!is_dust(d("-0.0065"), spy, min_qty, min_usd));
+        assert!(!is_dust(d("3.24483"), spy, min_qty, min_usd));
+        assert!(!is_dust(Decimal::ZERO, spy, min_qty, min_usd));
+        // Size rule off (0): only the notional decides.
+        assert!(is_dust(
+            d("0.00005"),
+            Some(d("83000")),
+            Decimal::ZERO,
+            min_usd
+        ));
+        assert!(!is_dust(
+            d("0.0001"),
+            Some(d("83000")),
+            Decimal::ZERO,
+            min_usd
+        ));
+
+        // Dust never flattens, for any reason; the same inventory long past
+        // max-hold, at startup and under a halt.
+        let cap = d("5000");
+        for (halt, startup) in [(None, false), (None, true), (Some("kill_switch"), false)] {
+            assert_eq!(
+                flatten_reason(
+                    left,
+                    spy,
+                    cap,
+                    Some(0),
+                    30_600_000,
+                    300,
+                    halt,
+                    startup,
+                    true
+                ),
+                None
+            );
+        }
+        // The same call without the dust flag would loop on MaxHold.
+        assert_eq!(
+            flatten_reason(left, spy, cap, Some(0), 30_600_000, 300, None, false, false),
+            Some(FlattenReason::MaxHold)
+        );
+        // And with no flatten the tick plan quotes again.
+        let plan = tick_plan(&TickInputs {
+            has_book: true,
+            startup_reconciled: true,
+            dms_armed: true,
+            flatten: None,
+            ..TickInputs::default()
+        });
+        assert!(!matches!(plan, TickPlan::Flatten(_)));
+    }
+
+    #[test]
+    fn a_fill_on_top_of_dust_gets_a_full_max_hold() {
+        use crate::ledger::Position;
+        let (min_qty, min_usd, cap) = (d("0.001"), d("5"), d("5000"));
+        let px = d("770.6");
+        // Dust left at t=0 (10-03 22:55Z), the runtime ticks for 8.5 h.
+        let mut pos = Position {
+            qty: d("-0.00046"),
+            avg_px: px,
+            opened_at_ms: Some(0),
+        };
+        let t_tick = 30_600_000;
+        let dust = is_dust(pos.qty, Some(px), min_qty, min_usd);
+        assert!(dust);
+        pos.opened_at_ms = dust_hold_clock(dust, pos.opened_at_ms, t_tick);
+        // A maker sell on the same side half a second later.
+        pos.apply(false, d("3.24483"), px, t_tick + 500);
+        assert!(!is_dust(pos.qty, Some(px), min_qty, min_usd));
+        let fr = |now: u64| {
+            flatten_reason(
+                pos.qty,
+                Some(px),
+                cap,
+                pos.opened_at_ms,
+                now,
+                300,
+                None,
+                false,
+                false,
+            )
+        };
+        // Not flattened at once (the dust's 8.5 h age is not inherited) ...
+        assert_eq!(fr(t_tick + 1_000), None);
+        assert_eq!(fr(t_tick + 300_000), None);
+        // ... but max-hold still applies from the fill.
+        assert_eq!(fr(t_tick + 300_001), Some(FlattenReason::MaxHold));
+        // Without the clock refresh the same fill would flatten immediately.
+        let mut stale = Position {
+            qty: d("-0.00046"),
+            avg_px: px,
+            opened_at_ms: Some(0),
+        };
+        stale.apply(false, d("3.24483"), px, t_tick + 500);
+        assert_eq!(
+            flatten_reason(
+                stale.qty,
+                Some(px),
+                cap,
+                stale.opened_at_ms,
+                t_tick + 1_000,
+                300,
+                None,
+                false,
+                false
+            ),
+            Some(FlattenReason::MaxHold)
+        );
+        // Not dust: the clock is untouched.
+        assert_eq!(dust_hold_clock(false, Some(7), 99), Some(7));
+        assert_eq!(dust_hold_clock(false, None, 99), None);
     }
 
     #[test]

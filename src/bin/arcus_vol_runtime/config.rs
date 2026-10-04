@@ -46,6 +46,12 @@ pub struct Config {
     pub maker_fee_bps: Decimal,
     pub qty_decimals: u32,
     pub min_quote_usd: Decimal,
+    /// The venue's minimum order size / notional (Arcus SPY-USD: 0.001 and
+    /// $5). Inventory below either is dust: it cannot be flattened (every
+    /// IOC is rejected), so it is never flattened (`logic::is_dust`).
+    /// `MIN_ORDER_QTY=0` turns the size rule off.
+    pub min_order_qty: Decimal,
+    pub min_order_usd: Decimal,
     pub flatten_slippage_bps: u32,
     /// How long a live fill with no reported fee waits before it is booked
     /// at the taker fee (`fee_estimated`).
@@ -132,6 +138,8 @@ impl Config {
             maker_fee_bps: dec(&p("MAKER_FEE_BPS"), "0")?,
             qty_decimals: int(&p("QTY_DECIMALS"), 5u32)?,
             min_quote_usd: dec(&p("MIN_QUOTE_USD"), "50")?,
+            min_order_qty: dec(&p("MIN_ORDER_QTY"), "0")?,
+            min_order_usd: dec(&p("MIN_ORDER_USD"), "5")?,
             flatten_slippage_bps: int(&p("FLATTEN_SLIPPAGE_BPS"), 20u32)?,
             fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
             quote_offset_bps: dec(&p("QUOTE_OFFSET_BPS"), "0")?,
@@ -411,6 +419,8 @@ mod tests {
             maker_fee_bps: Decimal::ZERO,
             qty_decimals: 5,
             min_quote_usd: Decimal::from(50),
+            min_order_qty: Decimal::ZERO,
+            min_order_usd: Decimal::from(5),
             flatten_slippage_bps: 20,
             fee_wait_secs: 30,
             quote_offset_bps: Decimal::ZERO,
