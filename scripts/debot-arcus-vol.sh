@@ -142,7 +142,19 @@ addr="$(echo "$ARCUS_ADDRESS" | tr 'A-Z' 'a-z')"
 fetch() { curl -4 -sf --max-time 20 "$API_BASE/v1/$1?address=$addr&accountIndex=$ACCOUNT_INDEX${2:+&$2}"; }
 pos="$(fetch positions "market=$MARKET")" || die "position read failed ($API_BASE)"
 ord="$(fetch openOrders "market=$MARKET")" || die "open-orders read failed ($API_BASE)"
-mkts="$(curl -4 -sf --max-time 20 "$API_BASE/v1/markets")" || die "markets read failed ($API_BASE); cannot judge a residual position, not starting blind"
+# /v1/markets is only needed to judge a residual position: a flat account
+# must start even while that endpoint is down (Codex round 2 on pairtrade#382).
+has_pos="$(python3 - "$pos" "$MARKET" <<'PY'
+import json, sys
+p = json.loads(sys.argv[1]).get("positions") or {}
+rows = p.values() if isinstance(p, dict) else p
+print(1 if any(v.get("marketDisplayName") == sys.argv[2] and float(v.get("size") or 0) != 0 for v in rows) else 0)
+PY
+)" || die "position payload unreadable"
+mkts="{}"
+if [ "$has_pos" = "1" ]; then
+    mkts="$(curl -4 -sf --max-time 20 "$API_BASE/v1/markets")" || die "markets read failed ($API_BASE); cannot judge a residual position, not starting blind"
+fi
 python3 - "$pos" "$ord" "$MARKET" "$mkts" <<'PY' || exit 1
 import json, sys
 p = json.loads(sys.argv[1]).get("positions") or {}

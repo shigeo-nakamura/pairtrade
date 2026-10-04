@@ -1885,6 +1885,15 @@ mod tests {
 
         let is_dust = main_fn_body("inventory_is_dust");
         assert!(is_dust.contains("self.forced_dust_qty == Some(qty)"));
+        // ...and the override is re-validated on every ticker refresh.
+        let meta_body = main_fn_body("refresh_venue_meta");
+        assert!(meta_body.contains("self.revalidate_forced_dust(ticker.price)"));
+        let reval = main_fn_body("revalidate_forced_dust");
+        assert!(before(
+            &reval,
+            "forced_dust_still_holds(",
+            "self.forced_dust_qty = None"
+        ));
         let hold = main_fn_body("track_hold");
         assert!(before(
             &hold,

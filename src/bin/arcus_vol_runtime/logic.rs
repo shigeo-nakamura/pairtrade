@@ -102,6 +102,15 @@ impl VenueMin {
         }
     }
 
+    /// Whether a below-minimum rejection recorded for `forced` still holds
+    /// for the current inventory `qty` at `px`: it lapses when the inventory
+    /// is no longer that quantity, or the quantity is an acceptable order
+    /// again (Codex round 2 on pairtrade#382: a forced override is never
+    /// permanent).
+    pub fn forced_dust_still_holds(&self, forced: Decimal, qty: Decimal, px: Decimal) -> bool {
+        forced == qty && self.is_dust(forced, px)
+    }
+
     /// Decimals a venue-bound size is rounded to: the venue's own step when
     /// known (finer than the runtime's quoting decimals on Arcus RWA
     /// markets: 7 vs 5), else the runtime's.
@@ -2608,6 +2617,34 @@ mod tests {
                 dust_usd: d("5"),
             },
         }
+    }
+
+    #[test]
+    fn a_forced_dust_override_lapses_when_the_quantity_is_an_order_again() {
+        // Venue minimum unknown → the $5 notional floor decides: 0.0065 SPY is
+        // dust at $750 ($4.88) and an order again at $800 ($5.20).
+        let v = VenueMin {
+            min_order_qty: None,
+            size_decimals: None,
+            dust_usd: d("5"),
+        };
+        let q = d("-0.0065");
+        assert!(v.forced_dust_still_holds(q, q, d("750")));
+        assert!(!v.forced_dust_still_holds(q, q, d("800")));
+        // A different inventory (a fill landed on it) lapses the override.
+        assert!(!v.forced_dust_still_holds(q, d("-3.2465"), d("750")));
+        // With the venue minimum known, that minimum decides (it already
+        // includes the notional floor at the current price).
+        let known = VenueMin {
+            min_order_qty: Some(d("0.0066")),
+            ..v
+        };
+        assert!(known.forced_dust_still_holds(q, q, d("800")));
+        let known = VenueMin {
+            min_order_qty: Some(d("0.0064")),
+            ..v
+        };
+        assert!(!known.forced_dust_still_holds(q, q, d("750")));
     }
 
     #[test]

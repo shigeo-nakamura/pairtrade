@@ -140,6 +140,9 @@ venue "$DUST" '{"orders":[{"marketDisplayName":"SPY-USD","side":"BUY","price":"7
 # markets endpoint missing -> refuse with a clear line, never start blind
 venue "$DUST" "$NO_ORDERS" "$(acct 5557 5377)"; rm "$T/venue/markets.json"; run
 [ "$RC" -eq 1 ] && grep -q "REFUSED: markets read failed" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "missing markets must refuse"
+# ...but a FLAT account does not need /v1/markets at all: it starts with the endpoint down
+venue "$FLAT" "$NO_ORDERS" "$(acct 5557 5377)"; rm "$T/venue/markets.json"; run
+[ "$RC" -eq 0 ] && grep -q "venue check: SPY-USD flat" <<< "$OUT" && [ -f "$T/env.out" ] || fail "flat account must start without /v1/markets: $OUT"
 # market row missing from /v1/markets -> refuse
 venue "$DUST" "$NO_ORDERS" "$(acct 5557 5377)"; printf '{"markets":[]}' > "$T/venue/markets.json"; run
 [ "$RC" -eq 1 ] && grep -q "not found in /v1/markets" <<< "$OUT" || fail "unknown market row must refuse"

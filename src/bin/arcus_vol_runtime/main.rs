@@ -282,6 +282,31 @@ impl Runtime {
         self.venue_min.is_dust(qty, self.dust_px(mid)) || self.forced_dust_qty == Some(qty)
     }
 
+    /// A below-minimum rejection is not permanent (Codex round 2 on
+    /// pairtrade#382): once the refreshed venue minimum says the same
+    /// quantity is an acceptable order again (the price moved, or the
+    /// minimum did), the override is dropped and max-hold / halt flattening
+    /// resume. Cleared too when the inventory is no longer that quantity.
+    fn revalidate_forced_dust(&mut self, px: Decimal) {
+        let Some(forced) = self.forced_dust_qty else {
+            return;
+        };
+        let px = if px > Decimal::ZERO {
+            px
+        } else {
+            self.dust_px(None)
+        };
+        if !self
+            .venue_min
+            .forced_dust_still_holds(forced, self.ledger.position.qty, px)
+        {
+            log::info!(
+                "[ARCUS_VOL] inventory {forced} is above the venue minimum again at {px}: flatten rules resume"
+            );
+            self.forced_dust_qty = None;
+        }
+    }
+
     /// Keep `hold_since_ms` in step with the inventory: cleared while flat or
     /// dust, set when the inventory becomes more than dust.
     fn track_hold(&mut self, now: u64, mid: Option<Decimal>) {
@@ -339,6 +364,7 @@ impl Runtime {
                     }
                     self.venue_min = min;
                 }
+                self.revalidate_forced_dust(ticker.price);
             }
             Ok(Err(e)) => self.on_error("venue ticker", &e),
             Err(_) => log::warn!("[ARCUS_VOL] venue ticker read timed out"),
