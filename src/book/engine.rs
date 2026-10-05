@@ -963,10 +963,14 @@ impl BookEngine {
         // Only held legs carry a mark clock: a leg closed by an ordinary
         // rebalance must not leave its old timestamp behind for a later
         // reopening to inherit (Codex P2, pairtrade#384).
+        // A retired leg's mark is kept while its frozen funding carry is
+        // unsettled: it is the only price that can settle it (Codex P1,
+        // pairtrade#384).
         let positions = &self.state.positions;
+        let pending = &self.state.pending_funding_qty_hours;
         self.state
             .last_marks
-            .retain(|s, _| positions.contains_key(s));
+            .retain(|s, _| positions.contains_key(s) || pending.contains_key(s));
         for (sym, px) in prices {
             if self.state.positions.contains_key(sym) {
                 self.state.last_marks.insert(sym.clone(), (now, *px));
@@ -1002,7 +1006,13 @@ impl BookEngine {
             let trades_closed_before = self.state.trades_closed;
             let realized = self.state.apply_fill(&sym, -qty, px, now);
             let leg_closed = self.state.trades_closed != trades_closed_before;
-            self.state.last_marks.remove(&sym);
+            // Keep the mark at its last observed price while a carry the
+            // close froze is unsettled; pruned once it settles.
+            if self.state.pending_funding_qty_hours.contains_key(&sym) {
+                self.state.last_marks.insert(sym.clone(), (ts, px));
+            } else {
+                self.state.last_marks.remove(&sym);
+            }
             self.state.dead_symbols.insert(sym.clone(), now);
             self.exec.retire_paper_position(&sym).await;
             log::warn!(
@@ -2432,7 +2442,14 @@ impl BookEngine {
             let Some(rate) = self.exec.funding_rate_hourly(&sym).await else {
                 continue;
             };
-            let Some(price) = prices.get(&sym).copied() else {
+            // A leg retired for a dead mark (paper, bot-strategy#937) never
+            // prices again; its retained last mark settles the carry its
+            // close froze (Codex P1, pairtrade#384).
+            let Some(price) = prices
+                .get(&sym)
+                .copied()
+                .or_else(|| self.state.last_marks.get(&sym).map(|&(_, px)| px))
+            else {
                 continue;
             };
             let qty_hours = self
@@ -3042,6 +3059,59 @@ mod tests {
         );
         assert!(engine.state.dead_symbols.is_empty());
         assert_eq!(engine.state.last_marks["DOT"].0, t1 + 60);
+    }
+
+    #[tokio::test]
+    async fn a_retired_legs_frozen_funding_settles_at_its_retained_mark() {
+        // Codex P1 pairtrade#384: retired while its funding rate is
+        // unknown, the leg's exposure is frozen into
+        // pending_funding_qty_hours; the market never prices again, so the
+        // retained last mark is the only price that can settle it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.mark_on_date_change = false;
+        engine.tick(d.timestamp()).await.unwrap();
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        // DOT's price AND funding rate are gone (clear_observations).
+        exec.clear_observations().await;
+        exec.set_price("BTC", 100_000.0).await;
+        exec.set_funding_rate_hourly("BTC", 0.0001).await;
+        let t9 = d.timestamp() + 9 * 86_400;
+        engine.tick(t9).await.unwrap();
+        assert!(!engine.state.positions.contains_key("DOT"));
+        let frozen = engine.state.pending_funding_qty_hours["DOT"];
+        assert!(frozen < 0.0, "short DOT exposure frozen: {frozen}");
+        assert_eq!(
+            engine.state.last_marks.get("DOT"),
+            Some(&(d.timestamp() + 5, 4.0))
+        );
+        // A later tick keeps the mark while the carry is unsettled.
+        engine.tick(t9 + 5).await.unwrap();
+        assert!(engine.state.last_marks.contains_key("DOT"));
+
+        // DOT's rate becomes known again (price still absent): the carry
+        // settles at the retained 4.0 mark, then the mark is pruned.
+        exec.set_funding_rate_hourly("DOT", 0.0001).await;
+        let funding_before = engine.state.cum_funding_est_usd;
+        let prices: HashMap<String, f64> = [("BTC".to_string(), 100_000.0)].into();
+        let (_, det) = engine.accrue_daily_funding(t9 + 10, &prices).await;
+        assert!(!engine.state.pending_funding_qty_hours.contains_key("DOT"));
+        // Settled at the retained 4.0 (short DOT receives at +rate).
+        let expected = -frozen * 4.0 * 0.0001;
+        assert!((det["DOT"]["est_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+        let btc = det["BTC"]["est_usd"].as_f64().unwrap();
+        assert!(
+            (engine.state.cum_funding_est_usd - funding_before - (expected + btc)).abs() < 1e-9
+        );
+        engine.tick(t9 + 15).await.unwrap();
+        assert!(
+            !engine.state.last_marks.contains_key("DOT"),
+            "pruned once settled"
+        );
     }
 
     #[test]
