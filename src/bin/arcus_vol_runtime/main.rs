@@ -78,12 +78,13 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    book_depth, classify_error, dms_armed, flatten_halt_label, flatten_reason, flatten_steps,
-    fresh_mark, market_position, may_disarm_dms, own_displayed, plan_inputs, plan_quotes,
-    position_check, position_gate_after, quote_action, quote_dists, quote_pass, read_within,
-    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, tick_plan, ticker_read_due,
-    touches, BatchSink, ErrorEffect, PlanState, PosCheck, PricePlan, QSide, QuoteAction,
-    QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan, VenueMin,
+    book_depth, classify_error, dms_armed, dms_disarm_unconfirmed_note, flatten_halt_label,
+    flatten_reason, flatten_steps, fresh_mark, market_position, may_disarm_dms, own_displayed,
+    plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, quote_dists,
+    quote_pass, read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows,
+    tick_plan, ticker_read_due, touches, BatchSink, ErrorEffect, PlanState, PosCheck, PricePlan,
+    QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
+    VenueMin,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -2013,7 +2014,14 @@ impl Runtime {
                         .schedule_cancel_market(&self.cfg.market, None)
                         .await
                     {
-                        log::warn!("[ARCUS_VOL] shutdown DMS disarm failed: {e}");
+                        log::warn!(
+                            "{}",
+                            dms_disarm_unconfirmed_note(
+                                &self.cfg.market,
+                                self.cfg.dms_secs,
+                                &e.to_string()
+                            )
+                        );
                     }
                 }
             }

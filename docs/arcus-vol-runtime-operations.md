@@ -142,7 +142,13 @@ order on subaccount 0 (a manual NEAR-USD limit was lost that way on
   switch.
 - The runtime only reports the switch armed when the venue echoed the
   market (`marketId`) back: a gateway that ignored the field would have
-  armed the account-wide switch, so that is an error and no quote is sent.
+  armed the account-wide switch, so that is an error, no quote is sent, and
+  the connector immediately disarms the account-wide switch again (the error
+  line says whether that worked).
+- At shutdown an unconfirmed per-market disarm is only a WARN ("…switch may
+  still fire within 30s -- it only cancels SPY-USD orders, which are already
+  cancelled; exiting normally"): the quotes were cancelled and read back
+  before the disarm.
 - Venue quotas: 10 auto-fires per UTC day per subaccount (shared by all of
   its switches), at most 50 armed switches per wallet.
 

@@ -1799,6 +1799,20 @@ mod tests {
             .unwrap();
         assert!(legacy < arm);
         assert!(flat.contains("self.legacy_dms_cleared=true;"));
+        // An unconfirmed / failed per-market disarm at shutdown is a WARN and
+        // the shutdown carries on (Codex P1 on dex-connector#131).
+        let disarm = flat
+            .find(".schedule_cancel_market(&self.cfg.market,None)")
+            .unwrap();
+        let branch = &flat[disarm..];
+        let branch = &branch[..branch.find("}}}").unwrap()];
+        assert!(
+            branch.contains("log::warn!(\"{}\",dms_disarm_unconfirmed_note("),
+            "{branch}"
+        );
+        for forbidden in ["return", "halt", "exit(", "panic!", "bail!", "?;"] {
+            assert!(!branch.contains(forbidden), "{forbidden} in {branch}");
+        }
     }
 
     #[test]
