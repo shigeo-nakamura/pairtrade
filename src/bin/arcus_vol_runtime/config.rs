@@ -65,16 +65,63 @@ pub struct Config {
     /// Must be >= 1 (`MIN_REPEG_BAND_BPS`) and < the offset. Ignored at
     /// offset 0.
     pub repeg_band_bps: Decimal,
+    /// Session offset (bot-strategy#1093): while the market's venue session
+    /// is open (US equity/ETF perps: 04:00–20:00 New York) quotes rest this
+    /// far behind the touch instead of `quote_offset_bps`, with this band.
+    /// Both unset = one offset at all times (the old behaviour). Requires
+    /// presence mode outside the session too (`quote_offset_bps` > 0), so
+    /// the quoting mode itself never flips at a boundary.
+    pub session_offset_bps: Option<Decimal>,
+    pub session_band_bps: Option<Decimal>,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
     /// `ARCUS_ACCOUNT_INDEX` (the connector's own env): live refuses 0.
     pub account_index: Option<u8>,
     pub ws_url: String,
+    /// `ARCUS_REST_ENDPOINT` (the connector's own env): the market-row read
+    /// that tells the session.
+    pub rest_url: String,
     /// `ARCUS_ADDRESS` (the connector's own env), for the account lock.
     pub arcus_address: Option<String>,
     /// Account-lock namespace, independent of STATE_DIR.
     pub lock_dir: PathBuf,
+}
+
+/// One offset/band pair: offset in 0..=100; with an offset the band must be
+/// at least `MIN_REPEG_BAND_BPS` (a zero or sub-tick band re-pegs on every
+/// tick: no "consistent" quote, only cancel/place churn) and smaller than
+/// the offset (a quote that is kept can never sit at or through the touch).
+fn validate_offset_pair(
+    off_name: &str,
+    band_name: &str,
+    offset: Decimal,
+    band: Decimal,
+) -> Result<()> {
+    if offset < Decimal::ZERO || offset > Decimal::ONE_HUNDRED {
+        bail!("ARCUS_VOL_{off_name} must be in 0..=100 (got {offset})");
+    }
+    if band < Decimal::ZERO {
+        bail!("ARCUS_VOL_{band_name} must be >= 0 (got {band})");
+    }
+    if offset > Decimal::ZERO && (band < MIN_REPEG_BAND_BPS || band >= offset) {
+        bail!(
+            "with ARCUS_VOL_{off_name}={offset} ARCUS_VOL_{band_name} must be >= {MIN_REPEG_BAND_BPS} and < the offset (got {band})"
+        );
+    }
+    Ok(())
+}
+
+/// An optional decimal env value: unset or blank = `None`.
+fn opt_dec(name: &str) -> Result<Option<Decimal>> {
+    match var(name) {
+        None => Ok(None),
+        Some(raw) => raw
+            .trim()
+            .parse::<Decimal>()
+            .map(Some)
+            .with_context(|| format!("{name}={raw} is not a decimal")),
+    }
 }
 
 fn var(name: &str) -> Option<String> {
@@ -142,6 +189,8 @@ impl Config {
             fee_wait_secs: int(&p("FEE_WAIT_SECS"), 30u64)?,
             quote_offset_bps: dec(&p("QUOTE_OFFSET_BPS"), "0")?,
             repeg_band_bps: dec(&p("REPEG_BAND_BPS"), "0")?,
+            session_offset_bps: opt_dec(&p("SESSION_OFFSET_BPS"))?,
+            session_band_bps: opt_dec(&p("SESSION_BAND_BPS"))?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -159,6 +208,10 @@ impl Config {
                         .with_context(|| format!("ARCUS_ACCOUNT_INDEX={raw}"))?,
                 ),
             },
+            rest_url: var("ARCUS_REST_ENDPOINT")
+                .unwrap_or_else(|| "https://api.arcus.xyz".to_string())
+                .trim_end_matches('/')
+                .to_string(),
             ws_url: var("ARCUS_WEBSOCKET_ENDPOINT")
                 .unwrap_or_else(|| "wss://api.arcus.xyz/v1/ws".to_string()),
             arcus_address: var("ARCUS_ADDRESS"),
@@ -201,35 +254,30 @@ impl Config {
         self.validate_presence()
     }
 
-    /// Presence-quoting parameters. With an offset the band must be at least
-    /// `MIN_REPEG_BAND_BPS` (a zero or sub-tick band re-pegs on every tick:
-    /// no "consistent" quote, only cancel/place churn) and smaller than the
-    /// offset (a quote that is kept can never sit at or through the touch).
+    /// Presence-quoting parameters: the base pair, and the session pair when
+    /// configured (see `validate_offset_pair`).
     fn validate_presence(&self) -> Result<()> {
-        let hundred = Decimal::ONE_HUNDRED;
-        if self.quote_offset_bps < Decimal::ZERO || self.quote_offset_bps > hundred {
-            bail!(
-                "ARCUS_VOL_QUOTE_OFFSET_BPS must be in 0..=100 (got {})",
-                self.quote_offset_bps
-            );
+        validate_offset_pair(
+            "QUOTE_OFFSET_BPS",
+            "REPEG_BAND_BPS",
+            self.quote_offset_bps,
+            self.repeg_band_bps,
+        )?;
+        match (self.session_offset_bps, self.session_band_bps) {
+            (None, None) => Ok(()),
+            (Some(offset), Some(band)) => {
+                if self.quote_offset_bps <= Decimal::ZERO {
+                    bail!("ARCUS_VOL_SESSION_OFFSET_BPS needs presence quoting off-session too (ARCUS_VOL_QUOTE_OFFSET_BPS > 0)");
+                }
+                if offset <= Decimal::ZERO {
+                    bail!("ARCUS_VOL_SESSION_OFFSET_BPS must be > 0 (got {offset})");
+                }
+                validate_offset_pair("SESSION_OFFSET_BPS", "SESSION_BAND_BPS", offset, band)
+            }
+            _ => bail!(
+                "set both ARCUS_VOL_SESSION_OFFSET_BPS and ARCUS_VOL_SESSION_BAND_BPS, or neither"
+            ),
         }
-        if self.repeg_band_bps < Decimal::ZERO {
-            bail!(
-                "ARCUS_VOL_REPEG_BAND_BPS must be >= 0 (got {})",
-                self.repeg_band_bps
-            );
-        }
-        if self.quote_offset_bps > Decimal::ZERO
-            && (self.repeg_band_bps < MIN_REPEG_BAND_BPS
-                || self.repeg_band_bps >= self.quote_offset_bps)
-        {
-            bail!(
-                "with ARCUS_VOL_QUOTE_OFFSET_BPS={} ARCUS_VOL_REPEG_BAND_BPS must be >= {MIN_REPEG_BAND_BPS} and < the offset (got {})",
-                self.quote_offset_bps,
-                self.repeg_band_bps
-            );
-        }
-        Ok(())
     }
 
     /// The cap actually enforced: the frozen hard cap, or what the allocated
@@ -248,6 +296,25 @@ impl Config {
         crate::logic::Presence {
             offset_bps: self.quote_offset_bps,
             band_bps: self.repeg_band_bps,
+        }
+    }
+
+    /// Whether a session offset is configured (only then is the session
+    /// read at all).
+    pub fn session_switching(&self) -> bool {
+        self.session_offset_bps.is_some() && self.session_band_bps.is_some()
+    }
+
+    /// The presence parameters in force: the session pair while the venue
+    /// session is open (`Some(true)`), the base pair otherwise — off-hours,
+    /// no session (crypto) or not known yet.
+    pub fn presence_for(&self, in_session: Option<bool>) -> crate::logic::Presence {
+        match (in_session, self.session_offset_bps, self.session_band_bps) {
+            (Some(true), Some(offset_bps), Some(band_bps)) => crate::logic::Presence {
+                offset_bps,
+                band_bps,
+            },
+            _ => self.presence(),
         }
     }
 
@@ -385,6 +452,52 @@ mod tests {
     }
 
     #[test]
+    fn the_session_pair_is_validated_and_used_only_in_session() {
+        let d = |s: &str| Decimal::from_str(s).unwrap();
+        let mut cfg = test_config();
+        cfg.quote_offset_bps = d("2");
+        cfg.repeg_band_bps = d("1");
+        // Unset: one pair at all times, no session read.
+        assert!(cfg.validate().is_ok());
+        assert!(!cfg.session_switching());
+        assert_eq!(cfg.presence_for(Some(true)), cfg.presence());
+        // Both set: the session pair while in session only.
+        cfg.session_offset_bps = Some(d("5"));
+        cfg.session_band_bps = Some(d("2"));
+        assert!(cfg.validate().is_ok());
+        assert!(cfg.session_switching());
+        let on = cfg.presence_for(Some(true));
+        assert_eq!((on.offset_bps, on.band_bps), (d("5"), d("2")));
+        for s in [Some(false), None] {
+            let p = cfg.presence_for(s);
+            assert_eq!((p.offset_bps, p.band_bps), (d("2"), d("1")), "{s:?}");
+        }
+        // The same rules as the base pair: band >= 1 and < offset, 0..=100.
+        for (off, band) in [
+            ("5", "0.5"),
+            ("5", "5"),
+            ("5", "-1"),
+            ("100.5", "2"),
+            ("0", "0"),
+        ] {
+            cfg.session_offset_bps = Some(d(off));
+            cfg.session_band_bps = Some(d(band));
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("SESSION_"), "{off}/{band}: {err}");
+        }
+        // Half a pair is refused.
+        cfg.session_offset_bps = Some(d("5"));
+        cfg.session_band_bps = None;
+        assert!(cfg.validate().unwrap_err().to_string().contains("both"));
+        // Off-session must be presence mode too (the mode never flips).
+        cfg.session_band_bps = Some(d("2"));
+        cfg.quote_offset_bps = Decimal::ZERO;
+        cfg.repeg_band_bps = Decimal::ZERO;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("QUOTE_OFFSET_BPS > 0"), "{err}");
+    }
+
+    #[test]
     fn effective_cap_is_the_smaller_of_hard_cap_and_margin_times_leverage() {
         let mut cfg = test_config();
         assert_eq!(cfg.effective_cap_usd(), Decimal::from(10_000));
@@ -423,11 +536,14 @@ mod tests {
             fee_wait_secs: 30,
             quote_offset_bps: Decimal::ZERO,
             repeg_band_bps: Decimal::ZERO,
+            session_offset_bps: None,
+            session_band_bps: None,
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),
             account_index: None,
             ws_url: String::new(),
+            rest_url: String::new(),
             arcus_address: None,
             lock_dir: PathBuf::from("/tmp/unused"),
         }

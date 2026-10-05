@@ -97,6 +97,26 @@ start (`clip = min(CLIP_MAX_USD, free * LEVERAGE / 2 * 0.9)` rounded down to
 $100; inventory cap 2 clips), so other positions on the cross account
 shrink the quotes rather than over-commit margin.
 
+### Session offset (optional)
+
+`SESSION_OFFSET_BPS` / `SESSION_BAND_BPS` in `config.env` (both or neither)
+make the quotes rest further behind the touch while the market's venue
+session is open — for the US equity/ETF perps 04:00–20:00 New York on
+weekdays — and at `QUOTE_OFFSET_BPS` / `REPEG_BAND_BPS` off-hours and at
+weekends. Reason (grid_report.md, 2026-10-05, SPY): at 2 bp the swept quotes
+cost about −1.4 bp per $ of volume in session but only −0.1 bp/$ off-hours;
+5 bp in session is about break-even.
+
+The session comes from the market's own row, `GET /v1/markets?market=…`,
+read once a minute only when a session offset is set: the venue's
+`isOutsideRth` flag decides while the last read is < 3 min old (it also
+knows holidays); otherwise `regularTradingHours` is evaluated on the host
+clock with the US daylight-saving rule (`America/New_York` only). A market
+without hours (crypto) never switches. Each switch logs one line
+(`[ARCUS_VOL] SPY-USD: in session → quotes rest 5 bp behind the touch`), and
+`status.json` shows `session` (`in` / `off`) with the active
+`quote_offset_bps` / `repeg_band_bps`. Changing the values needs a restart.
+
 ### Sentinels (in `STATE_DIR`)
 
 | file | meaning |

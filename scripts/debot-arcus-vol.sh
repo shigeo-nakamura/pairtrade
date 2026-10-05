@@ -84,7 +84,7 @@ load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -120,6 +120,16 @@ case "$MARKET" in *-USD) ;; *) die "MARKET must look like SPY-USD (got '$MARKET'
 for v in CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE; do
     [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
 done
+# Session offset (optional, both or neither): the distance/band while the
+# market's venue session is open (US equity/ETF perps: 04:00-20:00 New York).
+SESSION_OFFSET_BPS="${SESSION_OFFSET_BPS:-}"
+SESSION_BAND_BPS="${SESSION_BAND_BPS:-}"
+if [ -n "$SESSION_OFFSET_BPS$SESSION_BAND_BPS" ]; then
+    [ -n "$SESSION_OFFSET_BPS" ] && [ -n "$SESSION_BAND_BPS" ] || die "set both SESSION_OFFSET_BPS and SESSION_BAND_BPS, or neither"
+    for v in SESSION_OFFSET_BPS SESSION_BAND_BPS; do
+        [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
+    done
+fi
 [[ "$LEVERAGE" =~ ^[0-9]+$ ]] && [ "$LEVERAGE" -ge 1 ] || die "LEVERAGE must be a whole number >= 1"
 
 [ -x "$BIN" ] || die "binary missing or not executable: $BIN"
@@ -206,7 +216,7 @@ PY
 [ "${CLIP:-0}" -ge 500 ] || die "free collateral too small for presence quoting (free \$$FREE, clip \$$CLIP)"
 
 log "signing key: $KEY_MODE"
-log "sizing: market $MARKET, clip \$$CLIP per side (max \$$CLIP_MAX_USD), inventory cap \$$CAP, margin \$$MARGIN at ${LEVERAGE}x (free collateral \$$FREE); presence offset ${QUOTE_OFFSET_BPS} bp +/- ${REPEG_BAND_BPS} bp; daily stop \$$DAILY_STOP_USD, cumulative stop \$$CUM_STOP_USD; state $STATE_DIR"
+log "sizing: market $MARKET, clip \$$CLIP per side (max \$$CLIP_MAX_USD), inventory cap \$$CAP, margin \$$MARGIN at ${LEVERAGE}x (free collateral \$$FREE); presence offset ${QUOTE_OFFSET_BPS} bp +/- ${REPEG_BAND_BPS} bp${SESSION_OFFSET_BPS:+ (in session ${SESSION_OFFSET_BPS} bp +/- ${SESSION_BAND_BPS} bp)}; daily stop \$$DAILY_STOP_USD, cumulative stop \$$CUM_STOP_USD; state $STATE_DIR"
 
 # Everything from here on is the runtime's own process (systemd sees its pid).
 export ARCUS_VOL_DRY_RUN=false
@@ -222,6 +232,10 @@ export ARCUS_VOL_MARGIN_USD="$MARGIN"
 export ARCUS_VOL_LEVERAGE="$LEVERAGE"
 export ARCUS_VOL_QUOTE_OFFSET_BPS="$QUOTE_OFFSET_BPS"
 export ARCUS_VOL_REPEG_BAND_BPS="$REPEG_BAND_BPS"
+if [ -n "$SESSION_OFFSET_BPS" ]; then
+    export ARCUS_VOL_SESSION_OFFSET_BPS="$SESSION_OFFSET_BPS"
+    export ARCUS_VOL_SESSION_BAND_BPS="$SESSION_BAND_BPS"
+fi
 export ARCUS_VOL_DAILY_STOP_USD="$DAILY_STOP_USD"
 export ARCUS_VOL_CUM_STOP_USD="$CUM_STOP_USD"
 export ARCUS_WS_PRIVATE=1
