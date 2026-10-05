@@ -125,6 +125,27 @@ const PEEK_INTERVAL_SECS: i64 = 60;
 const REFUSED_RETRY_SECS: i64 = 300;
 const UNAVAILABLE_RETRY_SECS: i64 = 30;
 
+/// Default for [`BookEngine::dead_mark_secs`]: a day without a single
+/// mark is far beyond any feed blip (a mid expires after seconds).
+pub const DEFAULT_DEAD_MARK_SECS: i64 = 86_400;
+
+/// Whether a leg last marked at `last_mark_ts` counts as dead at `now`.
+fn mark_is_dead(last_mark_ts: i64, now: i64, dead_mark_secs: i64) -> bool {
+    dead_mark_secs > 0 && now - last_mark_ts >= dead_mark_secs
+}
+
+/// `weights` without the retired (dead-mark) symbols.
+fn without_dead(
+    weights: &BTreeMap<String, f64>,
+    dead: &BTreeMap<String, i64>,
+) -> BTreeMap<String, f64> {
+    weights
+        .iter()
+        .filter(|(s, _)| !dead.contains_key(*s))
+        .map(|(s, w)| (s.clone(), *w))
+        .collect()
+}
+
 pub struct BookEngine {
     pub cfg: BookConfig,
     scheduler: Scheduler,
@@ -144,6 +165,11 @@ pub struct BookEngine {
     /// Replay turns this off and calls [`BookEngine::daily_mark_now`] at
     /// the last tick of each bar date instead.
     pub mark_on_date_change: bool,
+    /// Paper only (bot-strategy#937): a held leg whose mark has been
+    /// absent this long is retired at its last observed price, so a
+    /// delisted / halted market cannot block every open forever. `0`
+    /// turns the retirement off. Env `BOOK_DEAD_MARK_SECS` in the runtime.
+    pub dead_mark_secs: i64,
     last_flatten_attempt: i64,
     /// Whether the last venue reconcile succeeded (live) — trading is
     /// suppressed while it is false.
@@ -293,6 +319,7 @@ impl BookEngine {
             last_status_write: 0,
             status_interval_secs: 30,
             mark_on_date_change: true,
+            dead_mark_secs: DEFAULT_DEAD_MARK_SECS,
             last_flatten_attempt: 0,
             positions_ready: true,
             equity_ready: true,
@@ -534,6 +561,9 @@ impl BookEngine {
 
         if !self.exec.is_paper() {
             self.positions_ready = self.reconcile_with_venue(now, &mut prices).await;
+        }
+        if self.exec.is_paper() {
+            self.retire_dead_paper_legs(now, &prices).await;
         }
 
         // On the first tick of a new UTC date, accrue funding since the
@@ -920,6 +950,97 @@ impl BookEngine {
         true
     }
 
+    /// Paper only (bot-strategy#937): remember each held leg's last fresh
+    /// mark and retire a leg whose mark has been absent for
+    /// `dead_mark_secs` -- closed in the paper book at its last observed
+    /// price (realized PnL booked, no fee: there is no market to pay it
+    /// to), so the "held leg without a fresh mark" rule stops blocking
+    /// every open. Before this, a delisted market (RESOLV / MYX / FOGO /
+    /// EDEN / DOLO, 9+ days without a mid) froze the book. A leg with no
+    /// remembered mark (state written before this field) starts its clock
+    /// now at its entry price. A symbol that prices again is un-retired.
+    async fn retire_dead_paper_legs(&mut self, now: i64, prices: &HashMap<String, f64>) {
+        // Only held legs carry a mark clock: a leg closed by an ordinary
+        // rebalance must not leave its old timestamp behind for a later
+        // reopening to inherit (Codex P2, pairtrade#384).
+        // A retired leg's mark is kept while its frozen funding carry is
+        // unsettled: it is the only price that can settle it (Codex P1,
+        // pairtrade#384).
+        let positions = &self.state.positions;
+        let pending = &self.state.pending_funding_qty_hours;
+        self.state
+            .last_marks
+            .retain(|s, _| positions.contains_key(s) || pending.contains_key(s));
+        for (sym, px) in prices {
+            if self.state.positions.contains_key(sym) {
+                self.state.last_marks.insert(sym.clone(), (now, *px));
+            }
+            if self.state.dead_symbols.remove(sym).is_some() {
+                log::info!("[DEAD_MARK] {sym} prices again ({px}); eligible for targets");
+            }
+        }
+        let held: Vec<(String, f64, f64)> = self
+            .state
+            .positions
+            .iter()
+            .map(|(s, p)| (s.clone(), p.qty, p.avg_price))
+            .collect();
+        for (sym, qty, avg) in held {
+            if prices.contains_key(&sym) {
+                continue;
+            }
+            let (ts, px) = *self
+                .state
+                .last_marks
+                .entry(sym.clone())
+                .or_insert((now, avg));
+            if !mark_is_dead(ts, now, self.dead_mark_secs) || !px.is_finite() || px <= 0.0 {
+                continue;
+            }
+            // Settle (or, without a rate, freeze into the symbol's
+            // pending carry) the leg's funding through now at the retained
+            // mark before the close removes it, as every other close does
+            // (Codex P1, pairtrade#384).
+            let rate = self.exec.funding_rate_hourly(&sym).await;
+            self.accrue_funding(&sym, now, px, rate);
+            let trades_closed_before = self.state.trades_closed;
+            let realized = self.state.apply_fill(&sym, -qty, px, now);
+            let leg_closed = self.state.trades_closed != trades_closed_before;
+            // Keep the mark at its last observed price while a carry the
+            // close froze is unsettled; pruned once it settles.
+            if self.state.pending_funding_qty_hours.contains_key(&sym) {
+                self.state.last_marks.insert(sym.clone(), (ts, px));
+            } else {
+                self.state.last_marks.remove(&sym);
+            }
+            self.state.dead_symbols.insert(sym.clone(), now);
+            self.exec.retire_paper_position(&sym).await;
+            log::warn!(
+                "[DEAD_MARK] {sym}: no fresh mark for {}s (>= {}s); paper leg {qty} closed at last observed {px}, realized {realized:.4}",
+                now - ts,
+                self.dead_mark_secs
+            );
+            let row = json!({
+                "symbol": sym,
+                "closed_qty": -qty,
+                "fill_price": px,
+                "fill_price_source": "dead_mark",
+                "estimated": true,
+                "mark_age_secs": now - ts,
+                "realized_usd": realized,
+                "fee_usd": 0.0,
+                "fee_known": true,
+                "paper": true,
+            });
+            self.ledger.write(now, "dead_mark_close", None, row.clone());
+            // A completed leg must show up in pnl.jsonl like any other
+            // close (Codex P2, pairtrade#384).
+            if leg_closed {
+                self.pnl.write(now, "exit", None, row);
+            }
+        }
+    }
+
     /// Current equity and whether it is a fresh venue value (paper equity
     /// is always fresh).
     async fn compute_equity(&self, prices: &HashMap<String, f64>) -> (f64, bool) {
@@ -1062,8 +1183,10 @@ impl BookEngine {
         }
         let lots = self.lots_for(&symbols).await;
         let current = self.state.signed_qty();
+        // A leg retired for a dead mark is not retried (bot-strategy#937).
+        let target_qty = without_dead(&rec.target_qty, &self.state.dead_symbols);
         let plan = match rebalance::plan_targets(
-            &rec.target_qty,
+            &target_qty,
             &current,
             prices,
             &lots,
@@ -1379,7 +1502,16 @@ impl BookEngine {
         // bound. A symbol it refuses rejects the whole signal, as an
         // unknown symbol does in `fixed` mode; one that cannot be admitted
         // *yet* rejects this tick and is retried inside the window.
-        let symbols: Vec<String> = sig.weights.keys().cloned().collect();
+        // A retired (dead-mark) symbol is left out of the plan anyway, so it
+        // must not reject the signal at admission either -- a delisted
+        // market is exactly what retires a leg (paper only; the set is
+        // empty live; Codex P2, pairtrade#384).
+        let symbols: Vec<String> = sig
+            .weights
+            .keys()
+            .filter(|s| !self.state.dead_symbols.contains_key(*s))
+            .cloned()
+            .collect();
         // Every symbol, tracked ones included: being subscribed does not
         // make a market still listed.
         if let Some((symbol, err)) = self.admit(now, &symbols, true).await.into_iter().next() {
@@ -1423,7 +1555,11 @@ impl BookEngine {
         }
         let lots = self.lots_for(&symbols).await;
         let current = self.state.signed_qty();
-        let plan = match rebalance::plan(&sig.weights, &current, prices, &lots, &self.cfg.sizing) {
+        // A retired (dead-mark) symbol has no price, so leaving it in the
+        // weights would reject the whole plan as MissingPrice: drop it
+        // until a fresh mark brings it back (paper only, bot-strategy#937).
+        let weights = without_dead(&sig.weights, &self.state.dead_symbols);
+        let plan = match rebalance::plan(&weights, &current, prices, &lots, &self.cfg.sizing) {
             Ok(p) => p,
             Err(r) => {
                 self.record_reject(now, d, r.label(), r.to_string(), attempts);
@@ -2306,7 +2442,14 @@ impl BookEngine {
             let Some(rate) = self.exec.funding_rate_hourly(&sym).await else {
                 continue;
             };
-            let Some(price) = prices.get(&sym).copied() else {
+            // A leg retired for a dead mark (paper, bot-strategy#937) never
+            // prices again; its retained last mark settles the carry its
+            // close froze (Codex P1, pairtrade#384).
+            let Some(price) = prices
+                .get(&sym)
+                .copied()
+                .or_else(|| self.state.last_marks.get(&sym).map(|&(_, px)| px))
+            else {
                 continue;
             };
             let qty_hours = self
@@ -2792,6 +2935,193 @@ mod tests {
         exec.set_price("DOT", 4.0).await;
         engine.daily_mark_now(mark_time + 5).await.unwrap();
         assert!(engine.state.last_mark_date.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_held_leg_with_a_dead_mark_is_retired_and_stops_blocking_opens() {
+        // bot-strategy#937 / #695: on Tokyo RESOLV / MYX / FOGO / EDEN /
+        // DOLO stopped pricing (delisted) while held; every tick logged
+        // "missing a fresh mark for a held leg ... opens blocked" for 9+
+        // days, so no rebalance could open anything.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.mark_on_date_change = false;
+        engine.tick(d.timestamp()).await.unwrap();
+        let dot_qty = engine.state.positions["DOT"].qty;
+        assert!(dot_qty < 0.0);
+        // The next tick records the held legs' fresh marks.
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        assert_eq!(engine.state.last_marks["DOT"], (d.timestamp() + 5, 4.0));
+
+        // DOT stops pricing; BTC keeps marking. DOT's last funding rate
+        // is still known, so its exposure up to the retirement settles.
+        exec.clear_observations().await;
+        exec.set_price("BTC", 100_000.0).await;
+        exec.set_funding_rate_hourly("DOT", 0.0001).await;
+
+        // Briefly stale (1 h, below the 24 h default): still held and
+        // still blocking opens, exactly as before.
+        engine.tick(d.timestamp() + 3_600).await.unwrap();
+        assert!(engine.state.positions.contains_key("DOT"));
+        assert!(
+            !engine.equity_ready,
+            "a briefly stale held leg still blocks opens"
+        );
+        assert!(engine.state.dead_symbols.is_empty());
+
+        // Nine days without a mark: retired at its last observed price.
+        let funding_before = engine.state.cum_funding_est_usd;
+        let realized_before = engine.state.cum_realized_usd;
+        let closed_before = engine.state.trades_closed;
+        let t9 = d.timestamp() + 9 * 86_400;
+        engine.tick(t9).await.unwrap();
+        assert!(!engine.state.positions.contains_key("DOT"));
+        assert!(!exec.positions().await.unwrap().contains_key("DOT"));
+        assert_eq!(engine.state.dead_symbols.get("DOT"), Some(&t9));
+        assert_eq!(engine.state.trades_closed, closed_before + 1);
+        let pnl_rows: Vec<serde_json::Value> = std::fs::read_to_string(&cfg.paths.pnl)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(pnl_rows.iter().any(|r| r["event"] == "exit"
+            && r["symbol"] == "DOT"
+            && r["fill_price_source"] == "dead_mark"));
+        // Closed at 4.0, the entry: nothing realized, nothing invented.
+        assert!((engine.state.cum_realized_usd - realized_before).abs() < 1e-9);
+        // Its funding was settled through the retirement (a short pays
+        // nothing at a positive rate: it receives), not dropped.
+        assert!(
+            engine.state.cum_funding_est_usd > funding_before,
+            "short DOT receives funding for the held days"
+        );
+        assert!(!engine.state.pending_funding_qty_hours.contains_key("DOT"));
+        assert!(engine.equity_ready, "opens are no longer blocked");
+        assert!(engine.opens_allowed());
+
+        // A new signal still naming DOT: planned without it (no
+        // MissingPrice reject of the whole plan) and DOT is not reopened.
+        let d2 = ts("2026-09-16T00:30:00Z");
+        write_signal(
+            dir.path(),
+            "2026-09-16",
+            d2,
+            &[("BTC", -0.3), ("ETH", 0.2), ("DOT", 0.1)],
+        );
+        exec.set_price("BTC", 100_000.0).await;
+        exec.set_price("ETH", 4_000.0).await;
+        engine.tick(d2.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.as_ref().unwrap();
+        assert_eq!(rec.key, "2026-09-16");
+        assert_ne!(rec.outcome, DecisionOutcome::Rejected, "{rec:?}");
+        assert!(engine.state.positions["BTC"].qty < 0.0);
+        assert!(engine.state.positions["ETH"].qty > 0.0);
+        assert!(!engine.state.positions.contains_key("DOT"));
+
+        // DOT prices again: eligible for targets once more.
+        exec.set_price("DOT", 4.0).await;
+        engine.tick(d2.timestamp() + 5).await.unwrap();
+        assert!(engine.state.dead_symbols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_closed_legs_old_mark_is_not_inherited_by_a_later_reopening() {
+        // Codex P2 pairtrade#384: a DOT leg closed by an ordinary rebalance
+        // left its mark behind; reopened ten days later with its quotes
+        // dropping right after, the new leg must start a fresh clock, not
+        // be retired as if unpriced since the old position.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.mark_on_date_change = false;
+        let t0 = ts("2026-09-06T12:00:00Z").timestamp();
+        // The closed leg's leftover mark.
+        engine.state.last_marks.insert("DOT".into(), (t0, 4.0));
+        let t1 = t0 + 10 * 86_400;
+        engine.tick(t1).await.unwrap();
+        assert!(
+            !engine.state.last_marks.contains_key("DOT"),
+            "pruned: not held"
+        );
+        // Reopened at t1; its quotes vanish right after.
+        engine.state.apply_fill("DOT", -10.0, 4.0, t1);
+        exec.clear_observations().await;
+        exec.set_price("BTC", 100_000.0).await;
+        engine.tick(t1 + 60).await.unwrap();
+        assert!(
+            engine.state.positions.contains_key("DOT"),
+            "a fresh leg is not retired on an inherited old mark"
+        );
+        assert!(engine.state.dead_symbols.is_empty());
+        assert_eq!(engine.state.last_marks["DOT"].0, t1 + 60);
+    }
+
+    #[tokio::test]
+    async fn a_retired_legs_frozen_funding_settles_at_its_retained_mark() {
+        // Codex P1 pairtrade#384: retired while its funding rate is
+        // unknown, the leg's exposure is frozen into
+        // pending_funding_qty_hours; the market never prices again, so the
+        // retained last mark is the only price that can settle it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BookConfig::from_yaml_str(&test_config_yaml()).unwrap();
+        sandbox(&mut cfg, dir.path());
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(dir.path(), "2026-09-06", d, &[("BTC", 0.5), ("DOT", -0.5)]);
+        let (mut engine, exec) = paper_engine(cfg.clone(), dir.path(), vec![]).await;
+        engine.mark_on_date_change = false;
+        engine.tick(d.timestamp()).await.unwrap();
+        engine.tick(d.timestamp() + 5).await.unwrap();
+        // DOT's price AND funding rate are gone (clear_observations).
+        exec.clear_observations().await;
+        exec.set_price("BTC", 100_000.0).await;
+        exec.set_funding_rate_hourly("BTC", 0.0001).await;
+        let t9 = d.timestamp() + 9 * 86_400;
+        engine.tick(t9).await.unwrap();
+        assert!(!engine.state.positions.contains_key("DOT"));
+        let frozen = engine.state.pending_funding_qty_hours["DOT"];
+        assert!(frozen < 0.0, "short DOT exposure frozen: {frozen}");
+        assert_eq!(
+            engine.state.last_marks.get("DOT"),
+            Some(&(d.timestamp() + 5, 4.0))
+        );
+        // A later tick keeps the mark while the carry is unsettled.
+        engine.tick(t9 + 5).await.unwrap();
+        assert!(engine.state.last_marks.contains_key("DOT"));
+
+        // DOT's rate becomes known again (price still absent): the carry
+        // settles at the retained 4.0 mark, then the mark is pruned.
+        exec.set_funding_rate_hourly("DOT", 0.0001).await;
+        let funding_before = engine.state.cum_funding_est_usd;
+        let prices: HashMap<String, f64> = [("BTC".to_string(), 100_000.0)].into();
+        let (_, det) = engine.accrue_daily_funding(t9 + 10, &prices).await;
+        assert!(!engine.state.pending_funding_qty_hours.contains_key("DOT"));
+        // Settled at the retained 4.0 (short DOT receives at +rate).
+        let expected = -frozen * 4.0 * 0.0001;
+        assert!((det["DOT"]["est_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+        let btc = det["BTC"]["est_usd"].as_f64().unwrap();
+        assert!(
+            (engine.state.cum_funding_est_usd - funding_before - (expected + btc)).abs() < 1e-9
+        );
+        engine.tick(t9 + 15).await.unwrap();
+        assert!(
+            !engine.state.last_marks.contains_key("DOT"),
+            "pruned once settled"
+        );
+    }
+
+    #[test]
+    fn dead_mark_threshold_and_weight_filter() {
+        assert!(!mark_is_dead(0, 86_399, 86_400));
+        assert!(mark_is_dead(0, 86_400, 86_400));
+        assert!(!mark_is_dead(0, 10 * 86_400, 0), "0 disables retirement");
+        let w: BTreeMap<String, f64> = [("BTC".to_string(), 0.5), ("DOT".to_string(), -0.5)].into();
+        let dead: BTreeMap<String, i64> = [("DOT".to_string(), 1)].into();
+        assert_eq!(without_dead(&w, &dead), [("BTC".to_string(), 0.5)].into());
     }
 
     #[tokio::test]
@@ -4511,6 +4841,31 @@ mod tests {
         assert!(engine.state.positions["BTC"].qty > 0.0);
         // Admitted once; the decision did not ask again.
         assert_eq!(venue.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retired_dead_mark_symbol_does_not_reject_the_signal_at_admission() {
+        // Codex P2 pairtrade#384: in venue_listed mode a delisted symbol is
+        // refused at admission before the plan's dead-symbol filter, so a
+        // signal still naming a retired leg would reject the whole
+        // rebalance.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut engine, venue, _) =
+            venue_listed_engine(dir.path(), vec![("ARB", 0.5)], vec![]).await;
+        venue.delisted.lock().unwrap().push("ARB");
+        engine.state.dead_symbols.insert("ARB".into(), 1);
+        let d = ts("2026-09-06T00:30:00Z");
+        write_signal(
+            dir.path(),
+            "2026-09-06",
+            d,
+            &[("BTC", -0.3), ("ETH", 0.2), ("ARB", 0.1)],
+        );
+        engine.tick(d.timestamp()).await.unwrap();
+        let rec = engine.state.last_decision.clone().unwrap();
+        assert_ne!(rec.outcome, DecisionOutcome::Rejected, "{rec:?}");
+        assert!(!engine.state.positions.contains_key("ARB"));
+        assert!(engine.state.positions["ETH"].qty > 0.0);
     }
 
     #[tokio::test]
