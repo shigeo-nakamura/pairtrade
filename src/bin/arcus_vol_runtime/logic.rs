@@ -1831,6 +1831,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_session_switch_of_the_offset_moves_a_resting_quote_and_back() {
+        // bot-strategy#1093 session offset: the runtime swaps the presence
+        // pair at a session boundary; the ordinary band rule must move a
+        // quote resting at the old distance, both ways, and keep it once
+        // it rests at the new one.
+        let t = at("770.43", "770.44");
+        let off = QuoteParams {
+            clip_usd: d("2500"),
+            presence: presence("2", "1"),
+            ..params()
+        };
+        let on = QuoteParams {
+            clip_usd: d("2500"),
+            presence: presence("5", "2"),
+            ..params()
+        };
+        let (bid_off, _) = plan_quotes(&t, Decimal::ZERO, &off);
+        let qty = bid_off.qty.unwrap();
+        let px2 = offset_px(QSide::Bid, d("770.43"), d("2"));
+        let px5 = offset_px(QSide::Bid, d("770.43"), d("5"));
+        let r2 = Resting {
+            qty,
+            ..resting(&px2.to_string(), "0")
+        };
+        let r5 = Resting {
+            qty,
+            ..resting(&px5.to_string(), "0")
+        };
+        // Off-session: the 2 bp quote is kept.
+        assert_eq!(quote_action(Some(&r2), &bid_off), QuoteAction::Keep);
+        // Session opens: 2 bp is outside 5 ± 2 → moved to 5 bp.
+        let (bid_on, _) = plan_quotes(&t, Decimal::ZERO, &on);
+        assert_eq!(
+            quote_action(Some(&r2), &bid_on),
+            QuoteAction::Replace(Some(QuoteTarget {
+                side: QSide::Bid,
+                px: px5,
+                qty
+            }))
+        );
+        assert_eq!(quote_action(Some(&r5), &bid_on), QuoteAction::Keep);
+        // Session closes: 5 bp is outside 2 ± 1 → back to 2 bp.
+        assert_eq!(
+            quote_action(Some(&r5), &bid_off),
+            QuoteAction::Replace(Some(QuoteTarget {
+                side: QSide::Bid,
+                px: px2,
+                qty
+            }))
+        );
+    }
+
     /// Presence params used by the tests below: $500 clip, 5 bp ± 2 bp.
     fn presence_params() -> QuoteParams {
         QuoteParams {

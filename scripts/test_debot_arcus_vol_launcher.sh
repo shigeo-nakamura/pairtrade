@@ -174,6 +174,16 @@ printf 'MARKET=QQQ-USD\nARCUS_ACCOUNT_INDEX=1\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "REFUSED: $T/etc/config.env line 2: key ARCUS_ACCOUNT_INDEX is not accepted here" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "config.env must not set ARCUS_ACCOUNT_INDEX"
 printf 'ARCUS_WEBSOCKET_ENDPOINT=wss://evil.example/ws\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "key ARCUS_WEBSOCKET_ENDPOINT is not accepted here" <<< "$OUT" || fail "config.env must refuse unknown keys"
+# session offset: both keys pass through; unset = not exported; half a pair or a non-number refuses
+printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\nSESSION_OFFSET_BPS=5\nSESSION_BAND_BPS=2\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_SESSION_OFFSET_BPS=5 "$T/env.out" && grep -qxF ARCUS_VOL_SESSION_BAND_BPS=2 "$T/env.out" \
+    && grep -qxF ARCUS_VOL_QUOTE_OFFSET_BPS=2 "$T/env.out" && grep -q "in session 5 bp +/- 2 bp" <<< "$OUT" || fail "session offset must reach the runtime"
+printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && ! grep -q '^ARCUS_VOL_SESSION_' "$T/env.out" || fail "no session keys must be exported when unset"
+printf 'SESSION_OFFSET_BPS=5\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "set both SESSION_OFFSET_BPS and SESSION_BAND_BPS" <<< "$OUT" || fail "half a session pair must refuse"
+printf 'SESSION_OFFSET_BPS=5\nSESSION_BAND_BPS=two\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "SESSION_BAND_BPS must be a number" <<< "$OUT" || fail "non-numeric session band must refuse"
 rm -f "$T/etc/config.env"
 printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nARCUS_ACCOUNT_INDEX=0\nARCUS_REST_ENDPOINT=https://evil.example\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
 [ "$RC" -eq 1 ] && grep -q "live.env line 5: key ARCUS_REST_ENDPOINT is not accepted here" <<< "$OUT" || fail "live.env must refuse endpoint keys"

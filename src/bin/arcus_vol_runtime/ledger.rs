@@ -1808,6 +1808,30 @@ mod tests {
     }
 
     #[test]
+    fn the_session_offset_is_wired_into_every_quote() {
+        // bot-strategy#1093 session offset: the tick reads the session, then
+        // fixes it on the fresh clock before planning; the one QuoteParams
+        // builder quotes with the session's presence pair.
+        let tick = main_fn_body("tick");
+        assert!(before(
+            &tick,
+            "self.refresh_session(now)",
+            "self.update_session(now)"
+        ));
+        assert!(before(
+            &tick,
+            "self.update_session(now)",
+            "self.quote_params()"
+        ));
+        let params = main_fn_body("quote_params");
+        assert!(params.contains("presence: self.cfg.presence_for(self.in_session)"));
+        assert!(!params.contains("self.cfg.presence()"));
+        // The read is skipped entirely when no session offset is configured.
+        let read = main_fn_body("refresh_session");
+        assert!(read.contains("!self.cfg.session_switching()"));
+    }
+
+    #[test]
     fn dust_is_carried_on_every_runtime_path() {
         // bot-strategy#1093 dust fix (live 2026-10-03: 0.00046 SPY below the
         // venue minimum, 11,383 rejected flatten IOCs, quotes pulled 10 h).

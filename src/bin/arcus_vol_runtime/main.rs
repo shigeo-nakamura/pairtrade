@@ -63,6 +63,7 @@
 mod config;
 mod ledger;
 mod logic;
+mod session;
 mod sim;
 mod tape;
 
@@ -141,6 +142,12 @@ fn utc_day() -> String {
 const TICK_REFRESH_MS: u64 = 60_000;
 const TICK_RETRY_MS: u64 = 30_000;
 const TICK_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// The market-row read for the venue session (bot-strategy#1093 session
+/// offset): once a minute, 30 s after a failure; the venue flag stays
+/// authoritative for `session::VENUE_FLAG_TTL_MS`, then the local hours.
+const SESSION_REFRESH_MS: u64 = 60_000;
+const SESSION_RETRY_MS: u64 = 30_000;
+const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct BookView {
     bid: Decimal,
@@ -233,6 +240,14 @@ struct Runtime {
     /// inventory below them is dust (bot-strategy#1093 dust fix).
     venue_min: VenueMin,
     next_tick_read_ms: u64,
+    /// The market's venue session (bot-strategy#1093 session offset), read
+    /// from its `/v1/markets` row once a minute while a session offset is
+    /// configured; `in_session` is the value the current tick quotes with.
+    session: session::Session,
+    in_session: Option<bool>,
+    next_session_read_ms: u64,
+    session_tz_warned: bool,
+    http: reqwest::Client,
     /// When the inventory last became more than dust (ms); drives MAX_HOLD
     /// instead of the ledger's `opened_at_ms`, so a fill landing on carried
     /// dust starts a fresh hold instead of inheriting the dust's age.
@@ -261,7 +276,7 @@ impl Runtime {
             cap_usd: self.cfg.quote_cap_usd(),
             min_quote_usd: self.cfg.min_quote_usd,
             qty_decimals: self.cfg.qty_decimals,
-            presence: self.cfg.presence(),
+            presence: self.cfg.presence_for(self.in_session),
             venue_min: self.venue_min,
         }
     }
@@ -329,6 +344,78 @@ impl Runtime {
     /// venue's order minimums (dust threshold and size step, bot-strategy#1093
     /// dust fix) and, for the paper sim, its price tick. Never gates quoting
     /// (the dust test falls back to `ARCUS_VOL_DUST_USD` until it lands).
+    /// Read the market's row for its session (`isOutsideRth` +
+    /// `regularTradingHours`) once a minute, only while a session offset is
+    /// configured. A failed read keeps the last knowledge: the venue flag
+    /// ages out and the local hours take over (`Session::in_session`).
+    async fn refresh_session(&mut self, now: u64) {
+        if !self.cfg.session_switching()
+            || !ticker_read_due(now, self.next_session_read_ms, self.backoff_until_ms)
+        {
+            return;
+        }
+        self.next_session_read_ms = now + SESSION_RETRY_MS;
+        let url = format!(
+            "{}/v1/markets?market={}",
+            self.cfg.rest_url, self.cfg.market
+        );
+        let read = async {
+            let body: serde_json::Value = self
+                .http
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok::<_, reqwest::Error>(body)
+        };
+        match read.await {
+            Ok(body) => match session::market_row(&body, &self.cfg.market) {
+                Some(row) => {
+                    let parsed = session::parse_market_row(row);
+                    if let Some(tz) = parsed.unsupported_tz.as_deref() {
+                        if !self.session_tz_warned {
+                            log::warn!("[ARCUS_VOL] {} trading hours are in {tz}, not {}: no session switching", self.cfg.market, session::NEW_YORK);
+                            self.session_tz_warned = true;
+                        }
+                    }
+                    self.session.apply(&parsed, now);
+                    self.next_session_read_ms = now + SESSION_REFRESH_MS;
+                }
+                None => log::warn!(
+                    "[ARCUS_VOL] session read: no {} row in /v1/markets",
+                    self.cfg.market
+                ),
+            },
+            Err(e) => log::warn!("[ARCUS_VOL] session read failed: {e}"),
+        }
+    }
+
+    /// The session this tick quotes with; one INFO line per change.
+    fn update_session(&mut self, now: u64) {
+        let next = if self.cfg.session_switching() {
+            self.session.in_session(now)
+        } else {
+            None
+        };
+        if next != self.in_session {
+            let p = self.cfg.presence_for(next);
+            let what = match next {
+                Some(true) => "in session",
+                Some(false) => "off session",
+                None => "no session known",
+            };
+            log::info!(
+                "[ARCUS_VOL] {}: {what} → quotes rest {} bp behind the touch (±{} bp)",
+                self.cfg.market,
+                p.offset_bps,
+                p.band_bps
+            );
+            self.in_session = next;
+        }
+    }
+
     async fn refresh_venue_meta(&mut self, now: u64) {
         if !ticker_read_due(now, self.next_tick_read_ms, self.backoff_until_ms) {
             return;
@@ -1525,9 +1612,11 @@ impl Runtime {
             }
         }
         self.refresh_venue_meta(now).await;
+        self.refresh_session(now).await;
         // Every awaited call of the tick is done: decide on a fresh clock
         // (Codex P1, pairtrade#361).
         let now = now_ms();
+        self.update_session(now);
         // Markouts only against a timestamp-fresh mid; late ones go missing
         // rather than price at a stale mid (Codex P2, pairtrade#361).
         let fresh_mid = fresh_mark(
@@ -1769,8 +1858,9 @@ impl Runtime {
             "market": self.cfg.market,
             "book": self.book.as_ref().map(|b| json!({"bid": b.bid.to_string(), "ask": b.ask.to_string()})),
             "quotes": {"bid": quote(QSide::Bid), "ask": quote(QSide::Ask)},
-            "quote_offset_bps": self.cfg.quote_offset_bps.to_string(),
-            "repeg_band_bps": self.cfg.repeg_band_bps.to_string(),
+            "quote_offset_bps": self.cfg.presence_for(self.in_session).offset_bps.to_string(),
+            "repeg_band_bps": self.cfg.presence_for(self.in_session).band_bps.to_string(),
+            "session": match self.in_session { Some(true) => Some("in"), Some(false) => Some("off"), None => None },
             "paper_tick": self.paper_tick.map(|t| t.to_string()),
             "inventory": {"qty": l.position.qty.to_string(),
                           "usd": (l.position.qty * mark).round_dp(2).to_string(),
@@ -1975,6 +2065,13 @@ async fn main() -> Result<()> {
     } else {
         log::info!("[ARCUS_VOL] quoting at the touch (ARCUS_VOL_QUOTE_OFFSET_BPS=0)");
     }
+    if let (Some(off), Some(band)) = (cfg.session_offset_bps, cfg.session_band_bps) {
+        log::info!(
+            "[ARCUS_VOL] SESSION offset: while the venue session is open quotes rest {off} bp behind the touch (±{band} bp); off-session {} bp (±{} bp)",
+            cfg.quote_offset_bps,
+            cfg.repeg_band_bps
+        );
+    }
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create {}", cfg.state_dir.display()))?;
     // Before state.json is read or the venue touched (Codex P1, pairtrade#361).
@@ -2082,6 +2179,14 @@ async fn main() -> Result<()> {
             dust_usd: cfg.dust_usd,
         },
         next_tick_read_ms: 0,
+        session: session::Session::default(),
+        in_session: None,
+        next_session_read_ms: 0,
+        session_tz_warned: false,
+        http: reqwest::Client::builder()
+            .timeout(SESSION_READ_TIMEOUT)
+            .build()
+            .context("session http client")?,
         hold_since_ms: None,
         forced_dust_qty: None,
         last_flatten_warn_ms: 0,
