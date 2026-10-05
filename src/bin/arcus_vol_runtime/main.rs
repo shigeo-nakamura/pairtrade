@@ -1585,18 +1585,26 @@ impl Runtime {
                 // Builds before bot-strategy#1093's per-market switch armed the
                 // ACCOUNT-WIDE switch; one left armed by an older process
                 // would cancel every market's orders (ours included) when it
-                // fires. Clear it once, best-effort, before the first arm.
+                // fires. Clear it before the first arm; until that disarm is
+                // confirmed, the per-market switch is not armed, so no quoting
+                // (retried every tick like a failed arm).
                 match self.dex.schedule_cancel(None).await {
-                    Ok(()) => log::info!(
-                        "[ARCUS_VOL] account-wide dead man's switch disarmed (left over from an older build, if any)"
-                    ),
-                    Err(e) => log::warn!(
-                        "[ARCUS_VOL] account-wide dead man's switch disarm failed: {e} (an older build's switch may still fire)"
-                    ),
+                    Ok(()) => {
+                        log::info!(
+                            "[ARCUS_VOL] account-wide dead man's switch disarmed (left over from an older build, if any)"
+                        );
+                        self.legacy_dms_cleared = true;
+                    }
+                    Err(e) => {
+                        self.dms_last_failed = true;
+                        self.on_error(
+                            "account-wide dead man's switch disarm (no new quotes until cleared)",
+                            &e,
+                        );
+                    }
                 }
-                self.legacy_dms_cleared = true;
             }
-            if due {
+            if due && self.legacy_dms_cleared {
                 match self
                     .dex
                     .schedule_cancel_market(&self.cfg.market, Some(self.cfg.dms_secs))

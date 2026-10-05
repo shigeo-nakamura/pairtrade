@@ -1799,6 +1799,12 @@ mod tests {
             .unwrap();
         assert!(legacy < arm);
         assert!(flat.contains("self.legacy_dms_cleared=true;"));
+        // The legacy switch counts as cleared only after a confirmed disarm,
+        // and the per-market arm waits for it (Codex P1 on #386).
+        assert!(
+            flat.contains("Ok(())=>{log::info!(\"[ARCUS_VOL]account-widedeadman'sswitchdisarmed")
+        );
+        assert!(flat.contains("ifdue&&self.legacy_dms_cleared{"));
         // An unconfirmed / failed per-market disarm at shutdown is a WARN and
         // the shutdown carries on (Codex P1 on dex-connector#131).
         let disarm = flat
