@@ -3,8 +3,8 @@
 `arcus_vol_runtime` quotes one Arcus Perps market on **subaccount 0** of the
 owner's wallet: post-only quotes resting `QUOTE_OFFSET_BPS` behind the touch
 (presence mode; `0` = at the touch), the inventory-reducing side at the touch,
-daily and cumulative stops, a 30 s dead man's switch (`scheduleCancel`,
-refreshed every 10 s). Binary: `src/bin/arcus_vol_runtime/` (module doc =
+daily and cumulative stops, a 30 s per-market dead man's switch
+(`scheduleCancel` with `marketId`, refreshed every 10 s). Binary: `src/bin/arcus_vol_runtime/` (module doc =
 design + invariants). Feature set: `--no-default-features --features
 arcus-sdk` (no lighter-sdk, no libsigner).
 
@@ -126,12 +126,31 @@ without hours (crypto) never switches. Each switch logs one line
 
 ### What the dead man's switch means for manual trading
 
-`scheduleCancel` is **account-wide**: if the host cannot reach the venue for
-~30 s (or the runtime dies), the venue cancels **every** open order on
-subaccount 0, including manual limit orders in other markets (this
-happened to a NEAR-USD limit on 2026-10-01). Positions are not touched.
-Keep manual resting orders on another subaccount while the runtime runs.
-Per-market `scheduleCancel` (`marketId`) is a recorded follow-up.
+The switch is **per-market** (`scheduleCancel` with `marketId`, dex-connector
+4.7.44+): if the host cannot reach the venue for ~30 s (or the runtime dies),
+the venue cancels only the open orders **in the runtime's market**
+(`MARKET`, e.g. SPY-USD). Manual orders in other markets survive. Before
+dex-connector 4.7.44 the switch was account-wide and cancelled every open
+order on subaccount 0 (a manual NEAR-USD limit was lost that way on
+2026-10-01). Positions are never touched.
+
+- Manual orders **in the runtime's own market** are still cancelled as
+  stray orders (and by the switch) — keep those on another subaccount.
+- On its first arm the runtime also disarms the account-wide switch once,
+  in case an older build left it armed (it would otherwise fire and cancel
+  every market). Nothing else on subaccount 0 may rely on the account-wide
+  switch.
+- The runtime only reports the switch armed when the venue echoed the
+  market (`marketId`) back: a gateway that ignored the field would have
+  armed the account-wide switch, so that is an error, no quote is sent, and
+  the connector immediately disarms the account-wide switch again (the error
+  line says whether that worked).
+- At shutdown an unconfirmed per-market disarm is only a WARN ("…switch may
+  still fire within 30s -- it only cancels SPY-USD orders, which are already
+  cancelled; exiting normally"): the quotes were cancelled and read back
+  before the disarm.
+- Venue quotas: 10 auto-fires per UTC day per subaccount (shared by all of
+  its switches), at most 50 armed switches per wallet.
 
 ## Moving state from another host
 

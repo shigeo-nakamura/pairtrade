@@ -5527,6 +5527,14 @@ mod tests {
             unimplemented!("QuoteOnly stub: not used on the DRY_RUN exit path")
         }
 
+        async fn schedule_cancel_market(
+            &self,
+            _symbol: &str,
+            _timeout_secs: Option<u64>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!("QuoteOnly stub: not used on the DRY_RUN exit path")
+        }
+
         async fn create_orders_batch(
             &self,
             _orders: Vec<dex_connector::BatchOrderRequest>,

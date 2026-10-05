@@ -1078,6 +1078,19 @@ pub fn shutdown_steps(live: bool) -> Vec<ShutdownStep> {
     }
 }
 
+/// The shutdown line when the per-market disarm did not come back
+/// confirmed (an error, or the venue did not echo `marketId`;
+/// bot-strategy#1093). Not a failure of the shutdown: our quotes were
+/// already cancelled and read back, and the market switch, if still armed,
+/// can only cancel this market's orders when its deadline passes.
+pub fn dms_disarm_unconfirmed_note(market: &str, dms_secs: u64, err: &str) -> String {
+    format!(
+        "[ARCUS_VOL] shutdown: per-market DMS disarm unconfirmed ({err}); the {market} switch may \
+         still fire within {dms_secs}s -- it only cancels {market} orders, which are already \
+         cancelled; exiting normally"
+    )
+}
+
 /// Disarm the DMS at shutdown only when the cancel succeeded AND a
 /// read-back found none of our orders resting (`None` = the read failed).
 pub fn may_disarm_dms(cancel_ok: bool, open_after: Option<usize>) -> bool {
@@ -1095,6 +1108,22 @@ pub fn book_stale(book_ts_ms: Option<u64>, now_ms: u64, stale_secs: u64) -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unconfirmed_shutdown_disarm_is_a_warning_about_this_market_only() {
+        let n = dms_disarm_unconfirmed_note(
+            "SPY-USD",
+            30,
+            "Arcus per-market disarm unconfirmed: venue did not echo marketId 7",
+        );
+        assert!(
+            n.contains("SPY-USD switch may still fire within 30s"),
+            "{n}"
+        );
+        assert!(n.contains("only cancels SPY-USD orders"), "{n}");
+        assert!(n.contains("exiting normally"), "{n}");
+        assert!(n.contains("did not echo marketId 7"), "{n}");
+    }
+
     use super::*;
     use std::str::FromStr;
 
