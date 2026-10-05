@@ -1758,6 +1758,50 @@ mod tests {
     }
 
     #[test]
+    fn the_dead_mans_switch_is_per_market() {
+        // bot-strategy#1093: arm, refresh and disarm target this runtime's
+        // market only, so a crash or an outage never cancels orders in other
+        // markets of the subaccount (the owner's manual orders) and several
+        // runtimes can share one. The only account-wide call left is the
+        // one-shot DISARM of a switch an older build may have left armed.
+        let main = include_str!("main.rs");
+        let code: String = main
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat: String = code.split_whitespace().collect();
+        assert!(
+            flat.contains(".schedule_cancel_market(&self.cfg.market,Some(self.cfg.dms_secs))"),
+            "arm/refresh must be per-market"
+        );
+        assert!(
+            flat.contains(".schedule_cancel_market(&self.cfg.market,None)"),
+            "shutdown disarm must be per-market"
+        );
+        assert_eq!(
+            flat.matches(".schedule_cancel(").count(),
+            1,
+            "exactly one account-wide call (the legacy disarm)"
+        );
+        assert!(
+            flat.contains(".schedule_cancel(None)"),
+            "the account-wide call may only disarm"
+        );
+        assert!(
+            !flat.contains(".schedule_cancel(Some("),
+            "never arm the account-wide switch"
+        );
+        // The legacy disarm runs once, before the first per-market arm.
+        let legacy = flat.find(".schedule_cancel(None)").unwrap();
+        let arm = flat
+            .find(".schedule_cancel_market(&self.cfg.market,Some(")
+            .unwrap();
+        assert!(legacy < arm);
+        assert!(flat.contains("self.legacy_dms_cleared=true;"));
+    }
+
+    #[test]
     fn the_runtime_never_appends_to_the_journal_without_rollback() {
         // Every fills.jsonl append must go through append_synced /
         // append_journal (Codex P1, pairtrade#361).

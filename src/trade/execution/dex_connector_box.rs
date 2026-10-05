@@ -779,6 +779,22 @@ impl DexConnector for DexConnectorBox {
         result
     }
 
+    async fn schedule_cancel_market(
+        &self,
+        symbol: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<(), DexError> {
+        let result = self
+            .inner
+            .schedule_cancel_market(symbol, timeout_secs)
+            .await;
+        if let Err(ref err) = result {
+            let detail = timeout_secs.map_or_else(|| "disarm".to_string(), |s| format!("{s}s"));
+            self.report_rate_limit("schedule_cancel_market", &format!("{symbol} {detail}"), err);
+        }
+        result
+    }
+
     async fn create_orders_batch(
         &self,
         orders: Vec<dex_connector::BatchOrderRequest>,
@@ -838,6 +854,17 @@ impl DexConnector for DexConnectorBox {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schedule_cancel_market_is_forwarded() {
+        // bot-strategy#1093: the per-market dead man's switch must reach the
+        // inner connector (CLAUDE.md: a missing forward silently downgrades).
+        let src = include_str!("dex_connector_box.rs");
+        // The impl only: this test's own text must not satisfy the check.
+        let impl_src = &src[..src.find("#[cfg(test)]").unwrap()];
+        let flat: String = impl_src.split_whitespace().collect();
+        assert!(flat.contains("self.inner.schedule_cancel_market(symbol,timeout_secs).await"));
+    }
+
     #[cfg(feature = "arcus-sdk")]
     use super::DexConnectorBox;
     use super::{first_rate_limited_row, mentions_http_429, DexError};

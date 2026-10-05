@@ -7191,6 +7191,14 @@ mod tests {
             unimplemented!("ReconcileDex: not used by the reconcile seam")
         }
 
+        async fn schedule_cancel_market(
+            &self,
+            _symbol: &str,
+            _timeout_secs: Option<u64>,
+        ) -> Result<(), DexError> {
+            unimplemented!("ReconcileDex: not used by the reconcile seam")
+        }
+
         async fn create_orders_batch(
             &self,
             _orders: Vec<dex_connector::BatchOrderRequest>,

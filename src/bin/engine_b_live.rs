@@ -7983,6 +7983,14 @@ mod tests {
             unimplemented!("the test drives latest_price directly")
         }
 
+        async fn schedule_cancel_market(
+            &self,
+            _symbol: &str,
+            _timeout_secs: Option<u64>,
+        ) -> Result<(), dex_connector::DexError> {
+            unimplemented!("the test drives latest_price directly")
+        }
+
         async fn create_orders_batch(
             &self,
             _orders: Vec<dex_connector::BatchOrderRequest>,

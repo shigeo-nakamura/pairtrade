@@ -229,6 +229,8 @@ struct Runtime {
     /// Last successful DMS arm/refresh, and whether the latest attempt failed.
     dms_last_ok_ms: Option<u64>,
     dms_last_failed: bool,
+    /// The one-shot disarm of a leftover ACCOUNT-WIDE switch ran.
+    legacy_dms_cleared: bool,
     last_reconcile_ms: u64,
     last_position_ms: u64,
     last_summary_ms: u64,
@@ -1578,15 +1580,34 @@ impl Runtime {
                 || self
                     .dms_last_ok_ms
                     .is_none_or(|t| now.saturating_sub(t) >= self.cfg.dms_refresh_secs * 1_000);
+            if due && !self.legacy_dms_cleared {
+                // Builds before bot-strategy#1093's per-market switch armed the
+                // ACCOUNT-WIDE switch; one left armed by an older process
+                // would cancel every market's orders (ours included) when it
+                // fires. Clear it once, best-effort, before the first arm.
+                match self.dex.schedule_cancel(None).await {
+                    Ok(()) => log::info!(
+                        "[ARCUS_VOL] account-wide dead man's switch disarmed (left over from an older build, if any)"
+                    ),
+                    Err(e) => log::warn!(
+                        "[ARCUS_VOL] account-wide dead man's switch disarm failed: {e} (an older build's switch may still fire)"
+                    ),
+                }
+                self.legacy_dms_cleared = true;
+            }
             if due {
-                match self.dex.schedule_cancel(Some(self.cfg.dms_secs)).await {
+                match self
+                    .dex
+                    .schedule_cancel_market(&self.cfg.market, Some(self.cfg.dms_secs))
+                    .await
+                {
                     Ok(()) => {
                         self.dms_last_ok_ms = Some(now);
                         self.dms_last_failed = false;
                     }
                     Err(e) => {
                         self.dms_last_failed = true;
-                        self.on_error("schedule_cancel (no new quotes until armed)", &e);
+                        self.on_error("schedule_cancel_market (no new quotes until armed)", &e);
                     }
                 }
             }
@@ -1985,9 +2006,13 @@ impl Runtime {
                 ShutdownStep::DisarmDms => {
                     if !may_disarm_dms(cancel_ok, open_after) {
                         log::error!(
-                            "[ARCUS_VOL] DMS LEFT ARMED (cancel_ok={cancel_ok}, open_after={open_after:?}); the venue cancels everything when it fires"
+                            "[ARCUS_VOL] DMS LEFT ARMED (cancel_ok={cancel_ok}, open_after={open_after:?}); the venue cancels this market's orders when it fires"
                         );
-                    } else if let Err(e) = self.dex.schedule_cancel(None).await {
+                    } else if let Err(e) = self
+                        .dex
+                        .schedule_cancel_market(&self.cfg.market, None)
+                        .await
+                    {
                         log::warn!("[ARCUS_VOL] shutdown DMS disarm failed: {e}");
                     }
                 }
@@ -2034,8 +2059,9 @@ async fn main() -> Result<()> {
     if !cfg.dry_run && cfg.account_index == Some(0) {
         log::warn!(
             "[ARCUS_VOL] LIVE ON SUBACCOUNT 0 (shared with manual trading): stray {} orders get \
-             cancelled, a {} position mismatch halts, and the dead man's switch cancels ALL \
-             orders on the account (every market) if this process stops refreshing it",
+             cancelled and a {} position mismatch halts; the dead man's switch is per-market \
+             ({} only), so orders in other markets survive if this process stops refreshing it",
+            cfg.market,
             cfg.market,
             cfg.market
         );
@@ -2168,6 +2194,7 @@ async fn main() -> Result<()> {
         fills_synced: false,
         dms_last_ok_ms: None,
         dms_last_failed: false,
+        legacy_dms_cleared: false,
         last_reconcile_ms: 0,
         last_position_ms: 0,
         last_summary_ms: 0,
