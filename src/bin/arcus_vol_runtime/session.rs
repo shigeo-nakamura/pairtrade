@@ -161,12 +161,20 @@ impl Session {
     /// market has no session (crypto, unsupported zone, never read).
     pub fn in_session(&self, now_ms: u64) -> Option<bool> {
         let h = self.hours?;
+        let clock = in_hours(now_ms, h);
         if let Some((outside, at)) = self.venue_flag {
-            if now_ms.saturating_sub(at) <= VENUE_FLAG_TTL_MS {
+            // The venue flag describes the session at its read time. Once
+            // the clock has crossed a session boundary since then, the flag
+            // is about the previous session (bot-strategy#1093, 2026-10-06
+            // 00:00Z: the 23:59 read kept the bot "in session" at the wider
+            // offset for 23 s after the session had closed); the clock
+            // decides until the next read.
+            let crossed = in_hours(at, h) != clock;
+            if now_ms.saturating_sub(at) <= VENUE_FLAG_TTL_MS && !crossed {
                 return Some(!outside);
             }
         }
-        Some(in_hours(now_ms, h))
+        Some(clock)
     }
 }
 
@@ -315,5 +323,45 @@ mod tests {
             mon_noon,
         );
         assert_eq!(s.in_session(mon_noon), None);
+    }
+
+    #[test]
+    fn a_venue_flag_read_before_a_session_boundary_yields_to_the_clock() {
+        // The 2026-10-06 resume: last read 23:59:37Z (in session, 19:59 ET),
+        // the session closed at 00:00Z (20:00 ET).
+        let mut s = Session::default();
+        s.apply(
+            &MarketSession {
+                hours: Some(SPY),
+                outside_rth: Some(false),
+                unsupported_tz: None,
+            },
+            ms("2026-10-05T23:59:37Z"),
+        );
+        assert_eq!(s.in_session(ms("2026-10-05T23:59:59Z")), Some(true));
+        // Within the flag's TTL, but past the close: the clock decides.
+        assert_eq!(s.in_session(ms("2026-10-06T00:00:00Z")), Some(false));
+        assert_eq!(s.in_session(ms("2026-10-06T00:00:20Z")), Some(false));
+        // The open the same way (08:00Z = 04:00 ET in EDT).
+        s.apply(
+            &MarketSession {
+                hours: Some(SPY),
+                outside_rth: Some(true),
+                unsupported_tz: None,
+            },
+            ms("2026-10-06T07:59:30Z"),
+        );
+        assert_eq!(s.in_session(ms("2026-10-06T07:59:59Z")), Some(false));
+        assert_eq!(s.in_session(ms("2026-10-06T08:00:01Z")), Some(true));
+        // No boundary since the read: a holiday flag still wins (unchanged).
+        s.apply(
+            &MarketSession {
+                hours: Some(SPY),
+                outside_rth: Some(true),
+                unsupported_tz: None,
+            },
+            ms("2026-10-06T12:00:00Z"),
+        );
+        assert_eq!(s.in_session(ms("2026-10-06T12:01:00Z")), Some(false));
     }
 }

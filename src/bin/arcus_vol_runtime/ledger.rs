@@ -1896,6 +1896,28 @@ mod tests {
     }
 
     #[test]
+    fn a_just_placed_quote_is_not_forgotten_by_the_open_orders_sweep() {
+        // bot-strategy#1093 2026-10-06 00:00:00Z: the sweep dropped two
+        // just-placed quotes the read did not list yet, and the same tick
+        // placed a second pair. The sweep must go through the grace-aware
+        // `sweep_open_orders`, and every placement / modify must record its
+        // placement time.
+        let sweep: String = main_fn_body("live_reconcile_orders")
+            .split_whitespace()
+            .collect();
+        assert!(sweep.contains("sweep_open_orders(&self.resting,&self.placed_at_ms,&ids,"));
+        assert!(sweep.contains("PLACE_VISIBILITY_GRACE_MS"));
+        assert!(!sweep.contains("self.resting.retain(|_,r|ids.contains(&r.order_id))"));
+        for f in ["send_places", "send_modifies"] {
+            let body: String = main_fn_body(f).split_whitespace().collect();
+            assert!(
+                body.contains("self.placed_at_ms.insert(resp.order_id.clone(),now_ms());"),
+                "{f} must record the placement time"
+            );
+        }
+    }
+
+    #[test]
     fn dust_is_carried_on_every_runtime_path() {
         // bot-strategy#1093 dust fix (live 2026-10-03: 0.00046 SPY below the
         // venue minimum, 11,383 rejected flatten IOCs, quotes pulled 10 h).

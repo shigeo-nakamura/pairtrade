@@ -3,7 +3,7 @@
 
 use dex_connector::{DexError, OrderBookLevel, OrderSide};
 use rust_decimal::{Decimal, RoundingStrategy};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// One of our two resting quotes. A bid fill buys (+inventory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -571,6 +571,57 @@ pub struct Resting {
     pub px: Decimal,
     pub qty: Decimal,
     pub filled: Decimal,
+}
+
+/// An order we placed less than this long ago may be missing from an
+/// open-orders read without being gone: the read lags the placement
+/// (bot-strategy#1093, 2026-10-06 00:00:00Z: the periodic reconcile ran in
+/// the tick after a placement, did not see the two new quotes, forgot them,
+/// and the same tick placed a second pair; the first pair rested untracked
+/// until the next sweep cancelled it as stray 15 s later).
+pub const PLACE_VISIBILITY_GRACE_MS: u64 = 10_000;
+
+/// What a periodic open-orders read changes in the local quote book.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderSweep {
+    /// Sides whose quote is gone: absent from the read and old enough that
+    /// the absence is real.
+    pub forget: Vec<QSide>,
+    /// Open orders on our market that are not one of our resting quotes.
+    pub strays: Vec<String>,
+}
+
+/// Reconcile our resting quotes with an open-orders read. A quote absent from
+/// the read is forgotten only once it is at least `grace_ms` old (by its
+/// placement time; unknown placement time = old): a young quote missing from
+/// the read is still ours, so it is neither re-placed nor treated as a stray
+/// when it shows up. Strays are open ids that are none of our resting quotes.
+pub fn sweep_open_orders(
+    resting: &HashMap<QSide, Resting>,
+    placed_at_ms: &HashMap<String, u64>,
+    open_ids: &HashSet<String>,
+    now_ms: u64,
+    grace_ms: u64,
+) -> OrderSweep {
+    let mut forget: Vec<QSide> = resting
+        .iter()
+        .filter(|(_, r)| {
+            !open_ids.contains(&r.order_id)
+                && placed_at_ms
+                    .get(&r.order_id)
+                    .is_none_or(|t| now_ms.saturating_sub(*t) >= grace_ms)
+        })
+        .map(|(side, _)| *side)
+        .collect();
+    forget.sort_by_key(|s| s.as_str());
+    let ours: HashSet<&String> = resting.values().map(|r| &r.order_id).collect();
+    let mut strays: Vec<String> = open_ids
+        .iter()
+        .filter(|id| !ours.contains(id))
+        .cloned()
+        .collect();
+    strays.sort();
+    OrderSweep { forget, strays }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2882,5 +2933,67 @@ mod tests {
             position_check(d("-0.00046"), Some(d("-0.00046")), true, None, 1_000, 5_000).0,
             PosCheck::InSync
         );
+    }
+
+    #[test]
+    fn a_young_quote_missing_from_the_open_orders_read_stays_ours() {
+        // 2026-10-06 00:00:00Z: quotes placed, the next tick's open-orders
+        // read does not list them yet.
+        let mut resting = HashMap::new();
+        resting.insert(
+            QSide::Bid,
+            Resting {
+                order_id: "b1".into(),
+                px: d("774.0"),
+                qty: d("3"),
+                filled: Decimal::ZERO,
+            },
+        );
+        resting.insert(
+            QSide::Ask,
+            Resting {
+                order_id: "a1".into(),
+                px: d("775.0"),
+                qty: d("3"),
+                filled: Decimal::ZERO,
+            },
+        );
+        let mut placed = HashMap::new();
+        placed.insert("b1".to_string(), 1_000u64);
+        placed.insert("a1".to_string(), 1_000u64);
+        let empty: HashSet<String> = HashSet::new();
+        // 500 ms later: not visible yet → nothing forgotten (so the tick does
+        // not place a second pair), nothing stray.
+        let s = sweep_open_orders(&resting, &placed, &empty, 1_500, PLACE_VISIBILITY_GRACE_MS);
+        assert_eq!(s, OrderSweep::default());
+        // Visible on the next read: still ours, not stray.
+        let both: HashSet<String> = ["b1".to_string(), "a1".to_string()].into();
+        let s = sweep_open_orders(&resting, &placed, &both, 16_000, PLACE_VISIBILITY_GRACE_MS);
+        assert_eq!(s, OrderSweep::default());
+        // Gone (filled / cancelled by the venue) past the grace: forgotten.
+        let only_ask: HashSet<String> = ["a1".to_string()].into();
+        let s = sweep_open_orders(
+            &resting,
+            &placed,
+            &only_ask,
+            1_000 + PLACE_VISIBILITY_GRACE_MS,
+            PLACE_VISIBILITY_GRACE_MS,
+        );
+        assert_eq!(s.forget, vec![QSide::Bid]);
+        assert!(s.strays.is_empty());
+        // Unknown placement time counts as old (startup / adopted state).
+        let s = sweep_open_orders(
+            &resting,
+            &HashMap::new(),
+            &only_ask,
+            1_500,
+            PLACE_VISIBILITY_GRACE_MS,
+        );
+        assert_eq!(s.forget, vec![QSide::Bid]);
+        // A foreign / lost order on our market is a stray.
+        let extra: HashSet<String> = ["b1".to_string(), "a1".to_string(), "x9".to_string()].into();
+        let s = sweep_open_orders(&resting, &placed, &extra, 1_500, PLACE_VISIBILITY_GRACE_MS);
+        assert!(s.forget.is_empty());
+        assert_eq!(s.strays, vec!["x9".to_string()]);
     }
 }

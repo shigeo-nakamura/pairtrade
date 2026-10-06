@@ -82,9 +82,9 @@ use logic::{
     flatten_reason, flatten_steps, fresh_mark, market_position, may_disarm_dms, own_displayed,
     plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, quote_dists,
     quote_pass, read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows,
-    tick_plan, ticker_read_due, touches, BatchSink, ErrorEffect, PlanState, PosCheck, PricePlan,
-    QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
-    VenueMin,
+    sweep_open_orders, tick_plan, ticker_read_due, touches, BatchSink, ErrorEffect, PlanState,
+    PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep,
+    SidePlan, Step, TickPlan, VenueMin, PLACE_VISIBILITY_GRACE_MS,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -200,6 +200,9 @@ struct Runtime {
     flatten_inflight_until_ms: u64,
     pending_markouts: Vec<PendingMarkout>,
     quote_ids: HashSet<String>,
+    /// Placement time (ms) of each quote id we placed or modified, for the
+    /// open-orders sweep's visibility grace (`sweep_open_orders`).
+    placed_at_ms: HashMap<String, u64>,
     ioc_ids: HashSet<String>,
     /// Newest public print (venue µs) applied to the paper sim.
     newest_print_ts_us: u64,
@@ -1239,10 +1242,22 @@ impl Runtime {
         match self.dex.get_open_orders(&market).await {
             Ok(open) => {
                 let ids: HashSet<String> = open.orders.iter().map(|o| o.order_id.clone()).collect();
-                self.resting.retain(|_, r| ids.contains(&r.order_id));
-                let ours: HashSet<String> =
-                    self.resting.values().map(|r| r.order_id.clone()).collect();
-                for stray in ids.difference(&ours) {
+                // A quote placed moments ago may not be in the read yet: it
+                // stays ours (not forgotten, so not re-placed; not a stray
+                // when it shows up) until the visibility grace has passed.
+                let sweep = sweep_open_orders(
+                    &self.resting,
+                    &self.placed_at_ms,
+                    &ids,
+                    now_ms(),
+                    PLACE_VISIBILITY_GRACE_MS,
+                );
+                for side in &sweep.forget {
+                    self.resting.remove(side);
+                }
+                let live: HashSet<&String> = self.resting.values().map(|r| &r.order_id).collect();
+                self.placed_at_ms.retain(|id, _| live.contains(id));
+                for stray in &sweep.strays {
                     log::warn!("[ARCUS_VOL] cancelling stray open order {stray}");
                     if let Err(e) = self.dex.cancel_order(&market, stray).await {
                         self.on_error("cancel stray", &e);
@@ -1430,6 +1445,7 @@ impl Runtime {
                     match row {
                         Ok(resp) => {
                             self.quote_ids.insert(resp.order_id.clone());
+                            self.placed_at_ms.insert(resp.order_id.clone(), now_ms());
                             self.resting.insert(
                                 side,
                                 Resting {
@@ -1467,6 +1483,7 @@ impl Runtime {
                     match row {
                         Ok(resp) => {
                             self.quote_ids.insert(resp.order_id.clone());
+                            self.placed_at_ms.insert(resp.order_id.clone(), now_ms());
                             self.resting.insert(
                                 t.side,
                                 Resting {
@@ -2193,6 +2210,7 @@ async fn main() -> Result<()> {
         flatten_inflight_until_ms: 0,
         pending_markouts: Vec::new(),
         quote_ids: HashSet::new(),
+        placed_at_ms: HashMap::new(),
         ioc_ids: HashSet::new(),
         newest_print_ts_us: 0,
         tape: tape::TapeHealth::default(),
