@@ -268,6 +268,7 @@ impl PaperBook {
                 }
                 // A reduce-only IOC never trades past flat (as live venues
                 // and the book PaperExecutor do; Codex on #376).
+                let requested = qty;
                 let qty = if reduce_only {
                     qty.min(self.reducible(side))
                 } else {
@@ -290,9 +291,10 @@ impl PaperBook {
                     left -= q;
                     self.book_fill(&id, side, q, l.price, self.params.taker_fee_bps);
                 }
-                // The unfilled remainder is cancelled, as a venue records it.
-                // (An IOC on an invalid book above is left unknown on purpose.)
-                if left > 1e-12 {
+                // The unfilled remainder is cancelled, as a venue records it,
+                // including any part cut by the reduce-only cap (Codex on
+                // #388). An IOC on an invalid book above is left unknown.
+                if left > 1e-12 || qty < requested - 1e-12 {
                     self.canceled.insert(id);
                 }
             }
@@ -737,6 +739,24 @@ mod tests {
         let c = b.canceled_ids();
         assert!(c.contains(&part) && c.contains(&none), "{c:?}");
         assert!(!c.contains(&full), "{c:?}");
+    }
+
+    /// Codex on #388: the reduce-only cap counts as an unfilled remainder.
+    #[test]
+    fn a_reduce_only_ioc_capped_by_the_position_is_recorded_cancelled() {
+        let mut b = book(zero());
+        // flat: nothing reducible at all
+        let flat = b.place_ioc(1, Side::Sell, 1.0, 99.0, true);
+        b.flush(1);
+        assert!(b.canceled_ids().contains(&flat));
+        // long 0.1, reduce-only sell 1.0: 0.1 fills, the capped 0.9 is cancelled
+        let open = b.place_ioc(2, Side::Buy, 0.1, 101.0, false);
+        b.flush(2);
+        assert!(!b.canceled_ids().contains(&open));
+        let capped = b.place_ioc(3, Side::Sell, 1.0, 99.0, true);
+        b.flush(3);
+        assert!(b.canceled_ids().contains(&capped));
+        assert!(b.position().abs() < 1e-12, "{}", b.position());
     }
 
     #[test]
