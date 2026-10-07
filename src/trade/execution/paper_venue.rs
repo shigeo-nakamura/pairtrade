@@ -290,6 +290,11 @@ impl PaperBook {
                     left -= q;
                     self.book_fill(&id, side, q, l.price, self.params.taker_fee_bps);
                 }
+                // The unfilled remainder is cancelled, as a venue records it.
+                // (An IOC on an invalid book above is left unknown on purpose.)
+                if left > 1e-12 {
+                    self.canceled.insert(id);
+                }
             }
         }
     }
@@ -718,6 +723,20 @@ mod tests {
         );
         let fee: f64 = b.fills().iter().map(|f| f.fee_usd.unwrap()).sum();
         assert!((fee - (100.1 + 100.2) * 2.8e-4).abs() < 1e-9);
+    }
+
+    /// An IOC's unfilled remainder is recorded as cancelled, as a venue does;
+    /// a fully filled IOC is not.
+    #[test]
+    fn an_ioc_remainder_is_recorded_cancelled() {
+        let mut b = book(zero());
+        let part = b.place_ioc(1, Side::Buy, 50.0, 100.1, false);
+        let none = b.place_ioc(1, Side::Buy, 1.0, 99.0, false);
+        let full = b.place_ioc(1, Side::Sell, 0.1, 99.0, false);
+        b.flush(1);
+        let c = b.canceled_ids();
+        assert!(c.contains(&part) && c.contains(&none), "{c:?}");
+        assert!(!c.contains(&full), "{c:?}");
     }
 
     #[test]

@@ -37,7 +37,11 @@
 //!   the current touch is within that bound.
 //! - An IOC whose fill never shows in agreeing records and position is
 //!   unresolved, because a zero-fill IOC cannot be told apart from a delayed
-//!   record.
+//!   record — unless the venue lists the IOC as cancelled AND nothing is
+//!   booked for it AND the position agrees with the records and stays
+//!   unchanged over three consecutive samples: then it ended with zero fill
+//!   (an unfillable remainder, e.g. the book ran past the limit). Without the
+//!   cancel record it stays unresolved.
 //! - Never arms a dead-man switch (account-wide on Lighter, stops included).
 //! - With a journal ([`MakerFirstExecutor::execute_journaled`]), every send
 //!   is persisted **before** it goes out, so a crash leaves a record that
@@ -667,6 +671,8 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         // position, and the position unchanged since the previous poll (later
         // slices of a multi-counterparty IOC still arriving otherwise).
         let mut prev: Option<f64> = None;
+        // Consecutive agreeing, unchanged, nothing-booked samples (zero fill).
+        let mut zero_stable: u32 = 0;
         for _ in 0..=self.timing.ioc_fill_polls {
             let fresh = self.harvest(run).await;
             match (fresh, self.read_position(run).await) {
@@ -674,9 +680,31 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                     if run.book.filled > before + run.eps && run.agrees(p) && prev == Some(p) {
                         return;
                     }
+                    let nothing_booked = run.book.filled <= before + run.eps;
+                    zero_stable = if nothing_booked && run.agrees(p) && prev == Some(p) {
+                        zero_stable + 1
+                    } else {
+                        0
+                    };
+                    // Three samples, two unchanged steps: then require the
+                    // venue's positive terminal evidence for the IOC.
+                    if zero_stable >= 2 {
+                        if let Ok(c) = self.venue.canceled_order_ids(&intent.symbol).await {
+                            if c.contains(&id) {
+                                log::info!(
+                                    "[MAKER_FIRST] {}: IOC {id} ended with zero fill (cancelled, position unchanged)",
+                                    intent.symbol
+                                );
+                                return;
+                            }
+                        }
+                    }
                     prev = Some(p);
                 }
-                _ => prev = None,
+                _ => {
+                    prev = None;
+                    zero_stable = 0;
+                }
             }
             tokio::time::sleep(self.timing.poll).await;
         }
@@ -866,6 +894,8 @@ mod tests {
         /// Cancels are acknowledged but the order stays listed open.
         cancel_noop: bool,
         ioc_fills: bool,
+        /// An IOC that does not fill is listed as cancelled (as a venue does).
+        ioc_cancel_unfilled: bool,
         ioc_hidden: bool,
         /// The IOC fills in two slices, the second visible later.
         ioc_two_slices: bool,
@@ -1079,6 +1109,10 @@ mod tests {
                     push_fill(&mut st, &id, qty, px);
                 }
             }
+            if st.ioc_cancel_unfilled {
+                // a venue lists an IOC's unfilled remainder as cancelled
+                st.canceled.insert(id.clone());
+            }
             Ok(id)
         }
     }
@@ -1260,6 +1294,56 @@ mod tests {
         assert_eq!(v.s().iocs.len(), 1);
         assert_eq!(o.unresolved.len(), 1);
         assert!(o.unresolved[0].starts_with('i'));
+    }
+
+    /// An IOC that fills nothing, is listed cancelled, and leaves the
+    /// position unchanged ended with zero fill: not unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_zero_fill_ioc_is_settled_not_unresolved() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| s.ioc_cancel_unfilled = true);
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert_eq!(v.s().iocs.len(), 1);
+        assert!(o.unresolved.is_empty(), "{:?}", o.unresolved);
+        assert_eq!(o.filled_qty, 0.0);
+    }
+
+    /// Without the venue's cancel record a zero-fill IOC stays unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_fill_ioc_without_a_cancel_record_stays_unresolved() {
+        let v = MockVenue::new((99.9, 100.1));
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert_eq!(v.s().iocs.len(), 1);
+        assert_eq!(o.unresolved.len(), 1, "{:?}", o.unresolved);
+        assert!(o.unresolved[0].starts_with('i'));
+    }
+
+    /// A cancel record does not override a position move the records do not
+    /// explain (a hidden fill): still unresolved.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_ioc_with_an_unexplained_position_move_stays_unresolved() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.ioc_fills = true;
+            s.ioc_hidden = true;
+            s.ioc_cancel_unfilled = true;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert_eq!(o.unresolved.len(), 1, "{:?}", o.unresolved);
+        assert!(o.unresolved[0].starts_with('i'));
+    }
+
+    /// Both views lag the IOC's fill by two samples while the venue already
+    /// lists its remainder cancelled: zero fill must not be concluded early.
+    #[tokio::test(start_paused = true)]
+    async fn a_lagging_ioc_fill_is_not_mistaken_for_zero_fill() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.ioc_fills = true;
+            s.ioc_cancel_unfilled = true;
+            s.record_delay = 3;
+            s.position_delay = 3;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert!(o.unresolved.is_empty(), "{:?}", o.unresolved);
+        assert!((o.filled_qty - 1.0).abs() < 1e-12, "{}", o.filled_qty);
     }
 
     #[tokio::test(start_paused = true)]
