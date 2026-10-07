@@ -38,8 +38,9 @@
 //! - An IOC whose fill never shows in agreeing records and position is
 //!   unresolved, because a zero-fill IOC cannot be told apart from a delayed
 //!   record — unless the venue lists the IOC as cancelled AND nothing is
-//!   booked for it AND the position agrees with the records and stays
-//!   unchanged over three consecutive samples: then it ended with zero fill
+//!   booked for it AND, counted from the first sample that shows the cancel,
+//!   the position agrees with the records and stays unchanged over three
+//!   consecutive samples: then it ended with zero fill
 //!   (an unfillable remainder, e.g. the book ran past the limit). Without the
 //!   cancel record it stays unresolved.
 //! - Never arms a dead-man switch (account-wide on Lighter, stops included).
@@ -671,7 +672,10 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
         // position, and the position unchanged since the previous poll (later
         // slices of a multi-counterparty IOC still arriving otherwise).
         let mut prev: Option<f64> = None;
-        // Consecutive agreeing, unchanged, nothing-booked samples (zero fill).
+        // Zero fill needs post-terminal stability: count unchanged, agreeing,
+        // nothing-booked samples only from the first sample on which the venue
+        // already lists the IOC as cancelled (Codex on #388).
+        let mut post_cancel: Option<f64> = None;
         let mut zero_stable: u32 = 0;
         for _ in 0..=self.timing.ioc_fill_polls {
             let fresh = self.harvest(run).await;
@@ -681,28 +685,35 @@ impl<'a, V: OrderVenue + ?Sized> MakerFirstExecutor<'a, V> {
                         return;
                     }
                     let nothing_booked = run.book.filled <= before + run.eps;
-                    zero_stable = if nothing_booked && run.agrees(p) && prev == Some(p) {
-                        zero_stable + 1
-                    } else {
-                        0
-                    };
-                    // Three samples, two unchanged steps: then require the
-                    // venue's positive terminal evidence for the IOC.
-                    if zero_stable >= 2 {
-                        if let Ok(c) = self.venue.canceled_order_ids(&intent.symbol).await {
-                            if c.contains(&id) {
-                                log::info!(
-                                    "[MAKER_FIRST] {}: IOC {id} ended with zero fill (cancelled, position unchanged)",
-                                    intent.symbol
-                                );
-                                return;
-                            }
+                    let cancelled = nothing_booked
+                        && self
+                            .venue
+                            .canceled_order_ids(&intent.symbol)
+                            .await
+                            .is_ok_and(|c| c.contains(&id));
+                    if cancelled && run.agrees(p) {
+                        zero_stable = if post_cancel == Some(p) {
+                            zero_stable + 1
+                        } else {
+                            0
+                        };
+                        post_cancel = Some(p);
+                        if zero_stable >= 2 {
+                            log::info!(
+                                "[MAKER_FIRST] {}: IOC {id} ended with zero fill (cancelled, position unchanged)",
+                                intent.symbol
+                            );
+                            return;
                         }
+                    } else {
+                        post_cancel = None;
+                        zero_stable = 0;
                     }
                     prev = Some(p);
                 }
                 _ => {
                     prev = None;
+                    post_cancel = None;
                     zero_stable = 0;
                 }
             }
@@ -896,6 +907,10 @@ mod tests {
         ioc_fills: bool,
         /// An IOC that does not fill is listed as cancelled (as a venue does).
         ioc_cancel_unfilled: bool,
+        /// ...but that cancel record shows only after this many more `fills()`
+        /// calls (0 = at once).
+        ioc_cancel_delay: usize,
+        cancel_pending: Vec<(usize, String)>,
         ioc_hidden: bool,
         /// The IOC fills in two slices, the second visible later.
         ioc_two_slices: bool,
@@ -1049,7 +1064,14 @@ mod tests {
             Ok(st.open.clone())
         }
         async fn canceled_order_ids(&self, _: &str) -> Result<HashSet<String>, DexError> {
-            Ok(self.s().canceled.clone())
+            let mut st = self.s();
+            let now = st.fills_calls;
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.cancel_pending)
+                .into_iter()
+                .partition(|(d, _)| *d <= now);
+            st.cancel_pending = later;
+            st.canceled.extend(due.into_iter().map(|(_, id)| id));
+            Ok(st.canceled.clone())
         }
         async fn fills(&self, _: &str) -> Result<Vec<VenueFill>, DexError> {
             let mut st = self.s();
@@ -1111,7 +1133,12 @@ mod tests {
             }
             if st.ioc_cancel_unfilled {
                 // a venue lists an IOC's unfilled remainder as cancelled
-                st.canceled.insert(id.clone());
+                if st.ioc_cancel_delay == 0 {
+                    st.canceled.insert(id.clone());
+                } else {
+                    let due = st.fills_calls + st.ioc_cancel_delay;
+                    st.cancel_pending.push((due, id.clone()));
+                }
             }
             Ok(id)
         }
@@ -1340,6 +1367,23 @@ mod tests {
             s.ioc_cancel_unfilled = true;
             s.record_delay = 3;
             s.position_delay = 3;
+        });
+        let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
+        assert!(o.unresolved.is_empty(), "{:?}", o.unresolved);
+        assert!((o.filled_qty - 1.0).abs() < 1e-12, "{}", o.filled_qty);
+    }
+
+    /// Codex on #388: the cancel record shows late, and the (partial) fill
+    /// later still. Stability must be counted from the cancel, so the fill is
+    /// booked rather than finalized as zero.
+    #[tokio::test(start_paused = true)]
+    async fn stability_is_counted_from_the_cancel_record_not_before() {
+        let v = MockVenue::new((99.9, 100.1)).with(|s| {
+            s.ioc_fills = true;
+            s.ioc_cancel_unfilled = true;
+            s.ioc_cancel_delay = 3;
+            s.record_delay = 4;
+            s.position_delay = 4;
         });
         let o = run(&v, &buy(1.0, Some(50.0), 250)).await;
         assert!(o.unresolved.is_empty(), "{:?}", o.unresolved);
