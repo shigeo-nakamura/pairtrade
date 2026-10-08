@@ -1838,12 +1838,13 @@ impl Runtime {
             stop_hit.is_some() || self.position_stop_latched,
             dust,
         );
-        if let (Some(FlattenReason::PositionStop), Some(adverse), Some(mark)) =
-            (&flatten, stop_hit, fresh_mid)
-        {
+        // Record and latch every observed stop hit, even when another
+        // reason (e.g. Cap) is the immediate flatten reason this tick
+        // (Codex P1 on pairtrade#389).
+        if let (Some(adverse), Some(mark)) = (stop_hit, fresh_mid) {
             self.note_position_stop(now, mark, adverse);
         }
-        if flatten == Some(FlattenReason::PositionStop) {
+        if stop_hit.is_some() || flatten == Some(FlattenReason::PositionStop) {
             self.position_stop_latched = true;
             // Keep the quote pull in force while the latched flatten retries.
             self.cooldown_until_ms = self.cooldown_until_ms.max(now + 1_000);
