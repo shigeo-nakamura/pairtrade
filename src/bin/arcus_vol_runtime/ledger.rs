@@ -1946,7 +1946,12 @@ mod tests {
             "ifdust||self.ledger.position.qty.is_zero(){self.position_stop_latched=false;}"
         ));
         assert!(flat_tick.contains(
-            "ifflatten==Some(FlattenReason::PositionStop){self.position_stop_latched=true;"
+            "ifstop_hit.is_some()||flatten==Some(FlattenReason::PositionStop){self.position_stop_latched=true;"
+        ));
+        // Every observed hit is journaled, not only when PositionStop is the
+        // selected reason (Codex P1 on pairtrade#389).
+        assert!(flat_tick.contains(
+            "iflet(Some(adverse),Some(mark))=(stop_hit,fresh_mid){self.note_position_stop("
         ));
         assert!(before(&tick, "flatten_reason(", "self.note_position_stop("));
         let note = main_fn_body("note_position_stop");
