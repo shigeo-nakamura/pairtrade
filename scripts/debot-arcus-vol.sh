@@ -84,7 +84,7 @@ load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -129,6 +129,12 @@ if [ -n "$SESSION_OFFSET_BPS$SESSION_BAND_BPS" ]; then
     for v in SESSION_OFFSET_BPS SESSION_BAND_BPS; do
         [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
     done
+fi
+# Per-position stop (optional): flatten once the open position is this many bp
+# against its average entry; the runtime validates 1..=500.
+POSITION_STOP_BPS="${POSITION_STOP_BPS:-}"
+if [ -n "$POSITION_STOP_BPS" ]; then
+    [[ "$POSITION_STOP_BPS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "POSITION_STOP_BPS must be a number (got '$POSITION_STOP_BPS')"
 fi
 [[ "$LEVERAGE" =~ ^[0-9]+$ ]] && [ "$LEVERAGE" -ge 1 ] || die "LEVERAGE must be a whole number >= 1"
 
@@ -235,6 +241,9 @@ export ARCUS_VOL_REPEG_BAND_BPS="$REPEG_BAND_BPS"
 if [ -n "$SESSION_OFFSET_BPS" ]; then
     export ARCUS_VOL_SESSION_OFFSET_BPS="$SESSION_OFFSET_BPS"
     export ARCUS_VOL_SESSION_BAND_BPS="$SESSION_BAND_BPS"
+fi
+if [ -n "$POSITION_STOP_BPS" ]; then
+    export ARCUS_VOL_POSITION_STOP_BPS="$POSITION_STOP_BPS"
 fi
 export ARCUS_VOL_DAILY_STOP_USD="$DAILY_STOP_USD"
 export ARCUS_VOL_CUM_STOP_USD="$CUM_STOP_USD"

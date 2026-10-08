@@ -1918,6 +1918,37 @@ mod tests {
     }
 
     #[test]
+    fn the_position_stop_is_wired_into_the_tick() {
+        // bot-strategy#1093 per-position stop: evaluated on the FRESH mark
+        // before the flatten decision, passed as the stop argument (dust
+        // still last), and a fired stop goes through note_position_stop
+        // (WARN + journal row + cooldown).
+        let tick = main_fn_body("tick");
+        assert!(before(
+            &tick,
+            "let fresh_mid = fresh_mark(",
+            "position_stop_bps("
+        ));
+        assert!(before(&tick, "position_stop_bps(", "flatten_reason("));
+        let stop_call = &tick[tick.find("position_stop_bps(").unwrap()..];
+        let stop_call = &stop_call[..stop_call.find(");").unwrap()];
+        assert!(stop_call.contains("fresh_mid"), "fresh mark only");
+        assert!(stop_call.contains("self.cfg.position_stop_bps"));
+        let call = &tick[tick.find("flatten_reason(").unwrap()..];
+        let call = &call[..call.find(");").unwrap()];
+        assert!(call.contains("stop_hit.is_some()"));
+        assert!(before(&tick, "flatten_reason(", "self.note_position_stop("));
+        let note = main_fn_body("note_position_stop");
+        assert!(note.contains("POSITION_STOP_COOLDOWN_SECS.max(self.cfg.cooldown_secs)"));
+        assert!(note.contains("self.cooldown_until_ms = self"));
+        assert!(note.contains("\"kind\": \"position_stop\""));
+        assert!(note.contains("append_synced("));
+        let main = include_str!("main.rs");
+        assert!(main.contains("const POSITION_STOP_COOLDOWN_SECS: u64 = 60;"));
+        assert!(main.contains("count_position_stops(&journal_rows, &rt.ledger.day)"));
+    }
+
+    #[test]
     fn dust_is_carried_on_every_runtime_path() {
         // bot-strategy#1093 dust fix (live 2026-10-03: 0.00046 SPY below the
         // venue minimum, 11,383 rejected flatten IOCs, quotes pulled 10 h).

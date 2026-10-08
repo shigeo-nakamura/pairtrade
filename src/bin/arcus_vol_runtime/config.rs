@@ -73,6 +73,11 @@ pub struct Config {
     /// the quoting mode itself never flips at a boundary.
     pub session_offset_bps: Option<Decimal>,
     pub session_band_bps: Option<Decimal>,
+    /// Per-position stop (bot-strategy#1093): flatten (taker) once the open
+    /// position's adverse move against its average entry reaches this many
+    /// bp at a fresh mark, then pull quotes for `POSITION_STOP_COOLDOWN_SECS`.
+    /// Unset = off. 1..=500.
+    pub position_stop_bps: Option<Decimal>,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -191,6 +196,7 @@ impl Config {
             repeg_band_bps: dec(&p("REPEG_BAND_BPS"), "0")?,
             session_offset_bps: opt_dec(&p("SESSION_OFFSET_BPS"))?,
             session_band_bps: opt_dec(&p("SESSION_BAND_BPS"))?,
+            position_stop_bps: opt_dec(&p("POSITION_STOP_BPS"))?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -250,6 +256,11 @@ impl Config {
         }
         if self.dms_secs < 5 || self.dms_secs > 300 || self.dms_refresh_secs >= self.dms_secs {
             bail!("ARCUS_VOL_DMS_SECS must be 5..=300 and above DMS_REFRESH_SECS");
+        }
+        if let Some(stop) = self.position_stop_bps {
+            if stop < Decimal::ONE || stop > Decimal::from(500) {
+                bail!("ARCUS_VOL_POSITION_STOP_BPS must be 1..=500 (got {stop})");
+            }
         }
         self.validate_presence()
     }
@@ -498,6 +509,20 @@ mod tests {
     }
 
     #[test]
+    fn position_stop_is_optional_and_bounded() {
+        let mut cfg = test_config();
+        assert!(cfg.validate().is_ok());
+        for ok in ["1", "25", "500"] {
+            cfg.position_stop_bps = Some(Decimal::from_str(ok).unwrap());
+            assert!(cfg.validate().is_ok(), "{ok}");
+        }
+        for bad in ["0", "0.5", "-25", "500.01"] {
+            cfg.position_stop_bps = Some(Decimal::from_str(bad).unwrap());
+            assert!(cfg.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn effective_cap_is_the_smaller_of_hard_cap_and_margin_times_leverage() {
         let mut cfg = test_config();
         assert_eq!(cfg.effective_cap_usd(), Decimal::from(10_000));
@@ -538,6 +563,7 @@ mod tests {
             repeg_band_bps: Decimal::ZERO,
             session_offset_bps: None,
             session_band_bps: None,
+            position_stop_bps: None,
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),
