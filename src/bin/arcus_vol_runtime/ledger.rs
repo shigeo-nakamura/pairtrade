@@ -1946,6 +1946,11 @@ mod tests {
         let main = include_str!("main.rs");
         assert!(main.contains("const POSITION_STOP_COOLDOWN_SECS: u64 = 60;"));
         assert!(main.contains("count_position_stops(&journal_rows, &rt.ledger.day)"));
+        // A book shock in the same tick must not shorten the stop's pull
+        // (Codex P2 on pairtrade#389): the shock keeps the later deadline.
+        let flat: String = tick.split_whitespace().collect();
+        assert!(flat.contains(".cooldown_until_ms.max(now+self.cfg.cooldown_secs*1_000)"));
+        assert!(!flat.contains("self.cooldown_until_ms=now+self.cfg.cooldown_secs*1_000;"));
     }
 
     #[test]

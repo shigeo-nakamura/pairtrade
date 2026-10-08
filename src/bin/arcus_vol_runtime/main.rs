@@ -1848,7 +1848,11 @@ impl Runtime {
                     self.cfg.cooldown_secs
                 );
             }
-            self.cooldown_until_ms = now + self.cfg.cooldown_secs * 1_000;
+            // Never shorten a longer pull already in force (a position
+            // stop's 60 s, Codex P2 on pairtrade#389).
+            self.cooldown_until_ms = self
+                .cooldown_until_ms
+                .max(now + self.cfg.cooldown_secs * 1_000);
         }
         // Safety actions are never gated by a 429 backoff; only new
         // placement / modification is (Codex P1, pairtrade#361).
