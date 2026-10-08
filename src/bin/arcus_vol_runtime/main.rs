@@ -272,6 +272,10 @@ struct Runtime {
     /// Until when a fired position stop keeps quotes pulled (and a second
     /// trigger is not logged / journaled again).
     position_stop_until_ms: u64,
+    /// A fired position stop stays in force until the inventory is flat
+    /// (or dust): a failed or partial IOC is retried even if the mark
+    /// recovers or goes stale (Codex P1 on pairtrade#389).
+    position_stop_latched: bool,
     /// A flatten IOC the venue rejected as below its minimum, for this exact
     /// inventory: treated as dust until the inventory changes (no retry).
     forced_dust_qty: Option<Decimal>,
@@ -1819,6 +1823,9 @@ impl Runtime {
             self.last_stop_mark_warn_ms = now;
             log::warn!("[ARCUS_VOL] position stop: no fresh mark, not evaluated");
         }
+        if dust || self.ledger.position.qty.is_zero() {
+            self.position_stop_latched = false;
+        }
         let flatten = flatten_reason(
             self.ledger.position.qty,
             mid,
@@ -1828,13 +1835,18 @@ impl Runtime {
             self.cfg.max_hold_secs,
             flatten_halt_label(halt_label.as_deref()),
             startup,
-            stop_hit.is_some(),
+            stop_hit.is_some() || self.position_stop_latched,
             dust,
         );
         if let (Some(FlattenReason::PositionStop), Some(adverse), Some(mark)) =
             (&flatten, stop_hit, fresh_mid)
         {
             self.note_position_stop(now, mark, adverse);
+        }
+        if flatten == Some(FlattenReason::PositionStop) {
+            self.position_stop_latched = true;
+            // Keep the quote pull in force while the latched flatten retries.
+            self.cooldown_until_ms = self.cooldown_until_ms.max(now + 1_000);
         }
         if shock(
             &self.mid_hist,
@@ -2337,6 +2349,7 @@ async fn main() -> Result<()> {
         position_stops_today: 0,
         position_stops_day: String::new(),
         position_stop_until_ms: 0,
+        position_stop_latched: false,
         forced_dust_qty: None,
         last_flatten_warn_ms: 0,
         last_peg_warn_ms: 0,

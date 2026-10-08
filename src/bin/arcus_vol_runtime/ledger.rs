@@ -1935,8 +1935,19 @@ mod tests {
         assert!(stop_call.contains("fresh_mid"), "fresh mark only");
         assert!(stop_call.contains("self.cfg.position_stop_bps"));
         let call = &tick[tick.find("flatten_reason(").unwrap()..];
-        let call = &call[..call.find(");").unwrap()];
-        assert!(call.contains("stop_hit.is_some()"));
+        let call: String = call[..call.find(");").unwrap()]
+            .split_whitespace()
+            .collect();
+        assert!(call.contains("stop_hit.is_some()||self.position_stop_latched"));
+        // The latch is released only when flat or dust, and set when the
+        // stop is the flatten reason (Codex P1 on pairtrade#389).
+        let flat_tick: String = tick.split_whitespace().collect();
+        assert!(flat_tick.contains(
+            "ifdust||self.ledger.position.qty.is_zero(){self.position_stop_latched=false;}"
+        ));
+        assert!(flat_tick.contains(
+            "ifflatten==Some(FlattenReason::PositionStop){self.position_stop_latched=true;"
+        ));
         assert!(before(&tick, "flatten_reason(", "self.note_position_stop("));
         let note = main_fn_body("note_position_stop");
         assert!(note.contains("POSITION_STOP_COOLDOWN_SECS.max(self.cfg.cooldown_secs)"));
