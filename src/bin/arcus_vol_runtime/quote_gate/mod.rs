@@ -372,16 +372,10 @@ pub struct FeedState {
     pub up: bool,
     /// Time of the last connected / gap event (cooldown input).
     pub last_event_ms: Option<u64>,
-    /// Up events after a Down: warmup restarts (the grid state is
-    /// contaminated by the stale values forward-filled through the gap).
-    pub recovered: bool,
 }
 
 impl FeedState {
     fn on(&mut self, now_ms: u64, up: bool) {
-        if up && !self.up && self.last_event_ms.is_some() {
-            self.recovered = true;
-        }
         self.up = up;
         self.last_event_ms = Some(now_ms);
     }
@@ -393,8 +387,8 @@ pub struct RefState {
     pub binance: FeedState,
     pub hyperliquid: FeedState,
     pub own_tape: FeedState,
-    /// Warmup clock: process start, restarted at a reference feed's gap
-    /// recovery.
+    /// Warmup clock: process start, restarted at every reference feed
+    /// connect (first or re-): the grid state and history start over then.
     pub warmup_since_ms: u64,
 }
 
@@ -419,13 +413,14 @@ impl RefState {
         match ev {
             RefEvent::Up => {
                 state.on(rx_ms, true);
-                if std::mem::take(&mut state.recovered) {
-                    // The gap forward-filled stale values into the grid
-                    // state: restart it with the warmup (Codex round 2 on
-                    // pairtrade#390).
-                    self.warmup_since_ms = rx_ms;
-                    self.engine.reset_grid(rx_ms);
-                }
+                // Every connect — the first one (possibly long after start,
+                // Codex round 3 on pairtrade#390) or a recovery (the gap
+                // forward-filled stale values into the grid state, round 2)
+                // — restarts the warmup and the grid, and drops the history
+                // gathered before it. At startup the feeds connect within
+                // seconds, so this costs nothing there.
+                self.warmup_since_ms = rx_ms;
+                self.engine.reset_grid(rx_ms);
             }
             RefEvent::Down(_) => state.on(rx_ms, false),
             RefEvent::BnL1 { bid, ask, bsz, asz } => {
@@ -1083,17 +1078,18 @@ mod tests {
         let bid = plan(QSide::Bid, Some("0.005"), at("84000"));
         let ask = plan(QSide::Ask, Some("0.005"), at("84000.1"));
         let mut gate = QuoteGate::new(cfg(GateMode::Shadow), Some(shipped()), origin, None);
+        let tau = g["rows"][0]["tau_ms"].as_u64().unwrap();
         {
             let mut s = gate.state();
-            for r in &records {
-                xtape::apply(&mut s.engine, r);
-            }
+            // Records received before τ (live pattern; retention is relative
+            // to the newest record).
+            let mut idx = 0;
+            features::tests::feed_until(&mut s.engine, &records, &mut idx, tau);
             // Feeds came up before the origin; no gap since.
             s.binance.on(origin - 900, true);
             s.hyperliquid.on(origin - 900, true);
             s.own_tape.on(origin - 900, true);
         }
-        let tau = g["rows"][0]["tau_ms"].as_u64().unwrap();
         // 1) warmup (900 s from the origin; τ is ~125 s in).
         let out = gate.evaluate(tau, &bid, &ask, 0, false);
         assert!(
@@ -1335,16 +1331,15 @@ mod tests {
         let mut c = cfg(GateMode::Shadow);
         c.warmup_ms = 0;
         let mut gate = QuoteGate::new(c, Some(shipped()), origin, None);
+        let tau = g["rows"][0]["tau_ms"].as_u64().unwrap();
         {
             let mut s = gate.state();
-            for r in &records {
-                xtape::apply(&mut s.engine, r);
-            }
+            let mut idx = 0;
+            features::tests::feed_until(&mut s.engine, &records, &mut idx, tau);
             s.binance.on(origin - 900, true);
             s.hyperliquid.on(origin - 900, true);
             // own tape: never an Up, never a Down.
         }
-        let tau = g["rows"][0]["tau_ms"].as_u64().unwrap();
         let out = gate.evaluate(tau, &bid, &ask, 0, false);
         assert!(
             matches!(
@@ -1437,14 +1432,14 @@ mod tests {
     /// values the gap forward-filled.
     #[test]
     fn a_reference_feed_recovery_resets_the_grid_state() {
-        let mut s = RefState::new(1_000);
+        let mut s = RefState::new(500);
+        s.on_ref(feed::RefFeed::Binance, 1_000, feed::RefEvent::Up);
         for t in 0..50u64 {
             let rx = 2_000 + t * 100;
             s.engine.on_own_l1(rx, 100.0, 100.1, 1.0, 1.0);
             s.engine.on_bn_l1(rx, 100.0, 100.1, 1.0, 1.0);
             s.engine.on_hl_l1(rx, 100.0, 100.1);
         }
-        s.on_ref(feed::RefFeed::Binance, 2_000, feed::RefEvent::Up);
         s.engine.advance_grid(7_000);
         let (o, next, init) = s.engine.grid_state();
         assert_eq!((o, init), (1_000, true));
@@ -1457,12 +1452,22 @@ mod tests {
         s.on_ref(feed::RefFeed::Binance, 9_000, feed::RefEvent::Up);
         assert_eq!(s.warmup_since_ms, 9_000);
         assert_eq!(s.engine.grid_state(), (9_000, 0, false));
-        // The next advance re-initialises the EMA from the first complete
-        // point after the new origin (the state before the gap is gone).
+        // The pre-gap history is gone too (Codex round 3): nothing before
+        // the new origin can seed the EMA.
+        assert_eq!(s.engine.record_count(), 0);
         s.engine.advance_grid(9_300);
-        let (o2, next2, init2) = s.engine.grid_state();
+        assert_eq!(
+            s.engine.grid_state(),
+            (9_000, 4, false),
+            "no complete point without new records"
+        );
+        // New records after the recovery initialise the EMA from themselves.
+        s.engine.on_own_l1(9_350, 100.0, 100.1, 1.0, 1.0);
+        s.engine.on_bn_l1(9_350, 100.0, 100.1, 1.0, 1.0);
+        s.engine.on_hl_l1(9_350, 100.0, 100.1);
+        s.engine.advance_grid(9_600);
+        let (o2, _, init2) = s.engine.grid_state();
         assert_eq!((o2, init2), (9_000, true));
-        assert!(next2 <= 4, "{next2}");
     }
 
     /// Codex P1 on pairtrade#390: a gate that never scores (no model) must
@@ -1544,7 +1549,14 @@ mod tests {
     fn gap_recovery_restarts_warmup() {
         let mut s = RefState::new(1_000);
         s.on_ref(feed::RefFeed::Binance, 2_000, feed::RefEvent::Up);
-        assert_eq!(s.warmup_since_ms, 1_000, "the first Up is not a recovery");
+        assert_eq!(
+            s.warmup_since_ms, 2_000,
+            "the first Up restarts the warmup too"
+        );
+        // A first connect long after start (Codex round 3): same.
+        s.on_ref(feed::RefFeed::Hyperliquid, 950_000, feed::RefEvent::Up);
+        assert_eq!(s.warmup_since_ms, 950_000);
+        assert_eq!(s.engine.grid_state().0, 950_000);
         s.on_ref(
             feed::RefFeed::Binance,
             5_000,

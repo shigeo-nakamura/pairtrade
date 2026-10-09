@@ -171,9 +171,9 @@ Features use only records received strictly before the decision time
 the Python values on a real tape slice).
 
 Fail-safe (`Fallback`, with a reason, never a zero-filled score):
-`model_missing`, `warmup:<s>` (900 s from start and after a reference
-feed's reconnect, which also restarts the EMA / vol grid state;
-`GATE_WARMUP_S`), `ref_stale:<feed>:<age_ms>` (no record
+`model_missing`, `warmup:<s>` (900 s from start and after any reference
+feed connect or reconnect, which also restarts the EMA / vol grid state
+and drops the feature history; `GATE_WARMUP_S`), `ref_stale:<feed>:<age_ms>` (no record
 in 10 s, `GATE_REF_STALE_MS`), `ref_gap_cooldown:<feed>:<s>` (60 s after a
 connect/gap event, `GATE_EVENT_COOLDOWN_S`), `feed_down:<feed>` (a feed
 that never connected, or reported Down and has not reconnected, however

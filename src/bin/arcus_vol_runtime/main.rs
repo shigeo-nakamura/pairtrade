@@ -644,19 +644,21 @@ impl Runtime {
 
     /// Tape health and prints (DRY_RUN). A disconnect pulls every virtual
     /// quote at once; the reconnect records the gap in fills.jsonl.
-    fn on_tape(&mut self, event: tape::TapeEvent) {
+    fn on_tape(&mut self, rx_ms: u64, event: tape::TapeEvent) {
         let now = now_ms();
         // The quote gate's own-flow features and its tape-health cooldown
-        // see every print in every mode (bot-strategy#1120); the paper sim
-        // below stays DRY_RUN only.
+        // see every print in every mode (bot-strategy#1120), stamped with
+        // the reader's receive time `rx_ms` (not the dequeue time: the
+        // channel is drained only between ticks); the paper sim below stays
+        // DRY_RUN only.
         if self.gate.on() {
             match &event {
-                tape::TapeEvent::Up => self.gate.on_own_tape(now, true),
-                tape::TapeEvent::Down(_) => self.gate.on_own_tape(now, false),
+                tape::TapeEvent::Up => self.gate.on_own_tape(rx_ms, true),
+                tape::TapeEvent::Down(_) => self.gate.on_own_tape(rx_ms, false),
                 tape::TapeEvent::Print(p) => {
                     if let (Some(px), Some(qty)) = (p.px.to_f64(), p.qty.to_f64()) {
                         self.gate
-                            .on_own_trade(now, p.taker == OrderSide::Long, px, qty);
+                            .on_own_trade(rx_ms, p.taker == OrderSide::Long, px, qty);
                     }
                 }
             }
@@ -2554,7 +2556,7 @@ async fn main() -> Result<()> {
             ));
         }
     }
-    let (tx, mut rx) = mpsc::channel::<tape::TapeEvent>(4_096);
+    let (tx, mut rx) = mpsc::channel::<(u64, tape::TapeEvent)>(4_096);
     // The public trades tape feeds the paper sim (DRY_RUN) and the quote
     // gate's own-flow features (any mode with the gate on).
     if rt.cfg.dry_run || rt.gate.on() {
@@ -2586,7 +2588,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => rt.tick().await,
-            Some(ev) = rx.recv() => rt.on_tape(ev),
+            Some((rx_ms, ev)) = rx.recv() => rt.on_tape(rx_ms, ev),
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
         }

@@ -44,6 +44,10 @@ pub const OWN_L2_LEVELS: usize = 20;
 const RETAIN_MS: u64 = 150_000;
 /// Longest realized-vol window in grid steps (60 s).
 const RV_STEPS: usize = 600;
+/// How far behind the newest receive time the grid is advanced at
+/// ingestion (records of the other streams stamped earlier than this have
+/// been pushed by then).
+const GRID_INGEST_LAG_MS: u64 = 2_000;
 
 /// Directional features (sign-flipped per side by the model input), in the
 /// exact order of `rf_common.DIR_NAMES`.
@@ -178,6 +182,23 @@ struct L2 {
     asks: Vec<(f64, f64)>,
 }
 
+/// What one complete grid point yields for the features.
+#[derive(Debug, Clone, Copy)]
+struct GridOut {
+    k: u64,
+    pdev_bn: [f64; 3],
+    pdev_hl: f64,
+    rv_a10: f64,
+    rv_a60: f64,
+    rv_b60: f64,
+}
+
+/// Grid outputs kept for decision-time lookup, in grid steps (30 s): live
+/// the frontier runs at most the ingestion lag (2 s) ahead of a decision;
+/// the slack keeps a decision exact even when far more of the future has
+/// been ingested first.
+const RECENT_CAP: usize = 300;
+
 /// One row of the 0.1 s grid: log mids (own / Binance / HL).
 #[derive(Debug, Clone, Copy)]
 struct GridPoint {
@@ -232,8 +253,11 @@ pub struct FeatureEngine {
     grid_next: u64,
     /// The last COMPLETE grid point's inputs (for the diffs) and state.
     last_grid: Option<GridPoint>,
-    pdev_bn: Option<[f64; 3]>,
-    pdev_hl: Option<f64>,
+    /// Outputs of the most recent COMPLETE grid points (newest last): the
+    /// grid may run ahead of a decision time by up to the ingestion lag, so
+    /// a decision reads the point at `floor((τ − origin) / dt)`, never
+    /// simply the latest.
+    recent: VecDeque<GridOut>,
     ema_bn: [Ema; 3],
     ema_hl: Ema,
     /// Squared grid diffs (bp²) of the own and Binance log mids, newest last,
@@ -256,8 +280,7 @@ impl FeatureEngine {
             hl_trades: VecDeque::new(),
             grid_next: 0,
             last_grid: None,
-            pdev_bn: None,
-            pdev_hl: None,
+            recent: VecDeque::with_capacity(RECENT_CAP),
             ema_bn: [
                 Ema::new(PDEV_BN_SPANS_S[0] * 1_000 / GRID_DT_MS),
                 Ema::new(PDEV_BN_SPANS_S[1] * 1_000 / GRID_DT_MS),
@@ -284,6 +307,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     /// Own L2 (best first, up to `OWN_L2_LEVELS` a side). Sizes are rounded
@@ -304,6 +328,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     /// Own print; `taker_buy` is the aggressor side.
@@ -318,6 +343,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     pub fn on_bn_l1(&mut self, rx_ms: u64, bid: f64, ask: f64, bid_sz: f64, ask_sz: f64) {
@@ -332,6 +358,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     /// Binance aggTrade; `maker_is_buyer` is the frame's `m` (true = the
@@ -347,6 +374,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     pub fn on_hl_l1(&mut self, rx_ms: u64, bid: f64, ask: f64) {
@@ -358,6 +386,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     /// Hyperliquid trade; `buy` = side "B".
@@ -372,6 +401,7 @@ impl FeatureEngine {
             },
             |r| r.rx,
         );
+        self.ingested(rx_ms);
     }
 
     /// Receive time of the newest record per stream (for staleness).
@@ -428,21 +458,39 @@ impl FeatureEngine {
                 // Sign: + = own venue cheap vs the reference = bullish for it.
                 pdev[i] = -(pb - ema.push(pb));
             }
-            self.pdev_bn = Some(pdev);
-            self.pdev_hl = Some(-(ph - self.ema_hl.push(ph)));
+            let out = GridOut {
+                k: self.grid_next - 1,
+                pdev_bn: pdev,
+                pdev_hl: -(ph - self.ema_hl.push(ph)),
+                rv_a10: Self::rv(&self.rv_a, RV_ARC_WINDOWS_S[0]),
+                rv_a60: Self::rv(&self.rv_a, RV_ARC_WINDOWS_S[1]),
+                rv_b60: Self::rv(&self.rv_b, RV_BN_WINDOW_S),
+            };
+            self.recent.push_back(out);
+            while self.recent.len() > RECENT_CAP {
+                self.recent.pop_front();
+            }
             self.last_grid = Some(point);
         }
     }
 
-    /// Restart the grid at `origin_ms`: EMA / vol state is dropped (a feed
-    /// gap forward-filled stale values into it) and warms up again from the
-    /// first complete point after the new origin. The rings are kept.
+    /// Restart the grid at `origin_ms`: EMA / vol state AND the record
+    /// rings are dropped (a feed gap forward-filled stale values into the
+    /// state, and a pre-gap record would otherwise seed the first grid point
+    /// at the new origin — Codex rounds 2-3 on pairtrade#390); everything
+    /// warms up again from records received after the reset.
     pub fn reset_grid(&mut self, origin_ms: u64) {
+        self.own_l1.clear();
+        self.own_l2.clear();
+        self.own_trades.clear();
+        self.bn_l1.clear();
+        self.bn_trades.clear();
+        self.hl_l1.clear();
+        self.hl_trades.clear();
         self.origin_ms = origin_ms;
         self.grid_next = 0;
         self.last_grid = None;
-        self.pdev_bn = None;
-        self.pdev_hl = None;
+        self.recent.clear();
         for e in self.ema_bn.iter_mut() {
             *e = Ema::new(e.span_steps);
         }
@@ -513,14 +561,21 @@ impl FeatureEngine {
         for (k, x) in arc_ret.iter().enumerate() {
             put(DIR_NAMES[9 + k], *x)?;
         }
-        let (pdev_bn, pdev_hl) = match (self.pdev_bn, self.pdev_hl) {
-            (Some(b), Some(h)) if tau_ms >= self.origin_ms => (b, h),
-            _ => return Err(FeatureGap::GridNotReady),
+        // The last complete grid point at or before τ (the study's
+        // `j = floor((T - g0) / dt)` on a forward-filled grid).
+        let grid = if tau_ms < self.origin_ms {
+            None
+        } else {
+            let kt = (tau_ms - self.origin_ms) / GRID_DT_MS;
+            self.recent.iter().rev().find(|o| o.k <= kt).copied()
         };
-        put("pdev_bn_10s", pdev_bn[0])?;
-        put("pdev_bn_60s", pdev_bn[1])?;
-        put("pdev_bn_300s", pdev_bn[2])?;
-        put("pdev_hl_60s", pdev_hl)?;
+        let Some(grid) = grid else {
+            return Err(FeatureGap::GridNotReady);
+        };
+        put("pdev_bn_10s", grid.pdev_bn[0])?;
+        put("pdev_bn_60s", grid.pdev_bn[1])?;
+        put("pdev_bn_300s", grid.pdev_bn[2])?;
+        put("pdev_hl_60s", grid.pdev_hl)?;
         put("lead_bn_1s", bn_ret[1] - arc_ret[0])?;
         let l1 = asof(&self.own_l1, tau_ms, |r| r.rx).ok_or(FeatureGap::NoRecord {
             name: "arc_top_imb",
@@ -549,9 +604,9 @@ impl FeatureEngine {
         put("hl_flow_30s", flow(&self.hl_trades, tau_ms, 30_000, true))?;
         // Non-directional.
         put("arc_spread_bp", (l1.ask - l1.bid) / l1.bid * 1e4)?;
-        put("rv_arc_10s", Self::rv(&self.rv_a, RV_ARC_WINDOWS_S[0]))?;
-        put("rv_arc_60s", Self::rv(&self.rv_a, RV_ARC_WINDOWS_S[1]))?;
-        put("rv_bn_60s", Self::rv(&self.rv_b, RV_BN_WINDOW_S))?;
+        put("rv_arc_10s", grid.rv_a10)?;
+        put("rv_arc_60s", grid.rv_a60)?;
+        put("rv_bn_60s", grid.rv_b60)?;
         put("arc_ntr_30s", count(&self.own_trades, tau_ms, 30_000))?;
         put(
             "bn_absflow_30s",
@@ -565,12 +620,27 @@ impl FeatureEngine {
         Ok(FeatureVector { values: v })
     }
 
-    /// Drop history older than the retention window behind `tau_ms`. Called
-    /// by `features_at` and by the gate on EVERY cycle, scored or not, so a
-    /// gate that never scores (no model, long fallback) does not grow the
-    /// rings without bound (Codex P1 on pairtrade#390).
-    pub fn trim(&mut self, tau_ms: u64) {
-        let cutoff = tau_ms.saturating_sub(RETAIN_MS);
+    /// After every ingested record: advance the grid to `rx − lag` (every
+    /// record with `rx < g` for those points has arrived — rx is the
+    /// receive time, per stream monotone, and the lag covers the stamp →
+    /// push skew), then trim. The grid state and the retention therefore
+    /// progress with the feeds alone, never only with the tick: a halted /
+    /// book-less / flattening tick that skips the gate for minutes leaves
+    /// neither a stale EMA continuation nor unbounded rings (Codex round 3
+    /// on pairtrade#390). `features_at(τ)` advances the last `lag` itself.
+    fn ingested(&mut self, rx_ms: u64) {
+        self.advance_grid(rx_ms.saturating_sub(GRID_INGEST_LAG_MS));
+        self.trim(rx_ms);
+    }
+
+    /// Drop history older than the retention window behind `t_ms`. Called
+    /// on EVERY ingested record (relative to its receive time) and on every
+    /// gate cycle, so the rings stay bounded whatever the tick does — a
+    /// halted / book-less / flattening tick never reaches the gate, and the
+    /// feed tasks keep appending meanwhile (Codex rounds 1 and 3 on
+    /// pairtrade#390).
+    pub fn trim(&mut self, t_ms: u64) {
+        let cutoff = t_ms.saturating_sub(RETAIN_MS);
         trim_before(&mut self.own_l1, cutoff, |r| r.rx);
         trim_before(&mut self.own_l2, cutoff, |r| r.rx);
         trim_before(&mut self.own_trades, cutoff, |r| r.rx);
@@ -702,7 +772,7 @@ fn l2_imbalances(l2: &L2) -> (f64, f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::xtape::{self, Record};
     use super::*;
 
@@ -712,6 +782,19 @@ mod tests {
     fn feed(engine: &mut FeatureEngine, records: &[Record]) {
         for r in records {
             xtape::apply(engine, r);
+        }
+    }
+
+    /// Live pattern: push the records received before `tau`, then decide.
+    pub(crate) fn feed_until(
+        engine: &mut FeatureEngine,
+        records: &[Record],
+        idx: &mut usize,
+        tau: u64,
+    ) {
+        while *idx < records.len() && records[*idx].rx_ms < tau {
+            xtape::apply(engine, &records[*idx]);
+            *idx += 1;
         }
     }
 
@@ -743,14 +826,18 @@ mod tests {
         let records = xtape::parse_jsonl(FIXTURE).unwrap();
         assert!(records.len() > 1_000);
         let mut engine = FeatureEngine::new(origin);
-        feed(&mut engine, &records);
         let rows = g["rows"].as_array().unwrap();
         assert!(rows.len() >= 60);
         let mut max_abs = 0.0f64;
         let mut nonzero = [false; N_FEATURES];
         let mut first_bid_x: Option<Vec<f32>> = None;
+        let mut idx = 0usize;
         for row in rows {
             let tau = row["tau_ms"].as_u64().unwrap();
+            // Records received before τ, as live (the engine keeps 150 s of
+            // history behind the newest record, so the whole slice cannot be
+            // pre-fed and then asked about its first τ).
+            feed_until(&mut engine, &records, &mut idx, tau);
             let want: Vec<f64> = row["features"]
                 .as_array()
                 .unwrap()
@@ -836,6 +923,10 @@ mod tests {
         let all = xtape::parse_jsonl(FIXTURE).unwrap();
         let tau = g["rows"][10]["tau_ms"].as_u64().unwrap();
         let before: Vec<Record> = all.iter().filter(|r| r.rx_ms < tau).cloned().collect();
+        // The future fed below stays within the retention window of the
+        // oldest lookup (τ − 120 s): retention is relative to the newest
+        // record, as live, where the newest record is never far past τ.
+        let horizon = tau + 20_000;
         let mut a = FeatureEngine::new(origin);
         feed(&mut a, &before);
         let base = a.features_at(tau).unwrap();
@@ -849,19 +940,20 @@ mod tests {
         for r in &at_tau {
             xtape::apply(&mut b, r);
         }
-        for r in all.iter().filter(|r| r.rx_ms >= tau) {
+        for r in all.iter().filter(|r| r.rx_ms >= tau && r.rx_ms < horizon) {
             xtape::apply(&mut b, &xtape::make_absurd(r));
         }
         let got = b.features_at(tau).unwrap();
         assert_eq!(got, base, "a record with rx >= τ influenced the features");
-        // ... and an engine fed the whole (unmodified) tape, future included,
-        // before its first query answers the same at τ.
+        // ... and an engine fed the (unmodified) tape past τ before its
+        // first query answers the same at τ.
         let mut c = FeatureEngine::new(origin);
-        feed(&mut c, &all);
+        let upto: Vec<Record> = all.iter().filter(|r| r.rx_ms < horizon).cloned().collect();
+        feed(&mut c, &upto);
         assert_eq!(c.features_at(tau).unwrap(), base);
-        // The future really would have changed things had it leaked: one
-        // grid step later the absurd records are inside the window.
-        assert_ne!(b.features_at(tau + 100).unwrap(), base);
+        // The future really would have changed things had it leaked: a
+        // decision inside the absurd window sees them.
+        assert_ne!(b.features_at(horizon - 50).unwrap(), base);
     }
 
     #[test]
@@ -892,6 +984,61 @@ mod tests {
             e3.features_at(origin + 150_050),
             Err(FeatureGap::NoRecord { .. })
         ));
+    }
+
+    /// Codex round 3 on pairtrade#390: with NO decision at all for the whole
+    /// slice (a halted tick never reaches the gate), the grid state still
+    /// progresses at ingestion, so the first decision afterwards equals the
+    /// offline value (golden) instead of an EMA re-initialised from the
+    /// trimmed tail.
+    #[test]
+    fn ingestion_alone_keeps_the_grid_state_current() {
+        let g = golden();
+        let origin = g["grid_origin_ms"].as_u64().unwrap();
+        let records = xtape::parse_jsonl(FIXTURE).unwrap();
+        let last = g["rows"].as_array().unwrap().last().unwrap();
+        let tau = last["tau_ms"].as_u64().unwrap();
+        let mut e = FeatureEngine::new(origin);
+        let mut idx = 0;
+        feed_until(&mut e, &records, &mut idx, tau);
+        let got = e.features_at(tau).unwrap();
+        let want: Vec<f64> = last["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        for (k, (a, b)) in got.values.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                "feature {k}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Codex round 3 on pairtrade#390: retention holds at ingestion, with no
+    /// gate cycle at all (a halted / book-less tick never reaches the gate
+    /// while the feed tasks keep pushing).
+    #[test]
+    fn ingestion_alone_keeps_every_ring_bounded() {
+        let mut e = FeatureEngine::new(0);
+        let l2: Vec<(f64, f64)> = (0..20).map(|i| (100.0 - i as f64 * 0.1, 0.5)).collect();
+        for k in 0..20_000u64 {
+            let t = 1_000 + k * 100;
+            e.on_own_l1(t, 100.0, 100.1, 1.0, 1.0);
+            e.on_own_l2(t, &l2, &l2);
+            e.on_own_trade(t, true, 100.0, 0.01);
+            e.on_bn_l1(t, 100.0, 100.1, 1.0, 1.0);
+            e.on_bn_trade(t, false, 100.0, 0.01);
+            e.on_hl_l1(t, 100.0, 100.1);
+            e.on_hl_trade(t, true, 100.0, 0.01);
+        }
+        // 150 s at 10 Hz ≈ 1,500 per ring × 7 rings, not 140,000.
+        let n = e.record_count();
+        assert!(n < 12_000, "{n} records retained");
+        // ... and the as-of at the retention edge still resolves.
+        let t_end = 1_000 + 19_999 * 100;
+        assert!(asof(&e.bn_l1, t_end - RETAIN_MS + 50, |r| r.rx).is_some());
     }
 
     #[test]
