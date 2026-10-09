@@ -191,11 +191,32 @@ printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 0 ] && ! grep -q '^ARCUS_VOL_POSITION_STOP_BPS=' "$T/env.out" || fail "no position stop must be exported when unset"
 printf 'POSITION_STOP_BPS=25bp\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "POSITION_STOP_BPS must be a number" <<< "$OUT" || fail "non-numeric position stop must refuse"
+# quote gate (bot-strategy#1120): off by default (exported as off, nothing else); shadow + model pass
+# through; a bad mode, an unreadable model, enforce without its confirm, a bad fallback refuse
+printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_GATE_MODE=off "$T/env.out" && ! grep -q '^ARCUS_VOL_GATE_MODEL=' "$T/env.out" && grep -q "quote gate: off" <<< "$OUT" || fail "gate must default to off"
+echo '{}' > "$T/etc/model.json"
+printf 'GATE_MODE=shadow\nGATE_MODEL=%s\nGATE_FALLBACK=baseline_then_pull:60\nGATE_LOG_FEATURES=all\n' "$T/etc/model.json" > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_GATE_MODE=shadow "$T/env.out" && grep -qxF "ARCUS_VOL_GATE_MODEL=$T/etc/model.json" "$T/env.out" \
+    && grep -qxF ARCUS_VOL_GATE_FALLBACK=baseline_then_pull:60 "$T/env.out" && grep -qxF ARCUS_VOL_GATE_LOG_FEATURES=all "$T/env.out" \
+    && ! grep -q '^ARCUS_VOL_GATE_ENFORCE_CONFIRM=' "$T/env.out" && grep -q "quote gate: shadow (model $T/etc/model.json), fallback baseline_then_pull:60" <<< "$OUT" || fail "gate settings must reach the runtime: $OUT"
+printf 'GATE_MODE=on\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "GATE_MODE must be off|shadow|enforce" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "bad gate mode must refuse"
+printf 'GATE_MODE=shadow\nGATE_MODEL=%s\n' "$T/etc/missing.json" > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "GATE_MODEL $T/etc/missing.json is not readable" <<< "$OUT" || fail "unreadable model must refuse"
+printf 'GATE_MODE=enforce\nGATE_MODEL=%s\n' "$T/etc/model.json" > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "GATE_MODE=enforce needs GATE_ENFORCE_CONFIRM and GATE_MODEL" <<< "$OUT" || fail "enforce without the confirm must refuse"
+printf 'GATE_MODE=enforce\nGATE_MODEL=%s\nGATE_ENFORCE_CONFIRM=1120-arcus\n' "$T/etc/model.json" > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_GATE_MODE=enforce "$T/env.out" && grep -qxF ARCUS_VOL_GATE_ENFORCE_CONFIRM=1120-arcus "$T/env.out" || fail "enforce with confirm + model passes through (the runtime checks the token)"
+printf 'GATE_FALLBACK=sometimes\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "GATE_FALLBACK must be" <<< "$OUT" || fail "bad fallback must refuse"
+printf 'GATE_LOG_FEATURES=some\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "GATE_LOG_FEATURES must be all|none" <<< "$OUT" || fail "bad log_features must refuse"
 rm -f "$T/etc/config.env"
 printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nARCUS_ACCOUNT_INDEX=0\nARCUS_REST_ENDPOINT=https://evil.example\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
 [ "$RC" -eq 1 ] && grep -q "live.env line 5: key ARCUS_REST_ENDPOINT is not accepted here" <<< "$OUT" || fail "live.env must refuse endpoint keys"
 write_live 600 0
-ok "config.env overrides are applied, validated, never executed, and allow-listed (no account / endpoint keys)"
+ok "config.env overrides are applied, validated, never executed, and allow-listed (no account / endpoint keys); quote gate keys pass through"
 
 # 7. sentinels: KILL_SWITCH / HALT -> exit 0 without starting (no restart loop)
 venue "$FLAT" "$NO_ORDERS" "$(acct 5557 5377)"
