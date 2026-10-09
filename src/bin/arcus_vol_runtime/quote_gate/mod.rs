@@ -166,6 +166,12 @@ pub enum FallbackReason {
     FeatureGap {
         name: &'static str,
     },
+    /// A feed that was up reported Down and has not come back: its stream
+    /// is silently stale (own trades can legitimately be quiet, so age
+    /// alone cannot tell), so no scoring until its `Up`.
+    FeedDown {
+        feed: &'static str,
+    },
 }
 
 impl FallbackReason {
@@ -177,6 +183,7 @@ impl FallbackReason {
             FallbackReason::RefStale { .. } => "ref_stale",
             FallbackReason::RefGapCooldown { .. } => "ref_gap_cooldown",
             FallbackReason::FeatureGap { .. } => "feature_gap",
+            FallbackReason::FeedDown { .. } => "feed_down",
         }
     }
 
@@ -193,6 +200,7 @@ impl FallbackReason {
                 format!("ref_gap_cooldown:{feed}:{secs_left}")
             }
             FallbackReason::FeatureGap { name } => format!("feature_gap:{name}"),
+            FallbackReason::FeedDown { feed } => format!("feed_down:{feed}"),
         }
     }
 }
@@ -627,6 +635,10 @@ impl QuoteGate {
                 binance_ms: age(rx.bn_l1),
                 hyperliquid_ms: age(rx.hl_l1),
             };
+            // Retention is enforced on every cycle, not only when the
+            // features are computed (Codex P1 on pairtrade#390: a gate that
+            // never scores would otherwise grow its rings without bound).
+            s.engine.trim(tau_ms);
             let verdict = self.verdict(&mut s, tau_ms, &ages);
             (ages, verdict)
         };
@@ -737,6 +749,13 @@ impl QuoteGate {
             ("hyperliquid", &s.hyperliquid),
             ("own_tape", &s.own_tape),
         ] {
+            // Down after having been up: fallback until its Up, however
+            // long ago the Down was (Codex P2 on pairtrade#390: the own
+            // trades tape can be quiet while connected, so the age check
+            // above cannot cover it, and the cooldown below expires).
+            if !st.up && st.last_event_ms.is_some() {
+                return Err(FallbackReason::FeedDown { feed });
+            }
             if let Some(t) = st.last_event_ms {
                 let since = tau_ms.saturating_sub(t);
                 if since < self.cfg.event_cooldown_ms {
@@ -1188,14 +1207,8 @@ mod tests {
             out.bid.decision
         );
         gate.state().binance.last_event_ms = Some(origin - 900);
-        // 5) stale feed: τ far past the last Binance record.
-        let out = gate.evaluate(tau + 60_000, &bid, &ask, 0, false);
-        assert!(
-            matches!(&out.bid.decision, GateDecision::Fallback { reason: FallbackReason::RefStale { feed: "own_book", age_ms: Some(a) }, .. } if *a > 10_000),
-            "{:?}",
-            out.bid.decision
-        );
-        // 6) a NaN in a reference record: feature gap, not a zero.
+        // 5) a NaN in a reference record: feature gap, not a zero (at τ, before
+        //    the clock moves on: retention is enforced on every cycle).
         {
             let mut s = gate.state();
             s.engine.on_bn_l1(tau - 10, f64::NAN, f64::NAN, 1.0, 1.0);
@@ -1210,6 +1223,13 @@ mod tests {
             out.row("BTC-USD", true)["bid"]["reason"],
             "feature_gap:bn_ret_0.5s"
         );
+        // 6) stale feed: τ far past the last Binance record.
+        let out = gate.evaluate(tau + 60_000, &bid, &ask, 0, false);
+        assert!(
+            matches!(&out.bid.decision, GateDecision::Fallback { reason: FallbackReason::RefStale { feed: "own_book", age_ms: Some(a) }, .. } if *a > 10_000),
+            "{:?}",
+            out.bid.decision
+        );
         // 7) no model: model_missing.
         let mut no_model = QuoteGate::new(cfg(GateMode::Shadow), None, origin, None);
         let out = no_model.evaluate(tau, &bid, &ask, 0, false);
@@ -1221,6 +1241,67 @@ mod tests {
             }
         ));
         assert_eq!(out.model_sha, None);
+        // 8) the own trades tape goes Down and stays down past the cooldown:
+        //    fallback until its Up (then the cooldown), never a score on
+        //    silently stale own-flow features. Same for a reference feed.
+        {
+            let mut s = gate.state();
+            s.engine
+                .on_bn_l1(tau + 70_000 - 5, 84000.0, 84000.1, 1.0, 1.0);
+            s.engine.on_hl_l1(tau + 70_000 - 5, 84000.0, 84000.1);
+            s.engine
+                .on_own_l1(tau + 70_000 - 5, 84000.0, 84000.1, 1.0, 1.0);
+            s.own_tape.on(origin - 900, true);
+            s.own_tape.on(tau, false);
+        }
+        let t2 = tau + 70_000;
+        let out = gate.evaluate(t2, &bid, &ask, 0, false);
+        assert!(
+            matches!(
+                &out.bid.decision,
+                GateDecision::Fallback {
+                    reason: FallbackReason::FeedDown { feed: "own_tape" },
+                    ..
+                }
+            ),
+            "{:?}",
+            out.bid.decision
+        );
+        assert_eq!(
+            out.row("BTC-USD", false)["bid"]["reason"],
+            "feed_down:own_tape"
+        );
+        gate.state().own_tape.on(t2, true);
+        let out = gate.evaluate(t2 + 1, &bid, &ask, 0, false);
+        assert!(
+            matches!(
+                &out.bid.decision,
+                GateDecision::Fallback {
+                    reason: FallbackReason::RefGapCooldown {
+                        feed: "own_tape",
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{:?}",
+            out.bid.decision
+        );
+        gate.state().hyperliquid.on(tau, false);
+        let out = gate.evaluate(t2, &bid, &ask, 0, false);
+        assert!(
+            matches!(
+                &out.bid.decision,
+                GateDecision::Fallback {
+                    reason: FallbackReason::FeedDown {
+                        feed: "hyperliquid"
+                    },
+                    ..
+                }
+            ),
+            "{:?}",
+            out.bid.decision
+        );
         // Counters and status reflect the fallbacks.
         let st = gate.status(tau, Some(&out), false);
         assert!(st["fallback_counts"]["warmup"].as_u64().unwrap() >= 1);
@@ -1229,6 +1310,32 @@ mod tests {
         assert_eq!(st["model"]["theta_bps"], -0.25);
         assert!(st["pull_rate_5m"][pulled.side.as_str()].as_f64().unwrap() > 0.0);
         assert!(gate.summary(tau).starts_with("gate=shadow pull5m"));
+    }
+
+    /// Codex P1 on pairtrade#390: a gate that never scores (no model) must
+    /// still bound its feature history.
+    #[test]
+    fn history_is_trimmed_even_when_scoring_is_bypassed() {
+        let bid = plan(QSide::Bid, Some("0.005"), at("84000"));
+        let ask = plan(QSide::Ask, Some("0.005"), at("84000.1"));
+        let mut g = QuoteGate::new(cfg(GateMode::Shadow), None, 0, None);
+        let l2: Vec<(f64, f64)> = (0..20).map(|i| (84000.0 - i as f64 * 0.1, 0.5)).collect();
+        for k in 0..20_000u64 {
+            let t = 1_000 + k * 500;
+            g.on_own_book(t, &l2, &l2);
+            g.on_own_trade(t, true, 84000.0, 0.01);
+            let out = g.evaluate(t + 1, &bid, &ask, 0, false);
+            assert!(matches!(
+                out.bid.decision,
+                GateDecision::Fallback {
+                    reason: FallbackReason::ModelMissing,
+                    ..
+                }
+            ));
+        }
+        // 150 s of retention at 2 Hz = ~300 records per ring, not 20,000.
+        let n = g.state().engine.record_count();
+        assert!(n < 1_000, "{n} records retained");
     }
 
     #[test]

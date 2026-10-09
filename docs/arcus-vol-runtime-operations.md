@@ -174,8 +174,10 @@ Fail-safe (`Fallback`, with a reason, never a zero-filled score):
 `model_missing`, `warmup:<s>` (900 s from start and after a reference
 feed's reconnect, `GATE_WARMUP_S`), `ref_stale:<feed>:<age_ms>` (no record
 in 10 s, `GATE_REF_STALE_MS`), `ref_gap_cooldown:<feed>:<s>` (60 s after a
-connect/gap event, `GATE_EVENT_COOLDOWN_S`), `feature_gap:<name>` (no
-history yet, NaN). The action a fallback takes under enforce is
+connect/gap event, `GATE_EVENT_COOLDOWN_S`), `feed_down:<feed>` (a feed
+that reported Down and has not reconnected, however long ago — the own
+trades tape can be quiet while connected, so its age alone is not used),
+`feature_gap:<name>` (no history yet, NaN). The action a fallback takes under enforce is
 `GATE_FALLBACK`: `baseline` (default: quote as planned), `pull`, or
 `baseline_then_pull:<secs>`; in shadow it is only recorded.
 

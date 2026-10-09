@@ -541,7 +541,11 @@ impl FeatureEngine {
         Ok(FeatureVector { values: v })
     }
 
-    fn trim(&mut self, tau_ms: u64) {
+    /// Drop history older than the retention window behind `tau_ms`. Called
+    /// by `features_at` and by the gate on EVERY cycle, scored or not, so a
+    /// gate that never scores (no model, long fallback) does not grow the
+    /// rings without bound (Codex P1 on pairtrade#390).
+    pub fn trim(&mut self, tau_ms: u64) {
         let cutoff = tau_ms.saturating_sub(RETAIN_MS);
         trim_before(&mut self.own_l1, cutoff, |r| r.rx);
         trim_before(&mut self.own_l2, cutoff, |r| r.rx);
@@ -550,6 +554,20 @@ impl FeatureEngine {
         trim_before(&mut self.bn_trades, cutoff, |r| r.rx);
         trim_before(&mut self.hl_l1, cutoff, |r| r.rx);
         trim_before(&mut self.hl_trades, cutoff, |r| r.rx);
+    }
+}
+
+impl FeatureEngine {
+    /// Records held across all rings (tests: retention bound).
+    #[cfg(test)]
+    pub fn record_count(&self) -> usize {
+        self.own_l1.len()
+            + self.own_l2.len()
+            + self.own_trades.len()
+            + self.bn_l1.len()
+            + self.bn_trades.len()
+            + self.hl_l1.len()
+            + self.hl_trades.len()
     }
 }
 
