@@ -63,6 +63,7 @@
 mod config;
 mod ledger;
 mod logic;
+mod quote_gate;
 mod session;
 mod sim;
 mod tape;
@@ -87,6 +88,8 @@ use logic::{
     QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
     VenueMin, PLACE_VISIBILITY_GRACE_MS,
 };
+use quote_gate::{GateOutput, QuoteGate};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::json;
 use sim::VirtualQuote;
@@ -290,6 +293,13 @@ struct Runtime {
     /// Live: the startup position read succeeded and is in the ledger.
     startup_reconciled: bool,
     halt: Option<Halt>,
+    /// Quote gate (bot-strategy#1120): off = the tick as before; shadow =
+    /// computed and logged, never applied; enforce = pulls applied.
+    gate: QuoteGate,
+    /// `GATE_OFF` sentinel in the state dir: demotes enforce to shadow.
+    gate_off_path: PathBuf,
+    /// The last quote cycle's gate output, taken by `finish_tick` for status.
+    last_gate: Option<GateOutput>,
 }
 
 impl Runtime {
@@ -586,9 +596,16 @@ impl Runtime {
             ));
         }
         let path = self.fills_path.clone();
-        let outcome = match ledger::book_fill_at(&mut self.ledger, &fill, fill_ts, now, |row| {
-            append_synced(&path, row)
-        }) {
+        let gate = self.gate_stamp(&fill, fill_ts);
+        let outcome = match ledger::book_fill_scoped_gate(
+            &mut self.ledger,
+            &fill,
+            fill_ts,
+            now,
+            ledger::DayScope::Current,
+            gate,
+            |row| append_synced(&path, row),
+        ) {
             Ok(o) => o,
             Err(e) => {
                 self.note_append_error(&e);
@@ -611,15 +628,44 @@ impl Runtime {
         Ok(outcome)
     }
 
+    /// The quote gate decision in force for a fill (bot-strategy#1120,
+    /// design §7.2): the last gate cycle at or before `t_fill − cancel
+    /// latency`, on the fill's side. `None` (row `gate: null`) with the
+    /// gate off.
+    fn gate_stamp(&self, fill: &FillIn, fill_ts: u64) -> Option<serde_json::Value> {
+        if !self.gate.on() {
+            return None;
+        }
+        let side = if fill.buy { QSide::Bid } else { QSide::Ask };
+        Some(self.gate.stamp_for_fill(side, fill_ts))
+    }
+
     // ---------------------------------------------------------------- paper
 
     /// Tape health and prints (DRY_RUN). A disconnect pulls every virtual
     /// quote at once; the reconnect records the gap in fills.jsonl.
-    fn on_tape(&mut self, event: tape::TapeEvent) {
+    fn on_tape(&mut self, rx_ms: u64, event: tape::TapeEvent) {
+        let now = now_ms();
+        // The quote gate's own-flow features and its tape-health cooldown
+        // see every print in every mode (bot-strategy#1120), stamped with
+        // the reader's receive time `rx_ms` (not the dequeue time: the
+        // channel is drained only between ticks); the paper sim below stays
+        // DRY_RUN only.
+        if self.gate.on() {
+            match &event {
+                tape::TapeEvent::Up => self.gate.on_own_tape(rx_ms, true),
+                tape::TapeEvent::Down(_) => self.gate.on_own_tape(rx_ms, false),
+                tape::TapeEvent::Print(p) => {
+                    if let (Some(px), Some(qty)) = (p.px.to_f64(), p.qty.to_f64()) {
+                        self.gate
+                            .on_own_trade(rx_ms, p.taker == OrderSide::Long, px, qty);
+                    }
+                }
+            }
+        }
         if !self.cfg.dry_run {
             return;
         }
-        let now = now_ms();
         let action = self.tape.on_event(&event, now);
         self.apply_health(action);
         if let tape::TapeEvent::Print(p) = event {
@@ -1163,16 +1209,22 @@ impl Runtime {
         }
         let scope = ledger::day_scope(&self.ledger.day, fill_ts);
         let path = self.fills_path.clone();
-        let outcome =
-            match ledger::book_fill_scoped(&mut self.ledger, &fill, fill_ts, now, scope, |row| {
-                append_synced(&path, row)
-            }) {
-                Ok(o) => o,
-                Err(e) => {
-                    self.note_append_error(&e);
-                    return Err(e);
-                }
-            };
+        let gate = self.gate_stamp(&fill, fill_ts);
+        let outcome = match ledger::book_fill_scoped_gate(
+            &mut self.ledger,
+            &fill,
+            fill_ts,
+            now,
+            scope,
+            gate,
+            |row| append_synced(&path, row),
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                self.note_append_error(&e);
+                return Err(e);
+            }
+        };
         if outcome != Booking::AlreadyBooked {
             log::warn!(
                 "[ARCUS_VOL] FILL (spilled, {scope:?}, ts {fill_ts}) {} {} {} @ {} fee {} inv {}",
@@ -1588,7 +1640,7 @@ impl Runtime {
     // ----------------------------------------------------------------- tick
 
     async fn read_book(&mut self, now: u64) {
-        let depth = book_depth(self.cfg.dry_run, self.cfg.presence().on());
+        let depth = book_depth(self.cfg.dry_run, self.cfg.presence().on(), self.gate.on());
         match self
             .dex
             .get_order_book(&self.cfg.market.clone(), depth)
@@ -1599,6 +1651,16 @@ impl Runtime {
                     self.book = None;
                     return;
                 };
+                if self.gate.on() {
+                    // Own L1 / L2 for the gate features, stamped with the
+                    // time the read came back (bot-strategy#1120).
+                    let lv = |l: &[OrderBookLevel]| -> Vec<(f64, f64)> {
+                        l.iter()
+                            .filter_map(|x| Some((x.price.to_f64()?, x.size.to_f64()?)))
+                            .collect()
+                    };
+                    self.gate.on_own_book(now_ms(), &lv(&b.bids), &lv(&b.asks));
+                }
                 self.book = Some(BookView {
                     bid: bid.price,
                     ask: ask.price,
@@ -1940,6 +2002,27 @@ impl Runtime {
             return;
         };
         let (bid, ask) = plan_quotes(&book, inv, &params);
+        // Quote gate (bot-strategy#1120): after the baseline plan, before
+        // `quote_action`, on the same fresh clock. Shadow: computed and
+        // logged, the plan below is the baseline's unchanged (`apply` is the
+        // identity); enforce: a Pull clears the side's size.
+        let (bid, ask) = if self.gate.on() {
+            let sentinel = self.gate_off_path.exists();
+            let inv_sign: i8 = if inv > Decimal::ZERO {
+                1
+            } else if inv < Decimal::ZERO {
+                -1
+            } else {
+                0
+            };
+            let out = self.gate.evaluate(now, &bid, &ask, inv_sign, sentinel);
+            let gated = (out.apply(bid), out.apply(ask));
+            self.gate.log(&out, &self.cfg.market);
+            self.last_gate = Some(out);
+            gated
+        } else {
+            (bid, ask)
+        };
         let unpriced = |p: &SidePlan| p.qty.is_some() && !matches!(p.price, PricePlan::At { .. });
         if (unpriced(&bid) || unpriced(&ask)) && now.saturating_sub(self.last_peg_warn_ms) > 30_000
         {
@@ -1974,6 +2057,16 @@ impl Runtime {
             log::error!("[ARCUS_VOL] state write failed: {e:#}");
         }
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
+        let (gate_status, gate_summary) = if self.gate.on() {
+            let sentinel = self.gate_off_path.exists();
+            let last = self.last_gate.take();
+            (
+                self.gate.status(now, last.as_ref(), sentinel),
+                format!(" {}", self.gate.summary(now)),
+            )
+        } else {
+            (serde_json::Value::Null, String::new())
+        };
         // Presence-quoting monitor: each resting quote's distance from the
         // reference its band is judged on (`dist_bps`) and from the raw
         // touch (`dist_touch_bps`); null without a book / a reference.
@@ -2030,6 +2123,7 @@ impl Runtime {
             "tape": {"ready": self.tape.ready, "gap_since_ms": self.tape.gap_since_ms},
             "plan": self.last_plan,
             "pending_unresolved": self.pending_unresolved,
+            "gate": gate_status,
         });
         // status.json is informational (dashboards, humans): a plain atomic
         // replace without fsync is enough; state.json above is the durable one.
@@ -2039,7 +2133,7 @@ impl Runtime {
         if now.saturating_sub(self.last_summary_ms) >= 60_000 {
             self.last_summary_ms = now;
             log::info!(
-                "[ARCUS_VOL] {} inv {} day_net {} cum_net {} vol_day {} vol_cum {} cost/1M {} halt {:?}",
+                "[ARCUS_VOL] {} inv {} day_net {} cum_net {} vol_day {} vol_cum {} cost/1M {} halt {:?}{}",
                 self.cfg.mode(),
                 l.position.qty,
                 l.daily_net(mark).round_dp(2),
@@ -2050,6 +2144,7 @@ impl Runtime {
                     .map(|c| c.round_dp(2).to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 self.halt.as_ref().map(Halt::label),
+                gate_summary,
             );
         }
     }
@@ -2174,6 +2269,50 @@ impl BatchSink<QuoteBatch> for Runtime {
     }
 }
 
+/// Build the quote gate (bot-strategy#1120): the model file, when given, is
+/// validated against this runtime's venue, market and feature engine and
+/// any mismatch refuses the start (fail closed on config, shadow included).
+fn build_gate(cfg: &Config) -> Result<QuoteGate> {
+    let g = &cfg.gate;
+    if !g.mode.on() {
+        return Ok(QuoteGate::new(g.config(), None, now_ms(), None));
+    }
+    let model = match &g.model {
+        Some(path) => Some(
+            quote_gate::model::GateModel::load(path, "arcus", &cfg.market)
+                .map_err(|e| anyhow!("[GATE] {e}"))?,
+        ),
+        None => None,
+    };
+    match &model {
+        Some(m) => log::info!(
+            "[GATE] loaded kind={} venue={} market={} cell={} theta={}bp sha={} frozen_at={} mode={} fallback={} warmup={}s",
+            m.kind,
+            m.venue,
+            m.market,
+            m.cell,
+            m.thresholds.quote_bps,
+            m.sha_short(),
+            m.thresholds.frozen_at,
+            g.mode.as_str(),
+            g.fallback.label(),
+            g.warmup_s
+        ),
+        None => log::warn!(
+            "[GATE] mode={} with no model file (ARCUS_VOL_GATE_MODEL unset): every cycle is recorded as fallback model_missing (policy {}); {} has no reference feed / model yet",
+            g.mode.as_str(),
+            g.fallback.label(),
+            cfg.market
+        ),
+    }
+    Ok(QuoteGate::new(
+        g.config(),
+        model,
+        now_ms(),
+        Some(&cfg.state_dir),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logger();
@@ -2212,6 +2351,7 @@ async fn main() -> Result<()> {
         cfg.cum_stop_usd,
         cfg.state_dir.display()
     );
+    let gate = build_gate(&cfg)?;
     if cfg.quote_offset_bps > Decimal::ZERO {
         log::info!(
             "[ARCUS_VOL] PRESENCE quoting: quotes rest {} bp behind the touch, kept while within ±{} bp of that; fills only on sweeps; the reducing side exits at the touch",
@@ -2359,6 +2499,9 @@ async fn main() -> Result<()> {
         sim_halted: None,
         startup_reconciled: false,
         halt: None,
+        gate,
+        gate_off_path: cfg.state_dir.join("GATE_OFF"),
+        last_gate: None,
         cfg,
     };
 
@@ -2395,11 +2538,33 @@ async fn main() -> Result<()> {
         }
     }
 
-    let (tx, mut rx) = mpsc::channel::<tape::TapeEvent>(4_096);
-    if rt.cfg.dry_run {
+    // Reference feeds for the quote gate (bot-strategy#1120): only with a
+    // model that names them; a dead feed only ever makes the gate fall back.
+    if let Some(m) = rt.gate.model() {
+        if let Some(sym) = m.ref_feeds.binance_symbol.clone() {
+            tokio::spawn(quote_gate::feed::run_binance(
+                rt.cfg.gate.binance_ws_base.clone(),
+                sym,
+                rt.gate.shared(),
+            ));
+        }
+        if let Some(coin) = m.ref_feeds.hl_coin.clone() {
+            tokio::spawn(quote_gate::feed::run_hyperliquid(
+                rt.cfg.gate.hyperliquid_ws.clone(),
+                coin,
+                rt.gate.shared(),
+            ));
+        }
+    }
+    let (tx, mut rx) = mpsc::channel::<(u64, tape::TapeEvent)>(4_096);
+    // The public trades tape feeds the paper sim (DRY_RUN) and the quote
+    // gate's own-flow features (any mode with the gate on).
+    if rt.cfg.dry_run || rt.gate.on() {
         tokio::spawn(tape::run(rt.cfg.ws_url.clone(), rt.cfg.market.clone(), tx));
     } else {
         drop(tx);
+    }
+    if !rt.cfg.dry_run {
         let market = rt.cfg.market.clone();
         rt.dex
             .set_leverage(&market, rt.cfg.leverage)
@@ -2423,7 +2588,7 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => rt.tick().await,
-            Some(ev) = rx.recv() => rt.on_tape(ev),
+            Some((rx_ms, ev)) = rx.recv() => rt.on_tape(rx_ms, ev),
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
         }

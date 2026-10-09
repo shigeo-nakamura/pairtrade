@@ -132,12 +132,99 @@ without hours (crypto) never switches. Each switch logs one line
 `status.json` shows `session` (`in` / `off`) with the active
 `quote_offset_bps` / `repeg_band_bps`. Changing the values needs a restart.
 
+### Quote gate (bot-strategy#1120) — shadow mode
+
+An adverse-selection gate that decides, per side and per quote cycle,
+whether the baseline quote should rest or be pulled. Design:
+`~/bot/logs/studies/2026-10-04-quote-gate-1120/DESIGN.md`. It sits after
+`plan_quotes` and before `quote_action`, so it can only REMOVE a quote the
+baseline planned (never add one, never price an unpriced side). The safety
+plan (`tick_plan`: flatten / halt / stale / shock / DMS) is untouched.
+
+`GATE_MODE` in `config.env` (launcher keys `GATE_*` → runtime
+`ARCUS_VOL_GATE_*`; a restart is needed to change them):
+
+| mode | effect |
+|---|---|
+| `off` (default) | nothing computed or written; the tick is as before |
+| `shadow` | every quote cycle is scored and logged; **the plan is never changed** (`apply` is the identity, unit-tested) |
+| `enforce` | pulls are applied. Needs `GATE_ENFORCE_CONFIRM=1120-arcus` AND `GATE_MODEL`, after a shadow readout PASS (design §10, owner decision) |
+
+Model file: `GATE_MODEL=<path>` (design §5.2 JSON envelope, `kind`
+`linear` in this build; `forest` / `lookup` are refused until their
+evaluators land). At start the runtime recomputes the file's
+`payload_sha256`, checks `venue` / `market` against this runtime and
+`feature_names` against its feature engine, and refuses to start on any
+mismatch — in shadow as in enforce. The deploy workflow installs the shipped
+`configs/quote_gate/quote_gate_linear_arcus_btc.json` (the 10-01 Binance
+premium-deviation rule, θ = −0.25 bp, **BTC-USD only**) at
+`/opt/debot-arcus-vol/gate/quote_gate_linear_arcus_btc.json`; a model for
+another market must be a separate file for that market. One `[GATE] loaded
+kind=… market=… theta=…bp sha=<12>` line at start is the fingerprint.
+
+Reference feeds (named by the model's `feature_spec.ref_feeds`): one
+Binance USDT-M combined WS (`bookTicker` + `aggTrade`) and one Hyperliquid WS
+(`bbo` + `trades`), reconnecting with backoff; the public Arcus `trades`
+tape is subscribed in every mode while the gate is on (own-flow features).
+Features use only records received strictly before the decision time
+(`rx < τ`, the 37 features of #1113 `rf_common`; a golden test pins them to
+the Python values on a real tape slice).
+
+Fail-safe (`Fallback`, with a reason, never a zero-filled score):
+`model_missing`, `warmup:<s>` (900 s from start and after any reference
+feed connect or reconnect, which also restarts the EMA / vol grid state
+and drops the feature history; `GATE_WARMUP_S`), `ref_stale:<feed>:<age_ms>` (no record
+in 10 s, `GATE_REF_STALE_MS`), `ref_gap_cooldown:<feed>:<s>` (60 s after a
+connect/gap event, `GATE_EVENT_COOLDOWN_S`), `feed_down:<feed>` (a feed
+that never connected, or reported Down and has not reconnected, however
+long ago — the own trades tape can be quiet while connected, so its age
+alone is not used),
+`feature_gap:<name>` (no history yet, NaN). The action a fallback takes under enforce is
+`GATE_FALLBACK`: `baseline` (default: quote as planned), `pull`, or
+`baseline_then_pull:<secs>`; in shadow it is only recorded.
+
+What shadow writes (all in `STATE_DIR`):
+
+- `gate_YYYYMMDD.jsonl` (UTC day, no fsync): one row per quote cycle —
+  `{"kind":"gate","ts_ms":τ,"market","mode","forced_shadow","model_sha",
+  "ref_age_ms":{own_book,own_tape,binance,hyperliquid},"features":{…37…},
+  "bid":{"decision":"scored"|"fallback","action":"quote"|"pull","pred_bps",
+  "reason","baseline_qty","reducing_side"},"ask":{…},"applied":false}`.
+  `GATE_LOG_FEATURES=none` drops `features` (keep `all` for the shadow
+  week: it is the re-calibration data). ≈ 2 Hz × ~600 B; archive it with
+  `fills.jsonl`.
+- `fills.jsonl`: every `fill` row gains `"gate": {ts_ms, mode, decision,
+  action, pred_bps|reason, model_sha, applied}` = the gate cycle in force at
+  `t_fill − 0.3 s` (the labels' τ), or `null` (gate off, or no cycle known
+  after a restart). Existing keys are unchanged; replay ignores `gate`.
+  The shadow readout (pull-group vs kept-group 30 s markout) needs only
+  these rows plus the existing `markout` rows.
+- `status.json` `gate`: `mode`, `effective_mode`, `model` (kind, sha,
+  theta), `cycles`, `fallback_counts`, `fallback_active`, `pull_rate_5m`,
+  `pred_bps_last`, `ref_age_ms`, `warmup_secs_left`. The 60 s summary line
+  ends with `gate=shadow pull5m b=18% a=22% fb=none`.
+
+Markets without a reference feed (SPY-USD, QQQ-USD, NVDA-USD, GLD-USD):
+the BTC model is refused for them (market mismatch). Shadow WITHOUT
+`GATE_MODEL` is allowed and records `fallback model_missing` on every cycle
+(nothing else is computed), which only proves the plumbing. A gate for the
+equity/ETF perps first needs a lead-lag study of the candidate references
+(Lighter index, Polymarket idx, Nado — design §8 / Q4), a feature-engine
+variant on that reference plus session flags, and its own frozen cell.
+
+To run the shadow week as designed (D9), use a **DRY_RUN BTC-USD at-touch
+instance** with its own `STATE_DIR` (never the live presence bots'
+subaccount) and `GATE_MODE=shadow`, `GATE_MODEL=…arcus_btc.json`,
+`GATE_LOG_FEATURES=all`. Turning the gate on, as any config change, is an
+operator restart.
+
 ### Sentinels (in `STATE_DIR`)
 
 | file | meaning |
 |---|---|
 | `KILL_SWITCH` | runtime pulls quotes, flattens (reduce-only IOC), halts while present. The launcher does **not** start while it exists (exit 0, so `Restart=on-failure` stays quiet): `sudo rm .../KILL_SWITCH` first. |
 | `HALT` | written by the runtime on a sticky halt (cumulative stop, unrecoverable reconcile). Read the journal, then remove it by hand before the next start. |
+| `GATE_OFF` | quote gate (bot-strategy#1120): while present, `GATE_MODE=enforce` is demoted to shadow from the next tick (no restart; rows carry `forced_shadow: true`). No effect in shadow / off. |
 
 ### What the dead man's switch means for manual trading
 

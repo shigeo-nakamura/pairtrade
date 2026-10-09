@@ -201,6 +201,7 @@ jobs:
             debot/scripts/debot-arcus-vol.sh
             debot/scripts/arcus_vol_encrypt_key.sh
             debot/scripts/debot-arcus-vol.env.example
+            debot/configs/quote_gate/quote_gate_linear_arcus_btc.json
             debot/deploy/debot-arcus-vol.service
 
   deploy:
@@ -237,6 +238,9 @@ jobs:
           aws s3 cp debot/scripts/arcus_vol_encrypt_key.sh "s3://${S3_BUCKET}/debot/scripts/arcus_vol_encrypt_key.sh"
           aws s3 cp debot/scripts/debot-arcus-vol.env.example "s3://${S3_BUCKET}/debot/scripts/debot-arcus-vol.env.example"
           aws s3 cp debot/deploy/debot-arcus-vol.service "s3://${S3_BUCKET}/deploy/debot-arcus-vol.service"
+          # Quote gate model (bot-strategy#1120): data only, read when a
+          # config.env opts in with GATE_MODE + GATE_MODEL (default off).
+          aws s3 cp debot/configs/quote_gate/quote_gate_linear_arcus_btc.json "s3://${S3_BUCKET}/debot/arcus-vol/gate/quote_gate_linear_arcus_btc.json"
 
       - name: Deploy via SSM (no service start)
         env:
@@ -271,6 +275,10 @@ jobs:
               "aws s3 cp s3://__S3_BUCKET__/debot/scripts/debot-arcus-vol.env.example /tmp/debot-arcus-vol.env.example",
               "sudo install -o root -g root -m 0644 /tmp/debot-arcus-vol.env.example /opt/debot/scripts/debot-arcus-vol.env.example",
               "rm -f /tmp/debot-arcus-vol.sh /tmp/debot-arcus-vol.env.example",
+              "sudo mkdir -p __INSTALL_DIR__/gate",
+              "aws s3 cp s3://__S3_BUCKET__/debot/arcus-vol/gate/quote_gate_linear_arcus_btc.json /tmp/quote_gate_linear_arcus_btc.json",
+              "sudo install -o root -g root -m 0644 /tmp/quote_gate_linear_arcus_btc.json __INSTALL_DIR__/gate/quote_gate_linear_arcus_btc.json",
+              "rm -f /tmp/quote_gate_linear_arcus_btc.json",
               "/bin/bash -lc 'set -e; svc=debot-arcus-vol; aws s3 cp s3://__S3_BUCKET__/deploy/$svc.service /tmp/$svc.service; if [ ! -f /etc/systemd/system/$svc.service ] || ! cmp -s /etc/systemd/system/$svc.service /tmp/$svc.service; then sudo install -o root -g root -m 0644 /tmp/$svc.service /etc/systemd/system/$svc.service; sudo systemctl daemon-reload; fi; rm -f /tmp/$svc.service; sudo systemctl enable $svc.service >/dev/null 2>&1 || true'",
               "sudo test -f /etc/debot-arcus-vol/live.env || echo 'NOTE: /etc/debot-arcus-vol/live.env does not exist yet -- the operator must create it (mode 600) from /opt/debot/scripts/debot-arcus-vol.env.example, then run sudo /opt/debot/scripts/arcus_vol_encrypt_key.sh to encrypt the signing key, before starting the service (bot-strategy#1093).'",
               "sudo test -f /etc/debot-arcus-vol/config.env || echo 'NOTE: /etc/debot-arcus-vol/config.env does not exist yet -- the launcher falls back to its defaults (SPY-USD, $2,500 per side, 5 bp +/- 2 bp, daily stop $5, cumulative stop $21).'",

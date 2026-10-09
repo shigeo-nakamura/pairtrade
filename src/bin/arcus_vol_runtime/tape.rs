@@ -230,10 +230,22 @@ impl Dedupe {
     }
 }
 
-/// Run forever: connect, subscribe, forward prints and health events;
-/// reconnect with backoff. `Up` is sent on the venue's subscribe ack and
+/// Receive time stamped on every event in the reader itself: the runtime
+/// dequeues the channel only between ticks, so a stamp taken at dequeue
+/// would lag a tick's REST round trips and bunch prints into later feature
+/// windows (Codex round 3 on pairtrade#390).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Run forever: connect, subscribe, forward `(rx_ms, event)` pairs — prints
+/// and health events stamped when the reader got them; reconnect with
+/// backoff. `Up` is sent on the venue's subscribe ack and
 /// `Down` whenever an acked subscription is lost.
-pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
+pub async fn run(url: String, market: String, tx: mpsc::Sender<(u64, TapeEvent)>) {
     let mut backoff = Duration::from_secs(1);
     let mut dedupe = Dedupe::new(20_000);
     loop {
@@ -271,7 +283,7 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
                                     up = true;
                                     backoff = Duration::from_secs(1);
                                     log::info!("[ARCUS_VOL] trades tape subscribed ({market})");
-                                    if tx.send(TapeEvent::Up).await.is_err() {
+                                    if tx.send((now_ms(), TapeEvent::Up)).await.is_err() {
                                         return;
                                     }
                                     continue;
@@ -280,7 +292,10 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
                                     Ok(prints) => {
                                         for p in prints {
                                             if dedupe.first(&p.trade_id)
-                                                && tx.send(TapeEvent::Print(p)).await.is_err()
+                                                && tx
+                                                    .send((now_ms(), TapeEvent::Print(p)))
+                                                    .await
+                                                    .is_err()
                                             {
                                                 return;
                                             }
@@ -308,7 +323,7 @@ pub async fn run(url: String, market: String, tx: mpsc::Sender<TapeEvent>) {
                         "[ARCUS_VOL] trades tape down; paper quotes pulled until resubscribed"
                     );
                     if tx
-                        .send(TapeEvent::Down(down_reason.to_string()))
+                        .send((now_ms(), TapeEvent::Down(down_reason.to_string())))
                         .await
                         .is_err()
                     {

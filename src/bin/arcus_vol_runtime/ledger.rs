@@ -857,6 +857,7 @@ pub fn book_fill(
 /// is when the fill happened (a paper fill: the print's venue timestamp) and
 /// drives the row's `ts_ms`, the position open time (max-hold) and the
 /// markout horizons; `rx_ms` is only when we processed it (`rx_ms` field).
+#[cfg(test)]
 pub fn book_fill_at(
     l: &mut Ledger,
     f: &FillIn,
@@ -869,12 +870,28 @@ pub fn book_fill_at(
 
 /// `book_fill_at` with an explicit day scope; a `CumulativeOnly` row is
 /// marked `late_prior_day` so replay keeps it out of the day counters too.
+#[cfg(test)]
 pub fn book_fill_scoped(
     l: &mut Ledger,
     f: &FillIn,
     ts_ms: u64,
     rx_ms: u64,
     scope: DayScope,
+    append: impl FnOnce(&serde_json::Value) -> std::io::Result<()>,
+) -> std::io::Result<Booking> {
+    book_fill_scoped_gate(l, f, ts_ms, rx_ms, scope, None, append)
+}
+
+/// `book_fill_scoped` with the quote gate's decision in force for this fill
+/// (bot-strategy#1120, design §7.2) under the row's `gate` key: `None` writes
+/// `null` (gate off, or no cycle known). Additive only: replay ignores it.
+pub fn book_fill_scoped_gate(
+    l: &mut Ledger,
+    f: &FillIn,
+    ts_ms: u64,
+    rx_ms: u64,
+    scope: DayScope,
+    gate: Option<serde_json::Value>,
     append: impl FnOnce(&serde_json::Value) -> std::io::Result<()>,
 ) -> std::io::Result<Booking> {
     if l.has_booked(&f.trade_id) {
@@ -902,6 +919,7 @@ pub fn book_fill_scoped(
         "fee_estimated": f.fee_estimated,
         "inventory": preview.qty.to_string(),
         "late_prior_day": scope == DayScope::CumulativeOnly,
+        "gate": gate.unwrap_or(serde_json::Value::Null),
     });
     append(&row)?;
     let booked = l.record_fill_scoped(f.buy, f.qty, f.px, f.fee, f.maker, ts_ms, scope);
