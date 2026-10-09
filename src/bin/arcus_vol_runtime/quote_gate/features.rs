@@ -188,6 +188,7 @@ struct GridPoint {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Ema {
+    span_steps: u64,
     alpha: f64,
     y: f64,
     init: bool,
@@ -196,6 +197,7 @@ struct Ema {
 impl Ema {
     fn new(span_steps: u64) -> Self {
         Ema {
+            span_steps,
             alpha: 2.0 / (span_steps as f64 + 1.0),
             y: 0.0,
             init: false,
@@ -387,8 +389,13 @@ impl FeatureEngine {
     /// Bring the grid up to the last point at or before `t_ms`. A point
     /// whose own / Binance / HL mids are not all available (no record before
     /// it) is incomplete: the EMAs are not advanced, a zero diff is recorded
-    /// for the vols.
-    fn advance_grid(&mut self, t_ms: u64) {
+    /// for the vols. Grid point k only ever uses records with
+    /// `rx < origin + k·dt`, so calling this early (every gate cycle, warmup
+    /// included — Codex round 2 on pairtrade#390) yields exactly the values a
+    /// later call would: it keeps the EMA state accumulating while the
+    /// rings are trimmed behind it, instead of initialising the 300 s EMA
+    /// from the last 150 s of history at the first score.
+    pub fn advance_grid(&mut self, t_ms: u64) {
         if t_ms < self.origin_ms {
             return;
         }
@@ -425,6 +432,23 @@ impl FeatureEngine {
             self.pdev_hl = Some(-(ph - self.ema_hl.push(ph)));
             self.last_grid = Some(point);
         }
+    }
+
+    /// Restart the grid at `origin_ms`: EMA / vol state is dropped (a feed
+    /// gap forward-filled stale values into it) and warms up again from the
+    /// first complete point after the new origin. The rings are kept.
+    pub fn reset_grid(&mut self, origin_ms: u64) {
+        self.origin_ms = origin_ms;
+        self.grid_next = 0;
+        self.last_grid = None;
+        self.pdev_bn = None;
+        self.pdev_hl = None;
+        for e in self.ema_bn.iter_mut() {
+            *e = Ema::new(e.span_steps);
+        }
+        self.ema_hl = Ema::new(self.ema_hl.span_steps);
+        self.rv_a.clear();
+        self.rv_b.clear();
     }
 
     fn rv(ring: &VecDeque<f64>, window_s: u64) -> f64 {
@@ -558,6 +582,12 @@ impl FeatureEngine {
 }
 
 impl FeatureEngine {
+    /// `(grid origin, next grid index, EMA initialised)` (tests).
+    #[cfg(test)]
+    pub fn grid_state(&self) -> (u64, u64, bool) {
+        (self.origin_ms, self.grid_next, self.ema_bn[2].init)
+    }
+
     /// Records held across all rings (tests: retention bound).
     #[cfg(test)]
     pub fn record_count(&self) -> usize {

@@ -166,9 +166,10 @@ pub enum FallbackReason {
     FeatureGap {
         name: &'static str,
     },
-    /// A feed that was up reported Down and has not come back: its stream
-    /// is silently stale (own trades can legitimately be quiet, so age
-    /// alone cannot tell), so no scoring until its `Up`.
+    /// A feed the model needs is not up: it never connected, or it reported
+    /// Down and has not come back. Its stream is silently stale (own trades
+    /// can legitimately be quiet, so age alone cannot tell), so no scoring
+    /// until its `Up` (Codex rounds 1-2 on pairtrade#390).
     FeedDown {
         feed: &'static str,
     },
@@ -419,7 +420,11 @@ impl RefState {
             RefEvent::Up => {
                 state.on(rx_ms, true);
                 if std::mem::take(&mut state.recovered) {
+                    // The gap forward-filled stale values into the grid
+                    // state: restart it with the warmup (Codex round 2 on
+                    // pairtrade#390).
                     self.warmup_since_ms = rx_ms;
+                    self.engine.reset_grid(rx_ms);
                 }
             }
             RefEvent::Down(_) => state.on(rx_ms, false),
@@ -635,9 +640,13 @@ impl QuoteGate {
                 binance_ms: age(rx.bn_l1),
                 hyperliquid_ms: age(rx.hl_l1),
             };
-            // Retention is enforced on every cycle, not only when the
-            // features are computed (Codex P1 on pairtrade#390: a gate that
-            // never scores would otherwise grow its rings without bound).
+            // The grid (EMA / vol state) advances and retention is enforced
+            // on every cycle, not only when the features are computed (Codex
+            // rounds 1-2 on pairtrade#390): a gate that never scores would
+            // otherwise grow its rings without bound, and a gate in warmup
+            // would reach its first score with an EMA initialised from the
+            // trimmed tail instead of the whole warmup.
+            s.engine.advance_grid(tau_ms);
             s.engine.trim(tau_ms);
             let verdict = self.verdict(&mut s, tau_ms, &ages);
             (ages, verdict)
@@ -749,11 +758,11 @@ impl QuoteGate {
             ("hyperliquid", &s.hyperliquid),
             ("own_tape", &s.own_tape),
         ] {
-            // Down after having been up: fallback until its Up, however
-            // long ago the Down was (Codex P2 on pairtrade#390: the own
-            // trades tape can be quiet while connected, so the age check
-            // above cannot cover it, and the cooldown below expires).
-            if !st.up && st.last_event_ms.is_some() {
+            // Not up — never connected, or Down and not back: fallback until
+            // its Up, however long ago (Codex rounds 1-2 on pairtrade#390:
+            // the own trades tape can be quiet while connected, so the age
+            // check above cannot cover it, and the cooldown below expires).
+            if !st.up {
                 return Err(FallbackReason::FeedDown { feed });
             }
             if let Some(t) = st.last_event_ms {
@@ -1082,6 +1091,7 @@ mod tests {
             // Feeds came up before the origin; no gap since.
             s.binance.on(origin - 900, true);
             s.hyperliquid.on(origin - 900, true);
+            s.own_tape.on(origin - 900, true);
         }
         let tau = g["rows"][0]["tau_ms"].as_u64().unwrap();
         // 1) warmup (900 s from the origin; τ is ~125 s in).
@@ -1310,6 +1320,149 @@ mod tests {
         assert_eq!(st["model"]["theta_bps"], -0.25);
         assert!(st["pull_rate_5m"][pulled.side.as_str()].as_f64().unwrap() > 0.0);
         assert!(gate.summary(tau).starts_with("gate=shadow pull5m"));
+    }
+
+    /// Codex round 2 on pairtrade#390: a feed that never connected (no Up,
+    /// no Down) is not a usable feed — never score on empty own flow.
+    #[test]
+    fn a_feed_that_never_came_up_keeps_the_gate_in_fallback() {
+        let g: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/golden_features.json")).unwrap();
+        let origin = g["grid_origin_ms"].as_u64().unwrap();
+        let records = xtape::parse_jsonl(include_str!("testdata/xtape_slice.jsonl")).unwrap();
+        let bid = plan(QSide::Bid, Some("0.005"), at("84000"));
+        let ask = plan(QSide::Ask, Some("0.005"), at("84000.1"));
+        let mut c = cfg(GateMode::Shadow);
+        c.warmup_ms = 0;
+        let mut gate = QuoteGate::new(c, Some(shipped()), origin, None);
+        {
+            let mut s = gate.state();
+            for r in &records {
+                xtape::apply(&mut s.engine, r);
+            }
+            s.binance.on(origin - 900, true);
+            s.hyperliquid.on(origin - 900, true);
+            // own tape: never an Up, never a Down.
+        }
+        let tau = g["rows"][0]["tau_ms"].as_u64().unwrap();
+        let out = gate.evaluate(tau, &bid, &ask, 0, false);
+        assert!(
+            matches!(
+                &out.bid.decision,
+                GateDecision::Fallback {
+                    reason: FallbackReason::FeedDown { feed: "own_tape" },
+                    ..
+                }
+            ),
+            "{:?}",
+            out.bid.decision
+        );
+        gate.state().own_tape.on(origin - 900, true);
+        let out = gate.evaluate(tau, &bid, &ask, 0, false);
+        assert!(
+            matches!(out.bid.decision, GateDecision::Scored { .. }),
+            "{:?}",
+            out.bid.decision
+        );
+    }
+
+    /// Codex round 2 on pairtrade#390: the grid (EMA / vol state) must keep
+    /// advancing through warmup cycles while the rings are trimmed behind
+    /// it, so the first score after warmup equals the offline value computed
+    /// on the whole history (the golden row), not one initialised from the
+    /// last 150 s.
+    #[test]
+    fn warmup_cycles_advance_the_grid_so_the_first_score_matches_offline() {
+        let g: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/golden_features.json")).unwrap();
+        let origin = g["grid_origin_ms"].as_u64().unwrap();
+        let records = xtape::parse_jsonl(include_str!("testdata/xtape_slice.jsonl")).unwrap();
+        let rows = g["rows"].as_array().unwrap();
+        let last = rows.last().unwrap();
+        let tau_end = last["tau_ms"].as_u64().unwrap();
+        let bid = plan(QSide::Bid, Some("0.005"), at("84000"));
+        let ask = plan(QSide::Ask, Some("0.005"), at("84000.1"));
+        let mut c = cfg(GateMode::Shadow);
+        c.warmup_ms = 10_000_000; // never warm during the feed
+        let mut gate = QuoteGate::new(c, Some(shipped()), origin, None);
+        {
+            // One lock: three `state()` guards at once would deadlock.
+            let mut st = gate.state();
+            st.binance.on(origin - 900, true);
+            st.hyperliquid.on(origin - 900, true);
+            st.own_tape.on(origin - 900, true);
+        }
+        // Feed records in rx order with a gate cycle every 500 ms (warmup
+        // fallback each time), as live.
+        let mut next_cycle = origin + 50;
+        let mut cycles = 0;
+        for r in &records {
+            while r.rx_ms >= next_cycle && next_cycle <= tau_end {
+                let out = gate.evaluate(next_cycle, &bid, &ask, 0, false);
+                assert!(matches!(
+                    out.bid.decision,
+                    GateDecision::Fallback {
+                        reason: FallbackReason::Warmup { .. },
+                        ..
+                    }
+                ));
+                next_cycle += 500;
+                cycles += 1;
+            }
+            xtape::apply(&mut gate.state().engine, r);
+        }
+        assert!(cycles > 250, "{cycles} warmup cycles");
+        // History older than 150 s before τ_end is gone...
+        assert!(gate.state().engine.record_count() < 4_000);
+        // ... yet the first score equals the offline golden features.
+        gate.cfg.warmup_ms = 0;
+        let out = gate.evaluate(tau_end, &bid, &ask, 0, false);
+        let f = out.features.expect("scored");
+        let want: Vec<f64> = last["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        for (k, (a, b)) in f.values.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                "feature {k}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Codex round 2 on pairtrade#390: a reference feed's reconnect restarts
+    /// the grid state together with the warmup, never continuing from the
+    /// values the gap forward-filled.
+    #[test]
+    fn a_reference_feed_recovery_resets_the_grid_state() {
+        let mut s = RefState::new(1_000);
+        for t in 0..50u64 {
+            let rx = 2_000 + t * 100;
+            s.engine.on_own_l1(rx, 100.0, 100.1, 1.0, 1.0);
+            s.engine.on_bn_l1(rx, 100.0, 100.1, 1.0, 1.0);
+            s.engine.on_hl_l1(rx, 100.0, 100.1);
+        }
+        s.on_ref(feed::RefFeed::Binance, 2_000, feed::RefEvent::Up);
+        s.engine.advance_grid(7_000);
+        let (o, next, init) = s.engine.grid_state();
+        assert_eq!((o, init), (1_000, true));
+        assert!(next > 50);
+        s.on_ref(
+            feed::RefFeed::Binance,
+            8_000,
+            feed::RefEvent::Down("x".into()),
+        );
+        s.on_ref(feed::RefFeed::Binance, 9_000, feed::RefEvent::Up);
+        assert_eq!(s.warmup_since_ms, 9_000);
+        assert_eq!(s.engine.grid_state(), (9_000, 0, false));
+        // The next advance re-initialises the EMA from the first complete
+        // point after the new origin (the state before the gap is gone).
+        s.engine.advance_grid(9_300);
+        let (o2, next2, init2) = s.engine.grid_state();
+        assert_eq!((o2, init2), (9_000, true));
+        assert!(next2 <= 4, "{next2}");
     }
 
     /// Codex P1 on pairtrade#390: a gate that never scores (no model) must
