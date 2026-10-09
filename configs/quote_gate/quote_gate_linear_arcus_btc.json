@@ -126,7 +126,8 @@
     "feature_definitions": "bot-strategy#1113 rf_common.py (sha256 e9173c7dbb4fadce4d2e4f04d1bbc9c5435380cf8930ee8071f474ace2b9f0b8), CUTOFF.md section 4; rx < tau strict, grid 0.1 s, EMA lfilter zi=(1-a)x[0]",
     "scope": "venue=arcus market=BTC-USD only. Arcus SPY-USD (and the other equity/ETF/commodity perps) has NO Binance/Hyperliquid reference for its underlying: this file is refused there (market mismatch) and the runtime records Fallback(model_missing) on every cycle by design. SPY needs (1) a lead-lag study of the candidate references (Lighter index, Polymarket idx, Nado bbo; DESIGN.md section 8 / Q4), (2) a feature engine variant with that reference in place of Binance/HL plus session flags, (3) its own frozen train/validation cell, before a quote_gate_*_arcus_spy.json can exist.",
     "exported_at": "2026-10-09T16:30:00Z",
-    "exporter": "hand-written from the study scripts (no models.pkl exists for the linear 10-01 rule); pairtrade PR for bot-strategy#1120"
+    "exporter": "hand-written from the study scripts (no models.pkl exists for the linear 10-01 rule); pairtrade PR for bot-strategy#1120",
+    "validation_caveat_20261009": "bot-strategy#1113 trainval of 2026-10-09 14:14Z on the NEW forward tape (2026-10-02..10-07, Binance recorded with size-only updates every 250 ms): the same linear premium-dev filter re-fitted on train barely helps on validation at q=0.5 (volume-weighted 30 s markout -1.225 -> -1.199 bp, 32% of maker volume retained; the RandomForest reached -0.904 bp at 26%). The 10-01 figure (-1.09 -> -0.61 bp/$) therefore must NOT be assumed for the shipped theta; it is only the 10-01 validation value kept for the shadow week, and the shadow readout (design section 10) decides whether this rule, the RF, or neither goes to enforce."
   },
-  "payload_sha256": "fcf8cff681afec30e789120e6f0be105a431c3ab43d3c24839f3cc8ab76de3c2"
+  "payload_sha256": "1c4b0927b858c03a0d19f81311dcc447f5ee928c5f7d98d70f2f308b93c47a85"
 }
