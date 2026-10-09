@@ -184,6 +184,13 @@ printf 'SESSION_OFFSET_BPS=5\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "set both SESSION_OFFSET_BPS and SESSION_BAND_BPS" <<< "$OUT" || fail "half a session pair must refuse"
 printf 'SESSION_OFFSET_BPS=5\nSESSION_BAND_BPS=two\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "SESSION_BAND_BPS must be a number" <<< "$OUT" || fail "non-numeric session band must refuse"
+# per-position stop: passes through when set, not exported when unset, a non-number refuses
+printf 'POSITION_STOP_BPS=25\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_POSITION_STOP_BPS=25 "$T/env.out" || fail "position stop must reach the runtime"
+printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && ! grep -q '^ARCUS_VOL_POSITION_STOP_BPS=' "$T/env.out" || fail "no position stop must be exported when unset"
+printf 'POSITION_STOP_BPS=25bp\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "POSITION_STOP_BPS must be a number" <<< "$OUT" || fail "non-numeric position stop must refuse"
 rm -f "$T/etc/config.env"
 printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nARCUS_ACCOUNT_INDEX=0\nARCUS_REST_ENDPOINT=https://evil.example\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
 [ "$RC" -eq 1 ] && grep -q "live.env line 5: key ARCUS_REST_ENDPOINT is not accepted here" <<< "$OUT" || fail "live.env must refuse endpoint keys"

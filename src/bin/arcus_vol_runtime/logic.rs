@@ -482,6 +482,10 @@ pub fn classify_error(err: &DexError) -> ErrorEffect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlattenReason {
     Cap,
+    /// The open position moved against its average entry by at least the
+    /// configured per-position stop (bot-strategy#1093). Not a halt: once
+    /// flat, quoting resumes after a short cooldown.
+    PositionStop,
     MaxHold,
     Halt(String),
     Startup,
@@ -496,6 +500,10 @@ pub enum FlattenReason {
 /// Startup, halt (incl. KILL_SWITCH) and max-hold need no book: side and
 /// size come from the position, and the live IOC prices off the connector's
 /// own view (Codex P1, pairtrade#361). Only the cap check needs a mid.
+///
+/// `position_stop` is the caller's `position_stop_bps(..).is_some()` (fresh
+/// mark only). It ranks after startup / halt / cap, so it never masks a
+/// halt, and before max-hold.
 #[allow(clippy::too_many_arguments)]
 pub fn flatten_reason(
     inv_qty: Decimal,
@@ -506,6 +514,7 @@ pub fn flatten_reason(
     max_hold_secs: u64,
     halt: Option<&str>,
     startup: bool,
+    position_stop: bool,
     dust: bool,
 ) -> Option<FlattenReason> {
     if inv_qty.is_zero() || dust {
@@ -520,10 +529,49 @@ pub fn flatten_reason(
     if mid.is_some_and(|m| (inv_qty * m).abs() >= effective_cap_usd) {
         return Some(FlattenReason::Cap);
     }
+    if position_stop {
+        return Some(FlattenReason::PositionStop);
+    }
     if opened_at_ms.is_some_and(|t| now_ms.saturating_sub(t) > max_hold_secs * 1_000) {
         return Some(FlattenReason::MaxHold);
     }
     None
+}
+
+/// Per-position stop (bot-strategy#1093): the open position's adverse move
+/// against its average entry, in bp of the entry, at a FRESH mark — a long
+/// loses when the mark is below the entry, a short when it is above.
+/// `Some(adverse_bps)` when the stop is configured, the position is not
+/// dust, a fresh mark exists and the adverse move is at least `stop_bps`;
+/// `None` otherwise (no mark = no trigger, like the deferred-unrealized
+/// rule of the daily stop).
+pub fn position_stop_bps(
+    inv_qty: Decimal,
+    avg_px: Decimal,
+    fresh_mark: Option<Decimal>,
+    stop_bps: Option<Decimal>,
+    dust: bool,
+) -> Option<Decimal> {
+    let stop = stop_bps?;
+    let mark = fresh_mark?;
+    if dust || inv_qty.is_zero() || avg_px <= Decimal::ZERO {
+        return None;
+    }
+    let adverse = if inv_qty > Decimal::ZERO {
+        (avg_px - mark) / avg_px
+    } else {
+        (mark - avg_px) / avg_px
+    } * Decimal::from(10_000);
+    (adverse >= stop).then_some(adverse)
+}
+
+/// How many `position_stop` journal rows belong to `day` (UTC
+/// `YYYY-MM-DD`): the status counter survives a restart.
+pub fn count_position_stops(rows: &[serde_json::Value], day: &str) -> u32 {
+    rows.iter()
+        .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some("position_stop"))
+        .filter(|r| r.get("day").and_then(|d| d.as_str()) == Some(day))
+        .count() as u32
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1287,7 +1335,18 @@ mod tests {
         let cap = d("10000");
         let m = Some(d("83642.95"));
         let fr = |inv: &str, mid: Option<Decimal>, now: u64, halt: Option<&str>, startup: bool| {
-            flatten_reason(d(inv), mid, cap, Some(0), now, 300, halt, startup, false)
+            flatten_reason(
+                d(inv),
+                mid,
+                cap,
+                Some(0),
+                now,
+                300,
+                halt,
+                startup,
+                false,
+                false,
+            )
         };
         assert_eq!(fr("0", m, 1_000_000, Some("kill"), true), None);
         assert_eq!(
@@ -1307,6 +1366,141 @@ mod tests {
     }
 
     #[test]
+    fn position_stop_triggers_at_the_threshold_long_and_short() {
+        let stop = Some(d("25"));
+        let avg = d("1000");
+        // Long: adverse = mark below entry. 25 bp below 1000 = 997.5.
+        assert_eq!(
+            position_stop_bps(d("3"), avg, Some(d("997.5")), stop, false),
+            Some(d("25"))
+        );
+        assert_eq!(
+            position_stop_bps(d("3"), avg, Some(d("997.51")), stop, false),
+            None
+        );
+        // A long gains when the mark is ABOVE entry: never a stop.
+        assert_eq!(
+            position_stop_bps(d("3"), avg, Some(d("1002.5")), stop, false),
+            None
+        );
+        // Short: adverse = mark above entry.
+        assert_eq!(
+            position_stop_bps(d("-3"), avg, Some(d("1002.5")), stop, false),
+            Some(d("25"))
+        );
+        assert_eq!(
+            position_stop_bps(d("-3"), avg, Some(d("1002.49")), stop, false),
+            None
+        );
+        assert_eq!(
+            position_stop_bps(d("-3"), avg, Some(d("997.5")), stop, false),
+            None
+        );
+        // Beyond the threshold reports the actual adverse move.
+        assert_eq!(
+            position_stop_bps(d("-3"), avg, Some(d("1004")), stop, false),
+            Some(d("40"))
+        );
+    }
+
+    #[test]
+    fn position_stop_needs_a_config_a_fresh_mark_and_real_inventory() {
+        let avg = d("1000");
+        let far = Some(d("900"));
+        assert_eq!(position_stop_bps(d("3"), avg, far, None, false), None); // off
+        assert_eq!(
+            position_stop_bps(d("3"), avg, None, Some(d("25")), false),
+            None
+        ); // no mark
+        assert_eq!(
+            position_stop_bps(d("3"), avg, far, Some(d("25")), true),
+            None
+        ); // dust
+        assert_eq!(
+            position_stop_bps(d("0"), avg, far, Some(d("25")), false),
+            None
+        ); // flat
+        assert_eq!(
+            position_stop_bps(d("3"), d("0"), far, Some(d("25")), false),
+            None
+        ); // no entry
+        assert!(position_stop_bps(d("3"), avg, far, Some(d("25")), false).is_some());
+    }
+
+    #[test]
+    fn position_stop_ranks_after_halt_and_cap_and_before_max_hold() {
+        let cap = d("10000");
+        let m = Some(d("1000"));
+        let fr =
+            |inv: &str, now: u64, halt: Option<&str>, startup: bool, stop: bool, dust: bool| {
+                flatten_reason(d(inv), m, cap, Some(0), now, 300, halt, startup, stop, dust)
+            };
+        assert_eq!(
+            fr("1", 1_000, None, false, true, false),
+            Some(FlattenReason::PositionStop)
+        );
+        // A halt is never masked by the stop.
+        assert_eq!(
+            fr("1", 1_000, Some("daily_stop"), false, true, false),
+            Some(FlattenReason::Halt("daily_stop".into()))
+        );
+        assert_eq!(
+            fr("1", 1_000, None, true, true, false),
+            Some(FlattenReason::Startup)
+        );
+        // Cap outranks it; it outranks max-hold.
+        assert_eq!(
+            fr("12", 1_000, None, false, true, false),
+            Some(FlattenReason::Cap)
+        );
+        assert_eq!(
+            fr("1", 300_001, None, false, true, false),
+            Some(FlattenReason::PositionStop)
+        );
+        // Dust never flattens.
+        assert_eq!(fr("1", 1_000, None, false, true, true), None);
+        // Once flat the stop is gone and the plan quotes again after the
+        // cooldown (the cooldown itself is a plain quote pull).
+        assert_eq!(fr("0", 1_000, None, false, false, false), None);
+        let cooling = TickInputs {
+            has_book: true,
+            shock_or_cooldown: true,
+            dms_armed: true,
+            startup_reconciled: true,
+            fills_synced: true,
+            tape_ready: true,
+            ..Default::default()
+        };
+        assert_eq!(tick_plan(&cooling), TickPlan::PullQuotes("shock"));
+        let after = TickInputs {
+            shock_or_cooldown: false,
+            ..cooling.clone()
+        };
+        assert_eq!(tick_plan(&after), TickPlan::Quote);
+        // While still holding, the flatten wins over the cooldown pull.
+        let holding = TickInputs {
+            flatten: Some(FlattenReason::PositionStop),
+            ..cooling
+        };
+        assert_eq!(
+            tick_plan(&holding),
+            TickPlan::Flatten(FlattenReason::PositionStop)
+        );
+    }
+
+    #[test]
+    fn position_stops_are_counted_per_day_from_the_journal() {
+        let rows = vec![
+            serde_json::json!({"kind": "position_stop", "day": "2026-10-08"}),
+            serde_json::json!({"kind": "position_stop", "day": "2026-10-09"}),
+            serde_json::json!({"kind": "position_stop", "day": "2026-10-09"}),
+            serde_json::json!({"kind": "fill", "day": "2026-10-09"}),
+        ];
+        assert_eq!(count_position_stops(&rows, "2026-10-09"), 2);
+        assert_eq!(count_position_stops(&rows, "2026-10-10"), 0);
+    }
+
+    #[test]
     fn halt_kill_startup_and_max_hold_flatten_without_a_book() {
         let cap = d("10000");
         let fr = |now: u64, halt: Option<&str>, startup: bool| {
@@ -1319,6 +1513,7 @@ mod tests {
                 300,
                 halt,
                 startup,
+                false,
                 false,
             )
         };
@@ -2881,6 +3076,7 @@ mod tests {
                     300,
                     halt,
                     startup,
+                    false,
                     true
                 ),
                 None
@@ -2897,6 +3093,7 @@ mod tests {
                 10_000_000,
                 300,
                 None,
+                false,
                 false,
                 false
             ),

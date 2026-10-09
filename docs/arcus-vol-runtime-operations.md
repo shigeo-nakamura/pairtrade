@@ -97,6 +97,21 @@ start (`clip = min(CLIP_MAX_USD, free * LEVERAGE / 2 * 0.9)` rounded down to
 $100; inventory cap 2 clips), so other positions on the cross account
 shrink the quotes rather than over-commit margin.
 
+### Per-position stop (optional)
+
+`POSITION_STOP_BPS` in `config.env` (bot-strategy#1093, 2026-10-08): once the
+open position's adverse move against its average entry reaches this many bp
+at a fresh mid, the runtime flattens it like any other flatten (pull quotes,
+reduce-only taker IOC) and keeps quotes pulled for 60 s (at least
+`ARCUS_VOL_COOLDOWN_SECS`); then it quotes again — it is not a halt. It ranks
+after startup / halt / cap and before the 300 s max-hold; dust never
+triggers; with no fresh mid it is not evaluated (a WARN once a minute). Each
+trigger logs `POSITION STOP: ...` and appends a `position_stop` row (entry,
+mark, adverse bp) to `fills.jsonl`; `status.json` shows `position_stop_bps`
+and `position_stops_today`. First setting 25 bp — far enough that normal
+noise around a 2-5 bp quote does not trip it; to be tuned on the recorded
+tape.
+
 ### Session offset (optional)
 
 `SESSION_OFFSET_BPS` / `SESSION_BAND_BPS` in `config.env` (both or neither)

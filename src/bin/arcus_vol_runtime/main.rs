@@ -78,13 +78,14 @@ use ledger::{
     PendingMarkout,
 };
 use logic::{
-    book_depth, classify_error, dms_armed, dms_disarm_unconfirmed_note, flatten_halt_label,
-    flatten_reason, flatten_steps, fresh_mark, market_position, may_disarm_dms, own_displayed,
-    plan_inputs, plan_quotes, position_check, position_gate_after, quote_action, quote_dists,
-    quote_pass, read_within, reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows,
-    sweep_open_orders, tick_plan, ticker_read_due, touches, BatchSink, ErrorEffect, PlanState,
-    PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep,
-    SidePlan, Step, TickPlan, VenueMin, PLACE_VISIBILITY_GRACE_MS,
+    book_depth, classify_error, count_position_stops, dms_armed, dms_disarm_unconfirmed_note,
+    flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position, may_disarm_dms,
+    own_displayed, plan_inputs, plan_quotes, position_check, position_gate_after,
+    position_stop_bps, quote_action, quote_dists, quote_pass, read_within, reconcile_cleared,
+    send_gated, shock, shutdown_steps, spill_rows, sweep_open_orders, tick_plan, ticker_read_due,
+    touches, BatchSink, ErrorEffect, FlattenReason, PlanState, PosCheck, PricePlan, QSide,
+    QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
+    VenueMin, PLACE_VISIBILITY_GRACE_MS,
 };
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -147,6 +148,11 @@ const TICK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// offset): once a minute, 30 s after a failure; the venue flag stays
 /// authoritative for `session::VENUE_FLAG_TTL_MS`, then the local hours.
 const SESSION_REFRESH_MS: u64 = 60_000;
+/// After a per-position stop, quotes stay pulled this long (at least
+/// `COOLDOWN_SECS`): a 25 bp move inside one hold is a fast market, and
+/// re-quoting 2-5 bp behind the touch at once would most likely re-enter
+/// the same move. A minute of lost presence per trigger is cheap.
+const POSITION_STOP_COOLDOWN_SECS: u64 = 60;
 const SESSION_RETRY_MS: u64 = 30_000;
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -219,6 +225,7 @@ struct Runtime {
     /// The last tick plan, for status.json.
     last_plan: String,
     last_mark_warn_ms: u64,
+    last_stop_mark_warn_ms: u64,
     last_roll_warn_ms: u64,
     /// Connector fill records missing fields: first seen (ms).
     incomplete_since: HashMap<String, u64>,
@@ -258,6 +265,17 @@ struct Runtime {
     /// instead of the ledger's `opened_at_ms`, so a fill landing on carried
     /// dust starts a fresh hold instead of inheriting the dust's age.
     hold_since_ms: Option<u64>,
+    /// Per-position stops on `position_stops_day` (UTC), for status.json;
+    /// seeded from the journal's `position_stop` rows at startup.
+    position_stops_today: u32,
+    position_stops_day: String,
+    /// Until when a fired position stop keeps quotes pulled (and a second
+    /// trigger is not logged / journaled again).
+    position_stop_until_ms: u64,
+    /// A fired position stop stays in force until the inventory is flat
+    /// (or dust): a failed or partial IOC is retried even if the mark
+    /// recovers or goes stale (Codex P1 on pairtrade#389).
+    position_stop_latched: bool,
     /// A flatten IOC the venue rejected as below its minimum, for this exact
     /// inventory: treated as dust until the inventory changes (no retry).
     forced_dust_qty: Option<Decimal>,
@@ -330,6 +348,48 @@ impl Runtime {
 
     /// Keep `hold_since_ms` in step with the inventory: cleared while flat or
     /// dust, set when the inventory becomes more than dust.
+    /// A per-position stop fired this tick: WARN once per trigger (the
+    /// flatten runs over this and maybe later ticks; the cooldown makes a
+    /// re-trigger before it is over a no-op), a durable `position_stop`
+    /// journal row for the later sim / readout, and a quote pull of at
+    /// least `POSITION_STOP_COOLDOWN_SECS` once flat (bot-strategy#1093).
+    fn note_position_stop(&mut self, now: u64, mark: Decimal, adverse: Decimal) {
+        if now < self.position_stop_until_ms {
+            return;
+        }
+        self.position_stop_until_ms =
+            now + POSITION_STOP_COOLDOWN_SECS.max(self.cfg.cooldown_secs) * 1_000;
+        self.cooldown_until_ms = self.cooldown_until_ms.max(self.position_stop_until_ms);
+        let p = self.ledger.position.clone();
+        log::warn!(
+            "[ARCUS_VOL] POSITION STOP: inventory {} entry {} mark {} adverse {} bp >= {} bp; flattening, quotes pulled {}s",
+            p.qty,
+            p.avg_px.round_dp(4),
+            mark,
+            adverse.round_dp(2),
+            self.cfg.position_stop_bps.unwrap_or_default(),
+            POSITION_STOP_COOLDOWN_SECS.max(self.cfg.cooldown_secs)
+        );
+        if self.position_stops_day != self.ledger.day {
+            self.position_stops_day = self.ledger.day.clone();
+            self.position_stops_today = 0;
+        }
+        self.position_stops_today += 1;
+        let row = json!({"kind": "position_stop", "seq": self.ledger.take_seq(), "ts_ms": now,
+                         "day": self.ledger.day, "market": self.cfg.market,
+                         "mode": self.cfg.mode(), "qty": p.qty.to_string(),
+                         "avg_px": p.avg_px.to_string(), "mark": mark.to_string(),
+                         "adverse_bps": adverse.round_dp(3).to_string(),
+                         "stop_bps": self.cfg.position_stop_bps.map(|s| s.to_string())});
+        if self.journal_unsafe {
+            return;
+        }
+        if let Err(e) = append_synced(&self.fills_path, &row) {
+            self.note_append_error(&e);
+            log::warn!("[ARCUS_VOL] position_stop append failed: {e}");
+        }
+    }
+
     fn track_hold(&mut self, now: u64, mid: Option<Decimal>) {
         if self.inventory_is_dust(mid) {
             self.hold_since_ms = None;
@@ -1747,6 +1807,25 @@ impl Runtime {
         if !startup {
             self.startup_flatten = false;
         }
+        let stop_hit = position_stop_bps(
+            self.ledger.position.qty,
+            self.ledger.position.avg_px,
+            fresh_mid,
+            self.cfg.position_stop_bps,
+            dust,
+        );
+        if self.cfg.position_stop_bps.is_some()
+            && fresh_mid.is_none()
+            && !self.ledger.position.qty.is_zero()
+            && !dust
+            && now.saturating_sub(self.last_stop_mark_warn_ms) >= 60_000
+        {
+            self.last_stop_mark_warn_ms = now;
+            log::warn!("[ARCUS_VOL] position stop: no fresh mark, not evaluated");
+        }
+        if dust || self.ledger.position.qty.is_zero() {
+            self.position_stop_latched = false;
+        }
         let flatten = flatten_reason(
             self.ledger.position.qty,
             mid,
@@ -1756,8 +1835,20 @@ impl Runtime {
             self.cfg.max_hold_secs,
             flatten_halt_label(halt_label.as_deref()),
             startup,
+            stop_hit.is_some() || self.position_stop_latched,
             dust,
         );
+        // Record and latch every observed stop hit, even when another
+        // reason (e.g. Cap) is the immediate flatten reason this tick
+        // (Codex P1 on pairtrade#389).
+        if let (Some(adverse), Some(mark)) = (stop_hit, fresh_mid) {
+            self.note_position_stop(now, mark, adverse);
+        }
+        if stop_hit.is_some() || flatten == Some(FlattenReason::PositionStop) {
+            self.position_stop_latched = true;
+            // Keep the quote pull in force while the latched flatten retries.
+            self.cooldown_until_ms = self.cooldown_until_ms.max(now + 1_000);
+        }
         if shock(
             &self.mid_hist,
             now,
@@ -1770,7 +1861,11 @@ impl Runtime {
                     self.cfg.cooldown_secs
                 );
             }
-            self.cooldown_until_ms = now + self.cfg.cooldown_secs * 1_000;
+            // Never shorten a longer pull already in force (a position
+            // stop's 60 s, Codex P2 on pairtrade#389).
+            self.cooldown_until_ms = self
+                .cooldown_until_ms
+                .max(now + self.cfg.cooldown_secs * 1_000);
         }
         // Safety actions are never gated by a 429 backoff; only new
         // placement / modification is (Codex P1, pairtrade#361).
@@ -1930,6 +2025,8 @@ impl Runtime {
             "cooldown": now < self.cooldown_until_ms,
             "backoff": now < self.backoff_until_ms,
             "effective_cap_usd": self.cfg.effective_cap_usd().to_string(),
+            "position_stop_bps": self.cfg.position_stop_bps.map(|s| s.to_string()),
+            "position_stops_today": if self.position_stops_day == l.day { self.position_stops_today } else { 0 },
             "tape": {"ready": self.tape.ready, "gap_since_ms": self.tape.gap_since_ms},
             "plan": self.last_plan,
             "pending_unresolved": self.pending_unresolved,
@@ -2220,6 +2317,7 @@ async fn main() -> Result<()> {
         rollover_blocked: false,
         last_plan: String::new(),
         last_mark_warn_ms: 0,
+        last_stop_mark_warn_ms: 0,
         last_roll_warn_ms: 0,
         incomplete_since: HashMap::new(),
         journal_unsafe: false,
@@ -2249,6 +2347,10 @@ async fn main() -> Result<()> {
             .build()
             .context("session http client")?,
         hold_since_ms: None,
+        position_stops_today: 0,
+        position_stops_day: String::new(),
+        position_stop_until_ms: 0,
+        position_stop_latched: false,
         forced_dust_qty: None,
         last_flatten_warn_ms: 0,
         last_peg_warn_ms: 0,
@@ -2273,6 +2375,8 @@ async fn main() -> Result<()> {
         );
     }
     rt.pending_markouts = restored;
+    rt.position_stops_day = rt.ledger.day.clone();
+    rt.position_stops_today = count_position_stops(&journal_rows, &rt.ledger.day);
     for m in missing {
         if let ledger::Markout::Missing {
             fill_id,
