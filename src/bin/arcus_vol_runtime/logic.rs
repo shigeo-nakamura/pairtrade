@@ -176,11 +176,14 @@ pub fn quote_dists(side: QSide, px: Decimal, t: &Touches) -> (Option<Decimal>, D
 /// Book levels to read per side. Paper presence quotes join the queue
 /// displayed at a deep price, so the sim needs that level in the snapshot
 /// (100 = the venue's maximum); everything else needs only the top.
-pub fn book_depth(dry_run: bool, presence_on: bool) -> usize {
-    if dry_run && presence_on {
-        100
+pub fn book_depth(dry_run: bool, presence_on: bool, gate_on: bool) -> usize {
+    let base = if dry_run && presence_on { 100 } else { 10 };
+    // The quote gate's L2 imbalance features are defined on the top 20
+    // levels (bot-strategy#1120); never fewer while it is on.
+    if gate_on {
+        base.max(crate::quote_gate::features::OWN_L2_LEVELS)
     } else {
-        10
+        base
     }
 }
 
@@ -2645,10 +2648,14 @@ mod tests {
     fn only_paper_presence_reads_a_deep_book() {
         // Review #7: a deep virtual quote must find its level in the
         // snapshot to join behind the displayed size.
-        assert_eq!(book_depth(true, true), 100);
-        assert_eq!(book_depth(true, false), 10);
-        assert_eq!(book_depth(false, true), 10);
-        assert_eq!(book_depth(false, false), 10);
+        assert_eq!(book_depth(true, true, false), 100);
+        assert_eq!(book_depth(true, false, false), 10);
+        assert_eq!(book_depth(false, true, false), 10);
+        assert_eq!(book_depth(false, false, false), 10);
+        // The quote gate needs 20 levels for its L2 features; a deeper paper
+        // read stays deeper.
+        assert_eq!(book_depth(false, false, true), 20);
+        assert_eq!(book_depth(true, true, true), 100);
         // With the level in the snapshot the quote joins behind it; without
         // it the queue is 0 (approximate, see `sim::join`).
         let levels = vec![lv("83438.4", "0.5"), lv("83396.6", "1.25")];

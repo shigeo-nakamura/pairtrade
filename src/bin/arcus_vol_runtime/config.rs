@@ -2,6 +2,7 @@
 //! frozen on bot-strategy#1093; loosening one needs an owner decision
 //! recorded there.
 
+use crate::quote_gate::{feed, FallbackPolicy, GateMode};
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use std::path::PathBuf;
@@ -9,6 +10,10 @@ use std::str::FromStr;
 
 /// `ARCUS_VOL_LIVE_CONFIRM` must equal this for any live order.
 pub const LIVE_CONFIRM_TOKEN: &str = "1093-G2";
+/// `ARCUS_VOL_GATE_ENFORCE_CONFIRM` must equal this for `GATE_MODE=enforce`
+/// (bot-strategy#1120 design §6.3): shadow readout PASS, then the owner
+/// sets it. Shadow needs no token.
+pub const GATE_ENFORCE_CONFIRM_TOKEN: &str = "1120-arcus";
 
 /// Smallest re-peg band with an offset. The venue rounds a resting price
 /// away from the touch by up to one tick, so a band narrower than the tick
@@ -78,6 +83,10 @@ pub struct Config {
     /// bp at a fresh mark, then pull quotes for `POSITION_STOP_COOLDOWN_SECS`.
     /// Unset = off. 1..=500.
     pub position_stop_bps: Option<Decimal>,
+    /// Quote gate (bot-strategy#1120, `quote_gate`): `ARCUS_VOL_GATE_*`.
+    /// `off` (default) leaves the tick exactly as before; `shadow` computes
+    /// and logs, never acts; `enforce` needs `GATE_ENFORCE_CONFIRM`.
+    pub gate: GateSettings,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -162,6 +171,110 @@ pub fn parse_bool(name: &str, raw: Option<&str>, default: bool) -> Result<bool> 
     }
 }
 
+/// `ARCUS_VOL_GATE_*` (bot-strategy#1120 design §6.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateSettings {
+    pub mode: GateMode,
+    /// Model file (design §5.2). Required for `enforce`; optional for
+    /// `shadow` (a market with no model records `model_missing` on every
+    /// cycle, e.g. SPY-USD, which has no Binance reference).
+    pub model: Option<PathBuf>,
+    pub fallback: FallbackPolicy,
+    pub ref_stale_ms: u64,
+    pub event_cooldown_s: u64,
+    pub warmup_s: u64,
+    /// `all` (default; the shadow week needs every feature) or `none`.
+    pub log_features: bool,
+    pub enforce_confirm: String,
+    /// Reference WS endpoints (tests / future sidecar); not launcher keys.
+    pub binance_ws_base: String,
+    pub hyperliquid_ws: String,
+}
+
+impl GateSettings {
+    fn from_env() -> Result<Self> {
+        let p = |k: &str| format!("ARCUS_VOL_GATE_{k}");
+        let mode = match var(&p("MODE")) {
+            None => GateMode::Off,
+            Some(raw) => {
+                GateMode::parse(&raw).map_err(|e| anyhow::anyhow!("{}: {e}", p("MODE")))?
+            }
+        };
+        let fallback = match var(&p("FALLBACK")) {
+            None => FallbackPolicy::Baseline,
+            Some(raw) => FallbackPolicy::parse(&raw)
+                .map_err(|e| anyhow::anyhow!("{}: {e}", p("FALLBACK")))?,
+        };
+        let log_features = match var(&p("LOG_FEATURES")).as_deref().map(str::trim) {
+            None | Some("all") => true,
+            Some("none") => false,
+            Some(other) => bail!("{}={other} is not all|none", p("LOG_FEATURES")),
+        };
+        Ok(GateSettings {
+            mode,
+            model: var(&p("MODEL")).map(PathBuf::from),
+            fallback,
+            ref_stale_ms: int(&p("REF_STALE_MS"), 10_000u64)?,
+            event_cooldown_s: int(&p("EVENT_COOLDOWN_S"), 60u64)?,
+            warmup_s: int(&p("WARMUP_S"), 900u64)?,
+            log_features,
+            enforce_confirm: var(&p("ENFORCE_CONFIRM")).unwrap_or_default(),
+            binance_ws_base: var(&p("BINANCE_WS_BASE"))
+                .unwrap_or_else(|| feed::BINANCE_WS_BASE.to_string()),
+            hyperliquid_ws: var(&p("HYPERLIQUID_WS"))
+                .unwrap_or_else(|| feed::HYPERLIQUID_WS.to_string()),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn off() -> Self {
+        GateSettings {
+            mode: GateMode::Off,
+            model: None,
+            fallback: FallbackPolicy::Baseline,
+            ref_stale_ms: 10_000,
+            event_cooldown_s: 60,
+            warmup_s: 900,
+            log_features: true,
+            enforce_confirm: String::new(),
+            binance_ws_base: feed::BINANCE_WS_BASE.to_string(),
+            hyperliquid_ws: feed::HYPERLIQUID_WS.to_string(),
+        }
+    }
+
+    pub fn config(&self) -> crate::quote_gate::GateConfig {
+        crate::quote_gate::GateConfig {
+            mode: self.mode,
+            fallback: self.fallback,
+            ref_stale_ms: self.ref_stale_ms,
+            event_cooldown_ms: self.event_cooldown_s * 1_000,
+            warmup_ms: self.warmup_s * 1_000,
+            log_features: self.log_features,
+        }
+    }
+}
+
+/// Enforce is never the default and never silent: it needs the exact
+/// confirm token AND a model file. Shadow and off need nothing.
+pub fn gate_enforce_gate(
+    mode: GateMode,
+    confirm: &str,
+    model: Option<&PathBuf>,
+) -> Result<(), String> {
+    if mode != GateMode::Enforce {
+        return Ok(());
+    }
+    if confirm != GATE_ENFORCE_CONFIRM_TOKEN {
+        return Err(format!(
+            "ARCUS_VOL_GATE_MODE=enforce needs ARCUS_VOL_GATE_ENFORCE_CONFIRM={GATE_ENFORCE_CONFIRM_TOKEN} (shadow readout PASS first, design §10)"
+        ));
+    }
+    if model.is_none() {
+        return Err("ARCUS_VOL_GATE_MODE=enforce needs ARCUS_VOL_GATE_MODEL".into());
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let p = |k: &str| format!("ARCUS_VOL_{k}");
@@ -197,6 +310,7 @@ impl Config {
             session_offset_bps: opt_dec(&p("SESSION_OFFSET_BPS"))?,
             session_band_bps: opt_dec(&p("SESSION_BAND_BPS"))?,
             position_stop_bps: opt_dec(&p("POSITION_STOP_BPS"))?,
+            gate: GateSettings::from_env()?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -260,6 +374,20 @@ impl Config {
         if let Some(stop) = self.position_stop_bps {
             if stop < Decimal::ONE || stop > Decimal::from(500) {
                 bail!("ARCUS_VOL_POSITION_STOP_BPS must be 1..=500 (got {stop})");
+            }
+        }
+        gate_enforce_gate(
+            self.gate.mode,
+            &self.gate.enforce_confirm,
+            self.gate.model.as_ref(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if self.gate.mode.on() {
+            if self.gate.ref_stale_ms < 1_000 || self.gate.ref_stale_ms > 120_000 {
+                bail!("ARCUS_VOL_GATE_REF_STALE_MS must be 1000..=120000");
+            }
+            if self.gate.warmup_s > 7_200 || self.gate.event_cooldown_s > 3_600 {
+                bail!("ARCUS_VOL_GATE_WARMUP_S must be <= 7200 and ARCUS_VOL_GATE_EVENT_COOLDOWN_S <= 3600");
             }
         }
         self.validate_presence()
@@ -523,6 +651,40 @@ mod tests {
     }
 
     #[test]
+    fn gate_enforce_needs_the_token_and_a_model_shadow_needs_nothing() {
+        let model = PathBuf::from("/etc/debot-arcus-vol/gate/arcus-BTC-USD.json");
+        assert!(gate_enforce_gate(GateMode::Off, "", None).is_ok());
+        assert!(gate_enforce_gate(GateMode::Shadow, "", None).is_ok());
+        assert!(gate_enforce_gate(GateMode::Shadow, "", Some(&model)).is_ok());
+        let err = gate_enforce_gate(GateMode::Enforce, "", Some(&model)).unwrap_err();
+        assert!(err.contains("GATE_ENFORCE_CONFIRM"), "{err}");
+        assert!(gate_enforce_gate(GateMode::Enforce, "1120", Some(&model)).is_err());
+        assert!(gate_enforce_gate(GateMode::Enforce, "1120-ARCUS", Some(&model)).is_err());
+        let err =
+            gate_enforce_gate(GateMode::Enforce, GATE_ENFORCE_CONFIRM_TOKEN, None).unwrap_err();
+        assert!(err.contains("GATE_MODEL"), "{err}");
+        assert!(
+            gate_enforce_gate(GateMode::Enforce, GATE_ENFORCE_CONFIRM_TOKEN, Some(&model)).is_ok()
+        );
+        // Through validate(): the default config is off and valid; enforce
+        // without the token is refused at startup.
+        let mut cfg = test_config();
+        assert_eq!(cfg.gate.mode, GateMode::Off);
+        assert!(cfg.validate().is_ok());
+        cfg.gate.mode = GateMode::Enforce;
+        cfg.gate.model = Some(model.clone());
+        assert!(cfg.validate().is_err());
+        cfg.gate.enforce_confirm = GATE_ENFORCE_CONFIRM_TOKEN.to_string();
+        assert!(cfg.validate().is_ok());
+        cfg.gate.mode = GateMode::Shadow;
+        cfg.gate.enforce_confirm.clear();
+        cfg.gate.model = None;
+        assert!(cfg.validate().is_ok());
+        cfg.gate.ref_stale_ms = 500;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn effective_cap_is_the_smaller_of_hard_cap_and_margin_times_leverage() {
         let mut cfg = test_config();
         assert_eq!(cfg.effective_cap_usd(), Decimal::from(10_000));
@@ -564,6 +726,7 @@ mod tests {
             session_offset_bps: None,
             session_band_bps: None,
             position_stop_bps: None,
+            gate: GateSettings::off(),
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),
