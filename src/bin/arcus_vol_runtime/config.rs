@@ -87,6 +87,10 @@ pub struct Config {
     /// `off` (default) leaves the tick exactly as before; `shadow` computes
     /// and logs, never acts; `enforce` needs `GATE_ENFORCE_CONFIRM`.
     pub gate: GateSettings,
+    /// Offset learner (bot-strategy#1093, `offset_learner`):
+    /// `ARCUS_VOL_LEARNER*`. `off` (default) or `shadow` (records what it
+    /// would choose; never changes the live offset).
+    pub learner: crate::offset_learner::LearnerSettings,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -169,6 +173,58 @@ pub fn parse_bool(name: &str, raw: Option<&str>, default: bool) -> Result<bool> 
         "false" | "0" | "no" => Ok(false),
         _ => bail!("{name}={raw} is not a boolean (use true/false/1/0/yes/no)"),
     }
+}
+
+/// `ARCUS_VOL_LEARNER*` (bot-strategy#1093 offset learner, shadow only).
+pub(crate) fn learner_from_env() -> Result<crate::offset_learner::LearnerSettings> {
+    use crate::offset_learner::{LearnerMode, LearnerSettings};
+    let mut s = LearnerSettings::off();
+    if let Some(raw) = var("ARCUS_VOL_LEARNER") {
+        s.mode = LearnerMode::parse(&raw).map_err(|e| anyhow::anyhow!("ARCUS_VOL_LEARNER: {e}"))?;
+    }
+    if let Some(raw) = var("ARCUS_VOL_LEARNER_ARMS") {
+        let mut arms = Vec::new();
+        for a in raw.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            let v: f64 = a
+                .parse()
+                .map_err(|_| anyhow::anyhow!("ARCUS_VOL_LEARNER_ARMS: {a} is not a number"))?;
+            if !(1.0..=100.0).contains(&v) {
+                bail!("ARCUS_VOL_LEARNER_ARMS: {v} is outside 1..=100 bp");
+            }
+            arms.push(v);
+        }
+        if arms.is_empty() {
+            bail!("ARCUS_VOL_LEARNER_ARMS is empty");
+        }
+        arms.sort_by(f64::total_cmp);
+        arms.dedup();
+        s.arms = arms;
+    }
+    let f = |k: &str, d: f64| -> Result<f64> {
+        match var(k) {
+            None => Ok(d),
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| anyhow::anyhow!("{k}={raw} is not a number")),
+        }
+    };
+    s.half_life_h = f("ARCUS_VOL_LEARNER_HALF_LIFE_H", s.half_life_h)?;
+    s.point_value_per_m = f("ARCUS_VOL_LEARN_POINT_VALUE_PER_M", s.point_value_per_m)?;
+    if !s.half_life_h.is_finite()
+        || s.half_life_h <= 0.0
+        || !s.point_value_per_m.is_finite()
+        || s.point_value_per_m < 0.0
+    {
+        bail!(
+            "ARCUS_VOL_LEARNER_HALF_LIFE_H must be > 0 and ARCUS_VOL_LEARN_POINT_VALUE_PER_M >= 0"
+        );
+    }
+    if let Some(raw) = var("ARCUS_VOL_LEARNER_HISTORY") {
+        s.history = LearnerSettings::parse_history(&raw)
+            .map_err(|e| anyhow::anyhow!("ARCUS_VOL_LEARNER_HISTORY: {e}"))?;
+    }
+    Ok(s)
 }
 
 /// `ARCUS_VOL_GATE_*` (bot-strategy#1120 design §6.3).
@@ -311,6 +367,7 @@ impl Config {
             session_band_bps: opt_dec(&p("SESSION_BAND_BPS"))?,
             position_stop_bps: opt_dec(&p("POSITION_STOP_BPS"))?,
             gate: GateSettings::from_env()?,
+            learner: learner_from_env()?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -500,7 +557,7 @@ pub fn live_gate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -727,6 +784,7 @@ mod tests {
             session_band_bps: None,
             position_stop_bps: None,
             gate: GateSettings::off(),
+            learner: crate::offset_learner::LearnerSettings::off(),
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),

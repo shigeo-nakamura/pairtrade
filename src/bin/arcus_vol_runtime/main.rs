@@ -63,6 +63,7 @@
 mod config;
 mod ledger;
 mod logic;
+mod offset_learner;
 mod quote_gate;
 mod session;
 mod sim;
@@ -300,6 +301,12 @@ struct Runtime {
     gate_off_path: PathBuf,
     /// The last quote cycle's gate output, taken by `finish_tick` for status.
     last_gate: Option<GateOutput>,
+    /// Offset learner (bot-strategy#1093), SHADOW ONLY: fed fills, markouts
+    /// and quoting time; its recommendation goes to `learner.jsonl` and
+    /// status.json and never to the quoting offset. Independent of the gate.
+    learner: offset_learner::Learner,
+    learner_state_path: PathBuf,
+    learner_journal_path: PathBuf,
 }
 
 impl Runtime {
@@ -597,6 +604,7 @@ impl Runtime {
         }
         let path = self.fills_path.clone();
         let gate = self.gate_stamp(&fill, fill_ts);
+        let mut booked_row: Option<serde_json::Value> = None;
         let outcome = match ledger::book_fill_scoped_gate(
             &mut self.ledger,
             &fill,
@@ -604,7 +612,10 @@ impl Runtime {
             now,
             ledger::DayScope::Current,
             gate,
-            |row| append_synced(&path, row),
+            |row| {
+                booked_row = Some(row.clone());
+                append_synced(&path, row)
+            },
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -625,7 +636,58 @@ impl Runtime {
             self.pending_markouts
                 .push(ledger::markouts_for(&fill, fill_ts));
         }
+        self.learner_ingest(booked_row.as_ref());
         Ok(outcome)
+    }
+
+    /// The offset live now (what the learner attributes to), in bp.
+    fn learner_live_offset(&self) -> Option<f64> {
+        self.cfg.presence_for(self.in_session).offset_bps.to_f64()
+    }
+
+    /// Feed one journal row (a booked fill or a priced markout) to the
+    /// offset learner. Shadow only: never touches quoting (bot-strategy#1093).
+    fn learner_ingest(&mut self, row: Option<&serde_json::Value>) {
+        if !self.learner.on() {
+            return;
+        }
+        let (Some(row), Some(dust)) = (row, self.cfg.dust_usd.to_f64()) else {
+            return;
+        };
+        let live = self.learner_live_offset();
+        self.learner.ingest(row, live, dust);
+    }
+
+    /// Per tick: quoting time, daily-stop breaches, the hourly `learner`
+    /// row (own file `learner.jsonl`) and its persisted state. Returns the
+    /// status block. Shadow only (bot-strategy#1093).
+    fn learner_tick(&mut self, now: u64) -> serde_json::Value {
+        if !self.learner.on() {
+            return serde_json::Value::Null;
+        }
+        let live = self.learner_live_offset();
+        self.learner.on_tick(now, live, self.last_plan == "quote");
+        if matches!(self.halt, Some(Halt::Day)) {
+            let day = self.ledger.day.clone();
+            self.learner.note_breach(now, live, &day);
+        }
+        if let Some(row) = self.learner.due_row(now, live, &self.cfg.market) {
+            if let Err(e) = append_synced(&self.learner_journal_path, &row) {
+                log::warn!("[ARCUS_VOL] learner row append failed: {e}");
+            }
+            if let Err(e) = self.learner.save(&self.learner_state_path) {
+                log::warn!("[ARCUS_VOL] learner state write failed: {e}");
+            }
+            log::info!(
+                "[ARCUS_VOL] learner (shadow) {} live {:?} → would pick {:?} ({}), {} trips",
+                row["window"].as_str().unwrap_or("?"),
+                row["live_offset_bps"],
+                row["recommended_offset_bps"],
+                row["reason"].as_str().unwrap_or("?"),
+                row["trips_in_context"]
+            );
+        }
+        self.learner.status(now, live)
     }
 
     /// The quote gate decision in force for a fill (bot-strategy#1120,
@@ -1210,6 +1272,7 @@ impl Runtime {
         let scope = ledger::day_scope(&self.ledger.day, fill_ts);
         let path = self.fills_path.clone();
         let gate = self.gate_stamp(&fill, fill_ts);
+        let mut booked_row: Option<serde_json::Value> = None;
         let outcome = match ledger::book_fill_scoped_gate(
             &mut self.ledger,
             &fill,
@@ -1217,7 +1280,10 @@ impl Runtime {
             now,
             scope,
             gate,
-            |row| append_synced(&path, row),
+            |row| {
+                booked_row = Some(row.clone());
+                append_synced(&path, row)
+            },
         ) {
             Ok(o) => o,
             Err(e) => {
@@ -1257,6 +1323,7 @@ impl Runtime {
                 }
             }
         }
+        self.learner_ingest(booked_row.as_ref());
         Ok(outcome)
     }
 
@@ -1818,6 +1885,7 @@ impl Runtime {
                             "fill_id": fill_id, "market": self.cfg.market,
                             "horizon_s": horizon_s, "reason": reason}),
             };
+            self.learner_ingest(Some(&row));
             if self.journal_unsafe {
                 continue;
             }
@@ -2057,6 +2125,7 @@ impl Runtime {
             log::error!("[ARCUS_VOL] state write failed: {e:#}");
         }
         let mark = mid.unwrap_or(self.ledger.position.avg_px);
+        let learner_status = self.learner_tick(now);
         let (gate_status, gate_summary) = if self.gate.on() {
             let sentinel = self.gate_off_path.exists();
             let last = self.last_gate.take();
@@ -2124,6 +2193,7 @@ impl Runtime {
             "plan": self.last_plan,
             "pending_unresolved": self.pending_unresolved,
             "gate": gate_status,
+            "learner": learner_status,
         });
         // status.json is informational (dashboards, humans): a plain atomic
         // replace without fsync is enough; state.json above is the durable one.
@@ -2269,6 +2339,29 @@ impl BatchSink<QuoteBatch> for Runtime {
     }
 }
 
+/// `learner-replay <fills.jsonl>`: print what the offset learner would
+/// recommend per window after replaying a fills journal (no venue, no state).
+fn learner_replay(path: Option<&str>) -> Result<()> {
+    let path =
+        path.ok_or_else(|| anyhow!("usage: arcus_vol_runtime learner-replay <fills.jsonl>"))?;
+    let mut settings = config::learner_from_env()?;
+    settings.mode = offset_learner::LearnerMode::Shadow;
+    let dust: f64 = std::env::var("ARCUS_VOL_DUST_USD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5.0);
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .with_context(|| format!("read {path}"))?
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let mut l = offset_learner::Learner::new(settings, Default::default());
+    for r in l.replay_offline(&rows, dust) {
+        println!("{}", serde_json::to_string(&r)?);
+    }
+    Ok(())
+}
+
 /// Build the quote gate (bot-strategy#1120): the model file, when given, is
 /// validated against this runtime's venue, market and feature engine and
 /// any mismatch refuses the start (fail closed on config, shadow included).
@@ -2316,6 +2409,13 @@ fn build_gate(cfg: &Config) -> Result<QuoteGate> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logger();
+    // Offline sanity check of the offset learner (bot-strategy#1093):
+    // `arcus_vol_runtime learner-replay <fills.jsonl>` with the same
+    // ARCUS_VOL_LEARNER_* env (HISTORY gives the offsets that were live).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("learner-replay") {
+        return learner_replay(args.get(2).map(String::as_str));
+    }
     let cfg = Config::from_env()?;
     let allow_account0 = std::env::var("ARCUS_VOL_ALLOW_ACCOUNT0").unwrap_or_default();
     config::live_gate(
@@ -2502,6 +2602,9 @@ async fn main() -> Result<()> {
         gate,
         gate_off_path: cfg.state_dir.join("GATE_OFF"),
         last_gate: None,
+        learner: offset_learner::Learner::new(cfg.learner.clone(), Default::default()),
+        learner_state_path: cfg.state_dir.join("learner.json"),
+        learner_journal_path: cfg.state_dir.join("learner.jsonl"),
         cfg,
     };
 
@@ -2520,6 +2623,23 @@ async fn main() -> Result<()> {
     rt.pending_markouts = restored;
     rt.position_stops_day = rt.ledger.day.clone();
     rt.position_stops_today = count_position_stops(&journal_rows, &rt.ledger.day);
+    if rt.learner.on() {
+        // Offset learner (bot-strategy#1093, shadow): saved state, then any
+        // journal rows after it (arms from ARCUS_VOL_LEARNER_HISTORY; rows
+        // with no known offset count as unknown trips).
+        let loaded = offset_learner::Learner::load(&rt.learner_state_path);
+        let resumed = loaded.is_some();
+        rt.learner.state = loaded.unwrap_or_default();
+        let dust = rt.cfg.dust_usd.to_f64().unwrap_or(5.0);
+        rt.learner.replay(&journal_rows, dust);
+        log::info!(
+            "[ARCUS_VOL] offset learner SHADOW ({}; arms {:?} bp, half-life {} h, point value ${}/1M): never changes the live offset",
+            if resumed { "state resumed" } else { "bootstrapped from the journal" },
+            rt.learner.settings.arms,
+            rt.learner.settings.half_life_h,
+            rt.learner.settings.point_value_per_m
+        );
+    }
     for m in missing {
         if let ledger::Markout::Missing {
             fill_id,

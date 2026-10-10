@@ -1,0 +1,9 @@
+{"kind": "fill", "seq": 1, "ts_ms": 1791169200000, "fill_id": "a1", "px": "100", "inventory": "25", "notional": "2500", "realized": "0", "fee": "0", "role": "maker"}
+{"kind": "fill", "seq": 2, "ts_ms": 1791169230000, "fill_id": "a2", "px": "100", "inventory": "0", "notional": "2500", "realized": "0.5", "fee": "0", "role": "maker"}
+{"kind": "fill", "seq": 3, "ts_ms": 1791255600000, "fill_id": "b1", "px": "100", "inventory": "-25", "notional": "2500", "realized": "0", "fee": "0", "role": "maker"}
+{"kind": "fill", "seq": 4, "ts_ms": 1791255901000, "fill_id": "b2", "px": "100", "inventory": "0", "notional": "2500", "realized": "-1", "fee": "0.5625", "role": "taker"}
+{"kind": "markout", "seq": 5, "ts_ms": 1791255660000, "fill_id": "b1", "horizon_s": 10, "bps": "-3"}
+{"kind": "fill", "seq": 6, "ts_ms": 1791295200000, "fill_id": "c1", "px": "100", "inventory": "25", "notional": "2500", "realized": "0", "fee": "0", "role": "maker"}
+{"kind": "markout", "seq": 7, "ts_ms": 1791295260000, "fill_id": "c1", "horizon_s": 60, "bps": "0.8"}
+{"kind": "fill", "seq": 8, "ts_ms": 1791295320000, "fill_id": "c2", "px": "100", "inventory": "0", "notional": "2500", "realized": "1.2", "fee": "0", "role": "maker"}
+{"kind": "position_stop", "seq": 9, "ts_ms": 1791298800000}
