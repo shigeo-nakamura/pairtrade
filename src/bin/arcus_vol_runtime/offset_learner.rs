@@ -240,6 +240,48 @@ pub struct Trip {
     pub taker: u32,
 }
 
+/// When a fill leaves the inventory flat: the runtime's own dust decision
+/// (`VenueMin::is_dust` + a below-minimum rejection), so trip boundaries
+/// match the runtime's. `From<f64>` = the notional fallback only.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DustRule {
+    /// The venue's smallest accepted base quantity, when known: below it is
+    /// dust whatever the price (the notional fallback is then unused).
+    pub min_qty: Option<f64>,
+    /// Notional dust floor when the venue minimum is unknown.
+    pub dust_usd: f64,
+    /// A quantity the venue already refused to flatten (carried as dust).
+    pub forced_qty: Option<f64>,
+}
+
+impl From<f64> for DustRule {
+    fn from(dust_usd: f64) -> Self {
+        DustRule {
+            dust_usd,
+            ..Default::default()
+        }
+    }
+}
+
+impl DustRule {
+    pub fn is_dust(&self, inv: f64, px: f64) -> bool {
+        let q = inv.abs();
+        if q == 0.0 {
+            return true;
+        }
+        if self
+            .forced_qty
+            .is_some_and(|f| (f - inv).abs() <= 1e-12 * f.abs().max(1.0))
+        {
+            return true;
+        }
+        match self.min_qty.filter(|m| *m > 0.0) {
+            Some(min) => q < min,
+            None => q * px.max(0.0) < self.dust_usd,
+        }
+    }
+}
+
 /// Persisted learner state (`learner.json` in the state dir).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LearnerState {
@@ -247,8 +289,10 @@ pub struct LearnerState {
     pub open: Option<Trip>,
     /// Entry fill id → window, for attributing its markout.
     pub entry_fills: VecDeque<(String, Window)>,
-    /// Highest journal `seq` ingested (rows at or below are skipped).
-    pub seen_seq: u64,
+    /// Highest journal `seq` ingested (rows at or below are skipped);
+    /// `None` = nothing yet (the journal's first row has `seq: 0`).
+    #[serde(default)]
+    pub seen_seq: Option<u64>,
     pub last_tick_ms: Option<u64>,
     pub last_emit_ms: u64,
     pub last_window: Option<Window>,
@@ -309,22 +353,21 @@ impl Learner {
     /// offset live at the fill (the runtime's current one when live; the
     /// `history` one when replayed). Rows at or below `seen_seq` are skipped,
     /// so bootstrapping and live ingest can overlap.
-    pub fn ingest(&mut self, row: &Value, arm: Option<f64>, dust_usd: f64) {
-        let seq = row.get("seq").and_then(Value::as_u64).unwrap_or(0);
-        if seq != 0 && seq <= self.state.seen_seq {
-            return;
-        }
-        if seq != 0 {
-            self.state.seen_seq = seq;
+    pub fn ingest(&mut self, row: &Value, arm: Option<f64>, dust: impl Into<DustRule>) {
+        if let Some(seq) = row.get("seq").and_then(Value::as_u64) {
+            if self.state.seen_seq.is_some_and(|seen| seq <= seen) {
+                return;
+            }
+            self.state.seen_seq = Some(seq);
         }
         match row.get("kind").and_then(Value::as_str) {
-            Some("fill") => self.ingest_fill(row, arm, dust_usd),
+            Some("fill") => self.ingest_fill(row, arm, dust.into()),
             Some("markout") => self.ingest_markout(row),
             _ => {}
         }
     }
 
-    fn ingest_fill(&mut self, row: &Value, arm: Option<f64>, dust_usd: f64) {
+    fn ingest_fill(&mut self, row: &Value, arm: Option<f64>, dust: DustRule) {
         let (Some(ts), Some(inv), Some(px), Some(notional)) = (
             row.get("ts_ms").and_then(Value::as_u64),
             num(row, "inventory"),
@@ -356,7 +399,7 @@ impl Learner {
         trip.vol += notional;
         trip.net += net;
         trip.taker += u32::from(taker);
-        if (inv * px).abs() < dust_usd {
+        if dust.is_dust(inv, px) {
             let trip = self.state.open.take().expect("open trip");
             self.close_trip(trip, ts);
         }
@@ -585,7 +628,7 @@ impl Learner {
     /// like `replay`, plus quoting time approximated from the row timestamps
     /// (gaps ≤ 15 min between consecutive rows count as quoting with the
     /// arm `history` says was live). Returns one recommendation per window.
-    pub fn replay_offline(&mut self, rows: &[Value], dust_usd: f64) -> Vec<Recommendation> {
+    pub fn replay_offline(&mut self, rows: &[Value], dust: DustRule) -> Vec<Recommendation> {
         let mut last_ts = 0;
         for row in rows {
             let Some(ts) = row.get("ts_ms").and_then(Value::as_u64) else {
@@ -593,7 +636,7 @@ impl Learner {
             };
             let arm = self.settings.history_arm(ts);
             self.on_tick_gap(ts, arm, true, 15 * 60_000);
-            self.ingest(row, arm, dust_usd);
+            self.ingest(row, arm, dust);
             last_ts = last_ts.max(ts);
         }
         [
@@ -622,13 +665,13 @@ impl Learner {
     }
 
     /// Replay journal rows (bootstrap / offline): arms from `history`.
-    pub fn replay(&mut self, rows: &[Value], dust_usd: f64) {
+    pub fn replay(&mut self, rows: &[Value], dust: DustRule) {
         for row in rows {
             let arm = row
                 .get("ts_ms")
                 .and_then(Value::as_u64)
                 .and_then(|t| self.settings.history_arm(t));
-            self.ingest(row, arm, dust_usd);
+            self.ingest(row, arm, dust);
         }
     }
 }
@@ -892,13 +935,13 @@ mod tests {
             .filter(|x| !x.trim().is_empty())
             .map(|x| serde_json::from_str(x).unwrap())
             .collect();
-        l.replay(&rows, 5.0);
+        l.replay(&rows, 5.0.into());
         // Before the history: unknown. Off-session trip → 2 bp; cash → 5 bp.
         assert_eq!(l.state.contexts[&Window::Off].unknown_trips, 1);
         assert_eq!(l.state.contexts[&Window::Off].arms["2"].trips, 1.0);
         assert_eq!(l.state.contexts[&Window::Cash].arms["5"].trips, 1.0);
         assert_eq!(l.state.contexts[&Window::Cash].markouts.len(), 1);
-        assert_eq!(l.state.seen_seq, 9);
+        assert_eq!(l.state.seen_seq, Some(9));
     }
 
     /// The body of `fn name(` in main.rs (to the next method).
@@ -936,6 +979,8 @@ mod tests {
             "learner_live_offset",
             "learner_ingest",
             "learner_tick",
+            "learner_arm_at",
+            "learner_dust_rule",
             "book_at",
             "book_spilled",
             "finish_tick",
@@ -944,6 +989,13 @@ mod tests {
             let owner = allowed.iter().any(|f| main_body(f).contains(line.trim()));
             assert!(owner, "learner call outside the shadow hooks: {line}");
         }
+        // Fills are credited by their own timestamp with the runtime's dust
+        // rule (Codex P2 x2 on pairtrade#391), not the ingestion-time offset.
+        let ingest = main_body("learner_ingest");
+        assert!(ingest.contains("self.learner_arm_at(ts)"));
+        assert!(ingest.contains("self.learner_dust_rule()"));
+        assert!(!ingest.contains("learner_live_offset"));
+        assert!(main_body("learner_dust_rule").contains("self.venue_min.min_order_qty"));
         // The module holds no config and no quoting handle.
         let me = include_str!("offset_learner.rs");
         let code = &me[..me.find("#[cfg(test)]").unwrap()];
@@ -978,7 +1030,7 @@ mod tests {
             .filter(|x| !x.trim().is_empty())
             .map(|x| serde_json::from_str(x).unwrap())
             .collect();
-        let recs = l.replay_offline(&rows, 5.0);
+        let recs = l.replay_offline(&rows, 5.0.into());
         assert_eq!(recs.len(), 5);
         let cash = recs.iter().find(|r| r.window == Window::Cash).unwrap();
         assert_eq!(cash.live_offset_bps, Some(5.0));
@@ -986,6 +1038,152 @@ mod tests {
             .arms
             .iter()
             .any(|a| a.offset_bps == 5.0 && a.hours > 0.0));
+    }
+
+    #[test]
+    fn a_restart_never_re_ingests_seq_0() {
+        // Codex P1 on pairtrade#391: the journal's first row has seq 0.
+        let t0 = ms("2026-10-06T03:00:00Z");
+        let rows = vec![
+            fill(0, t0, "25", "2500", "0", "maker"),
+            fill(1, t0 + 30_000, "0", "2500", "1", "maker"),
+            fill(2, t0 + 60_000, "-25", "2500", "0", "maker"),
+            fill(3, t0 + 90_000, "0", "2500", "-0.5", "taker"),
+        ];
+        let mut s = shadow();
+        s.history = LearnerSettings::parse_history("2026-10-01T00:00:00Z=2/5").unwrap();
+        let mut l = Learner::new(s.clone(), LearnerState::default());
+        l.replay(&rows, 5.0.into());
+        assert_eq!(l.state.seen_seq, Some(3));
+        assert_eq!(l.state.contexts[&Window::Off].trips, 2);
+        let dir = std::env::temp_dir().join(format!("learner-seq0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("learner.json");
+        l.save(&path).unwrap();
+        // Restart: load, then the same journal is replayed again.
+        let mut again = Learner::new(s, Learner::load(&path).unwrap());
+        again.replay(&rows, 5.0.into());
+        assert_eq!(again.state, l.state);
+        assert_eq!(again.state.contexts[&Window::Off].trips, 2);
+        assert!(again.state.open.is_none());
+        // A fresh state still takes seq 0.
+        let mut fresh = Learner::new(shadow(), LearnerState::default());
+        fresh.ingest(&rows[0], Some(2.0), 5.0);
+        assert!(fresh.state.open.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn trips_close_on_the_runtimes_venue_minimum_not_the_fallback() {
+        // Codex P2 on pairtrade#391: min order 0.001 BTC at $100k = $100,
+        // above the $5 fallback. 0.0005 BTC ($50) left over is dust to the
+        // runtime, so the trip ends there.
+        let rule = DustRule {
+            min_qty: Some(0.001),
+            dust_usd: 5.0,
+            forced_qty: None,
+        };
+        let t0 = ms("2026-10-06T03:00:00Z");
+        let row = |seq: u64, ts: u64, inv: &str| {
+            json!({"kind": "fill", "seq": seq, "ts_ms": ts, "fill_id": format!("f{seq}"),
+                   "px": "100000", "inventory": inv, "notional": "100",
+                   "realized": "0", "fee": "0", "role": "maker"})
+        };
+        let mut l = Learner::new(shadow(), LearnerState::default());
+        l.ingest(&row(1, t0, "0.002"), Some(2.0), rule);
+        l.ingest(&row(2, t0 + 1_000, "0.0005"), Some(2.0), rule);
+        assert!(l.state.open.is_none(), "closed at the venue minimum");
+        let mut fallback = Learner::new(shadow(), LearnerState::default());
+        fallback.ingest(&row(1, t0, "0.002"), Some(2.0), 5.0);
+        fallback.ingest(&row(2, t0 + 1_000, "0.0005"), Some(2.0), 5.0);
+        assert!(
+            fallback.state.open.is_some(),
+            "the $5 fallback alone keeps it open"
+        );
+        // Same decision as the runtime's VenueMin::is_dust, case by case.
+        use rust_decimal::prelude::FromPrimitive;
+        for (min, qty, px) in [
+            (Some(0.001), 0.0005, 100_000.0),
+            (Some(0.001), 0.001, 100_000.0),
+            (None, 0.00004, 100_000.0),
+            (None, 0.00006, 100_000.0),
+            (Some(0.001), 0.0, 1.0),
+        ] {
+            let vm = crate::logic::VenueMin {
+                min_order_qty: min.and_then(rust_decimal::Decimal::from_f64),
+                size_decimals: None,
+                dust_usd: rust_decimal::Decimal::from(5),
+            };
+            let r = DustRule {
+                min_qty: min,
+                dust_usd: 5.0,
+                forced_qty: None,
+            };
+            let d = |x: f64| rust_decimal::Decimal::from_f64(x).unwrap();
+            assert_eq!(
+                r.is_dust(qty, px),
+                vm.is_dust(d(qty), d(px)),
+                "{min:?} {qty} {px}"
+            );
+        }
+        // A quantity the venue refused to flatten is dust too.
+        let forced = DustRule {
+            forced_qty: Some(0.003),
+            ..rule
+        };
+        assert!(forced.is_dust(0.003, 100_000.0));
+    }
+
+    #[test]
+    fn a_fill_is_credited_to_the_offset_live_at_its_own_timestamp() {
+        // Codex P2 on pairtrade#391: 2 bp off-session, 5 bp in session
+        // (09:30-16:00 ET). A fill at 09:29 ET booked after the open counts
+        // for the off-session 2 bp, not the 5 bp live at ingestion.
+        use rust_decimal::Decimal;
+        let mut cfg = crate::config::tests::test_config();
+        cfg.quote_offset_bps = Decimal::from(2);
+        cfg.repeg_band_bps = Decimal::from(1);
+        cfg.session_offset_bps = Some(Decimal::from(5));
+        cfg.session_band_bps = Some(Decimal::from(2));
+        let session = crate::session::Session {
+            hours: Some(crate::session::TradingHours {
+                start_s: 9 * 3_600 + 1_800,
+                end_s: 16 * 3_600,
+                overnight: false,
+            }),
+            venue_flag: None,
+        };
+        let started = ms("2026-10-05T13:00:00Z"); // 09:00 ET
+        let fill_ts = ms("2026-10-05T13:29:00Z"); // 09:29 ET
+        let s = shadow();
+        let arm = crate::learner_arm_at(&cfg, &session, &s, started, fill_ts);
+        assert_eq!(arm, Some(2.0));
+        assert_eq!(
+            crate::learner_arm_at(&cfg, &session, &s, started, ms("2026-10-05T13:31:00Z")),
+            Some(5.0)
+        );
+        let mut l = Learner::new(s.clone(), LearnerState::default());
+        l.ingest(&fill(1, fill_ts, "25", "2500", "0", "maker"), arm, 5.0);
+        l.ingest(
+            &fill(2, fill_ts + 30_000, "0", "2500", "1", "maker"),
+            arm,
+            5.0,
+        );
+        assert_eq!(l.state.contexts[&Window::Pre].arms["2"].trips, 1.0);
+        assert!(!l.state.contexts[&Window::Pre].arms.contains_key("5"));
+        // Before this process started, the history decides when it covers
+        // the fill; otherwise the config does.
+        let mut h = s.clone();
+        h.history = LearnerSettings::parse_history("2026-10-01T00:00:00Z=3/8").unwrap();
+        let later = ms("2026-10-05T14:00:00Z");
+        assert_eq!(
+            crate::learner_arm_at(&cfg, &session, &h, later, fill_ts),
+            Some(8.0)
+        );
+        assert_eq!(
+            crate::learner_arm_at(&cfg, &session, &s, later, fill_ts),
+            Some(2.0)
+        );
     }
 
     #[test]

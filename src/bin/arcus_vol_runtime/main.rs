@@ -307,6 +307,10 @@ struct Runtime {
     learner: offset_learner::Learner,
     learner_state_path: PathBuf,
     learner_journal_path: PathBuf,
+    /// Process start: fills stamped before it may have quoted under an
+    /// earlier config, so the learner takes their offset from
+    /// `ARCUS_VOL_LEARNER_HISTORY` when that covers them.
+    learner_started_ms: u64,
 }
 
 impl Runtime {
@@ -645,17 +649,46 @@ impl Runtime {
         self.cfg.presence_for(self.in_session).offset_bps.to_f64()
     }
 
+    /// The offset that was live at `ts_ms` (a fill's own timestamp, which
+    /// may be well before it is booked: late harvest, spilled fills,
+    /// restart). Deterministic: the config's session / off-session offset
+    /// by the market's trading hours at `ts_ms`; before this process
+    /// started, `ARCUS_VOL_LEARNER_HISTORY` when it covers `ts_ms`.
+    fn learner_arm_at(&self, ts_ms: u64) -> Option<f64> {
+        learner_arm_at(
+            &self.cfg,
+            &self.session,
+            &self.learner.settings,
+            self.learner_started_ms,
+            ts_ms,
+        )
+    }
+
+    /// The runtime's own dust decision (`inventory_is_dust`), for the
+    /// learner's trip boundaries.
+    fn learner_dust_rule(&self) -> offset_learner::DustRule {
+        offset_learner::DustRule {
+            min_qty: self.venue_min.min_order_qty.and_then(|m| m.to_f64()),
+            dust_usd: self.venue_min.dust_usd.to_f64().unwrap_or(5.0),
+            forced_qty: self.forced_dust_qty.and_then(|q| q.to_f64()),
+        }
+    }
+
     /// Feed one journal row (a booked fill or a priced markout) to the
     /// offset learner. Shadow only: never touches quoting (bot-strategy#1093).
     fn learner_ingest(&mut self, row: Option<&serde_json::Value>) {
         if !self.learner.on() {
             return;
         }
-        let (Some(row), Some(dust)) = (row, self.cfg.dust_usd.to_f64()) else {
+        let Some(row) = row else {
             return;
         };
-        let live = self.learner_live_offset();
-        self.learner.ingest(row, live, dust);
+        let arm = row
+            .get("ts_ms")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|ts| self.learner_arm_at(ts));
+        let dust = self.learner_dust_rule();
+        self.learner.ingest(row, arm, dust);
     }
 
     /// Per tick: quoting time, daily-stop breaches, the hourly `learner`
@@ -2339,6 +2372,27 @@ impl BatchSink<QuoteBatch> for Runtime {
     }
 }
 
+/// See `Runtime::learner_arm_at` (free so it can be tested without a venue).
+fn learner_arm_at(
+    cfg: &Config,
+    session: &session::Session,
+    settings: &offset_learner::LearnerSettings,
+    started_ms: u64,
+    ts_ms: u64,
+) -> Option<f64> {
+    if ts_ms < started_ms {
+        if let Some(a) = settings.history_arm(ts_ms) {
+            return Some(a);
+        }
+    }
+    let in_session = if cfg.session_switching() {
+        session.hours.map(|h| session::in_hours(ts_ms, h))
+    } else {
+        None
+    };
+    cfg.presence_for(in_session).offset_bps.to_f64()
+}
+
 /// `learner-replay <fills.jsonl>`: print what the offset learner would
 /// recommend per window after replaying a fills journal (no venue, no state).
 fn learner_replay(path: Option<&str>) -> Result<()> {
@@ -2356,7 +2410,7 @@ fn learner_replay(path: Option<&str>) -> Result<()> {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     let mut l = offset_learner::Learner::new(settings, Default::default());
-    for r in l.replay_offline(&rows, dust) {
+    for r in l.replay_offline(&rows, dust.into()) {
         println!("{}", serde_json::to_string(&r)?);
     }
     Ok(())
@@ -2605,6 +2659,7 @@ async fn main() -> Result<()> {
         learner: offset_learner::Learner::new(cfg.learner.clone(), Default::default()),
         learner_state_path: cfg.state_dir.join("learner.json"),
         learner_journal_path: cfg.state_dir.join("learner.jsonl"),
+        learner_started_ms: now_ms(),
         cfg,
     };
 
@@ -2630,7 +2685,7 @@ async fn main() -> Result<()> {
         let loaded = offset_learner::Learner::load(&rt.learner_state_path);
         let resumed = loaded.is_some();
         rt.learner.state = loaded.unwrap_or_default();
-        let dust = rt.cfg.dust_usd.to_f64().unwrap_or(5.0);
+        let dust = rt.learner_dust_rule();
         rt.learner.replay(&journal_rows, dust);
         log::info!(
             "[ARCUS_VOL] offset learner SHADOW ({}; arms {:?} bp, half-life {} h, point value ${}/1M): never changes the live offset",
