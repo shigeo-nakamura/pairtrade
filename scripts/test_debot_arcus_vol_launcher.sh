@@ -212,6 +212,18 @@ printf 'GATE_FALLBACK=sometimes\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "GATE_FALLBACK must be" <<< "$OUT" || fail "bad fallback must refuse"
 printf 'GATE_LOG_FEATURES=some\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "GATE_LOG_FEATURES must be all|none" <<< "$OUT" || fail "bad log_features must refuse"
+# offset learner (bot-strategy#1093): off by default (nothing exported); shadow + knobs pass
+# through; a bad mode or bad arms refuse
+printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && ! grep -q '^ARCUS_VOL_LEARN' "$T/env.out" && grep -q "offset learner: off" <<< "$OUT" || fail "learner must default to off"
+printf 'LEARNER=shadow\nLEARNER_ARMS=2,3,5,8,12\nLEARNER_HALF_LIFE_H=168\nLEARNER_POINT_VALUE_PER_M=15\nLEARNER_HISTORY=2026-10-05T10:19:00Z=2/5,2026-10-09T17:08:00Z=3/5\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_LEARNER=shadow "$T/env.out" && grep -qxF ARCUS_VOL_LEARNER_ARMS=2,3,5,8,12 "$T/env.out" \
+    && grep -qxF ARCUS_VOL_LEARNER_HALF_LIFE_H=168 "$T/env.out" && grep -qxF ARCUS_VOL_LEARN_POINT_VALUE_PER_M=15 "$T/env.out" \
+    && grep -qxF ARCUS_VOL_LEARNER_HISTORY=2026-10-05T10:19:00Z=2/5,2026-10-09T17:08:00Z=3/5 "$T/env.out" || fail "learner settings must reach the runtime: $OUT"
+printf 'LEARNER=live\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "LEARNER must be off|shadow" <<< "$OUT" || fail "learner live mode must refuse (shadow only)"
+printf 'LEARNER=shadow\nLEARNER_ARMS=2;3\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] || fail "bad learner arms must refuse"
 rm -f "$T/etc/config.env"
 printf 'ARCUS_ADDRESS=0xA2C7\nARCUS_API_KEY=fake\nARCUS_API_PRIVATE_KEY=Y2lwaGVydGV4dA==\nARCUS_ACCOUNT_INDEX=0\nARCUS_REST_ENDPOINT=https://evil.example\n' > "$T/etc/live.env"; chmod 600 "$T/etc/live.env"; run
 [ "$RC" -eq 1 ] && grep -q "live.env line 5: key ARCUS_REST_ENDPOINT is not accepted here" <<< "$OUT" || fail "live.env must refuse endpoint keys"

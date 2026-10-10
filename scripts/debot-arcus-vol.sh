@@ -29,6 +29,10 @@
 #   off), GATE_MODEL=<model json>, GATE_FALLBACK, GATE_LOG_FEATURES,
 #   GATE_ENFORCE_CONFIRM in config.env pass through as ARCUS_VOL_GATE_*; shadow
 #   computes and logs only, enforce needs the runtime's confirm token.
+#   Optional offset learner (bot-strategy#1093): LEARNER=off|shadow (default
+#   off), LEARNER_ARMS, LEARNER_HALF_LIFE_H, LEARNER_POINT_VALUE_PER_M,
+#   LEARNER_HISTORY pass through as ARCUS_VOL_LEARNER*; shadow only records
+#   what it would choose (learner.jsonl, status.json) and never moves quotes.
 #
 # Operator quick reference (STATE_DIR, default /var/lib/debot-arcus-vol/state):
 #   touch KILL_SWITCH   runtime pulls quotes, flattens, halts; remove before
@@ -88,7 +92,7 @@ load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -161,6 +165,16 @@ fi
 if [ "$GATE_MODE" = enforce ]; then
     [ -n "$GATE_ENFORCE_CONFIRM" ] && [ -n "$GATE_MODEL" ] || die "GATE_MODE=enforce needs GATE_ENFORCE_CONFIRM and GATE_MODEL (shadow readout first, bot-strategy#1120)"
 fi
+
+# Offset learner (bot-strategy#1093), shadow only; independent of the gate.
+LEARNER="${LEARNER:-off}"
+case "$LEARNER" in off|shadow) ;; *) die "LEARNER must be off|shadow (got '$LEARNER')" ;; esac
+LEARNER_ARMS="${LEARNER_ARMS:-}"
+[ -z "$LEARNER_ARMS" ] || [[ "$LEARNER_ARMS" =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || die "LEARNER_ARMS must be comma-separated bp numbers (got '$LEARNER_ARMS')"
+for v in LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M; do
+    [ -z "${!v:-}" ] || [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
+done
+LEARNER_HISTORY="${LEARNER_HISTORY:-}"
 
 [ -x "$BIN" ] || die "binary missing or not executable: $BIN"
 if ldd "$BIN" 2>/dev/null | grep -q 'not found'; then die "unresolved shared libraries: $(ldd "$BIN" | grep 'not found' | tr '\n' ' ')"; fi
@@ -248,6 +262,7 @@ PY
 log "signing key: $KEY_MODE"
 log "sizing: market $MARKET, clip \$$CLIP per side (max \$$CLIP_MAX_USD), inventory cap \$$CAP, margin \$$MARGIN at ${LEVERAGE}x (free collateral \$$FREE); presence offset ${QUOTE_OFFSET_BPS} bp +/- ${REPEG_BAND_BPS} bp${SESSION_OFFSET_BPS:+ (in session ${SESSION_OFFSET_BPS} bp +/- ${SESSION_BAND_BPS} bp)}; daily stop \$$DAILY_STOP_USD, cumulative stop \$$CUM_STOP_USD; state $STATE_DIR"
 log "quote gate: $GATE_MODE${GATE_MODEL:+ (model $GATE_MODEL)}${GATE_FALLBACK:+, fallback $GATE_FALLBACK}"
+log "offset learner: $LEARNER"
 
 # Everything from here on is the runtime's own process (systemd sees its pid).
 export ARCUS_VOL_DRY_RUN=false
@@ -275,6 +290,13 @@ export ARCUS_VOL_GATE_MODE="$GATE_MODE"
 [ -n "$GATE_FALLBACK" ] && export ARCUS_VOL_GATE_FALLBACK="$GATE_FALLBACK"
 [ -n "$GATE_LOG_FEATURES" ] && export ARCUS_VOL_GATE_LOG_FEATURES="$GATE_LOG_FEATURES"
 [ -n "$GATE_ENFORCE_CONFIRM" ] && export ARCUS_VOL_GATE_ENFORCE_CONFIRM="$GATE_ENFORCE_CONFIRM"
+if [ "$LEARNER" = shadow ]; then
+    export ARCUS_VOL_LEARNER=shadow
+    [ -n "$LEARNER_ARMS" ] && export ARCUS_VOL_LEARNER_ARMS="$LEARNER_ARMS"
+    [ -n "${LEARNER_HALF_LIFE_H:-}" ] && export ARCUS_VOL_LEARNER_HALF_LIFE_H="$LEARNER_HALF_LIFE_H"
+    [ -n "${LEARNER_POINT_VALUE_PER_M:-}" ] && export ARCUS_VOL_LEARN_POINT_VALUE_PER_M="$LEARNER_POINT_VALUE_PER_M"
+    [ -n "$LEARNER_HISTORY" ] && export ARCUS_VOL_LEARNER_HISTORY="$LEARNER_HISTORY"
+fi
 export ARCUS_VOL_DAILY_STOP_USD="$DAILY_STOP_USD"
 export ARCUS_VOL_CUM_STOP_USD="$CUM_STOP_USD"
 export ARCUS_WS_PRIVATE=1

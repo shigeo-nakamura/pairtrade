@@ -87,6 +87,10 @@ pub struct Config {
     /// `off` (default) leaves the tick exactly as before; `shadow` computes
     /// and logs, never acts; `enforce` needs `GATE_ENFORCE_CONFIRM`.
     pub gate: GateSettings,
+    /// Offset learner (bot-strategy#1093, `offset_learner`):
+    /// `ARCUS_VOL_LEARNER*`. `off` (default) or `shadow` (records what it
+    /// would choose; never changes the live offset).
+    pub learner: crate::offset_learner::LearnerSettings,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -169,6 +173,58 @@ pub fn parse_bool(name: &str, raw: Option<&str>, default: bool) -> Result<bool> 
         "false" | "0" | "no" => Ok(false),
         _ => bail!("{name}={raw} is not a boolean (use true/false/1/0/yes/no)"),
     }
+}
+
+/// `ARCUS_VOL_LEARNER*` (bot-strategy#1093 offset learner, shadow only).
+pub(crate) fn learner_from_env() -> Result<crate::offset_learner::LearnerSettings> {
+    use crate::offset_learner::{LearnerMode, LearnerSettings};
+    let mut s = LearnerSettings::off();
+    if let Some(raw) = var("ARCUS_VOL_LEARNER") {
+        s.mode = LearnerMode::parse(&raw).map_err(|e| anyhow::anyhow!("ARCUS_VOL_LEARNER: {e}"))?;
+    }
+    if let Some(raw) = var("ARCUS_VOL_LEARNER_ARMS") {
+        let mut arms = Vec::new();
+        for a in raw.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            let v: f64 = a
+                .parse()
+                .map_err(|_| anyhow::anyhow!("ARCUS_VOL_LEARNER_ARMS: {a} is not a number"))?;
+            if !(1.0..=100.0).contains(&v) {
+                bail!("ARCUS_VOL_LEARNER_ARMS: {v} is outside 1..=100 bp");
+            }
+            arms.push(v);
+        }
+        if arms.is_empty() {
+            bail!("ARCUS_VOL_LEARNER_ARMS is empty");
+        }
+        arms.sort_by(f64::total_cmp);
+        arms.dedup();
+        s.arms = arms;
+    }
+    let f = |k: &str, d: f64| -> Result<f64> {
+        match var(k) {
+            None => Ok(d),
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| anyhow::anyhow!("{k}={raw} is not a number")),
+        }
+    };
+    s.half_life_h = f("ARCUS_VOL_LEARNER_HALF_LIFE_H", s.half_life_h)?;
+    s.point_value_per_m = f("ARCUS_VOL_LEARN_POINT_VALUE_PER_M", s.point_value_per_m)?;
+    if !s.half_life_h.is_finite()
+        || s.half_life_h <= 0.0
+        || !s.point_value_per_m.is_finite()
+        || s.point_value_per_m < 0.0
+    {
+        bail!(
+            "ARCUS_VOL_LEARNER_HALF_LIFE_H must be > 0 and ARCUS_VOL_LEARN_POINT_VALUE_PER_M >= 0"
+        );
+    }
+    if let Some(raw) = var("ARCUS_VOL_LEARNER_HISTORY") {
+        s.history = LearnerSettings::parse_history(&raw)
+            .map_err(|e| anyhow::anyhow!("ARCUS_VOL_LEARNER_HISTORY: {e}"))?;
+    }
+    Ok(s)
 }
 
 /// `ARCUS_VOL_GATE_*` (bot-strategy#1120 design §6.3).
@@ -311,6 +367,7 @@ impl Config {
             session_band_bps: opt_dec(&p("SESSION_BAND_BPS"))?,
             position_stop_bps: opt_dec(&p("POSITION_STOP_BPS"))?,
             gate: GateSettings::from_env()?,
+            learner: learner_from_env()?,
             state_dir: PathBuf::from(
                 var(&p("STATE_DIR")).unwrap_or_else(|| "/opt/debot/arcus_vol".to_string()),
             ),
@@ -347,6 +404,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_learner_arms()?;
         let positive = [
             ("CLIP_USD", self.clip_usd),
             ("SKEW_USD", self.skew_usd),
@@ -440,6 +498,30 @@ impl Config {
 
     /// Whether a session offset is configured (only then is the session
     /// read at all).
+    /// Offset learner (bot-strategy#1093): every live offset in use must be
+    /// one of its arms, or its quoting time and trips would belong to no
+    /// arm (an at-touch 0 bp offset with the learner on is invalid).
+    fn validate_learner_arms(&self) -> Result<()> {
+        if self.learner.mode == crate::offset_learner::LearnerMode::Off {
+            return Ok(());
+        }
+        let live = [
+            ("ARCUS_VOL_QUOTE_OFFSET_BPS", Some(self.quote_offset_bps)),
+            ("ARCUS_VOL_SESSION_OFFSET_BPS", self.session_offset_bps),
+        ];
+        for (name, v) in live {
+            let Some(v) = v else { continue };
+            let bp = rust_decimal::prelude::ToPrimitive::to_f64(&v).unwrap_or(f64::NAN);
+            if !self.learner.arms.iter().any(|a| (a - bp).abs() < 1e-9) {
+                bail!(
+                    "{name}={v} is not one of ARCUS_VOL_LEARNER_ARMS {:?}: with ARCUS_VOL_LEARNER=shadow every live offset must be an arm",
+                    self.learner.arms
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn session_switching(&self) -> bool {
         self.session_offset_bps.is_some() && self.session_band_bps.is_some()
     }
@@ -500,7 +582,7 @@ pub fn live_gate(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -685,6 +767,35 @@ mod tests {
     }
 
     #[test]
+    fn the_learner_needs_every_live_offset_to_be_an_arm() {
+        use crate::offset_learner::LearnerMode;
+        let mut cfg = test_config();
+        cfg.quote_offset_bps = Decimal::ZERO; // at the touch
+        cfg.session_offset_bps = None;
+        assert!(cfg.validate_learner_arms().is_ok(), "learner off: no check");
+        cfg.learner.mode = LearnerMode::Shadow;
+        let e = cfg.validate_learner_arms().unwrap_err().to_string();
+        assert!(e.contains("ARCUS_VOL_QUOTE_OFFSET_BPS=0"), "{e}");
+        cfg.quote_offset_bps = Decimal::from(2);
+        assert!(cfg.validate_learner_arms().is_ok());
+        cfg.session_offset_bps = Some(Decimal::from(4));
+        let e = cfg.validate_learner_arms().unwrap_err().to_string();
+        assert!(e.contains("ARCUS_VOL_SESSION_OFFSET_BPS=4"), "{e}");
+        cfg.session_offset_bps = Some(Decimal::from(5));
+        assert!(cfg.validate_learner_arms().is_ok());
+        cfg.quote_offset_bps = Decimal::from_str("2.5").unwrap();
+        assert!(cfg.validate_learner_arms().is_err());
+        // The full validation runs it too: a config valid with the learner
+        // off is refused with it on, for this reason.
+        let mut full = test_config();
+        full.validate().expect("the base test config is valid");
+        full.learner.mode = LearnerMode::Shadow;
+        full.learner.arms = vec![7.0];
+        let e = full.validate().unwrap_err().to_string();
+        assert!(e.contains("is not one of ARCUS_VOL_LEARNER_ARMS"), "{e}");
+    }
+
+    #[test]
     fn effective_cap_is_the_smaller_of_hard_cap_and_margin_times_leverage() {
         let mut cfg = test_config();
         assert_eq!(cfg.effective_cap_usd(), Decimal::from(10_000));
@@ -727,6 +838,7 @@ mod tests {
             session_band_bps: None,
             position_stop_bps: None,
             gate: GateSettings::off(),
+            learner: crate::offset_learner::LearnerSettings::off(),
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),

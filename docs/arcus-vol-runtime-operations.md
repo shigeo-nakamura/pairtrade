@@ -218,6 +218,50 @@ subaccount) and `GATE_MODE=shadow`, `GATE_MODEL=…arcus_btc.json`,
 `GATE_LOG_FEATURES=all`. Turning the gate on, as any config change, is an
 operator restart.
 
+### Offset learner (bot-strategy#1093) — shadow mode
+
+`LEARNER=shadow` in `config.env` (default `off`). The runtime learns, per
+time window of the market's day in New York time (`off` 20:00–04:00 ET on
+weekdays, `pre` 04:00–09:30, `cash` 09:30–16:00, `after` 16:00–20:00,
+`weekend` Fri 20:00 → Sun 20:00 ET), which quote distance pays best, and
+**only records** what it would choose — the live offset stays
+`QUOTE_OFFSET_BPS` / `SESSION_OFFSET_BPS`.
+
+- **Data**: each round trip (first fill out of flat → back to flat or dust) is
+  attributed to the offset live at its entry fill and the window of that fill;
+  quoting time accrues to the live offset every tick. Statistics decay with
+  `LEARNER_HALF_LIFE_H` (default 168 h).
+- **Score**: (net $ + `LEARNER_POINT_VALUE_PER_M` × volume / $1M) per quoting
+  hour. The point value turns volume into $ (≈ 60 pt per $1M on the 10-07
+  drop × an assumed $/pt; default $15 per $1M = $0.25/pt, deliberately low).
+- **Policy**: arms with too few quoting hours (< max(2 h, 10 % of the window's
+  hours / arms)) are explored first, nearest the live offset; otherwise the
+  best rate plus a UCB bonus. **Markout guard**: when the window's last 20
+  entry markouts (60 s) average below −1 bp, only offsets ≥ the live one are
+  eligible (the QQQ lesson). **Stop guard**: the arm live when the daily stop
+  tripped is excluded in that window for 24 h.
+- **Config check**: with the learner on, `QUOTE_OFFSET_BPS` and (if set)
+  `SESSION_OFFSET_BPS` must each be one of `LEARNER_ARMS`, or the runtime
+  refuses to start (at-touch 0 bp with the learner on is invalid).
+- **Attribution after a restart**: a fill stamped before the process started
+  is credited only via `LEARNER_HISTORY`; uncovered ones are `unknown_trips`.
+- **Shadow limits**: only the live offset gets data, so the other arms read
+  `explore` until a live mode plays them. The shadow phase checks the
+  attribution, the guards and the statistics against the journal.
+- **Output**: `learner.jsonl` in `STATE_DIR` (one row per hour and on every
+  window change: window, live and recommended offset, reason, per-arm
+  hours / trips / volume / net / rate / eligible), `status.json.learner`, and
+  the persisted state `learner.json`. On a fresh start it bootstraps from
+  `fills.jsonl`; `LEARNER_HISTORY=<RFC3339>=<off>/<session>,...` says which
+  offsets were live before (rows outside it count as `unknown_trips`).
+- **Offline check**: `arcus_vol_runtime learner-replay <fills.jsonl>` with the
+  same `ARCUS_VOL_LEARNER_*` env prints one recommendation per window
+  (quoting time approximated from row timestamps, gaps ≤ 15 min).
+- **With the quote gate (#1120)**: the two shadows are independent (separate
+  files and status keys, no shared state). A future live mode must apply the
+  gate first (pull or quote) and let the learner choose the offset only when
+  the cycle quotes.
+
 ### Sentinels (in `STATE_DIR`)
 
 | file | meaning |
