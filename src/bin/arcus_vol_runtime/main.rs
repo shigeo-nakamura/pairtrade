@@ -653,7 +653,7 @@ impl Runtime {
     /// may be well before it is booked: late harvest, spilled fills,
     /// restart). Deterministic: the config's session / off-session offset
     /// by the market's trading hours at `ts_ms`; before this process
-    /// started, `ARCUS_VOL_LEARNER_HISTORY` when it covers `ts_ms`.
+    /// started, `ARCUS_VOL_LEARNER_HISTORY` only (`None` = unknown trip).
     fn learner_arm_at(&self, ts_ms: u64) -> Option<f64> {
         learner_arm_at(
             &self.cfg,
@@ -2381,9 +2381,9 @@ fn learner_arm_at(
     ts_ms: u64,
 ) -> Option<f64> {
     if ts_ms < started_ms {
-        if let Some(a) = settings.history_arm(ts_ms) {
-            return Some(a);
-        }
+        // Before this process the config may have differed: only the
+        // history says, else unattributed (as in the startup replay).
+        return settings.history_arm(ts_ms);
     }
     let in_session = if cfg.session_switching() {
         session.hours.map(|h| session::in_hours(ts_ms, h))

@@ -240,6 +240,11 @@ weekdays, `pre` 04:00–09:30, `cash` 09:30–16:00, `after` 16:00–20:00,
   entry markouts (60 s) average below −1 bp, only offsets ≥ the live one are
   eligible (the QQQ lesson). **Stop guard**: the arm live when the daily stop
   tripped is excluded in that window for 24 h.
+- **Config check**: with the learner on, `QUOTE_OFFSET_BPS` and (if set)
+  `SESSION_OFFSET_BPS` must each be one of `LEARNER_ARMS`, or the runtime
+  refuses to start (at-touch 0 bp with the learner on is invalid).
+- **Attribution after a restart**: a fill stamped before the process started
+  is credited only via `LEARNER_HISTORY`; uncovered ones are `unknown_trips`.
 - **Shadow limits**: only the live offset gets data, so the other arms read
   `explore` until a live mode plays them. The shadow phase checks the
   attribution, the guards and the statistics against the journal.

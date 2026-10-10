@@ -404,6 +404,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        self.validate_learner_arms()?;
         let positive = [
             ("CLIP_USD", self.clip_usd),
             ("SKEW_USD", self.skew_usd),
@@ -497,6 +498,30 @@ impl Config {
 
     /// Whether a session offset is configured (only then is the session
     /// read at all).
+    /// Offset learner (bot-strategy#1093): every live offset in use must be
+    /// one of its arms, or its quoting time and trips would belong to no
+    /// arm (an at-touch 0 bp offset with the learner on is invalid).
+    fn validate_learner_arms(&self) -> Result<()> {
+        if self.learner.mode == crate::offset_learner::LearnerMode::Off {
+            return Ok(());
+        }
+        let live = [
+            ("ARCUS_VOL_QUOTE_OFFSET_BPS", Some(self.quote_offset_bps)),
+            ("ARCUS_VOL_SESSION_OFFSET_BPS", self.session_offset_bps),
+        ];
+        for (name, v) in live {
+            let Some(v) = v else { continue };
+            let bp = rust_decimal::prelude::ToPrimitive::to_f64(&v).unwrap_or(f64::NAN);
+            if !self.learner.arms.iter().any(|a| (a - bp).abs() < 1e-9) {
+                bail!(
+                    "{name}={v} is not one of ARCUS_VOL_LEARNER_ARMS {:?}: with ARCUS_VOL_LEARNER=shadow every live offset must be an arm",
+                    self.learner.arms
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn session_switching(&self) -> bool {
         self.session_offset_bps.is_some() && self.session_band_bps.is_some()
     }
@@ -739,6 +764,35 @@ pub(crate) mod tests {
         assert!(cfg.validate().is_ok());
         cfg.gate.ref_stale_ms = 500;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn the_learner_needs_every_live_offset_to_be_an_arm() {
+        use crate::offset_learner::LearnerMode;
+        let mut cfg = test_config();
+        cfg.quote_offset_bps = Decimal::ZERO; // at the touch
+        cfg.session_offset_bps = None;
+        assert!(cfg.validate_learner_arms().is_ok(), "learner off: no check");
+        cfg.learner.mode = LearnerMode::Shadow;
+        let e = cfg.validate_learner_arms().unwrap_err().to_string();
+        assert!(e.contains("ARCUS_VOL_QUOTE_OFFSET_BPS=0"), "{e}");
+        cfg.quote_offset_bps = Decimal::from(2);
+        assert!(cfg.validate_learner_arms().is_ok());
+        cfg.session_offset_bps = Some(Decimal::from(4));
+        let e = cfg.validate_learner_arms().unwrap_err().to_string();
+        assert!(e.contains("ARCUS_VOL_SESSION_OFFSET_BPS=4"), "{e}");
+        cfg.session_offset_bps = Some(Decimal::from(5));
+        assert!(cfg.validate_learner_arms().is_ok());
+        cfg.quote_offset_bps = Decimal::from_str("2.5").unwrap();
+        assert!(cfg.validate_learner_arms().is_err());
+        // The full validation runs it too: a config valid with the learner
+        // off is refused with it on, for this reason.
+        let mut full = test_config();
+        full.validate().expect("the base test config is valid");
+        full.learner.mode = LearnerMode::Shadow;
+        full.learner.arms = vec![7.0];
+        let e = full.validate().unwrap_err().to_string();
+        assert!(e.contains("is not one of ARCUS_VOL_LEARNER_ARMS"), "{e}");
     }
 
     #[test]

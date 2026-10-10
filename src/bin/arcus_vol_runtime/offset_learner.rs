@@ -1171,8 +1171,9 @@ mod tests {
         );
         assert_eq!(l.state.contexts[&Window::Pre].arms["2"].trips, 1.0);
         assert!(!l.state.contexts[&Window::Pre].arms.contains_key("5"));
-        // Before this process started, the history decides when it covers
-        // the fill; otherwise the config does.
+        // Before this process started, only the history decides; a fill it
+        // does not cover is unattributed, never credited to the current
+        // config (Codex round 2 on pairtrade#391).
         let mut h = s.clone();
         h.history = LearnerSettings::parse_history("2026-10-01T00:00:00Z=3/8").unwrap();
         let later = ms("2026-10-05T14:00:00Z");
@@ -1182,8 +1183,28 @@ mod tests {
         );
         assert_eq!(
             crate::learner_arm_at(&cfg, &session, &s, later, fill_ts),
-            Some(2.0)
+            None
         );
+        let mut late = h.clone();
+        late.history = LearnerSettings::parse_history("2026-10-05T13:45:00Z=3/8").unwrap();
+        assert_eq!(
+            crate::learner_arm_at(&cfg, &session, &late, later, fill_ts),
+            None
+        );
+        let mut u = Learner::new(s.clone(), LearnerState::default());
+        let pre_start = crate::learner_arm_at(&cfg, &session, &s, later, fill_ts);
+        u.ingest(
+            &fill(1, fill_ts, "25", "2500", "0", "maker"),
+            pre_start,
+            5.0,
+        );
+        u.ingest(
+            &fill(2, fill_ts + 30_000, "0", "2500", "1", "maker"),
+            pre_start,
+            5.0,
+        );
+        assert_eq!(u.state.contexts[&Window::Pre].unknown_trips, 1);
+        assert!(u.state.contexts[&Window::Pre].arms.is_empty());
     }
 
     #[test]
