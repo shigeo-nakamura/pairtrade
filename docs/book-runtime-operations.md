@@ -297,10 +297,13 @@ DRY_RUN still opens a Lighter WS/REST session through `dex-connector`, so
 `get_lighter_config_from_env` needs the same variables `engine-b-live`
 uses. Provision `/etc/book-runtime/xsmom-695-secrets.env` (mode 0640,
 `root:book-runtime`) following `docs/engine-b-live-operations.md`
-"Credential provisioning" — a dedicated read-only API key on a separate
-Lighter account is the right shape for a paper book; reuse of the Engine B
-account is possible but couples two identities that were deliberately
-isolated. `InaccessiblePaths` in the unit keeps this identity out of
+"Credential provisioning" — a dedicated API key on a separate Lighter
+account; reuse of the Engine B account is possible but couples two
+identities that were deliberately isolated. A read-only key is enough only
+for a paper book: **xsmom-695 is live** (sub-account 281474976624818), so a
+new host or a key rotation needs a **trading** API key for that account,
+KMS-encrypted like every bot key on AWS hosts, or the live connector cannot
+send the orders `dry_run: false` enables. `InaccessiblePaths` in the unit keeps this identity out of
 `/opt/debot`, `/opt/engine-b-*`, `/etc/engine-b-live`.
 
 ## Start / stop
