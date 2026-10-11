@@ -1,5 +1,5 @@
 [Unit]
-Description=Book runtime xsmom-695 (bot-strategy#937 / #695) -- DRY_RUN paper book driven by the XSMOM shadow signal
+Description=Book runtime xsmom-695 (bot-strategy#937 / #695) -- LIVE book ($1000, Lighter) driven by the XSMOM shadow signal
 After=network-online.target
 Wants=network-online.target
 

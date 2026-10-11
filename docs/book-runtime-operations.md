@@ -311,9 +311,14 @@ sudo systemctl start book-runtime-xsmom-695
 sudo journalctl -u book-runtime-xsmom-695 -n 50 --no-pager
 ```
 
-Expected startup lines: `[CONFIG] instance=xsmom-695 … fp=<12hex>` (must
-match `book_runtime --validate` on the deployed YAML), `[STARTUP]
-instance=xsmom-695 mode=DRY_RUN positions=… last_decision=…`.
+Expected startup lines: `[CONFIG] instance=xsmom-695 … dry_run=false … fp=<12hex>`
+(must match `book_runtime --validate` on the deployed YAML), `[STARTUP]
+instance=xsmom-695 mode=LIVE positions=… last_decision=…`. XSMOM is **live**
+since 2026-10-08 16:54Z (bot-strategy#695): a `dry_run=true` / `mode=DRY_RUN`
+line after a restart means the deployed YAML lost the live flag, so stop
+and fix the config before the next decision window. On 2026-10-11 a
+host-only flip was reverted by `deploy-configs.yml` this way; the committed
+`configs/book/xsmom-695.yaml` is the deployed config.
 
 Stopping does not close the paper book (or a live one); the state is
 persisted and the next start resumes from it.
@@ -352,9 +357,13 @@ persisted and the next start resumes from it.
 - Daily halt (`max_daily_loss_bps: 500`): opens blocked until the next UTC
   day, no flatten.
 
-## Live transition (only after the 2026-10-02 readout passes on #695)
+## Live transition (DONE 2026-10-08 for xsmom-695; kept for the next book)
 
-Not a checklist to execute now; recorded so the path is explicit:
+xsmom-695 went live on 2026-10-08 16:54Z after the #695 readout (owner
+decision; $1000 on Lighter sub-account 281474976624818, paper files
+archived under `/var/lib/book-runtime/xsmom-695-paper-archive-20261008T165458Z/`).
+Step 2 must be a **repo change**: a flip made only on the host is reverted by
+the next `deploy-configs.yml` run (2026-10-11). The steps, for the next book:
 
 1. Fund a dedicated Lighter account at the intended notional (small), key
    it, put the credentials in the secrets file.
