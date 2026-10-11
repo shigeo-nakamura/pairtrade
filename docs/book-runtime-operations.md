@@ -297,10 +297,13 @@ DRY_RUN still opens a Lighter WS/REST session through `dex-connector`, so
 `get_lighter_config_from_env` needs the same variables `engine-b-live`
 uses. Provision `/etc/book-runtime/xsmom-695-secrets.env` (mode 0640,
 `root:book-runtime`) following `docs/engine-b-live-operations.md`
-"Credential provisioning" — a dedicated read-only API key on a separate
-Lighter account is the right shape for a paper book; reuse of the Engine B
-account is possible but couples two identities that were deliberately
-isolated. `InaccessiblePaths` in the unit keeps this identity out of
+"Credential provisioning" — a dedicated API key on a separate Lighter
+account; reuse of the Engine B account is possible but couples two
+identities that were deliberately isolated. A read-only key is enough only
+for a paper book: **xsmom-695 is live** (sub-account 281474976624818), so a
+new host or a key rotation needs a **trading** API key for that account,
+KMS-encrypted like every bot key on AWS hosts, or the live connector cannot
+send the orders `dry_run: false` enables. `InaccessiblePaths` in the unit keeps this identity out of
 `/opt/debot`, `/opt/engine-b-*`, `/etc/engine-b-live`.
 
 ## Start / stop
@@ -311,9 +314,14 @@ sudo systemctl start book-runtime-xsmom-695
 sudo journalctl -u book-runtime-xsmom-695 -n 50 --no-pager
 ```
 
-Expected startup lines: `[CONFIG] instance=xsmom-695 … fp=<12hex>` (must
-match `book_runtime --validate` on the deployed YAML), `[STARTUP]
-instance=xsmom-695 mode=DRY_RUN positions=… last_decision=…`.
+Expected startup lines: `[CONFIG] instance=xsmom-695 … dry_run=false … fp=<12hex>`
+(must match `book_runtime --validate` on the deployed YAML), `[STARTUP]
+instance=xsmom-695 mode=LIVE positions=… last_decision=…`. XSMOM is **live**
+since 2026-10-08 16:54Z (bot-strategy#695): a `dry_run=true` / `mode=DRY_RUN`
+line after a restart means the deployed YAML lost the live flag, so stop
+and fix the config before the next decision window. On 2026-10-11 a
+host-only flip was reverted by `deploy-configs.yml` this way; the committed
+`configs/book/xsmom-695.yaml` is the deployed config.
 
 Stopping does not close the paper book (or a live one); the state is
 persisted and the next start resumes from it.
@@ -352,9 +360,13 @@ persisted and the next start resumes from it.
 - Daily halt (`max_daily_loss_bps: 500`): opens blocked until the next UTC
   day, no flatten.
 
-## Live transition (only after the 2026-10-02 readout passes on #695)
+## Live transition (DONE 2026-10-08 for xsmom-695; kept for the next book)
 
-Not a checklist to execute now; recorded so the path is explicit:
+xsmom-695 went live on 2026-10-08 16:54Z after the #695 readout (owner
+decision; $1000 on Lighter sub-account 281474976624818, paper files
+archived under `/var/lib/book-runtime/xsmom-695-paper-archive-20261008T165458Z/`).
+Step 2 must be a **repo change**: a flip made only on the host is reverted by
+the next `deploy-configs.yml` run (2026-10-11). The steps, for the next book:
 
 1. Fund a dedicated Lighter account at the intended notional (small), key
    it, put the credentials in the secrets file.

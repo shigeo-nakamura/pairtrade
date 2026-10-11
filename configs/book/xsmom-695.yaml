@@ -1,4 +1,4 @@
-# Book runtime config for the XSMOM shadow → DRY_RUN track (bot-strategy#695 /
+# Book runtime config for XSMOM (bot-strategy#695 /
 # #937). Copy to the host as /opt/book-runtime/xsmom-695.yaml. Everything
 # here is reviewable in a PR diff; credentials never live in this file.
 #
@@ -8,7 +8,13 @@
 schema_version: 1
 instance_id: xsmom-695
 venue: lighter
-dry_run: true
+# LIVE since 2026-10-08 16:54Z (owner decision on bot-strategy#695, $1000 on
+# Lighter sub-account 281474976624818; the host also needs the
+# BOOK_CONFIRM_LIVE=yes-i-mean-it drop-in). This file IS the deployed config:
+# deploy-configs.yml installs it over /opt/book-runtime/xsmom-695.yaml on every
+# matching push, so a live flip made only on the host is reverted by the next
+# deploy (2026-10-11: reverted at 06:09Z, loaded as DRY_RUN at the 13:32Z restart).
+dry_run: false
 
 universe:
   # The runtime rejects any signal naming a symbol outside this list, so it
