@@ -51,6 +51,13 @@ GROSS_USD = 1000.0
 # 09-16 book for five days).
 MAX_SYMBOL_WEIGHT = 0.15
 NET_TOLERANCE = 0.15
+# The shadow watcher sizes NEW legs at gross/n but keeps CARRIED legs at their
+# marked value, so a book whose carried legs gained can sum to slightly more
+# than the gross (2026-10-11: ENA/AAVE/LIT carried, $1006.93 on $1000, the
+# producer refused and the live runtime skipped that rebalance). Up to this
+# much over, every weight is scaled by 1/sum(|w|): the shadow's proportions are
+# kept and the live book is exactly the gross. Beyond it the book is refused.
+OVERSIZE_TOLERANCE = 0.02
 
 
 def on_grid(d: date, anchor: date = ANCHOR, every: int = EVERY_DAYS) -> bool:
@@ -121,6 +128,13 @@ def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PR
     if "book" not in row:
         raise SystemExit(f"rebalance row for {row.get('date')} has no 'book' key; refusing (a flat book is an explicit {{}})")
     weights = weights_from_book(row["book"], gross)
+    raw_gross = sum(abs(w) for w in weights.values())
+    scaled_from = None
+    if 1.0 + 1e-9 < raw_gross <= 1.0 + OVERSIZE_TOLERANCE:
+        weights = {sym: w / raw_gross for sym, w in weights.items()}
+        scaled_from = round(raw_gross * gross, 2)
+        print(f"note: {row['date']} book sums to ${scaled_from} on ${gross:g} gross "
+              f"(carried legs marked up); weights scaled by 1/{raw_gross:.6f}", file=sys.stderr)
     check_caps(weights, max_symbol_weight, net_tolerance)
     as_of = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
     def _finite_or_none(v):
@@ -140,6 +154,8 @@ def build(row: dict, gross: float, generated_at: datetime, producer_id: str = PR
         "net_usd": round(sum(weights.values()) * gross, 2),
         "gross_reference_usd": gross,
     }
+    if scaled_from is not None:
+        meta["scaled_from_gross_usd"] = scaled_from
     return bsf.build_signal(producer_id, generated_at, as_of, d.isoformat(), weights, meta)
 
 

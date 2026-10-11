@@ -81,6 +81,38 @@ class ProducerTests(unittest.TestCase):
         flat = dict(ROW, book={})
         self.assertEqual(xp.build(flat, 1000.0, datetime.now(timezone.utc))["weights"], {})
 
+    def test_a_slightly_oversized_book_is_scaled_not_refused(self):
+        """The real 2026-10-11 rebalance row: carried legs (ENA/AAVE/LIT) marked up
+        push the book to $1006.93 on $1000; it must become a signal, not a skip."""
+        legs = {"ENA": (1, 93.5), "AAVE": (1, 89.4), "LIT": (-1, 87.41), "ZRO": (1, 83.33),
+                "STRK": (1, 83.33), "XMR": (-1, 83.33), "VVV": (-1, 83.33), "ETHFI": (-1, 83.33),
+                "ETH": (-1, 83.33), "DOGE": (-1, 83.33), "JUP": (1, 81.83), "NEAR": (1, 71.48)}
+        row = {"type": "rebalance", "date": "2026-10-11", "n_eligible": 32, "k": 6,
+               "book": {s: {"side": sd, "notional": n} for s, (sd, n) in legs.items()}}
+        sig = xp.build(row, 1000.0, datetime(2026, 10, 11, 0, 20, tzinfo=timezone.utc))
+        w = sig["weights"]
+        self.assertAlmostEqual(sum(abs(x) for x in w.values()), 1.0, places=9)
+        self.assertEqual(sig["meta"]["scaled_from_gross_usd"], 1006.93)
+        self.assertAlmostEqual(sig["meta"]["gross_usd"], 1000.0, places=2)
+        # proportions and signs are the shadow's
+        self.assertAlmostEqual(w["ENA"] / w["NEAR"], 93.5 / 71.48, places=9)
+        self.assertTrue(w["LIT"] < 0 < w["AAVE"])
+        # an in-tolerance book (10-06, $992.65) is left as is: no scaling, no meta key
+        under = dict(row, book={"A": {"side": 1, "notional": 496.0}, "B": {"side": -1, "notional": 496.65}})
+        sig = xp.build(under, 1000.0, datetime.now(timezone.utc), max_symbol_weight=0.5)
+        self.assertNotIn("scaled_from_gross_usd", sig["meta"])
+        self.assertAlmostEqual(sig["weights"]["A"], 0.496)
+
+    def test_an_oversized_book_beyond_tolerance_is_still_refused(self):
+        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 103.0} for i in range(10)}  # $1030
+        row = {"type": "rebalance", "date": "2026-10-11", "book": legs}
+        with self.assertRaises(SystemExit):
+            xp.build(row, 1000.0, datetime.now(timezone.utc))
+        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 102.0} for i in range(10)}  # $1020: edge
+        row = dict(row, book=legs)
+        sig = xp.build(row, 1000.0, datetime.now(timezone.utc))
+        self.assertEqual(sig["meta"]["scaled_from_gross_usd"], 1020.0)
+
     def test_non_finite_metadata_is_refused(self):
         with self.assertRaises(SystemExit):
             xp.build(dict(ROW, k=float("nan")), 1000.0, datetime.now(timezone.utc))
