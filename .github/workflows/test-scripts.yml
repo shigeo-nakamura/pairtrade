@@ -11,6 +11,7 @@ on:
   push:
     paths:
       - "scripts/**"
+      - "deploy/arcus_vol/**"
 
 jobs:
   test-scripts:
@@ -36,6 +37,8 @@ jobs:
         run: bash scripts/test_install_lighter_core_points_snapshot.sh
       - name: Run Arcus volume runtime launcher tests (bot-strategy#1093)
         run: bash scripts/test_debot_arcus_vol_launcher.sh
+      - name: Run Arcus volume host-state installer tests (bot-strategy#1093)
+        run: bash scripts/test_arcus_vol_host_install.sh
       - name: Run Arcus volume runtime key-encryption tests (bot-strategy#1093)
         run: |
           python3 -m pip install --quiet --disable-pip-version-check cryptography

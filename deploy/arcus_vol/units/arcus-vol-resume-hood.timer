@@ -1,0 +1,7 @@
+[Unit]
+Description=arcus-vol weekend resume for hood (bot-strategy#1093)
+[Timer]
+OnCalendar=Sun *-*-* 20:10:00 America/New_York
+Persistent=false
+[Install]
+WantedBy=timers.target

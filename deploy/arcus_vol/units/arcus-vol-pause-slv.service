@@ -1,0 +1,5 @@
+[Unit]
+Description=arcus-vol weekend pause for slv (bot-strategy#1093)
+[Service]
+Type=oneshot
+ExecStart=/opt/debot/scripts/arcus-vol-pause.sh pause slv
