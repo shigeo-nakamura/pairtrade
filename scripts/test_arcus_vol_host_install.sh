@@ -19,9 +19,9 @@ case "\$1" in
   enable) [ "\$2" = --now ] && { echo enabled > "$T/en/\$3"; echo active > "$T/act/\$3"; } || echo enabled > "$T/en/\$2" ;;
   disable) echo disabled > "$T/en/\$2" ;;
   daemon-reload) ;;
-  stop) echo inactive > "$T/act/\$2" ;;
-  start) echo active > "$T/act/\$2" ;;
-  list-units) for f in "$T"/act/debot-arcus-vol*; do [ "\$(cat "\$f")" = active ] && echo "\$(basename "\$f").service loaded active running x"; done ;;
+  stop) [ -e "$T/stopfail" ] && exit 1; echo inactive > "$T/act/\$2" ;;
+  start) [ -e "$T/startfail" ] && exit 1; [ -e "$T/startdies" ] && { echo inactive > "$T/act/\$2"; exit 0; }; echo active > "$T/act/\$2" ;;
+  list-units) [ -e "$T/listfail" ] && exit 1; for f in "$T"/act/debot-arcus-vol*; do [ "\$(cat "\$f")" = active ] && echo "\$(basename "\$f").service loaded active running x"; done ;;
   *) echo "unexpected systemctl \$*" >> "$T/bad" ;;
 esac
 SH
@@ -83,25 +83,53 @@ out=$(bash "$INST" --apply 2>&1); rc=$?; chmod 700 "$T/scripts"
 # 8. pause / reopen scripts (fake systemctl, fake root)
 PS="$HERE/deploy/arcus_vol/scripts/arcus-vol-pause.sh"; RS="$HERE/deploy/arcus_vol/scripts/arcus-vol-reopen.sh"
 export ARCUS_VOL_PAUSE_WAIT_S=2 ARCUS_VOL_PAUSE_STEP_S=1 ARCUS_VOL_RESUME_SETTLE_S=0 ARCUS_VOL_PAUSE_SCRIPT="$PS"
-st() { mkdir -p "$T/root/var/lib/debot-arcus-vol-$1/state"; echo "{\"inventory\":{\"qty\":\"$2\"}}" > "$T/root/var/lib/debot-arcus-vol-$1/state/status.json"; }
-for n in gld aapl hood slv; do echo active > "$T/act/debot-arcus-vol-$n"; done
+FUT=$(( $(date +%s) * 1000 + 3600000 )); OLD=$(( $(date +%s) * 1000 - 60000 ))
+# st <name> <ts_ms> <halt|null> <qty> [resting]  — status.json as the runtime writes it
+st() { local q='{"bid":null,"ask":null}'; [ "${5:-}" = resting ] && q='{"bid":{"px":"1"},"ask":null}'
+  local h=null; [ "$3" != null ] && h="\"$3\""
+  mkdir -p "$T/root/var/lib/debot-arcus-vol-$1/state"
+  echo "{\"ts_ms\":$2,\"halt\":$h,\"quotes\":$q,\"inventory\":{\"qty\":\"$4\"}}" > "$T/root/var/lib/debot-arcus-vol-$1/state/status.json"; }
+ks() { [ -f "$T/root/var/lib/debot-arcus-vol-$1/state/KILL_SWITCH" ]; }
+act() { cat "$T/act/debot-arcus-vol-$1"; }
+up() { for n in "$@"; do echo active > "$T/act/debot-arcus-vol-$n"; done; }
 rm -f "$T/act/debot-arcus-vol-nvda" "$T/act/debot-arcus-vol"
-st gld 0.0000000; st aapl 7.32; st hood 0; rm -f "$T/root/var/lib/debot-arcus-vol-hood/state/status.json"; echo '{bad json' > "$T/root/var/lib/debot-arcus-vol-hood/state/status.json"; st slv 0
-: > "$T/calls"
-bash "$PS" pause aapl >/dev/null 2>&1; rc=$?
-[ $rc = 3 ] && [ "$(cat "$T/act/debot-arcus-vol-aapl")" = active ] && [ -f "$T/root/var/lib/debot-arcus-vol-aapl/state/KILL_SWITCH" ] && ok "never-flat: not stopped, KILL_SWITCH kept, rc 3" || bad "never-flat pause rc=$rc act=$(cat "$T/act/debot-arcus-vol-aapl")"
-grep -q "^stop debot-arcus-vol-aapl" "$T/calls" && bad "never-flat instance was stopped" || ok "never-flat: no stop call"
-bash "$PS" pause hood >/dev/null 2>&1; rc=$?
-[ $rc = 3 ] && [ "$(cat "$T/act/debot-arcus-vol-hood")" = active ] && ok "unreadable status.json = not flat, not stopped" || bad "unreadable status rc=$rc"
-bash "$PS" pause gld >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && [ "$(cat "$T/act/debot-arcus-vol-gld")" = inactive ] && [ ! -f "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH" ] && ok "flat: stopped, KILL_SWITCH removed" || bad "flat pause rc=$rc"
-# reopen: gld already stopped; aapl/hood not flat, slv flat
-rm -f "$T/root/var/lib/debot-arcus-vol-aapl/state/KILL_SWITCH" "$T/root/var/lib/debot-arcus-vol-hood/state/KILL_SWITCH"
-bash "$RS" pause > "$T/rs.out" 2>&1; rc=$?
-rec="$T/root/var/lib/arcus-vol-reopen/paused"
-[ $rc != 0 ] && grep -qx aapl "$rec" && grep -qx hood "$rec" && grep -qx slv "$rec" && ! grep -qx gld "$rec" && ok "reopen pause: failures recorded, rc≠0, stopped instance not recorded" || bad "reopen pause rc=$rc rec=$(tr '\n' ' ' < "$rec" 2>/dev/null)"
-[ "$(cat "$T/act/debot-arcus-vol-slv")" = inactive ] && [ "$(cat "$T/act/debot-arcus-vol-aapl")" = active ] && ok "reopen pause: flat one stopped, not-flat one left running" || bad "reopen pause states"
+pz() { : > "$T/calls"; bash "$PS" pause "$1" >/dev/null 2>&1; }
+
+up gld; st gld "$FUT" kill_switch 0;              pz gld; rc=$?
+[ $rc = 0 ] && [ "$(act gld)" = inactive ] && ! ks gld && ok "acked (post-touch, halt, no quotes, flat): stopped, KILL_SWITCH removed" || bad "acked pause rc=$rc"
+up gld; st gld "$OLD" kill_switch 0;              pz gld; rc=$?
+[ $rc = 3 ] && [ "$(act gld)" = active ] && ks gld && ! grep -q "^stop" "$T/calls" && ok "pre-touch flat status is not an ack: not stopped, KILL_SWITCH kept, rc 3" || bad "stale ack rc=$rc"
+up gld; st gld "$FUT" kill_switch 0 resting;      pz gld; rc=$?
+[ $rc = 3 ] && [ "$(act gld)" = active ] && ok "quote still resting: not stopped" || bad "resting rc=$rc"
+up gld; st gld "$FUT" null 0;                     pz gld; rc=$?
+[ $rc = 3 ] && [ "$(act gld)" = active ] && ok "no halt in status: not stopped" || bad "no-halt rc=$rc"
+up aapl; st aapl "$FUT" kill_switch 7.32;         pz aapl; rc=$?
+[ $rc = 3 ] && [ "$(act aapl)" = active ] && ks aapl && ok "never flat: not stopped, KILL_SWITCH kept, rc 3" || bad "never-flat rc=$rc"
+up hood; st hood "$FUT" kill_switch 0; echo '{bad' > "$T/root/var/lib/debot-arcus-vol-hood/state/status.json"; pz hood; rc=$?
+[ $rc = 3 ] && [ "$(act hood)" = active ] && ok "unreadable status.json: not stopped" || bad "unreadable rc=$rc"
+up gld; st gld "$FUT" kill_switch 0; touch "$T/stopfail"; pz gld; rc=$?; rm -f "$T/stopfail"
+[ $rc = 4 ] && ks gld && ok "stop fails: KILL_SWITCH kept, rc 4" || bad "stop-fail rc=$rc"
+rm -f "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; echo inactive > "$T/act/debot-arcus-vol-gld"
+touch "$T/startfail"; bash "$PS" resume gld >/dev/null 2>&1; rc=$?; rm -f "$T/startfail"
+[ $rc = 5 ] && ok "start fails: resume rc 5" || bad "start-fail rc=$rc"
+touch "$T/startdies"; bash "$PS" resume gld >/dev/null 2>&1; rc=$?; rm -f "$T/startdies"
+[ $rc = 5 ] && ok "start ok but unit dies: resume rc 5" || bad "start-dies rc=$rc"
+bash "$PS" resume gld >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act gld)" = active ] && ok "resume starts the unit" || bad "resume rc=$rc"
+
+# reopen: gld acked, aapl never flat, slv acked, hood already stopped
+rec="$T/root/var/lib/arcus-vol-reopen/paused"; rm -f "$rec"
+for f in "$T"/root/var/lib/debot-arcus-vol-*/state/KILL_SWITCH; do rm -f "$f"; done
+up gld aapl slv; echo inactive > "$T/act/debot-arcus-vol-hood"
+st gld "$FUT" kill_switch 0; st aapl "$FUT" kill_switch 7.32; st slv "$FUT" kill_switch 0
+bash "$RS" pause >/dev/null 2>&1; rc=$?
+[ $rc != 0 ] && grep -qx aapl "$rec" && grep -qx gld "$rec" && grep -qx slv "$rec" && ! grep -qx hood "$rec" && ok "reopen pause: failure recorded, rc≠0, stopped instance not recorded" || bad "reopen pause rc=$rc rec=$(tr '\n' ' ' < "$rec" 2>/dev/null)"
+[ "$(act slv)" = inactive ] && [ "$(act aapl)" = active ] && ks aapl && ok "reopen pause: acked one stopped, not-flat one left running with KILL_SWITCH" || bad "reopen pause states"
+touch "$T/startfail"; bash "$RS" resume >/dev/null 2>&1; rc=$?; rm -f "$T/startfail"
+[ $rc != 0 ] && grep -qx slv "$rec" && grep -qx gld "$rec" && ! ks aapl && ok "reopen resume: failed starts kept for retry, rc≠0 (running one cleared)" || bad "resume-fail rc=$rc rec=$(tr '\n' ' ' < "$rec" 2>/dev/null)"
 bash "$RS" resume >/dev/null 2>&1; rc=$?
-[ $rc = 0 ] && [ ! -f "$T/root/var/lib/debot-arcus-vol-aapl/state/KILL_SWITCH" ] && [ ! -f "$T/root/var/lib/debot-arcus-vol-hood/state/KILL_SWITCH" ] && [ "$(cat "$T/act/debot-arcus-vol-slv")" = active ] && [ ! -f "$rec" ] && ok "reopen resume: KILL_SWITCH cleared, stopped one started, record removed" || bad "reopen resume rc=$rc"
-[ "$(cat "$T/act/debot-arcus-vol-gld")" = inactive ] && ok "reopen resume leaves an instance it did not pause alone" || bad "resume started gld"
+[ $rc = 0 ] && [ ! -e "$rec" ] && [ "$(act slv)" = active ] && [ "$(act gld)" = active ] && ok "reopen resume retry: all started, record removed" || bad "resume retry rc=$rc"
+[ "$(act hood)" = inactive ] && ok "reopen never starts an instance it did not pause" || bad "hood started"
+touch "$T/listfail"; up gld; bash "$RS" pause >/dev/null 2>&1; rc=$?; rm -f "$T/listfail"
+[ $rc = 1 ] && [ "$(act gld)" = active ] && [ ! -s "$rec" ] && ok "list-units fails: pause exits 1, nothing claimed" || bad "list-fail rc=$rc"
 exit $fail
