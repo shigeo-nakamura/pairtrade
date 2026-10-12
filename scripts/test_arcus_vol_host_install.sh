@@ -132,4 +132,32 @@ bash "$RS" resume >/dev/null 2>&1; rc=$?
 [ "$(act hood)" = inactive ] && ok "reopen never starts an instance it did not pause" || bad "hood started"
 touch "$T/listfail"; up gld; bash "$RS" pause >/dev/null 2>&1; rc=$?; rm -f "$T/listfail"
 [ $rc = 1 ] && [ "$(act gld)" = active ] && [ ! -s "$rec" ] && ok "list-units fails: pause exits 1, nothing claimed" || bad "list-fail rc=$rc"
+
+# 9. weekend path (own record per tag) and record-before-pause
+for f in "$T"/root/var/lib/debot-arcus-vol-*/state/KILL_SWITCH; do rm -f "$f"; done
+RD="$T/root/var/lib/arcus-vol-reopen"; rm -f "$RD"/*
+# operator stopped HOOD before Saturday: weekend pause skips it, resume must not start it
+echo inactive > "$T/act/debot-arcus-vol-hood"; : > "$T/calls"
+bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ ! -s "$RD/weekend-hood" ] && ok "weekend pause: already-stopped bot skipped, not recorded" || bad "weekend skip rc=$rc"
+bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act hood)" = inactive ] && ! grep -q "^start debot-arcus-vol-hood" "$T/calls" && ok "weekend resume does not start an operator-stopped bot" || bad "weekend resume started hood rc=$rc"
+# normal weekend: running + acked → stopped, recorded under its tag only; resume starts it
+up hood gld; st hood "$FUT" kill_switch 0
+bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act hood)" = inactive ] && grep -qx hood "$RD/weekend-hood" && [ "$(act gld)" = active ] && [ ! -e "$RD/paused" ] && ok "weekend pause: named bot stopped + recorded under its tag, others untouched" || bad "weekend pause rc=$rc"
+bash "$RS" resume >/dev/null 2>&1
+[ "$(act hood)" = inactive ] && ok "default-tag resume ignores the weekend record" || bad "default resume started hood"
+bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act hood)" = active ] && [ ! -e "$RD/weekend-hood" ] && ok "weekend resume starts what it stopped, record removed" || bad "weekend resume rc=$rc"
+# record cannot be written → nothing paused, rc≠0
+up gld slv; st gld "$FUT" kill_switch 0; st slv "$FUT" kill_switch 0; rm -f "$RD"/*; chmod 500 "$RD"; : > "$T/calls"
+bash "$RS" pause >/dev/null 2>&1; rc=$?; chmod 700 "$RD"
+[ $rc = 1 ] && [ "$(act gld)" = active ] && [ "$(act slv)" = active ] && ! grep -q "^stop" "$T/calls" && ! ks gld && ok "record write fails: nothing paused, no KILL_SWITCH, rc 1" || bad "record-fail rc=$rc"
+bash "$RS" pause --tag ../x hood >/dev/null 2>&1; [ $? = 2 ] && ok "bad --tag rejected" || bad "bad tag accepted"
+# units: every pause/resume oneshot can outlive the 180 s ack wait
+for u in "$HERE"/deploy/arcus_vol/units/arcus-vol-*.service; do
+  grep -qx "TimeoutStartSec=600" "$u" || bad "no TimeoutStartSec=600 in $(basename "$u")"
+done; ok "TimeoutStartSec=600 on every pause/resume service"
+grep -l "arcus-vol-pause.sh" "$HERE"/deploy/arcus_vol/units/*.service >/dev/null 2>&1 && bad "a unit calls arcus-vol-pause.sh directly (bypasses the record)" || ok "all units go through the recorded path"
 exit $fail

@@ -14,7 +14,7 @@ byte-for-byte from the host on 2026-10-12; `install_arcus_vol_host.sh
 | `config/qqq.config.retired` | — | QQQ retired 2026-10-10; host keeps `config.env.retired-*`, no `config.env` |
 | `scripts/arcus-vol-pause.sh` | `/opt/debot/scripts/` | pause = KILL_SWITCH → wait flat → stop; resume = start |
 | `scripts/arcus-vol-reopen.sh` | `/opt/debot/scripts/` | pause every ACTIVE instance (records them), resume only those |
-| `units/arcus-vol-{pause,resume}-{hood,slv}.*` | `/etc/systemd/system/` | HOOD/SLV weekend pause: Sat 00:00 UTC → Sun 20:10 New York |
+| `units/arcus-vol-{pause,resume}-{hood,slv}.*` | `/etc/systemd/system/` | HOOD/SLV weekend pause: Sat 00:00 UTC → Sun 20:10 New York (via `arcus-vol-reopen.sh --tag weekend-<m>`: only a bot the pause actually stopped is resumed) |
 | `units/arcus-vol-reopen-{pause,resume}.*` | `/etc/systemd/system/` | Sunday reopen blackout 17:55–18:05 and 19:55–20:05 New York |
 | `units/arcus-vol-open-{pause,resume}.*` | `/etc/systemd/system/` | weekday cash-open blackout 09:28–09:35 New York |
 
@@ -36,6 +36,20 @@ sudo deploy/arcus_vol/install_arcus_vol_host.sh --apply --apply-config   # also 
 `enable --now`s the timers. It prints `systemctl restart` lines for instances
 whose unit or config changed — restarting is the operator's call (owner
 approval for any bot restart on this host; check the instance is flat).
+
+## Known limitations (owner-accepted 2026-10-12)
+
+- **No catch-up after a reboot.** The pause timers are `Persistent=false`. If
+  the host is down when a pause should fire (e.g. Saturday 00:00 UTC) and
+  comes back inside the window, the enabled instances start through
+  `multi-user.target` and quote through the rest of that window. Check the
+  instances by hand after an unplanned reboot.
+- **The fleet check cannot see a failed blackout.** `fleet_check.py` runs at
+  minute 15 of the hour, so it never samples the weekday 09:27–09:38 or the
+  Sunday :54–:08 windows; `ACTIVE_IN_PAUSE` only catches a failed HOOD/SLV
+  weekend pause. A failed short blackout shows up only in the journal
+  (`journalctl -u arcus-vol-open-pause -u arcus-vol-reopen-pause`, syslog tag
+  `arcus-vol-reopen` / `arcus-vol-pause`).
 
 ## Rule
 
