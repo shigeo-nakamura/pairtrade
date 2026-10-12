@@ -21,7 +21,7 @@ case "\$1" in
   daemon-reload) ;;
   stop) [ -e "$T/stopfail" ] && exit 1; echo inactive > "$T/act/\$2" ;;
   start) [ -e "$T/startfail" ] && exit 1; [ -e "$T/startdies" ] && { echo inactive > "$T/act/\$2"; exit 0; }; echo active > "$T/act/\$2" ;;
-  list-units) [ -e "$T/listfail" ] && exit 1; for f in "$T"/act/debot-arcus-vol*; do [ "\$(cat "\$f")" = active ] && echo "\$(basename "\$f").service loaded active running x"; done ;;
+  list-units) [ -e "$T/listfail" ] && exit 1; for f in "$T"/act/debot-arcus-vol*; do [ "\$(cat "\$f")" = active ] && echo "\$(basename "\$f").service loaded active running x"; done; exit 0 ;;
   *) echo "unexpected systemctl \$*" >> "$T/bad" ;;
 esac
 SH
@@ -160,4 +160,26 @@ for u in "$HERE"/deploy/arcus_vol/units/arcus-vol-*.service; do
   grep -qx "TimeoutStartSec=600" "$u" || bad "no TimeoutStartSec=600 in $(basename "$u")"
 done; ok "TimeoutStartSec=600 on every pause/resume service"
 grep -l "arcus-vol-pause.sh" "$HERE"/deploy/arcus_vol/units/*.service >/dev/null 2>&1 && bad "a unit calls arcus-vol-pause.sh directly (bypasses the record)" || ok "all units go through the recorded path"
+
+# 10. run EVERY timer-driven unit's ExecStart (as systemd would) against the stubs:
+#     nothing running, no records → each must exit 0 and touch no unit
+for f in "$T"/act/debot-arcus-vol*; do echo inactive > "$f"; done
+rm -f "$T"/root/var/lib/arcus-vol-reopen/*; : > "$T/calls"; nexec=0
+for u in "$HERE"/deploy/arcus_vol/units/arcus-vol-*.service; do
+  line=$(grep -E '^ExecStart=' "$u" | head -1 | cut -d= -f2-)
+  [ -n "$line" ] || { bad "no ExecStart in $(basename "$u")"; continue; }
+  cmd=${line//\/opt\/debot\/scripts\//$HERE\/deploy\/arcus_vol\/scripts\/}
+  out=$(bash -c "$cmd" 2>&1); rc=$?; nexec=$((nexec + 1))
+  [ $rc = 0 ] || bad "ExecStart of $(basename "$u") exits $rc: $out"
+done
+[ $nexec = 8 ] && ok "ran all 8 unit ExecStart lines" || bad "ran $nexec unit ExecStart lines, expected 8"
+grep -qE "^(start|stop|restart) " "$T/calls" && bad "an idle ExecStart started/stopped a unit" || ok "idle ExecStart lines touch no unit"
+# and a recorded weekend round trip through the units' own command lines
+up hood; st hood "$FUT" kill_switch 0
+for a in pause resume; do
+  line=$(grep -E '^ExecStart=' "$HERE/deploy/arcus_vol/units/arcus-vol-$a-hood.service" | cut -d= -f2-)
+  bash -c "${line//\/opt\/debot\/scripts\//$HERE/deploy/arcus_vol/scripts/}" >/dev/null 2>&1 || bad "weekend $a unit command failed"
+  [ $a = pause ] && { [ "$(act hood)" = inactive ] && ok "weekend pause unit stops HOOD" || bad "weekend pause unit"; }
+done
+[ "$(act hood)" = active ] && [ ! -e "$T/root/var/lib/arcus-vol-reopen/weekend-hood" ] && ok "weekend resume unit restarts what its pause stopped" || bad "weekend resume unit"
 exit $fail

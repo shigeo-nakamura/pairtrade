@@ -3,4 +3,4 @@ Description=arcus-vol weekend resume for slv (bot-strategy#1093)
 [Service]
 Type=oneshot
 TimeoutStartSec=600
-ExecStart=/opt/debot/scripts/arcus-vol-reopen.sh resume --tag weekend-slv slv
+ExecStart=/opt/debot/scripts/arcus-vol-reopen.sh resume --tag weekend-slv
