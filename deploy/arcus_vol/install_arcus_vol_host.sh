@@ -25,19 +25,23 @@ SCRIPTS=${ARCUS_VOL_SCRIPTS_DIR:-/opt/debot/scripts}
 ROOT=${ARCUS_VOL_ROOT:-}            # test hook: prefix for /etc and /var/lib paths
 SYSTEMCTL=${ARCUS_VOL_SYSTEMCTL:-systemctl}
 OWN=(-o root -g root); [ "${ARCUS_VOL_TEST_NO_CHOWN:-}" = 1 ] && OWN=()   # test hook only
-drift=0; changed=(); ts=$(date -u +%Y%m%dT%H%M%SZ)
+drift=0; failed=0; changed=(); ts=$(date -u +%Y%m%dT%H%M%SZ)
 say() { echo "$*"; }
 d() { drift=1; say "DRIFT $*"; }
+failf() { failed=1; say "FAIL $*" >&2; }
 
 # file <repo-src> <host-dst> <mode>
 file() {
   local src=$1 dst=$2 mode=$3
   if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
-    local m; m=$(stat -c %a "$dst"); [ "$m" = "$mode" ] || { d "mode $dst $m != $mode"; [ $MODE = apply ] && chmod "$mode" "$dst"; }
+    local m; m=$(stat -c %a "$dst"); [ "$m" = "$mode" ] || { d "mode $dst $m != $mode"; [ $MODE = apply ] && { chmod "$mode" "$dst" || failf "chmod $dst"; }; }
     return 0
   fi
   if [ -f "$dst" ]; then d "content $dst"; else d "missing $dst"; fi
-  if [ $MODE = apply ]; then install "${OWN[@]}" -m "$mode" "$src" "$dst" && say "  installed $dst"; return 1; fi
+  if [ $MODE = apply ]; then
+    if install "${OWN[@]}" -m "$mode" "$src" "$dst"; then say "  installed $dst"; else failf "install $dst"; fi
+    return 1
+  fi
   return 1
 }
 
@@ -65,36 +69,47 @@ while read -r name unit etc state enab wallet note; do
     else
       if [ -f "$dst" ]; then d "content $dst"; else d "missing $dst"; fi
       if [ $MODE = apply ] && { [ ! -f "$dst" ] || [ $APPLY_CONFIG = 1 ]; }; then
-        mkdir -p -m 700 "$ROOT$etc"
-        [ -f "$dst" ] && cp -p "$dst" "$dst.bak-$ts"
-        install "${OWN[@]}" -m 644 "$cfg" "$dst" && say "  installed $dst"; changed+=("$unit")
+        mkdir -p -m 700 "$ROOT$etc" || failf "mkdir $ROOT$etc"
+        if [ -f "$dst" ] && ! cp -p "$dst" "$dst.bak-$ts"; then failf "backup $dst"
+        elif install "${OWN[@]}" -m 644 "$cfg" "$dst"; then say "  installed $dst"; changed+=("$unit")
+        else failf "install $dst"; fi
       elif [ $MODE = apply ]; then say "  kept host $dst (use --apply-config to overwrite)"; fi
     fi
   fi
-  [ $MODE = apply ] && mkdir -p "$ROOT$state/state" "$ROOT$state/locks"
+  [ $MODE = apply ] && { mkdir -p "$ROOT$state/state" "$ROOT$state/locks" || failf "mkdir $ROOT$state"; }
   # enablement only — never start/stop
   cur=$($SYSTEMCTL is-enabled "$unit" 2>/dev/null || true)
   if [ "$cur" != "$enab" ]; then
     d "enablement $unit $cur != $enab"
-    [ $MODE = apply ] && $SYSTEMCTL "${enab%d}" "$unit" >/dev/null 2>&1   # enable / disable (no --now)
+    [ $MODE = apply ] && { $SYSTEMCTL "${enab%d}" "$unit" >/dev/null 2>&1 || failf "${enab%d} $unit"; }   # enable / disable (no --now)
   fi
 done < "$HERE/instances.tsv"
 
 # 4. timers enabled + active
-if [ $MODE = apply ] && [ $reload = 1 ]; then $SYSTEMCTL daemon-reload; fi
+if [ $MODE = apply ] && [ $reload = 1 ]; then $SYSTEMCTL daemon-reload || failf daemon-reload; fi
 for t in "$HERE"/units/arcus-vol-*.timer; do
   t=$(basename "$t")
   e=$($SYSTEMCTL is-enabled "$t" 2>/dev/null || true); a=$($SYSTEMCTL is-active "$t" 2>/dev/null || true)
   if [ "$e" != enabled ] || [ "$a" != active ]; then
     d "timer $t enabled=$e active=$a"
-    [ $MODE = apply ] && $SYSTEMCTL enable --now "$t" >/dev/null 2>&1
+    [ $MODE = apply ] && { $SYSTEMCTL enable --now "$t" >/dev/null 2>&1 || failf "enable --now $t"; }
   fi
 done
 
 if [ $MODE = apply ] && [ ${#changed[@]} -gt 0 ]; then
-  say ""; say "Changed instance unit/config — restart is the OPERATOR's call (owner approval; check flat first):"
-  for u in $(printf '%s\n' "${changed[@]}" | sort -u); do say "  sudo systemctl restart $u"; done
+  # Only instances that are enabled AND running now need a restart to pick the
+  # change up; a disabled / stopped one (retired QQQ, stopped NVDA) must never
+  # be suggested. try-restart is a no-op if the unit stopped in the meantime.
+  hint=()
+  for u in $(printf '%s\n' "${changed[@]}" | sort -u); do
+    [ "$($SYSTEMCTL is-enabled "$u" 2>/dev/null)" = enabled ] && $SYSTEMCTL is-active --quiet "$u" && hint+=("$u")
+  done
+  if [ ${#hint[@]} -gt 0 ]; then
+    say ""; say "Changed unit/config of running instances — restart is the OPERATOR's call (owner approval; check flat first):"
+    for u in "${hint[@]}"; do say "  sudo systemctl try-restart $u"; done
+  fi
 fi
+if [ $failed = 1 ]; then say "apply FAILED (see FAIL lines above)"; exit 4; fi
 if [ $drift = 0 ]; then say "OK: host matches repo (deploy/arcus_vol)"; exit 0; fi
 [ $MODE = verify ] && { say "drift found (verify only, nothing changed)"; exit 1; }
 say "apply done (drift listed above was being corrected)"; exit 0
