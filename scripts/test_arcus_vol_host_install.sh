@@ -88,7 +88,7 @@ FUT=$(( $(date +%s) * 1000 + 3600000 )); OLD=$(( $(date +%s) * 1000 - 60000 ))
 st() { local q='{"bid":null,"ask":null}'; [ "${5:-}" = resting ] && q='{"bid":{"px":"1"},"ask":null}'
   local h=null; [ "$3" != null ] && h="\"$3\""
   mkdir -p "$T/root/var/lib/debot-arcus-vol-$1/state"
-  local mn=""; [ -n "${6:-}" ] && mn=",\"venue_min_qty\":\"$6\""
+  local mn=""; [ -n "${6:-}" ] && mn=",\"venue_min_qty\":\"$6\""; [ -n "${7:-}" ] && mn="$mn,\"dust\":$7"
   echo "{\"ts_ms\":$2,\"halt\":$h,\"quotes\":$q,\"inventory\":{\"qty\":\"$4\"$mn}}" > "$T/root/var/lib/debot-arcus-vol-$1/state/status.json"; }
 ks() { [ -f "$T/root/var/lib/debot-arcus-vol-$1/state/KILL_SWITCH" ]; }
 act() { cat "$T/act/debot-arcus-vol-$1"; }
@@ -142,6 +142,11 @@ up aapl; st aapl "$FUT" kill_switch 0.02 "" 0.0146458
 bash "$PS" pause aapl >/dev/null 2>&1; rc=$?
 [ $rc = 3 ] && [ "$(act aapl)" = active ] && ok "tradeable inventory above venue_min_qty is not flat: not stopped" || bad "above-min pause rc=$rc"
 rm -f "$T"/root/var/lib/debot-arcus-vol-aapl/state/KILL_SWITCH
+# runtime marked it dust (min unknown / flatten rejected): honour inventory.dust
+up aapl; st aapl "$FUT" kill_switch 0.05 "" "" true
+bash "$PS" pause aapl >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act aapl)" = inactive ] && ok "inventory.dust=true is flat even without venue_min_qty" || bad "dust flag pause rc=$rc"
+up aapl; rm -f "$T"/root/var/lib/debot-arcus-vol-aapl/state/KILL_SWITCH
 
 # 9. weekend path (own record per tag) and record-before-pause
 for f in "$T"/root/var/lib/debot-arcus-vol-*/state/KILL_SWITCH; do rm -f "$f"; done

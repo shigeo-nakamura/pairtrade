@@ -44,7 +44,7 @@ acked() { python3 - "$C/status.json" "$1" <<'PY'
 import json, sys
 def flat(inv):
     q = abs(float(inv["qty"]))
-    if q < 1e-9:
+    if q < 1e-9 or inv.get("dust") is True:   # the runtime's own dust decision wins
         return True
     m = inv.get("venue_min_qty")
     return m is not None and 0 < float(m) and q < float(m)
