@@ -14,9 +14,10 @@ byte-for-byte from the host on 2026-10-12; `install_arcus_vol_host.sh
 | `config/qqq.config.retired` | — | QQQ retired 2026-10-10; host keeps `config.env.retired-*`, no `config.env` |
 | `scripts/arcus-vol-pause.sh` | `/opt/debot/scripts/` | pause = KILL_SWITCH → wait flat → stop; resume = start |
 | `scripts/arcus-vol-reopen.sh` | `/opt/debot/scripts/` | pause every ACTIVE instance (records them), resume only those |
-| `units/arcus-vol-{pause,resume}-{hood,slv}.*` | `/etc/systemd/system/` | HOOD/SLV weekend pause: Sat 00:00 UTC → Sun 20:10 New York (via `arcus-vol-reopen.sh --tag weekend-<m>`: only a bot the pause actually stopped is resumed) |
+| `units/arcus-vol-{pause,resume}-slv.*` | `/etc/systemd/system/` | SLV weekend pause (HOOD's removed 2026-10-13 with HOOD): Sat 00:00 UTC → Sun 20:10 New York (via `arcus-vol-reopen.sh --tag weekend-<m>`: only a bot the pause actually stopped is resumed) |
 | `units/arcus-vol-reopen-{pause,resume}.*` | `/etc/systemd/system/` | Sunday reopen blackout 17:55–18:05 and 19:55–20:05 New York |
 | `units/arcus-vol-open-{pause,resume}.*` | `/etc/systemd/system/` | weekday cash-open blackout 09:28–09:35 New York |
+| `units/arcus-vol-evening-{pause,resume}.*` | `/etc/systemd/system/` | weekday overnight-session-start blackout 19:55–20:05 New York, Mon–Thu (Fri 20:00 is the weekend pause) |
 
 The config files are named `.config` (not `.env`) because `*.env` is
 gitignored repo-wide as a secrets guard. `live.env` (credentials, KMS-encrypted key) is never in the repo, never read
