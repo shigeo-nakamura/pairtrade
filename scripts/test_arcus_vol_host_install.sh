@@ -156,6 +156,12 @@ bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1
 echo disabled > "$T/en/debot-arcus-vol-hood"; : > "$T/calls"
 bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && [ "$(act hood)" = inactive ] && ! grep -q "^start debot-arcus-vol-hood" "$T/calls" && ok "resume leaves a bot disabled after the pause stopped" || bad "resume started a disabled bot rc=$rc"
+# enablement lookup fails (garbage/unknown) → error, record kept for retry, not started
+up hood; st hood "$FUT" kill_switch 0; rm -f "$RD"/weekend-hood; echo enabled > "$T/en/debot-arcus-vol-hood"
+bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1
+echo "Failed to get unit file state" > "$T/en/debot-arcus-vol-hood"; : > "$T/calls"
+bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
+[ $rc != 0 ] && [ "$(act hood)" = inactive ] && grep -qx hood "$RD/weekend-hood" && ! grep -q "^start debot-arcus-vol-hood" "$T/calls" && ok "enablement lookup failure: rc≠0, record kept, not started" || bad "lookup failure rc=$rc"
 echo enabled > "$T/en/debot-arcus-vol-hood"; up hood; rm -f "$RD"/weekend-hood
 # record cannot be written → nothing paused, rc≠0
 up gld slv; st gld "$FUT" kill_switch 0; st slv "$FUT" kill_switch 0; rm -f "$RD"/*; chmod 500 "$RD"; : > "$T/calls"
