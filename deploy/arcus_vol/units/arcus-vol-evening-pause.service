@@ -1,0 +1,6 @@
+[Unit]
+Description=arcus-vol weekday evening (overnight-session start) blackout pause (bot-strategy#1093)
+[Service]
+Type=oneshot
+TimeoutStartSec=600
+ExecStart=/opt/debot/scripts/arcus-vol-reopen.sh pause

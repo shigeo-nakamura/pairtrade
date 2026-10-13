@@ -3,7 +3,7 @@
 spy     debot-arcus-vol       /etc/debot-arcus-vol       /var/lib/debot-arcus-vol    enabled     0xA2C7  base unit = deploy/debot-arcus-vol.service
 gld     debot-arcus-vol-gld   /etc/debot-arcus-vol-gld   /var/lib/debot-arcus-vol-gld   enabled  0xA2C7  -
 aapl    debot-arcus-vol-aapl  /etc/debot-arcus-vol-aapl  /var/lib/debot-arcus-vol-aapl  enabled  0x812B  -
-hood    debot-arcus-vol-hood  /etc/debot-arcus-vol-hood  /var/lib/debot-arcus-vol-hood  enabled  0x812B  weekend pause timers
+hood    debot-arcus-vol-hood  /etc/debot-arcus-vol-hood  /var/lib/debot-arcus-vol-hood  disabled 0x812B  stopped 2026-10-13 (cum -19.50 of 20, markout60 -5.09 bp); weekend timers removed
 slv     debot-arcus-vol-slv   /etc/debot-arcus-vol-slv   /var/lib/debot-arcus-vol-slv   enabled  0x812B  weekend pause timers
 nvda    debot-arcus-vol-nvda  /etc/debot-arcus-vol-nvda  /var/lib/debot-arcus-vol-nvda  disabled 0x812B  stopped 2026-10-12 (cum -29.59 of 30)
 qqq     debot-arcus-vol-qqq   /etc/debot-arcus-vol-qqq   /var/lib/debot-arcus-vol-qqq   disabled 0x812B  retired 2026-10-10 (config.env renamed .retired-*)

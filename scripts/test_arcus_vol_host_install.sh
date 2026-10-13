@@ -136,6 +136,8 @@ touch "$T/listfail"; up gld; bash "$RS" pause >/dev/null 2>&1; rc=$?; rm -f "$T/
 # 9. weekend path (own record per tag) and record-before-pause
 for f in "$T"/root/var/lib/debot-arcus-vol-*/state/KILL_SWITCH; do rm -f "$f"; done
 RD="$T/root/var/lib/arcus-vol-reopen"; rm -f "$RD"/*
+# the tag/record logic is exercised on hood (disabled in instances.tsv since 2026-10-13): enable it in the stub
+echo enabled > "$T/en/debot-arcus-vol-hood"
 # operator stopped HOOD before Saturday: weekend pause skips it, resume must not start it
 echo inactive > "$T/act/debot-arcus-vol-hood"; : > "$T/calls"
 bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1; rc=$?
@@ -188,11 +190,17 @@ done
 [ $nexec = 8 ] && ok "ran all 8 unit ExecStart lines" || bad "ran $nexec unit ExecStart lines, expected 8"
 grep -qE "^(start|stop|restart) " "$T/calls" && bad "an idle ExecStart started/stopped a unit" || ok "idle ExecStart lines touch no unit"
 # and a recorded weekend round trip through the units' own command lines
-up hood; st hood "$FUT" kill_switch 0
+up slv; st slv "$FUT" kill_switch 0
 for a in pause resume; do
-  line=$(grep -E '^ExecStart=' "$HERE/deploy/arcus_vol/units/arcus-vol-$a-hood.service" | cut -d= -f2-)
+  line=$(grep -E '^ExecStart=' "$HERE/deploy/arcus_vol/units/arcus-vol-$a-slv.service" | cut -d= -f2-)
   bash -c "${line//\/opt\/debot\/scripts\//$HERE/deploy/arcus_vol/scripts/}" >/dev/null 2>&1 || bad "weekend $a unit command failed"
-  [ $a = pause ] && { [ "$(act hood)" = inactive ] && ok "weekend pause unit stops HOOD" || bad "weekend pause unit"; }
+  [ $a = pause ] && { [ "$(act slv)" = inactive ] && ok "weekend pause unit stops SLV" || bad "weekend pause unit"; }
 done
-[ "$(act hood)" = active ] && [ ! -e "$T/root/var/lib/arcus-vol-reopen/weekend-hood" ] && ok "weekend resume unit restarts what its pause stopped" || bad "weekend resume unit"
+[ "$(act slv)" = active ] && [ ! -e "$T/root/var/lib/arcus-vol-reopen/weekend-slv" ] && ok "weekend resume unit restarts what its pause stopped" || bad "weekend resume unit"
+# evening blackout: Mon..Thu only (Friday 20:00 NY is the weekend pause), 19:55 / 20:05 New York
+for a in pause resume; do
+  t="$HERE/deploy/arcus_vol/units/arcus-vol-evening-$a.timer"
+  grep -qx "OnCalendar=Mon..Thu \*-\*-\* $([ $a = pause ] && echo 19:55 || echo 20:05):00 America/New_York" "$t" && ok "evening $a timer Mon..Thu" || bad "evening $a timer calendar"
+done
+[ ! -e "$HERE/deploy/arcus_vol/units/arcus-vol-pause-hood.timer" ] && ok "HOOD weekend timers removed" || bad "HOOD weekend timers still present"
 exit $fail

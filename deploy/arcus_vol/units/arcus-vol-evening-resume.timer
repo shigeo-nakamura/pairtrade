@@ -1,0 +1,9 @@
+[Unit]
+Description=arcus-vol weekday evening blackout resume (bot-strategy#1093)
+[Timer]
+# Mon..Thu only: Friday 20:00 New York is the HOOD/SLV weekend pause (Sat 00:00 UTC);
+# an evening resume at 20:05 Friday would restart a weekend-paused bot.
+OnCalendar=Mon..Thu *-*-* 20:05:00 America/New_York
+Persistent=false
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,0 @@
-[Unit]
-Description=arcus-vol weekend pause for hood (bot-strategy#1093)
-[Service]
-Type=oneshot
-TimeoutStartSec=600
-ExecStart=/opt/debot/scripts/arcus-vol-reopen.sh pause --tag weekend-hood hood
