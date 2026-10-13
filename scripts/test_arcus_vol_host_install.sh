@@ -14,7 +14,7 @@ cat > "$T/bin/systemctl" <<SH
 echo "\$*" >> "$T/calls"
 q=0; [ "\$2" = --quiet ] && { q=1; set -- "\$1" "\$3"; }
 case "\$1" in
-  is-enabled) cat "$T/en/\$2" 2>/dev/null || { echo disabled; exit 1; } ;;
+  is-enabled) s=\$(cat "$T/en/\$2" 2>/dev/null || echo disabled); [ \$q = 1 ] || echo "\$s"; [ "\$s" = enabled ] ;;
   is-active) s=\$(cat "$T/act/\$2" 2>/dev/null || echo inactive); [ \$q = 1 ] || echo "\$s"; [ "\$s" = active ] ;;
   enable) [ "\$2" = --now ] && { echo enabled > "$T/en/\$3"; echo active > "$T/act/\$3"; } || echo enabled > "$T/en/\$2" ;;
   disable) echo disabled > "$T/en/\$2" ;;
@@ -150,6 +150,19 @@ bash "$RS" resume >/dev/null 2>&1
 [ "$(act hood)" = inactive ] && ok "default-tag resume ignores the weekend record" || bad "default resume started hood"
 bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && [ "$(act hood)" = active ] && [ ! -e "$RD/weekend-hood" ] && ok "weekend resume starts what it stopped, record removed" || bad "weekend resume rc=$rc"
+# operator disabled HOOD after the weekend pause → resume must leave it stopped
+st hood "$FUT" kill_switch 0
+bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1
+echo disabled > "$T/en/debot-arcus-vol-hood"; : > "$T/calls"
+bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act hood)" = inactive ] && ! grep -q "^start debot-arcus-vol-hood" "$T/calls" && ok "resume leaves a bot disabled after the pause stopped" || bad "resume started a disabled bot rc=$rc"
+# enablement lookup fails (garbage/unknown) → error, record kept for retry, not started
+up hood; st hood "$FUT" kill_switch 0; rm -f "$RD"/weekend-hood; echo enabled > "$T/en/debot-arcus-vol-hood"
+bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1
+echo "Failed to get unit file state" > "$T/en/debot-arcus-vol-hood"; : > "$T/calls"
+bash "$RS" resume --tag weekend-hood >/dev/null 2>&1; rc=$?
+[ $rc != 0 ] && [ "$(act hood)" = inactive ] && grep -qx hood "$RD/weekend-hood" && ! grep -q "^start debot-arcus-vol-hood" "$T/calls" && ok "enablement lookup failure: rc≠0, record kept, not started" || bad "lookup failure rc=$rc"
+echo enabled > "$T/en/debot-arcus-vol-hood"; up hood; rm -f "$RD"/weekend-hood
 # record cannot be written → nothing paused, rc≠0
 up gld slv; st gld "$FUT" kill_switch 0; st slv "$FUT" kill_switch 0; rm -f "$RD"/*; chmod 500 "$RD"; : > "$T/calls"
 bash "$RS" pause >/dev/null 2>&1; rc=$?; chmod 700 "$RD"

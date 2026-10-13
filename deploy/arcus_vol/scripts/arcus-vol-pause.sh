@@ -76,6 +76,16 @@ case "$ACT" in
     rm -f "$C/KILL_SWITCH"
     echo "$U paused (inactive)" ;;
   resume)
+    # An operator who disabled the unit after the pause wants it to stay down
+    # (e.g. a risk hold over the weekend): leave it — and any KILL_SWITCH — alone.
+    # Only an explicit disabled/masked state is a hold; a failed lookup is an
+    # error (nonzero) so the caller keeps the record and retries.
+    en=$($SYSTEMCTL is-enabled "$U" 2>/dev/null)
+    case "$en" in
+      enabled|enabled-runtime|static|indirect|alias|generated|transient) ;;
+      disabled|masked|masked-runtime) echo "$U is $en: not resuming (operator hold)"; exit 0 ;;
+      *) loud "is-enabled lookup failed (${en:-no output}); not resuming"; exit 6 ;;
+    esac
     rm -f "$C/KILL_SWITCH"
     if ! $SYSTEMCTL start "$U"; then loud "start failed"; exit 5; fi
     sleep "$SETTLE_S"
