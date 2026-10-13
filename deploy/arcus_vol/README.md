@@ -50,6 +50,12 @@ approval for any bot restart on this host; check the instance is flat).
   weekend pause. A failed short blackout shows up only in the journal
   (`journalctl -u arcus-vol-open-pause -u arcus-vol-reopen-pause`, syslog tag
   `arcus-vol-reopen` / `arcus-vol-pause`).
+- **Run instances enabled.** Resume treats a `disabled`/`masked` unit as an
+  operator hold and leaves it stopped. An instance that was started by hand
+  while disabled will therefore be paused by a blackout and never resumed.
+  Keep every live instance `enabled` (as `instances.tsv` and `--apply` do);
+  disable a unit only when it should stay down. A failed `is-enabled` lookup is
+  an error: resume exits 6 and keeps the record for the next run (#396).
 
 ## Rule
 
