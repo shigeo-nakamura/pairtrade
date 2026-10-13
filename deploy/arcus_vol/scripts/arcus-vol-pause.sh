@@ -76,6 +76,11 @@ case "$ACT" in
     rm -f "$C/KILL_SWITCH"
     echo "$U paused (inactive)" ;;
   resume)
+    # An operator who disabled the unit after the pause wants it to stay down
+    # (e.g. a risk hold over the weekend): leave it — and any KILL_SWITCH — alone.
+    if ! $SYSTEMCTL is-enabled --quiet "$U" 2>/dev/null; then
+      echo "$U is disabled: not resuming (operator hold)"; exit 0
+    fi
     rm -f "$C/KILL_SWITCH"
     if ! $SYSTEMCTL start "$U"; then loud "start failed"; exit 5; fi
     sleep "$SETTLE_S"
