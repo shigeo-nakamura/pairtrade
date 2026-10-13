@@ -88,7 +88,8 @@ FUT=$(( $(date +%s) * 1000 + 3600000 )); OLD=$(( $(date +%s) * 1000 - 60000 ))
 st() { local q='{"bid":null,"ask":null}'; [ "${5:-}" = resting ] && q='{"bid":{"px":"1"},"ask":null}'
   local h=null; [ "$3" != null ] && h="\"$3\""
   mkdir -p "$T/root/var/lib/debot-arcus-vol-$1/state"
-  echo "{\"ts_ms\":$2,\"halt\":$h,\"quotes\":$q,\"inventory\":{\"qty\":\"$4\"}}" > "$T/root/var/lib/debot-arcus-vol-$1/state/status.json"; }
+  local mn=""; [ -n "${6:-}" ] && mn=",\"venue_min_qty\":\"$6\""
+  echo "{\"ts_ms\":$2,\"halt\":$h,\"quotes\":$q,\"inventory\":{\"qty\":\"$4\"$mn}}" > "$T/root/var/lib/debot-arcus-vol-$1/state/status.json"; }
 ks() { [ -f "$T/root/var/lib/debot-arcus-vol-$1/state/KILL_SWITCH" ]; }
 act() { cat "$T/act/debot-arcus-vol-$1"; }
 up() { for n in "$@"; do echo active > "$T/act/debot-arcus-vol-$n"; done; }
@@ -132,6 +133,15 @@ bash "$RS" resume >/dev/null 2>&1; rc=$?
 [ "$(act hood)" = inactive ] && ok "reopen never starts an instance it did not pause" || bad "hood started"
 touch "$T/listfail"; up gld; bash "$RS" pause >/dev/null 2>&1; rc=$?; rm -f "$T/listfail"
 [ $rc = 1 ] && [ "$(act gld)" = active ] && [ ! -s "$rec" ] && ok "list-units fails: pause exits 1, nothing claimed" || bad "list-fail rc=$rc"
+
+# 8b. venue dust counts as flat (AAPL 2026-10-13: 0.0070712 < min 0.0146458 never reached 0)
+up aapl; st aapl "$FUT" kill_switch 0.0070712 "" 0.0146458; : > "$T/calls"
+bash "$PS" pause aapl >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && [ "$(act aapl)" = inactive ] && ok "dust below venue_min_qty is flat: paused" || bad "dust pause rc=$rc"
+up aapl; st aapl "$FUT" kill_switch 0.02 "" 0.0146458
+bash "$PS" pause aapl >/dev/null 2>&1; rc=$?
+[ $rc = 3 ] && [ "$(act aapl)" = active ] && ok "tradeable inventory above venue_min_qty is not flat: not stopped" || bad "above-min pause rc=$rc"
+rm -f "$T"/root/var/lib/debot-arcus-vol-aapl/state/KILL_SWITCH
 
 # 9. weekend path (own record per tag) and record-before-pause
 for f in "$T"/root/var/lib/debot-arcus-vol-*/state/KILL_SWITCH; do rm -f "$f"; done

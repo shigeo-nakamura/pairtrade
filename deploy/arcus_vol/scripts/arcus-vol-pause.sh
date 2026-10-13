@@ -37,15 +37,23 @@ C=$(grep -E '^STATE_DIR=' "$E" | cut -d= -f2)
 [ -n "$C" ] || C=/var/lib/$U/state
 C=$ROOT$C
 loud() { echo "ERROR $U: $*" >&2; logger -t arcus-vol-pause -p user.err "$U: $*" 2>/dev/null || true; }
-# exit 0 iff status.json was written after $1 (epoch ms) and shows halt + no quotes + flat
+# exit 0 iff status.json was written after $1 (epoch ms) and shows halt + no quotes + flat.
+# "flat" includes venue dust: |qty| below inventory.venue_min_qty cannot be traded
+# (the runtime carries it by design), so waiting for exact zero never ends (AAPL 2026-10-13).
 acked() { python3 - "$C/status.json" "$1" <<'PY'
 import json, sys
+def flat(inv):
+    q = abs(float(inv["qty"]))
+    if q < 1e-9:
+        return True
+    m = inv.get("venue_min_qty")
+    return m is not None and 0 < float(m) and q < float(m)
 try:
     d = json.load(open(sys.argv[1])); since = int(sys.argv[2])
     q = d.get("quotes") or {}
     ok = (int(d["ts_ms"]) > since and d.get("halt") is not None
           and q.get("bid") is None and q.get("ask") is None
-          and abs(float(d["inventory"]["qty"])) < 1e-9)
+          and flat(d["inventory"]))
 except Exception:
     ok = False
 sys.exit(0 if ok else 1)
