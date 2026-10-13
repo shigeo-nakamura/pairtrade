@@ -13,6 +13,7 @@ scripts/venv/
 *.md
 !online_adaptation_plan.md
 !docs/*.md
+!deploy/arcus_vol/README.md
 *.patch
 pairtrade_history.json
 *.swp

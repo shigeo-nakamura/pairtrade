@@ -31,6 +31,12 @@ ap-northeast-1, aarch64 AL2023) has a stable IPv4 path.
 | `/opt/debot/scripts/debot-arcus-vol.env.example` | both env files' keys with defaults (`scripts/`) |
 | `/etc/systemd/system/debot-arcus-vol.service` | unit (`deploy/`) |
 
+Per-market instances (`debot-arcus-vol-<market>`), their `config.env`, the
+pause/reopen scripts and the weekend / reopen / cash-open blackout timers are
+host state that the deploy workflow does not install: they live in
+[`deploy/arcus_vol/`](../deploy/arcus_vol/README.md) with an idempotent
+`install_arcus_vol_host.sh` (`--verify` reports repo-vs-host drift).
+
 ## Deploy (workflow_dispatch, never starts the unit)
 
 ```bash

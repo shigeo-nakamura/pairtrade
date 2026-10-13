@@ -1,0 +1,7 @@
+[Unit]
+Description=arcus-vol weekday open blackout resume (bot-strategy#1093)
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:35:00 America/New_York
+Persistent=false
+[Install]
+WantedBy=timers.target
