@@ -1843,15 +1843,18 @@ impl Runtime {
         }
         let sent = now_ms();
         let prev_ok = self.dms_last_ok_ms;
+        // After a restart the runtime's own last-ok is gone; the persisted one
+        // still dates the previous process's arm (an expiry while down counts).
+        let lapse_base = prev_ok.or(self.dms_health.last_ok_ms);
         // A lapse is counted on the attempt, whatever its result (a capped
         // day answers 429, a stall times out) -- once per expired arm.
         if self
             .dms_health
-            .note_attempt(&day, sent, prev_ok, self.cfg.dms_secs)
+            .note_attempt(&day, sent, lapse_base, self.cfg.dms_secs)
         {
             log::warn!(
                 "[ARCUS_VOL] dead man's switch refresh due {}s after the previous one (deadline {}s): it most likely FIRED (Arcus caps fires at 10 per UTC day per subaccount); suspected fires today {}",
-                sent.saturating_sub(prev_ok.unwrap_or(sent)) / 1_000,
+                sent.saturating_sub(lapse_base.unwrap_or(sent)) / 1_000,
                 self.cfg.dms_secs,
                 self.dms_health.suspected_fires
             );
@@ -1876,11 +1879,10 @@ impl Runtime {
                 let done = now_ms();
                 self.dms_last_ok_ms = Some(now);
                 self.dms_last_failed = false;
-                let had_streak = self.dms_health.streak > 0;
-                self.dms_health.on_ok(&day, sent, done);
-                if had_streak {
-                    self.save_dms_health();
-                }
+                self.dms_health.on_ok(&day, now, sent, done);
+                // every success: the persisted last-ok dates the arm for a
+                // restart (tiny file, one write per refresh)
+                self.save_dms_health();
             }
             Ok(Err(e)) => {
                 self.dms_last_failed = true;

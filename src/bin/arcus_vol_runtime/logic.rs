@@ -1183,6 +1183,11 @@ pub struct DmsHealth {
     /// The last-ok time whose expiry was already counted.
     #[serde(default)]
     counted_for: Option<u64>,
+    /// The last successful arm (persisted): after a restart it is the baseline
+    /// for counting an expiry that happened while the process was down. Never
+    /// used to decide that the switch is armed.
+    #[serde(default)]
+    pub last_ok_ms: Option<u64>,
 }
 
 pub const DMS_BACKOFF_FIRST_MS: u64 = 30_000;
@@ -1195,7 +1200,12 @@ impl DmsHealth {
     pub fn restore(saved: Option<DmsHealth>, day: &str) -> DmsHealth {
         match saved {
             Some(h) if h.day == day => h,
-            _ => DmsHealth {
+            Some(h) => DmsHealth {
+                day: day.to_string(),
+                last_ok_ms: h.last_ok_ms,
+                ..DmsHealth::default()
+            },
+            None => DmsHealth {
                 day: day.to_string(),
                 ..DmsHealth::default()
             },
@@ -1206,6 +1216,7 @@ impl DmsHealth {
         if self.day != day {
             *self = DmsHealth {
                 day: day.to_string(),
+                last_ok_ms: self.last_ok_ms,
                 ..DmsHealth::default()
             };
         }
@@ -1236,9 +1247,11 @@ impl DmsHealth {
         true
     }
 
-    /// A successful arm/refresh sent at `sent_ms`, answered at `done_ms`.
-    pub fn on_ok(&mut self, day: &str, sent_ms: u64, done_ms: u64) {
+    /// A successful arm/refresh sent at `sent_ms`, answered at `done_ms`;
+    /// `ok_ms` is the runtime's armed-since time (its tick start).
+    pub fn on_ok(&mut self, day: &str, ok_ms: u64, sent_ms: u64, done_ms: u64) {
         self.roll(day);
+        self.last_ok_ms = Some(ok_ms);
         let latency = done_ms.saturating_sub(sent_ms);
         self.last_latency_ms = Some(latency);
         self.max_latency_ms = self.max_latency_ms.max(latency);
@@ -1334,10 +1347,10 @@ mod tests {
         let d = "2026-10-14";
         // first arm after start: nothing to compare against
         assert!(!h.note_attempt(d, 1_000, None, 60));
-        h.on_ok(d, 1_000, 1_200);
+        h.on_ok(d, 1_000, 1_000, 1_200);
         // on time (10 s after the last ok)
         assert!(!h.note_attempt(d, 11_000, Some(1_000), 60));
-        h.on_ok(d, 11_000, 11_100);
+        h.on_ok(d, 11_000, 11_000, 11_100);
         // sent 60 s after the last ok: the deadline had passed -> counted,
         // even though this attempt is refused (429) ...
         assert!(h.note_attempt(d, 71_000, Some(11_000), 60));
@@ -1346,7 +1359,7 @@ mod tests {
         assert!(!h.note_attempt(d, 101_000, Some(11_000), 60));
         assert!(!h.note_attempt(d, 131_000, Some(11_000), 60));
         assert_eq!(h.suspected_fires, 1);
-        h.on_ok(d, 131_000, 131_050);
+        h.on_ok(d, 131_000, 131_000, 131_050);
         assert_eq!(h.last_latency_ms, Some(50));
         assert_eq!(h.max_latency_ms, 200);
         // a later lapse of the new arm counts again
@@ -1378,10 +1391,29 @@ mod tests {
         // the cap resets at 00:00Z: a new day may call at once
         assert!(h.may_call("2026-10-15", t0 + 1));
         // a success clears the streak and the wait
-        h.on_ok(d, t0 + 900_000, t0 + 900_100);
+        h.on_ok(d, t0 + 900_000, t0 + 900_000, t0 + 900_100);
         assert_eq!(h.streak, 0);
         assert!(h.may_call(d, t0 + 900_100));
         assert_eq!(h.rate_limited, 14);
+    }
+
+    #[test]
+    fn dms_expiry_while_the_process_was_down_is_counted_after_restart() {
+        let d = "2026-10-14";
+        let mut h = DmsHealth::default();
+        h.on_ok(d, 10_000, 10_010, 10_050);
+        let saved: DmsHealth = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        // restart 90 s later: the runtime's own last-ok is gone, the saved one is not
+        let mut r = DmsHealth::restore(Some(saved.clone()), d);
+        assert!(r.note_attempt(d, 100_000, r.last_ok_ms, 60));
+        assert_eq!(r.suspected_fires, 1);
+        // a quick restart (within the deadline) is not a fire
+        let mut q = DmsHealth::restore(Some(saved.clone()), d);
+        assert!(!q.note_attempt(d, 40_000, q.last_ok_ms, 60));
+        // across midnight the baseline survives, the counters reset
+        let n = DmsHealth::restore(Some(saved), "2026-10-15");
+        assert_eq!(n.last_ok_ms, Some(10_000));
+        assert_eq!(n.suspected_fires, 0);
     }
 
     #[test]

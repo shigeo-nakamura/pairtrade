@@ -1840,6 +1840,9 @@ mod tests {
         assert!(flat.contains(
             "timeout(limit,self.dex.schedule_cancel_market(&self.cfg.market,Some(self.cfg.dms_secs))"
         ));
+        // A lapse is dated from the persisted last arm after a restart.
+        assert!(flat.contains("letlapse_base=prev_ok.or(self.dms_health.last_ok_ms);"));
+        assert!(flat.contains(".note_attempt(&day,sent,lapse_base,self.cfg.dms_secs)"));
         // An unconfirmed / failed per-market disarm at shutdown is a WARN and
         // the shutdown carries on (Codex P1 on dex-connector#131).
         let disarm = flat
