@@ -298,7 +298,7 @@ order on subaccount 0 (a manual NEAR-USD limit was lost that way on
   the connector immediately disarms the account-wide switch again (the error
   line says whether that worked).
 - At shutdown an unconfirmed per-market disarm is only a WARN ("…switch may
-  still fire within 30s -- it only cancels SPY-USD orders, which are already
+  still fire within 60s -- it only cancels SPY-USD orders, which are already
   cancelled; exiting normally"): the quotes were cancelled and read back
   before the disarm.
 - Venue quotas: 10 auto-fires per UTC day per subaccount (shared by all of
