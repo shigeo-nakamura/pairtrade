@@ -1819,10 +1819,27 @@ mod tests {
         assert!(flat.contains("self.legacy_dms_cleared=true;"));
         // The legacy switch counts as cleared only after a confirmed disarm,
         // and the per-market arm waits for it (Codex P1 on #386).
+        assert!(flat
+            .contains("Ok(Ok(()))=>{log::info!(\"[ARCUS_VOL]account-widedeadman'sswitchdisarmed"));
+        // A failed or timed-out legacy disarm returns before the arm
+        // (bot-strategy#1093: both calls are bounded by a timeout now).
+        let between = &flat[legacy..arm];
         assert!(
-            flat.contains("Ok(())=>{log::info!(\"[ARCUS_VOL]account-widedeadman'sswitchdisarmed")
+            between.matches("return;").count() >= 2,
+            "the arm must wait for a confirmed legacy disarm: {between}"
         );
-        assert!(flat.contains("ifdue&&self.legacy_dms_cleared{"));
+        // bot-strategy#1093 (2026-10-14): the switch is refreshed first in
+        // every tick, before any venue call that can stall, and the arm call
+        // itself is bounded by a short timeout.
+        assert!(
+            flat.contains(
+                "if!self.cfg.dry_run{self.refresh_dms(now).await;}self.read_book(now).await;"
+            ),
+            "refresh_dms must run before the tick's first venue call"
+        );
+        assert!(flat.contains(
+            "timeout(limit,self.dex.schedule_cancel_market(&self.cfg.market,Some(self.cfg.dms_secs))"
+        ));
         // An unconfirmed / failed per-market disarm at shutdown is a WARN and
         // the shutdown carries on (Codex P1 on dex-connector#131).
         let disarm = flat

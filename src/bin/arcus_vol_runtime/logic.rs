@@ -1151,6 +1151,98 @@ pub fn dms_armed(
     !last_attempt_failed && last_ok_ms.is_some_and(|t| now_ms.saturating_sub(t) < dms_secs * 1_000)
 }
 
+/// Refresh bookkeeping of the per-market dead man's switch (bot-strategy#1093,
+/// 2026-10-14 incident: refreshes queued behind slow venue calls missed the
+/// deadline, Arcus fired the switch ~10x per wallet and then refused every arm
+/// with 429 "trigger limit reached (10 per UTC day)" until 00:00Z; the runtime
+/// retried every 500 ms tick and logged/emailed each one).
+///
+/// * A refresh whose request was sent `dms_secs` or more after the last
+///   successful one cannot have beaten the venue deadline: the switch fired
+///   (a *suspected fire*; Arcus counts fires, not arms or refreshes).
+/// * After a 429 the next arm attempt waits 30 s, doubling per consecutive
+///   429 up to 10 min (never earlier than the venue's own retry time), so a
+///   capped day costs a few calls an hour instead of two a second. A new UTC
+///   day (the cap's reset) clears the wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DmsHealth {
+    /// UTC day the counters belong to.
+    pub day: String,
+    pub suspected_fires: u32,
+    pub rate_limited: u32,
+    pub last_latency_ms: Option<u64>,
+    pub max_latency_ms: u64,
+    /// Consecutive 429s on the arm/refresh (reset by a success).
+    pub streak: u32,
+    /// No arm/refresh attempt before this (epoch ms); 0 = none pending.
+    pub retry_at_ms: u64,
+    alerted: bool,
+}
+
+pub const DMS_BACKOFF_FIRST_MS: u64 = 30_000;
+pub const DMS_BACKOFF_MAX_MS: u64 = 600_000;
+
+impl DmsHealth {
+    fn roll(&mut self, day: &str) {
+        if self.day != day {
+            *self = DmsHealth {
+                day: day.to_string(),
+                ..DmsHealth::default()
+            };
+        }
+    }
+
+    /// May an arm/refresh be sent now? Always on a new UTC day.
+    pub fn may_call(&self, day: &str, now_ms: u64) -> bool {
+        self.day != day || now_ms >= self.retry_at_ms
+    }
+
+    /// A successful arm/refresh sent at `sent_ms`, answered at `done_ms`.
+    /// Returns true when it landed after the previous deadline (suspected fire).
+    pub fn on_ok(
+        &mut self,
+        day: &str,
+        sent_ms: u64,
+        done_ms: u64,
+        prev_ok_ms: Option<u64>,
+        dms_secs: u64,
+    ) -> bool {
+        self.roll(day);
+        let latency = done_ms.saturating_sub(sent_ms);
+        self.last_latency_ms = Some(latency);
+        self.max_latency_ms = self.max_latency_ms.max(latency);
+        self.streak = 0;
+        self.retry_at_ms = 0;
+        let lapsed = prev_ok_ms.is_some_and(|t| sent_ms.saturating_sub(t) >= dms_secs * 1_000);
+        if lapsed {
+            self.suspected_fires += 1;
+        }
+        lapsed
+    }
+
+    /// A 429 on the arm/refresh: returns the time of the next attempt.
+    pub fn on_rate_limited(&mut self, day: &str, now_ms: u64, venue_until_ms: u64) -> u64 {
+        self.roll(day);
+        self.rate_limited += 1;
+        self.streak += 1;
+        let shift = (self.streak - 1).min(16);
+        let wait = DMS_BACKOFF_FIRST_MS
+            .saturating_mul(1u64 << shift)
+            .min(DMS_BACKOFF_MAX_MS);
+        self.retry_at_ms = venue_until_ms.max(now_ms + wait);
+        self.retry_at_ms
+    }
+
+    /// True once per UTC day when the suspected fires reach `threshold`.
+    pub fn take_alert(&mut self, threshold: u32) -> bool {
+        if threshold > 0 && !self.alerted && self.suspected_fires >= threshold {
+            self.alerted = true;
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownStep {
     CancelAll,
@@ -1210,6 +1302,70 @@ pub fn book_stale(book_ts_ms: Option<u64>, now_ms: u64, stale_secs: u64) -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dms_refresh_after_the_deadline_is_a_suspected_fire() {
+        let mut h = DmsHealth::default();
+        // first arm after start: nothing to compare against
+        assert!(!h.on_ok("2026-10-14", 1_000, 1_200, None, 60));
+        // on time (10 s after the last ok)
+        assert!(!h.on_ok("2026-10-14", 11_000, 11_100, Some(1_000), 60));
+        // sent 60 s after the last ok: the venue deadline had passed
+        assert!(h.on_ok("2026-10-14", 71_000, 71_050, Some(11_000), 60));
+        assert_eq!(h.suspected_fires, 1);
+        assert_eq!(h.last_latency_ms, Some(50));
+        assert_eq!(h.max_latency_ms, 200);
+        // a new UTC day resets the counters
+        assert!(!h.on_ok("2026-10-15", 80_000, 80_010, Some(71_000), 60));
+        assert_eq!(h.suspected_fires, 0);
+        assert_eq!(h.max_latency_ms, 10);
+    }
+
+    #[test]
+    fn dms_429_backs_off_exponentially_to_ten_minutes_and_resets() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        assert!(h.may_call(d, 0));
+        let t0 = 1_000_000;
+        // venue retry_after shorter than our floor: we wait 30 s
+        assert_eq!(h.on_rate_limited(d, t0, t0 + 2_000), t0 + 30_000);
+        assert!(!h.may_call(d, t0 + 29_999));
+        assert!(h.may_call(d, t0 + 30_000));
+        assert_eq!(h.on_rate_limited(d, t0, t0), t0 + 60_000);
+        assert_eq!(h.on_rate_limited(d, t0, t0), t0 + 120_000);
+        for _ in 0..10 {
+            h.on_rate_limited(d, t0, t0);
+        }
+        assert_eq!(h.retry_at_ms, t0 + DMS_BACKOFF_MAX_MS);
+        // the venue's own later retry time wins
+        assert_eq!(h.on_rate_limited(d, t0, t0 + 900_000), t0 + 900_000);
+        // the cap resets at 00:00Z: a new day may call at once
+        assert!(h.may_call("2026-10-15", t0 + 1));
+        // a success clears the streak and the wait
+        h.on_ok(d, t0 + 900_000, t0 + 900_100, None, 60);
+        assert_eq!(h.streak, 0);
+        assert!(h.may_call(d, t0 + 900_100));
+        assert_eq!(h.rate_limited, 14);
+    }
+
+    #[test]
+    fn dms_fire_alert_fires_once_per_day() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        let mut ok = 0u64;
+        for i in 0..4u64 {
+            h.on_ok(d, ok + 61_000, ok + 61_010, Some(ok), 60);
+            ok += 61_000;
+            assert_eq!(h.take_alert(3), i == 2, "alert exactly at the 3rd fire");
+        }
+        assert!(!h.take_alert(0), "0 disables the alert");
+        h.on_ok("2026-10-15", ok + 61_000, ok + 61_010, Some(ok), 60);
+        assert_eq!(
+            h.suspected_fires, 1,
+            "new day: counters reset, this lapse counted"
+        );
+        assert!(h.take_alert(1), "the alert re-arms on a new UTC day");
+    }
+
     #[test]
     fn an_unconfirmed_shutdown_disarm_is_a_warning_about_this_market_only() {
         let n = dms_disarm_unconfirmed_note(

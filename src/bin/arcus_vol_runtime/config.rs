@@ -45,6 +45,13 @@ pub struct Config {
     pub book_stale_secs: u64,
     pub dms_secs: u64,
     pub dms_refresh_secs: u64,
+    /// Request timeout of one arm/refresh call (bot-strategy#1093): a stalled
+    /// venue call must not hold the refresh past the deadline.
+    pub dms_call_timeout_secs: u64,
+    /// Log an ERROR once per UTC day when this market's suspected switch
+    /// fires reach this count (0 = off). Arcus caps fires at 10 per UTC day
+    /// per subaccount, shared by the markets of the wallet.
+    pub dms_fire_alert: u32,
     pub reconcile_secs: u64,
     pub position_poll_secs: u64,
     pub taker_fee_bps: Decimal,
@@ -352,6 +359,8 @@ impl Config {
             book_stale_secs: int(&p("BOOK_STALE_SECS"), 5u64)?,
             dms_secs: int(&p("DMS_SECS"), 30u64)?,
             dms_refresh_secs: int(&p("DMS_REFRESH_SECS"), 10u64)?,
+            dms_call_timeout_secs: int(&p("DMS_CALL_TIMEOUT_SECS"), 4u64)?,
+            dms_fire_alert: int(&p("DMS_FIRE_ALERT"), 3u32)?,
             reconcile_secs: int(&p("RECONCILE_SECS"), 15u64)?,
             position_poll_secs: int(&p("POSITION_POLL_SECS"), 5u64)?,
             taker_fee_bps: dec(&p("TAKER_FEE_BPS"), "2.25")?,
@@ -428,6 +437,13 @@ impl Config {
         }
         if self.dms_secs < 5 || self.dms_secs > 300 || self.dms_refresh_secs >= self.dms_secs {
             bail!("ARCUS_VOL_DMS_SECS must be 5..=300 and above DMS_REFRESH_SECS");
+        }
+        if self.dms_call_timeout_secs == 0
+            || self.dms_call_timeout_secs + self.dms_refresh_secs >= self.dms_secs
+        {
+            bail!(
+                "ARCUS_VOL_DMS_CALL_TIMEOUT_SECS must be >= 1 and DMS_REFRESH_SECS + it below DMS_SECS"
+            );
         }
         if let Some(stop) = self.position_stop_bps {
             if stop < Decimal::ONE || stop > Decimal::from(500) {
@@ -823,6 +839,8 @@ pub(crate) mod tests {
             book_stale_secs: 5,
             dms_secs: 30,
             dms_refresh_secs: 10,
+            dms_call_timeout_secs: 4,
+            dms_fire_alert: 3,
             reconcile_secs: 15,
             position_poll_secs: 5,
             taker_fee_bps: Decimal::from_str("2.25").unwrap(),
