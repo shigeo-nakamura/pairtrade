@@ -140,8 +140,14 @@ touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; st gld "$FUT" kil
 [ $rc = 5 ] && ok "resume: runtime still in kill halt → rc 5" || bad "no-release rc=$rc"
 touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; st gld "$OLD" null 0; rz gld; rc=$?
 [ $rc = 5 ] && ok "resume: no status written after the removal → rc 5" || bad "stale release rc=$rc"
-echo inactive > "$T/act/debot-arcus-vol-gld"; touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; rz gld; rc=$?
-[ $rc = 0 ] && ! ks gld && [ "$(act gld)" = inactive ] && nocalls && ok "resume: a stopped unit is NOT started (KILL_SWITCH cleared)" || bad "resume inactive rc=$rc"
+# crash / reboot during the hold: the launcher refused to start while KILL_SWITCH existed
+echo inactive > "$T/act/debot-arcus-vol-gld"; touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; st gld "$FUT" null 0; rz gld; rc=$?
+[ $rc = 0 ] && ! ks gld && [ "$(act gld)" = active ] && grep -q "^start debot-arcus-vol-gld" "$T/calls" && ok "resume: a recorded unit that died during the hold is started after the removal" || bad "resume inactive rc=$rc"
+echo inactive > "$T/act/debot-arcus-vol-gld"; touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH" "$T/startfail"; rz gld; rc=$?; rm -f "$T/startfail"
+[ $rc = 5 ] && ok "resume: start fails → rc 5" || bad "resume start-fail rc=$rc"
+echo inactive > "$T/act/debot-arcus-vol-gld"; touch "$T/startdies"; rz gld; rc=$?; rm -f "$T/startdies"
+[ $rc = 5 ] && ok "resume: started but dies → rc 5" || bad "resume start-dies rc=$rc"
+up gld
 
 # reopen with the fake runtime: gld/slv flatten, aapl never flat, hood stopped
 rec="$T/root/var/lib/arcus-vol-reopen/paused"; rm -f "$rec"
@@ -208,7 +214,26 @@ for u in "$HERE"/deploy/arcus_vol/units/arcus-vol-*.service; do
   grep -qx "TimeoutStartSec=600" "$u" || bad "no TimeoutStartSec=600 in $(basename "$u")"
 done; ok "TimeoutStartSec=600 on every pause/resume service"
 grep -l "arcus-vol-pause.sh" "$HERE"/deploy/arcus_vol/units/*.service >/dev/null 2>&1 && bad "a unit calls arcus-vol-pause.sh directly (bypasses the record)" || ok "all units go through the recorded path"
-grep -qE "SYSTEMCTL (start|stop|restart)" "$PS" "$RS" && bad "a pause/reopen script can start/stop a unit" || ok "pause/reopen scripts contain no systemctl start/stop/restart"
+grep -qE "SYSTEMCTL (stop|restart)" "$PS" "$RS" && bad "a pause/reopen script can stop/restart a unit" || ok "pause/reopen scripts never stop or restart a unit"
+[ "$(grep -cE 'SYSTEMCTL start' "$PS")" = 1 ] && ! grep -qE "SYSTEMCTL start" "$RS" && ok "the only start is resume's restart of a unit that died during its hold" || bad "unexpected systemctl start"
+# overlapping windows: SLV's weekend hold must survive the Sunday reopen blackout
+for f in "$T"/act/debot-arcus-vol*; do echo inactive > "$f"; done
+up slv gld; rt slv gld; sleep 0.3; rm -f "${RD:?}"/*
+bash "$RS" pause --tag weekend-slv slv >/dev/null 2>&1
+ks slv && grep -qx slv "$RD/weekend-slv" || bad "weekend hold setup"
+: > "$T/calls"; bash "$RS" pause >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && ! grep -qx slv "$RD/paused" && grep -qx gld "$RD/paused" && ks gld && ok "blackout skips a unit already held by another window (not recorded)" || bad "overlap pause rc=$rc rec=$(tr '\n' ' ' < "$RD/paused" 2>/dev/null)"
+bash "$RS" resume >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && ks slv && ! ks gld && ok "blackout resume releases only its own hold; the weekend hold stays" || bad "overlap resume rc=$rc"
+# a failed earlier pause of the same TAG stays ours: still recorded, released by resume
+touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; echo gld > "$RD/paused"
+bash "$RS" pause >/dev/null 2>&1; grep -qx gld "$RD/paused" && ok "own earlier hold (in this TAG's record) is kept, not skipped" || bad "own hold dropped"
+bash "$RS" resume >/dev/null 2>&1; ! ks gld && [ ! -e "$RD/paused" ] && ok "own earlier hold released by resume" || bad "own hold not released"
+# an operator's KILL_SWITCH is never taken over by a blackout
+touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"
+bash "$RS" pause >/dev/null 2>&1; bash "$RS" resume >/dev/null 2>&1
+ks gld && ok "operator KILL_SWITCH survives a blackout pause/resume" || bad "operator hold released"
+clr gld; bash "$RS" resume --tag weekend-slv >/dev/null 2>&1; ! ks slv || bad "weekend release"; rt_off slv gld
 
 # 10. run EVERY timer-driven unit's ExecStart (as systemd would) against the stubs:
 #     nothing running, no records → each must exit 0 and touch no unit

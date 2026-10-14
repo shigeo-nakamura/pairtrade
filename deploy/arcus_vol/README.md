@@ -12,8 +12,8 @@ byte-for-byte from the host on 2026-10-12; `install_arcus_vol_host.sh
 | `units/debot-arcus-vol-<m>.service` | `/etc/systemd/system/` | per-market instance units (= base unit + `DEBOT_ARCUS_VOL_ETC_DIR` + own `WorkingDirectory`) |
 | `config/<m>.config` | `/etc/debot-arcus-vol[-<m>]/config.env` | market / sizing / offsets / stops / learner params (no secrets) |
 | `config/qqq.config.retired` | — | QQQ retired 2026-10-10; host keeps `config.env.retired-*`, no `config.env` |
-| `scripts/arcus-vol-pause.sh` | `/opt/debot/scripts/` | IN PROCESS: pause = touch KILL_SWITCH → wait for the runtime's ack (halt, no quotes, flat) and keep the hold; resume = remove KILL_SWITCH → confirm the kill halt is released. Never stops or starts a unit |
-| `scripts/arcus-vol-reopen.sh` | `/opt/debot/scripts/` | pause every ACTIVE instance (records them), resume (release) only those |
+| `scripts/arcus-vol-pause.sh` | `/opt/debot/scripts/` | IN PROCESS: pause = touch KILL_SWITCH → wait for the runtime's ack (halt, no quotes, flat) and keep the hold; resume = remove KILL_SWITCH → confirm the kill halt is released (starts the unit only if it died during the hold). Never stops a unit |
+| `scripts/arcus-vol-reopen.sh` | `/opt/debot/scripts/` | pause every ACTIVE instance not already held (records them), resume (release) only those; a window never takes over another window's or the operator's hold |
 | `units/arcus-vol-{pause,resume}-slv.*` | `/etc/systemd/system/` | SLV weekend pause (HOOD's removed 2026-10-13 with HOOD): Sat 00:00 UTC → Sun 20:10 New York (via `arcus-vol-reopen.sh --tag weekend-<m>`: the process stays up all weekend in its KILL_SWITCH hold; only a hold the pause recorded is released) |
 | `units/arcus-vol-reopen-{pause,resume}.*` | `/etc/systemd/system/` | Sunday reopen blackout 17:55–18:05 and 19:55–20:05 New York |
 | `units/arcus-vol-open-{pause,resume}.*` | `/etc/systemd/system/` | weekday cash-open blackout 09:28–09:35 New York |
@@ -26,8 +26,9 @@ subaccount. A stop that could not disarm the switch cost one fire, and the
 blackouts stopped/started every instance several times a day. Holding the
 running runtime in its KILL_SWITCH halt keeps the switch refreshed (the
 runtime refreshes it every tick, halted or not), so a window costs no fire.
-The hold also survives a crash or reboot: `KILL_SWITCH` is a file, and a
-restarted runtime is halted from its first tick until resume removes it.
+The hold also survives a crash or reboot: `KILL_SWITCH` is a file and the
+launcher refuses to start while it exists, so the instance stays down (no
+quotes) until resume removes it and starts it again.
 
 The config files are named `.config` (not `.env`) because `*.env` is
 gitignored repo-wide as a secrets guard. `live.env` (credentials, KMS-encrypted key) is never in the repo, never read
@@ -70,9 +71,10 @@ approval for any bot restart on this host; check the instance is flat).
   Keep every live instance `enabled` (as `instances.tsv` and `--apply` do);
   disable a unit only when it should stay down. A failed `is-enabled` lookup is
   an error: resume exits 6 and keeps the record for the next run (#396).
-- **Resume never starts a unit.** An instance that is not running at resume
-  (crashed past systemd's restart limit, or stopped by the operator) gets its
-  `KILL_SWITCH` cleared and is left stopped, logged loudly.
+- **Resume starts a recorded instance that is no longer running** (a crash or
+  reboot during the hold; the launcher refuses to start with `KILL_SWITCH`).
+  To keep an instance down across a window, `disable` it (operator hold), do
+  not just stop it.
 
 ## Rule
 

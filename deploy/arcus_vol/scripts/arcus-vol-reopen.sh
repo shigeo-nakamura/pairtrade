@@ -10,8 +10,11 @@
 # Invariants
 #   1. Only ACTIVE instances are paused (a named one that is already stopped,
 #      e.g. by the operator before the weekend, is skipped and NOT recorded).
-#      Resume never starts a unit; it only releases the KILL_SWITCH holds it
-#      recorded.
+#      An instance that is already HELD (KILL_SWITCH present: another window's
+#      hold, e.g. SLV's weekend hold during the Sunday reopen blackout, or the
+#      operator's) is skipped and not newly recorded, so a window never
+#      releases a hold it did not create. (A hold left by a failed earlier
+#      pause of this TAG is still in this TAG's record and still released.)
 #   2. If the active instances cannot be listed, the pause FAILS (exit 1).
 #   3. The record (every instance about to be paused) is written and synced
 #      BEFORE any pause starts; if that fails nothing is paused (exit 1).
@@ -43,6 +46,11 @@ case "$ACT" in
     else
       mapfile -t todo < <(printf '%s\n' "$active" | awk 'NF')
     fi
+    keep=(); for n in "${todo[@]}"; do
+      if "$PAUSE" held "$n" >/dev/null 2>&1; then
+        echo "$n already held (KILL_SWITCH present); skipped, not recorded"
+      else keep+=("$n"); fi
+    done; todo=("${keep[@]}")
     [ ${#todo[@]} -gt 0 ] || { echo "$TAG: nothing running to pause"; exit 0; }
     # record first, durably; no record → no pause
     if ! { mkdir -p "$DIR" \

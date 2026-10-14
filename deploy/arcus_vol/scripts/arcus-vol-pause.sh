@@ -2,6 +2,7 @@
 # Pause / resume one arcus-vol instance IN PROCESS (bot-strategy#1093).
 #   arcus-vol-pause.sh pause  <name>
 #   arcus-vol-pause.sh resume <name>
+#   arcus-vol-pause.sh held   <name>   exit 0 iff a KILL_SWITCH hold is in place
 # <name> = spy (unit debot-arcus-vol) or the suffix of debot-arcus-vol-<name>.
 #
 # The process is never stopped or started: a blackout / weekend pause holds the
@@ -25,11 +26,13 @@
 #   resume
 #   4. A disabled/masked unit is an operator hold: KILL_SWITCH and unit left
 #      alone (exit 0). A failed is-enabled lookup is an error (exit 6).
-#   5. KILL_SWITCH is removed. A running instance must then show a status.json
-#      written after the removal whose halt is not kill_switch (it may still be
-#      halted by a daily/cum stop) within the settle time, else exit 5.
-#      An instance that is not running is NOT started (exit 0, logged loudly):
-#      starting units is the operator's call.
+#   5. KILL_SWITCH is removed. An instance that is no longer running (it
+#      crashed or the host rebooted during the hold: the launcher refuses to
+#      start while KILL_SWITCH exists) is started — it was running when the
+#      pause recorded it; an operator who wants it down disables it (4).
+#      The instance must then be active and show a status.json written after
+#      the removal whose halt is not kill_switch (it may still be halted by a
+#      daily/cum stop) within the settle time, else exit 5.
 set -uo pipefail
 ACT=${1:-}; NAME=${2:-}
 [ -n "$ACT" ] && [ -n "$NAME" ] || { echo "usage: $0 pause|resume <name>"; exit 2; }
@@ -109,8 +112,12 @@ case "$ACT" in
     since=$(date +%s%3N)
     rm -f "$C/KILL_SWITCH" || { loud "cannot remove KILL_SWITCH"; exit 5; }
     if ! $SYSTEMCTL is-active --quiet "$U"; then
-      loud "not running at resume; KILL_SWITCH cleared, unit NOT started (operator's call)"
-      exit 0
+      # crashed / rebooted during the hold: the launcher refused to start while
+      # KILL_SWITCH existed; it was running when the pause recorded it
+      echo "$U not running at resume (crash/reboot during the hold): starting it"
+      if ! $SYSTEMCTL start "$U" || ! $SYSTEMCTL is-active --quiet "$U"; then
+        loud "start failed or unit not active after start"; exit 5
+      fi
     fi
     waited=0
     until released "$since"; do
@@ -121,5 +128,7 @@ case "$ACT" in
       sleep "$STEP_S"; waited=$((waited + STEP_S))
     done
     echo "$U resumed in process (KILL_SWITCH removed, kill halt released)" ;;
-  *) echo "usage: $0 pause|resume <name>"; exit 2 ;;
+  held)
+    [ -e "$C/KILL_SWITCH" ] ;;
+  *) echo "usage: $0 pause|resume|held <name>"; exit 2 ;;
 esac
