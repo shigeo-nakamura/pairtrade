@@ -114,6 +114,9 @@ case "$ACT" in
     esac
     since=$(date +%s%3N)
     rm -f "$C/KILL_SWITCH" || { loud "cannot remove KILL_SWITCH"; exit 5; }
+    # durable before the record is dropped: a power loss must not bring the
+    # sentinel back (the launcher would then refuse every start, no retry left)
+    sync "$C" || { loud "cannot fsync $C after removing KILL_SWITCH"; exit 5; }
     if ! $SYSTEMCTL is-active --quiet "$U"; then
       # crashed / rebooted during the hold: the launcher refused to start while
       # KILL_SWITCH existed; it was running when the pause recorded it

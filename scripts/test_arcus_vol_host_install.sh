@@ -129,6 +129,7 @@ up aapl; st aapl "$FUT" kill_switch 7.32;         pz aapl; rc=$?
 up hood; st hood "$FUT" kill_switch 0; echo '{bad' > "$T/root/var/lib/debot-arcus-vol-hood/state/status.json"; pz hood; rc=$?
 [ $rc = 3 ] && ok "unreadable status.json: rc 3" || bad "unreadable rc=$rc"
 grep -qF 'sync "$C/KILL_SWITCH" "$C" ||' "$PS" && ok "KILL_SWITCH and its directory are fsynced before the hold is reported" || bad "KILL_SWITCH not fsynced"
+grep -qF 'sync "$C" || { loud "cannot fsync $C after removing KILL_SWITCH"' "$PS" && ok "the KILL_SWITCH removal is fsynced before resume reports success" || bad "removal not fsynced"
 clr gld aapl hood; echo inactive > "$T/act/debot-arcus-vol-gld"; pz gld; rc=$?
 [ $rc = 0 ] && ! ks gld && nocalls && ok "not running: left alone, no KILL_SWITCH" || bad "not-running pause rc=$rc"
 
