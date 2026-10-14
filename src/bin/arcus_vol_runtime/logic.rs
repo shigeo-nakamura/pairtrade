@@ -1157,9 +1157,11 @@ pub fn dms_armed(
 /// with 429 "trigger limit reached (10 per UTC day)" until 00:00Z; the runtime
 /// retried every 500 ms tick and logged/emailed each one).
 ///
-/// * A refresh whose request was sent `dms_secs` or more after the last
+/// * An arm/refresh attempt sent `dms_secs` or more after the last
 ///   successful one cannot have beaten the venue deadline: the switch fired
-///   (a *suspected fire*; Arcus counts fires, not arms or refreshes).
+///   (a *suspected fire*; Arcus counts fires, not arms or refreshes). Counted
+///   on the attempt, whatever its result (a 429 or a timeout too), once per
+///   expired arm.
 /// * After a 429 the next arm attempt waits 30 s, doubling per consecutive
 ///   429 up to 10 min (never earlier than the venue's own retry time), so a
 ///   capped day costs a few calls an hour instead of two a second. A new UTC
@@ -1178,6 +1180,9 @@ pub struct DmsHealth {
     pub retry_at_ms: u64,
     #[serde(default)]
     alerted: bool,
+    /// The last-ok time whose expiry was already counted.
+    #[serde(default)]
+    counted_for: Option<u64>,
 }
 
 pub const DMS_BACKOFF_FIRST_MS: u64 = 30_000;
@@ -1211,27 +1216,34 @@ impl DmsHealth {
         self.day != day || now_ms >= self.retry_at_ms
     }
 
-    /// A successful arm/refresh sent at `sent_ms`, answered at `done_ms`.
-    /// Returns true when it landed after the previous deadline (suspected fire).
-    pub fn on_ok(
+    /// An arm/refresh attempt about to be sent at `sent_ms`. Returns true
+    /// when the previous arm (`prev_ok_ms`) had already expired — counted once
+    /// per expired arm, whatever the attempt's outcome.
+    pub fn note_attempt(
         &mut self,
         day: &str,
         sent_ms: u64,
-        done_ms: u64,
         prev_ok_ms: Option<u64>,
         dms_secs: u64,
     ) -> bool {
+        self.roll(day);
+        let Some(t) = prev_ok_ms else { return false };
+        if sent_ms.saturating_sub(t) < dms_secs * 1_000 || self.counted_for == Some(t) {
+            return false;
+        }
+        self.counted_for = Some(t);
+        self.suspected_fires += 1;
+        true
+    }
+
+    /// A successful arm/refresh sent at `sent_ms`, answered at `done_ms`.
+    pub fn on_ok(&mut self, day: &str, sent_ms: u64, done_ms: u64) {
         self.roll(day);
         let latency = done_ms.saturating_sub(sent_ms);
         self.last_latency_ms = Some(latency);
         self.max_latency_ms = self.max_latency_ms.max(latency);
         self.streak = 0;
         self.retry_at_ms = 0;
-        let lapsed = prev_ok_ms.is_some_and(|t| sent_ms.saturating_sub(t) >= dms_secs * 1_000);
-        if lapsed {
-            self.suspected_fires += 1;
-        }
-        lapsed
     }
 
     /// A 429 on the arm/refresh: returns the time of the next attempt.
@@ -1317,21 +1329,32 @@ pub fn book_stale(book_ts_ms: Option<u64>, now_ms: u64, stale_secs: u64) -> bool
 #[cfg(test)]
 mod tests {
     #[test]
-    fn dms_refresh_after_the_deadline_is_a_suspected_fire() {
+    fn dms_attempt_after_the_deadline_is_one_suspected_fire() {
         let mut h = DmsHealth::default();
+        let d = "2026-10-14";
         // first arm after start: nothing to compare against
-        assert!(!h.on_ok("2026-10-14", 1_000, 1_200, None, 60));
+        assert!(!h.note_attempt(d, 1_000, None, 60));
+        h.on_ok(d, 1_000, 1_200);
         // on time (10 s after the last ok)
-        assert!(!h.on_ok("2026-10-14", 11_000, 11_100, Some(1_000), 60));
-        // sent 60 s after the last ok: the venue deadline had passed
-        assert!(h.on_ok("2026-10-14", 71_000, 71_050, Some(11_000), 60));
+        assert!(!h.note_attempt(d, 11_000, Some(1_000), 60));
+        h.on_ok(d, 11_000, 11_100);
+        // sent 60 s after the last ok: the deadline had passed -> counted,
+        // even though this attempt is refused (429) ...
+        assert!(h.note_attempt(d, 71_000, Some(11_000), 60));
+        h.on_rate_limited(d, 71_000, 71_000);
+        // ... and the retries for the same expired arm are not counted again
+        assert!(!h.note_attempt(d, 101_000, Some(11_000), 60));
+        assert!(!h.note_attempt(d, 131_000, Some(11_000), 60));
         assert_eq!(h.suspected_fires, 1);
+        h.on_ok(d, 131_000, 131_050);
         assert_eq!(h.last_latency_ms, Some(50));
         assert_eq!(h.max_latency_ms, 200);
+        // a later lapse of the new arm counts again
+        assert!(h.note_attempt(d, 200_000, Some(131_000), 60));
+        assert_eq!(h.suspected_fires, 2);
         // a new UTC day resets the counters
-        assert!(!h.on_ok("2026-10-15", 80_000, 80_010, Some(71_000), 60));
+        assert!(!h.note_attempt("2026-10-15", 205_000, Some(200_000), 60));
         assert_eq!(h.suspected_fires, 0);
-        assert_eq!(h.max_latency_ms, 10);
     }
 
     #[test]
@@ -1355,7 +1378,7 @@ mod tests {
         // the cap resets at 00:00Z: a new day may call at once
         assert!(h.may_call("2026-10-15", t0 + 1));
         // a success clears the streak and the wait
-        h.on_ok(d, t0 + 900_000, t0 + 900_100, None, 60);
+        h.on_ok(d, t0 + 900_000, t0 + 900_100);
         assert_eq!(h.streak, 0);
         assert!(h.may_call(d, t0 + 900_100));
         assert_eq!(h.rate_limited, 14);
@@ -1365,8 +1388,8 @@ mod tests {
     fn dms_health_survives_a_restart_within_the_day() {
         let mut h = DmsHealth::default();
         let d = "2026-10-14";
-        h.on_ok(d, 61_000, 61_010, Some(0), 60);
-        h.on_ok(d, 122_000, 122_010, Some(61_000), 60);
+        h.note_attempt(d, 61_000, Some(0), 60);
+        h.note_attempt(d, 122_000, Some(61_000), 60);
         assert!(h.take_alert(2));
         let t = h.on_rate_limited(d, 200_000, 200_000);
         let json = serde_json::to_string(&h).unwrap();
@@ -1394,12 +1417,12 @@ mod tests {
         let d = "2026-10-14";
         let mut ok = 0u64;
         for i in 0..4u64 {
-            h.on_ok(d, ok + 61_000, ok + 61_010, Some(ok), 60);
+            h.note_attempt(d, ok + 61_000, Some(ok), 60);
             ok += 61_000;
             assert_eq!(h.take_alert(3), i == 2, "alert exactly at the 3rd fire");
         }
         assert!(!h.take_alert(0), "0 disables the alert");
-        h.on_ok("2026-10-15", ok + 61_000, ok + 61_010, Some(ok), 60);
+        h.note_attempt("2026-10-15", ok + 61_000, Some(ok), 60);
         assert_eq!(
             h.suspected_fires, 1,
             "new day: counters reset, this lapse counted"

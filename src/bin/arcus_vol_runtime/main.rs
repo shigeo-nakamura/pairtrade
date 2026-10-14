@@ -1843,6 +1843,28 @@ impl Runtime {
         }
         let sent = now_ms();
         let prev_ok = self.dms_last_ok_ms;
+        // A lapse is counted on the attempt, whatever its result (a capped
+        // day answers 429, a stall times out) -- once per expired arm.
+        if self
+            .dms_health
+            .note_attempt(&day, sent, prev_ok, self.cfg.dms_secs)
+        {
+            log::warn!(
+                "[ARCUS_VOL] dead man's switch refresh due {}s after the previous one (deadline {}s): it most likely FIRED (Arcus caps fires at 10 per UTC day per subaccount); suspected fires today {}",
+                sent.saturating_sub(prev_ok.unwrap_or(sent)) / 1_000,
+                self.cfg.dms_secs,
+                self.dms_health.suspected_fires
+            );
+            self.save_dms_health();
+            if self.dms_health.take_alert(self.cfg.dms_fire_alert) {
+                self.save_dms_health();
+                log::error!(
+                    "[ARCUS_VOL] {} suspected dead man's switch fires today on {} (Arcus allows 10 per UTC day per subaccount, shared by the wallet's markets); quoting stops for the day once the venue refuses to arm",
+                    self.dms_health.suspected_fires,
+                    self.cfg.market
+                );
+            }
+        }
         let res = tokio::time::timeout(
             limit,
             self.dex
@@ -1855,27 +1877,9 @@ impl Runtime {
                 self.dms_last_ok_ms = Some(now);
                 self.dms_last_failed = false;
                 let had_streak = self.dms_health.streak > 0;
-                let lapsed = self
-                    .dms_health
-                    .on_ok(&day, sent, done, prev_ok, self.cfg.dms_secs);
-                if lapsed {
-                    log::warn!(
-                        "[ARCUS_VOL] dead man's switch refreshed {}s after the previous one (deadline {}s): it most likely FIRED (Arcus caps fires at 10 per UTC day per subaccount); suspected fires today {}",
-                        sent.saturating_sub(prev_ok.unwrap_or(sent)) / 1_000,
-                        self.cfg.dms_secs,
-                        self.dms_health.suspected_fires
-                    );
-                }
-                let alert = self.dms_health.take_alert(self.cfg.dms_fire_alert);
-                if lapsed || had_streak || alert {
+                self.dms_health.on_ok(&day, sent, done);
+                if had_streak {
                     self.save_dms_health();
-                }
-                if alert {
-                    log::error!(
-                        "[ARCUS_VOL] {} suspected dead man's switch fires today on {} (Arcus allows 10 per UTC day per subaccount, shared by the wallet's markets); quoting stops for the day once the venue refuses to arm",
-                        self.dms_health.suspected_fires,
-                        self.cfg.market
-                    );
                 }
             }
             Ok(Err(e)) => {
@@ -1910,6 +1914,12 @@ impl Runtime {
         // stall it past the deadline (bot-strategy#1093, 2026-10-14 incident).
         if !self.cfg.dry_run {
             self.refresh_dms(now).await;
+            // Unarmed: pull our resting quotes before this tick's other venue
+            // calls, which can stall past the previous arm's deadline (the plan
+            // pulls too, but only after them).
+            if self.dms_last_failed && !self.resting.is_empty() {
+                self.pull_quotes().await;
+            }
         }
         self.read_book(now).await;
         let mid = self.book.as_ref().map(BookView::mid);
