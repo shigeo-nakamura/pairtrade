@@ -19,6 +19,8 @@
 #      ACKNOWLEDGE it: a status.json written AFTER the touch that shows a halt,
 #      no resting quote on either side, and a flat inventory (venue dust counts
 #      as flat). A pre-touch "flat" status never counts.
+#   2b. The KILL_SWITCH is created atomically (create-if-absent). One that
+#      already exists is someone else's hold: not adopted, exit 7.
 #   3. Acknowledged: exit 0, process left running, KILL_SWITCH kept (the hold).
 #      Not acknowledged within the wait (or status.json unreadable): KILL_SWITCH
 #      kept too (quotes stay pulled, the runtime keeps flattening), logged
@@ -32,7 +34,8 @@
 #      pause recorded it; an operator who wants it down disables it (4).
 #      The instance must then be active and show a status.json written after
 #      the removal whose halt is not kill_switch (it may still be halted by a
-#      daily/cum stop) within the settle time, else exit 5.
+#      daily/cum stop) within the settle time, and still be active after it,
+#      else exit 5.
 set -uo pipefail
 ACT=${1:-}; NAME=${2:-}
 [ -n "$ACT" ] && [ -n "$NAME" ] || { echo "usage: $0 pause|resume <name>"; exit 2; }
@@ -88,7 +91,15 @@ case "$ACT" in
     $SYSTEMCTL is-active --quiet "$U" || { echo "$U not running; left alone"; exit 0; }
     [ -d "$C" ] || { loud "no state dir $C; cannot pause"; exit 3; }
     since=$(date +%s%3N)
-    touch "$C/KILL_SWITCH" || { loud "cannot create KILL_SWITCH; NOT paused"; exit 3; }
+    # Claim the hold atomically (create-if-absent): a KILL_SWITCH that already
+    # exists belongs to someone else (the operator, another window) and is
+    # never adopted, so this pause's resume can never release it. exit 7.
+    if ! ( set -o noclobber; : > "$C/KILL_SWITCH" ) 2>/dev/null; then
+      if [ -e "$C/KILL_SWITCH" ]; then
+        echo "$U already held (KILL_SWITCH exists, not ours): not claimed"; exit 7
+      fi
+      loud "cannot create KILL_SWITCH; NOT paused"; exit 3
+    fi
     # durable before the hold is reported: a power loss must not drop the
     # sentinel while the (synced) pause record survives
     sync "$C/KILL_SWITCH" "$C" || { loud "cannot fsync KILL_SWITCH / $C; hold NOT confirmed"; exit 3; }
@@ -133,6 +144,10 @@ case "$ACT" in
       fi
       sleep "$STEP_S"; waited=$((waited + STEP_S))
     done
+    # the runtime may have written its release status and then died
+    if ! $SYSTEMCTL is-active --quiet "$U"; then
+      loud "unit not active after the release acknowledgement"; exit 5
+    fi
     echo "$U resumed in process (KILL_SWITCH removed, kill halt released)" ;;
   held)
     [ -e "$C/KILL_SWITCH" ] ;;

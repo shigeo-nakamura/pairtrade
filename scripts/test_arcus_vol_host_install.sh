@@ -8,14 +8,15 @@ fail=0; ok() { echo "ok   $*"; }; bad() { echo "FAIL $*"; fail=1; }
 T=$(mktemp -d); trap 'rm -rf "${T:?}"' EXIT
 mkdir -p "$T/sys" "$T/scripts" "$T/root" "$T/bin"
 # fake systemctl: enablement in $T/en/<unit>, active timers in $T/act/<unit>, log of calls
-mkdir -p "$T/en" "$T/act"
+mkdir -p "$T/en" "$T/act" "$T/flip"
 cat > "$T/bin/systemctl" <<SH
 #!/bin/bash
 echo "\$*" >> "$T/calls"
 q=0; [ "\$2" = --quiet ] && { q=1; set -- "\$1" "\$3"; }
 case "\$1" in
   is-enabled) s=\$(cat "$T/en/\$2" 2>/dev/null || echo disabled); [ \$q = 1 ] || echo "\$s"; [ "\$s" = enabled ] ;;
-  is-active) s=\$(cat "$T/act/\$2" 2>/dev/null || echo inactive); [ \$q = 1 ] || echo "\$s"; [ "\$s" = active ] ;;
+  is-active) s=\$(cat "$T/act/\$2" 2>/dev/null || echo inactive); [ \$q = 1 ] || echo "\$s"
+             [ -e "$T/flip/\$2" ] && { rm -f "$T/flip/\$2"; echo inactive > "$T/act/\$2"; }; [ "\$s" = active ] ;;
   enable) [ "\$2" = --now ] && { echo enabled > "$T/en/\$3"; echo active > "$T/act/\$3"; } || echo enabled > "$T/en/\$2" ;;
   disable) echo disabled > "$T/en/\$2" ;;
   daemon-reload) ;;
@@ -129,6 +130,15 @@ up aapl; st aapl "$FUT" kill_switch 7.32;         pz aapl; rc=$?
 up hood; st hood "$FUT" kill_switch 0; echo '{bad' > "$T/root/var/lib/debot-arcus-vol-hood/state/status.json"; pz hood; rc=$?
 [ $rc = 3 ] && ok "unreadable status.json: rc 3" || bad "unreadable rc=$rc"
 grep -qF 'sync "$C/KILL_SWITCH" "$C" ||' "$PS" && ok "KILL_SWITCH and its directory are fsynced before the hold is reported" || bad "KILL_SWITCH not fsynced"
+# atomic claim: an existing KILL_SWITCH is someone else's hold -> exit 7, untouched
+up gld; touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; st gld "$FUT" kill_switch 0; pz gld; rc=$?
+[ $rc = 7 ] && ks gld && nocalls && ok "existing KILL_SWITCH is not claimed: rc 7, left in place" || bad "claim of existing hold rc=$rc"
+clr gld
+# resume: release acknowledged, then the unit dies -> rc 5 (record kept by the caller)
+up gld; touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; st gld "$FUT" null 0
+touch "$T/flip/debot-arcus-vol-gld"; rz gld; rc=$?; rm -f "$T/flip/debot-arcus-vol-gld"
+[ $rc = 5 ] && ok "resume: unit dead after the release acknowledgement -> rc 5" || bad "release-then-die rc=$rc"
+up gld
 grep -qF 'sync "$C" || { loud "cannot fsync $C after removing KILL_SWITCH"' "$PS" && ok "the KILL_SWITCH removal is fsynced before resume reports success" || bad "removal not fsynced"
 clr gld aapl hood; echo inactive > "$T/act/debot-arcus-vol-gld"; pz gld; rc=$?
 [ $rc = 0 ] && ! ks gld && nocalls && ok "not running: left alone, no KILL_SWITCH" || bad "not-running pause rc=$rc"
@@ -227,6 +237,17 @@ ks slv && grep -qx slv "$RD/weekend-slv" || bad "weekend hold setup"
 [ $rc = 0 ] && ! grep -qx slv "$RD/paused" && grep -qx gld "$RD/paused" && ks gld && ok "blackout skips a unit already held by another window (not recorded)" || bad "overlap pause rc=$rc rec=$(tr '\n' ' ' < "$RD/paused" 2>/dev/null)"
 bash "$RS" resume >/dev/null 2>&1; rc=$?
 [ $rc = 0 ] && ks slv && ! ks gld && ok "blackout resume releases only its own hold; the weekend hold stays" || bad "overlap resume rc=$rc"
+# race: a hold appears between reopen's held check and the claim -> not recorded, never released
+cat > "$T/racepause" <<RP
+#!/bin/bash
+[ "\$1" = pause ] && [ "\$2" = gld ] && touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"
+exec bash "$PS" "\$@"
+RP
+chmod +x "$T/racepause"; rm -f "$RD/paused"
+ARCUS_VOL_PAUSE_SCRIPT="$T/racepause" bash "$RS" pause >/dev/null 2>&1; rc=$?
+[ $rc = 0 ] && ! { [ -f "$RD/paused" ] && grep -qx gld "$RD/paused"; } && ks gld && ok "race: a hold created before our claim is not recorded" || bad "race pause rc=$rc rec=$(tr '\n' ' ' < "$RD/paused" 2>/dev/null)"
+bash "$RS" resume >/dev/null 2>&1; ks gld && ok "race: that hold survives our resume" || bad "race hold released"
+clr gld; rm -f "$RD/paused"
 # a failed earlier pause of the same TAG stays ours: still recorded, released by resume
 touch "$T/root/var/lib/debot-arcus-vol-gld/state/KILL_SWITCH"; echo gld > "$RD/paused"
 bash "$RS" pause >/dev/null 2>&1; grep -qx gld "$RD/paused" && ok "own earlier hold (in this TAG's record) is kept, not skipped" || bad "own hold dropped"
