@@ -81,13 +81,13 @@ use ledger::{
 };
 use logic::{
     book_depth, classify_error, count_position_stops, dms_armed, dms_disarm_unconfirmed_note,
-    flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position, may_disarm_dms,
-    own_displayed, plan_inputs, plan_quotes, position_check, position_gate_after,
-    position_stop_bps, quote_action, quote_dists, quote_pass, read_within, reconcile_cleared,
-    send_gated, shock, shutdown_steps, spill_rows, sweep_open_orders, tick_plan, ticker_read_due,
-    touches, BatchSink, ErrorEffect, FlattenReason, PlanState, PosCheck, PricePlan, QSide,
-    QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
-    VenueMin, PLACE_VISIBILITY_GRACE_MS,
+    dms_emergency_pull, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
+    market_position, may_disarm_dms, own_displayed, plan_inputs, plan_quotes, position_check,
+    position_gate_after, position_stop_bps, quote_action, quote_dists, quote_pass, read_within,
+    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, sweep_open_orders, tick_plan,
+    ticker_read_due, touches, BatchSink, DmsHealth, ErrorEffect, FlattenReason, PlanState,
+    PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep,
+    SidePlan, Step, TickPlan, VenueMin, PLACE_VISIBILITY_GRACE_MS,
 };
 use quote_gate::{GateOutput, QuoteGate};
 use rust_decimal::prelude::ToPrimitive;
@@ -246,6 +246,11 @@ struct Runtime {
     dms_last_failed: bool,
     /// The one-shot disarm of a leftover ACCOUNT-WIDE switch ran.
     legacy_dms_cleared: bool,
+    /// Refresh latency, suspected fires and 429 back-off of the switch.
+    dms_health: DmsHealth,
+    dms_health_path: PathBuf,
+    /// The market-wide emergency pull ran since the last failed arm/refresh.
+    dms_pulled: bool,
     last_reconcile_ms: u64,
     last_position_ms: u64,
     last_summary_ms: u64,
@@ -1779,8 +1784,171 @@ impl Runtime {
         }
     }
 
+    /// Arm / refresh the per-market dead man's switch on schedule; after a
+    /// failure retry every tick (no new quoting meanwhile, see `dms_armed` in
+    /// the tick plan) — except after a 429, which backs off (`DmsHealth`).
+    /// Every call is bounded by `dms_call_timeout_secs`.
+    /// Persist the day's switch health (counters, back-off, alert flag) so a
+    /// restart does not forget them: the venue's cap is per UTC day.
+    fn save_dms_health(&self) {
+        match serde_json::to_string(&self.dms_health) {
+            Ok(body) => {
+                if let Err(e) = debot::directional::atomic_write(&self.dms_health_path, &body) {
+                    log::warn!("[ARCUS_VOL] dms_health.json write failed: {e}");
+                }
+            }
+            Err(e) => log::warn!("[ARCUS_VOL] dms_health encode failed: {e}"),
+        }
+    }
+
+    /// Market-wide cancel at the venue (bounded by the DMS call timeout).
+    async fn dms_emergency_cancel(&mut self) {
+        let limit = Duration::from_secs(self.cfg.dms_call_timeout_secs);
+        let market = self.cfg.market.clone();
+        match tokio::time::timeout(limit, self.dex.cancel_all_orders(Some(market))).await {
+            Ok(Ok(())) => {
+                self.resting.clear();
+                self.dms_pulled = true;
+                log::warn!(
+                    "[ARCUS_VOL] dead man's switch not armed: cancelled every {} order at the venue",
+                    self.cfg.market
+                );
+            }
+            Ok(Err(e)) => self.on_error("unarmed-DMS cancel_all (retried next tick)", &e),
+            Err(_) => log::warn!(
+                "[ARCUS_VOL] unarmed-DMS cancel_all timed out after {}s (retried next tick)",
+                self.cfg.dms_call_timeout_secs
+            ),
+        }
+    }
+
+    async fn refresh_dms(&mut self, now: u64) {
+        let due = self.dms_last_failed
+            || self
+                .dms_last_ok_ms
+                .is_none_or(|t| now.saturating_sub(t) >= self.cfg.dms_refresh_secs * 1_000);
+        let day = ledger::utc_day_of(now);
+        if !due || !self.dms_health.may_call(&day, now) {
+            return;
+        }
+        let limit = Duration::from_secs(self.cfg.dms_call_timeout_secs);
+        if !self.legacy_dms_cleared {
+            // Builds before bot-strategy#1093's per-market switch armed the
+            // ACCOUNT-WIDE switch; one left armed by an older process
+            // would cancel every market's orders (ours included) when it
+            // fires. Clear it before the first arm; until that disarm is
+            // confirmed, the per-market switch is not armed, so no quoting
+            // (retried every tick like a failed arm).
+            match tokio::time::timeout(limit, self.dex.schedule_cancel(None)).await {
+                Ok(Ok(())) => {
+                    log::info!(
+                        "[ARCUS_VOL] account-wide dead man's switch disarmed (left over from an older build, if any)"
+                    );
+                    self.legacy_dms_cleared = true;
+                }
+                Ok(Err(e)) => {
+                    self.dms_last_failed = true;
+                    self.on_error(
+                        "account-wide dead man's switch disarm (no new quotes until cleared)",
+                        &e,
+                    );
+                    return;
+                }
+                Err(_) => {
+                    self.dms_last_failed = true;
+                    log::warn!(
+                        "[ARCUS_VOL] account-wide dead man's switch disarm timed out after {}s (no new quotes until cleared)",
+                        self.cfg.dms_call_timeout_secs
+                    );
+                    return;
+                }
+            }
+        }
+        let sent = now_ms();
+        let prev_ok = self.dms_last_ok_ms;
+        // After a restart the runtime's own last-ok is gone; the persisted one
+        // still dates the previous process's arm (an expiry while down counts).
+        let lapse_base = prev_ok.or(self.dms_health.last_ok_ms);
+        // A lapse is counted on the attempt, whatever its result (a capped
+        // day answers 429, a stall times out) -- once per expired arm.
+        if self
+            .dms_health
+            .note_attempt(&day, sent, lapse_base, self.cfg.dms_secs)
+        {
+            log::warn!(
+                "[ARCUS_VOL] dead man's switch refresh due {}s after the previous one (deadline {}s): it most likely FIRED (Arcus caps fires at 10 per UTC day per subaccount); suspected fires today {}",
+                sent.saturating_sub(lapse_base.unwrap_or(sent)) / 1_000,
+                self.cfg.dms_secs,
+                self.dms_health.suspected_fires
+            );
+            self.save_dms_health();
+            if self.dms_health.take_alert(self.cfg.dms_fire_alert) {
+                self.save_dms_health();
+                log::error!(
+                    "[ARCUS_VOL] {} suspected dead man's switch fires today on {} (Arcus allows 10 per UTC day per subaccount, shared by the wallet's markets); quoting stops for the day once the venue refuses to arm",
+                    self.dms_health.suspected_fires,
+                    self.cfg.market
+                );
+            }
+        }
+        let res = tokio::time::timeout(
+            limit,
+            self.dex
+                .schedule_cancel_market(&self.cfg.market, Some(self.cfg.dms_secs)),
+        )
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                let done = now_ms();
+                self.dms_last_ok_ms = Some(now);
+                self.dms_last_failed = false;
+                self.dms_pulled = false;
+                self.dms_health.on_ok(&day, now, sent, done);
+                // every success: the persisted last-ok dates the arm for a
+                // restart (tiny file, one write per refresh)
+                self.save_dms_health();
+            }
+            Ok(Err(e)) => {
+                self.dms_last_failed = true;
+                if let DexError::RateLimited { until_unix } = e {
+                    self.apply_error(&e);
+                    let venue_until = (until_unix.max(0) as u64) * 1_000;
+                    let next = self.dms_health.on_rate_limited(&day, now, venue_until);
+                    self.save_dms_health();
+                    log::warn!(
+                        "[ARCUS_VOL] dead man's switch arm refused (429, #{} today; the daily fire cap if it persists): no new quotes, next attempt in {}s",
+                        self.dms_health.rate_limited,
+                        next.saturating_sub(now) / 1_000
+                    );
+                } else {
+                    self.on_error("schedule_cancel_market (no new quotes until armed)", &e);
+                }
+            }
+            Err(_) => {
+                self.dms_last_failed = true;
+                log::warn!(
+                    "[ARCUS_VOL] dead man's switch arm/refresh timed out after {}s (no new quotes until armed)",
+                    self.cfg.dms_call_timeout_secs
+                );
+            }
+        }
+    }
+
     async fn tick(&mut self) {
         let now = now_ms();
+        // The dead man's switch first, before any venue call of this tick can
+        // stall it past the deadline (bot-strategy#1093, 2026-10-14 incident).
+        if !self.cfg.dry_run {
+            self.refresh_dms(now).await;
+            // Unarmed: pull every order of the market at the venue before this
+            // tick's other venue calls, which can stall past the previous arm's
+            // deadline (the plan pulls too, but only after them, and only the
+            // locally known quotes). Once per failure episode; retried each
+            // tick until it succeeds.
+            if dms_emergency_pull(self.dms_last_failed, self.dms_pulled) {
+                self.dms_emergency_cancel().await;
+            }
+        }
         self.read_book(now).await;
         let mid = self.book.as_ref().map(BookView::mid);
         if let Some(m) = mid {
@@ -1813,51 +1981,6 @@ impl Runtime {
                 self.live_fills(now).await;
             } else {
                 self.fills_synced = false;
-            }
-            // Refresh on schedule; after a failure, retry every tick (no new
-            // quoting meanwhile, see `dms_armed` in the tick plan).
-            let due = self.dms_last_failed
-                || self
-                    .dms_last_ok_ms
-                    .is_none_or(|t| now.saturating_sub(t) >= self.cfg.dms_refresh_secs * 1_000);
-            if due && !self.legacy_dms_cleared {
-                // Builds before bot-strategy#1093's per-market switch armed the
-                // ACCOUNT-WIDE switch; one left armed by an older process
-                // would cancel every market's orders (ours included) when it
-                // fires. Clear it before the first arm; until that disarm is
-                // confirmed, the per-market switch is not armed, so no quoting
-                // (retried every tick like a failed arm).
-                match self.dex.schedule_cancel(None).await {
-                    Ok(()) => {
-                        log::info!(
-                            "[ARCUS_VOL] account-wide dead man's switch disarmed (left over from an older build, if any)"
-                        );
-                        self.legacy_dms_cleared = true;
-                    }
-                    Err(e) => {
-                        self.dms_last_failed = true;
-                        self.on_error(
-                            "account-wide dead man's switch disarm (no new quotes until cleared)",
-                            &e,
-                        );
-                    }
-                }
-            }
-            if due && self.legacy_dms_cleared {
-                match self
-                    .dex
-                    .schedule_cancel_market(&self.cfg.market, Some(self.cfg.dms_secs))
-                    .await
-                {
-                    Ok(()) => {
-                        self.dms_last_ok_ms = Some(now);
-                        self.dms_last_failed = false;
-                    }
-                    Err(e) => {
-                        self.dms_last_failed = true;
-                        self.on_error("schedule_cancel_market (no new quotes until armed)", &e);
-                    }
-                }
             }
             if !self.startup_reconciled {
                 self.startup_reconcile().await;
@@ -2227,6 +2350,15 @@ impl Runtime {
             "pending_unresolved": self.pending_unresolved,
             "gate": gate_status,
             "learner": learner_status,
+            "dms": {"secs": self.cfg.dms_secs,
+                    "armed": self.cfg.dry_run || self.dms_armed_now(),
+                    "last_ok_ms": self.dms_last_ok_ms,
+                    "day": self.dms_health.day,
+                    "last_latency_ms": self.dms_health.last_latency_ms,
+                    "max_latency_ms": self.dms_health.max_latency_ms,
+                    "suspected_fires": self.dms_health.suspected_fires,
+                    "rate_limited": self.dms_health.rate_limited,
+                    "retry_at_ms": (self.dms_health.retry_at_ms > now).then_some(self.dms_health.retry_at_ms)},
         });
         // status.json is informational (dashboards, humans): a plain atomic
         // replace without fsync is enough; state.json above is the durable one.
@@ -2329,19 +2461,29 @@ impl Runtime {
                         log::error!(
                             "[ARCUS_VOL] DMS LEFT ARMED (cancel_ok={cancel_ok}, open_after={open_after:?}); the venue cancels this market's orders when it fires"
                         );
-                    } else if let Err(e) = self
-                        .dex
-                        .schedule_cancel_market(&self.cfg.market, None)
-                        .await
-                    {
-                        log::warn!(
-                            "{}",
-                            dms_disarm_unconfirmed_note(
-                                &self.cfg.market,
-                                self.cfg.dms_secs,
-                                &e.to_string()
-                            )
-                        );
+                    } else {
+                        match self
+                            .dex
+                            .schedule_cancel_market(&self.cfg.market, None)
+                            .await
+                        {
+                            Ok(()) => {
+                                // nothing can fire now: a planned restart must not
+                                // count a lapse of this arm
+                                self.dms_health.on_disarmed();
+                                self.save_dms_health();
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "{}",
+                                    dms_disarm_unconfirmed_note(
+                                        &self.cfg.market,
+                                        self.cfg.dms_secs,
+                                        &e.to_string()
+                                    )
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2621,6 +2763,14 @@ async fn main() -> Result<()> {
         dms_last_ok_ms: None,
         dms_last_failed: false,
         legacy_dms_cleared: false,
+        dms_health: DmsHealth::restore(
+            std::fs::read_to_string(cfg.state_dir.join("dms_health.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok()),
+            &ledger::utc_day_of(now_ms()),
+        ),
+        dms_health_path: cfg.state_dir.join("dms_health.json"),
+        dms_pulled: false,
         last_reconcile_ms: 0,
         last_position_ms: 0,
         last_summary_ms: 0,

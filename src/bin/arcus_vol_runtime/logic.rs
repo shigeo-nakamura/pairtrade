@@ -1151,6 +1151,148 @@ pub fn dms_armed(
     !last_attempt_failed && last_ok_ms.is_some_and(|t| now_ms.saturating_sub(t) < dms_secs * 1_000)
 }
 
+/// Refresh bookkeeping of the per-market dead man's switch (bot-strategy#1093,
+/// 2026-10-14 incident: refreshes queued behind slow venue calls missed the
+/// deadline, Arcus fired the switch ~10x per wallet and then refused every arm
+/// with 429 "trigger limit reached (10 per UTC day)" until 00:00Z; the runtime
+/// retried every 500 ms tick and logged/emailed each one).
+///
+/// * An arm/refresh attempt sent `dms_secs` or more after the last
+///   successful one cannot have beaten the venue deadline: the switch fired
+///   (a *suspected fire*; Arcus counts fires, not arms or refreshes). Counted
+///   on the attempt, whatever its result (a 429 or a timeout too), once per
+///   expired arm.
+/// * After a 429 the next arm attempt waits 30 s, doubling per consecutive
+///   429 up to 10 min (never earlier than the venue's own retry time), so a
+///   capped day costs a few calls an hour instead of two a second. A new UTC
+///   day (the cap's reset) clears the wait.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DmsHealth {
+    /// UTC day the counters belong to.
+    pub day: String,
+    pub suspected_fires: u32,
+    pub rate_limited: u32,
+    pub last_latency_ms: Option<u64>,
+    pub max_latency_ms: u64,
+    /// Consecutive 429s on the arm/refresh (reset by a success).
+    pub streak: u32,
+    /// No arm/refresh attempt before this (epoch ms); 0 = none pending.
+    pub retry_at_ms: u64,
+    #[serde(default)]
+    alerted: bool,
+    /// The last-ok time whose expiry was already counted.
+    #[serde(default)]
+    counted_for: Option<u64>,
+    /// The last successful arm (persisted): after a restart it is the baseline
+    /// for counting an expiry that happened while the process was down. Never
+    /// used to decide that the switch is armed.
+    #[serde(default)]
+    pub last_ok_ms: Option<u64>,
+}
+
+pub const DMS_BACKOFF_FIRST_MS: u64 = 30_000;
+pub const DMS_BACKOFF_MAX_MS: u64 = 600_000;
+
+impl DmsHealth {
+    /// The day's health survives a restart (counters, back-off, alert flag):
+    /// the venue's cap is per UTC day, not per process. A file from an
+    /// earlier day starts fresh.
+    pub fn restore(saved: Option<DmsHealth>, day: &str) -> DmsHealth {
+        match saved {
+            Some(h) if h.day == day => h,
+            Some(h) => DmsHealth {
+                day: day.to_string(),
+                last_ok_ms: h.last_ok_ms,
+                counted_for: h.counted_for,
+                ..DmsHealth::default()
+            },
+            None => DmsHealth {
+                day: day.to_string(),
+                ..DmsHealth::default()
+            },
+        }
+    }
+
+    fn roll(&mut self, day: &str) {
+        if self.day != day {
+            *self = DmsHealth {
+                day: day.to_string(),
+                last_ok_ms: self.last_ok_ms,
+                // the carried arm's expiry may already be counted (yesterday):
+                // never count the same arm twice across midnight
+                counted_for: self.counted_for,
+                ..DmsHealth::default()
+            };
+        }
+    }
+
+    /// May an arm/refresh be sent now? Always on a new UTC day.
+    pub fn may_call(&self, day: &str, now_ms: u64) -> bool {
+        self.day != day || now_ms >= self.retry_at_ms
+    }
+
+    /// An arm/refresh attempt about to be sent at `sent_ms`. Returns true
+    /// when the previous arm (`prev_ok_ms`) had already expired — counted once
+    /// per expired arm, whatever the attempt's outcome.
+    pub fn note_attempt(
+        &mut self,
+        day: &str,
+        sent_ms: u64,
+        prev_ok_ms: Option<u64>,
+        dms_secs: u64,
+    ) -> bool {
+        self.roll(day);
+        let Some(t) = prev_ok_ms else { return false };
+        if sent_ms.saturating_sub(t) < dms_secs * 1_000 || self.counted_for == Some(t) {
+            return false;
+        }
+        self.counted_for = Some(t);
+        self.suspected_fires += 1;
+        true
+    }
+
+    /// A successful arm/refresh sent at `sent_ms`, answered at `done_ms`;
+    /// `ok_ms` is the runtime's armed-since time (its tick start).
+    pub fn on_ok(&mut self, day: &str, ok_ms: u64, sent_ms: u64, done_ms: u64) {
+        self.roll(day);
+        self.last_ok_ms = Some(ok_ms);
+        let latency = done_ms.saturating_sub(sent_ms);
+        self.last_latency_ms = Some(latency);
+        self.max_latency_ms = self.max_latency_ms.max(latency);
+        self.streak = 0;
+        self.retry_at_ms = 0;
+    }
+
+    /// The switch was disarmed (confirmed): nothing can fire any more, so a
+    /// later restart must not date a lapse from the old arm.
+    pub fn on_disarmed(&mut self) {
+        self.last_ok_ms = None;
+        self.counted_for = None;
+    }
+
+    /// A 429 on the arm/refresh: returns the time of the next attempt.
+    pub fn on_rate_limited(&mut self, day: &str, now_ms: u64, venue_until_ms: u64) -> u64 {
+        self.roll(day);
+        self.rate_limited += 1;
+        self.streak += 1;
+        let shift = (self.streak - 1).min(16);
+        let wait = DMS_BACKOFF_FIRST_MS
+            .saturating_mul(1u64 << shift)
+            .min(DMS_BACKOFF_MAX_MS);
+        self.retry_at_ms = venue_until_ms.max(now_ms + wait);
+        self.retry_at_ms
+    }
+
+    /// True once per UTC day when the suspected fires reach `threshold`.
+    pub fn take_alert(&mut self, threshold: u32) -> bool {
+        if threshold > 0 && !self.alerted && self.suspected_fires >= threshold {
+            self.alerted = true;
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownStep {
     CancelAll,
@@ -1160,6 +1302,13 @@ pub enum ShutdownStep {
     HarvestFills,
     Persist,
     DisarmDms,
+}
+
+/// After a failed arm/refresh the switch may not protect our quotes: pull
+/// every order of the market at the venue (not only the locally known ones,
+/// e.g. after an ambiguous placement), once per failure episode.
+pub fn dms_emergency_pull(last_attempt_failed: bool, pulled_since_failure: bool) -> bool {
+    last_attempt_failed && !pulled_since_failure
 }
 
 /// Shutdown order (Codex P1, pairtrade#361): cancel first so nothing new
@@ -1210,6 +1359,168 @@ pub fn book_stale(book_ts_ms: Option<u64>, now_ms: u64, stale_secs: u64) -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dms_attempt_after_the_deadline_is_one_suspected_fire() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        // first arm after start: nothing to compare against
+        assert!(!h.note_attempt(d, 1_000, None, 60));
+        h.on_ok(d, 1_000, 1_000, 1_200);
+        // on time (10 s after the last ok)
+        assert!(!h.note_attempt(d, 11_000, Some(1_000), 60));
+        h.on_ok(d, 11_000, 11_000, 11_100);
+        // sent 60 s after the last ok: the deadline had passed -> counted,
+        // even though this attempt is refused (429) ...
+        assert!(h.note_attempt(d, 71_000, Some(11_000), 60));
+        h.on_rate_limited(d, 71_000, 71_000);
+        // ... and the retries for the same expired arm are not counted again
+        assert!(!h.note_attempt(d, 101_000, Some(11_000), 60));
+        assert!(!h.note_attempt(d, 131_000, Some(11_000), 60));
+        assert_eq!(h.suspected_fires, 1);
+        h.on_ok(d, 131_000, 131_000, 131_050);
+        assert_eq!(h.last_latency_ms, Some(50));
+        assert_eq!(h.max_latency_ms, 200);
+        // a later lapse of the new arm counts again
+        assert!(h.note_attempt(d, 200_000, Some(131_000), 60));
+        assert_eq!(h.suspected_fires, 2);
+        // a new UTC day resets the counters
+        assert!(!h.note_attempt("2026-10-15", 205_000, Some(200_000), 60));
+        assert_eq!(h.suspected_fires, 0);
+    }
+
+    #[test]
+    fn dms_429_backs_off_exponentially_to_ten_minutes_and_resets() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        assert!(h.may_call(d, 0));
+        let t0 = 1_000_000;
+        // venue retry_after shorter than our floor: we wait 30 s
+        assert_eq!(h.on_rate_limited(d, t0, t0 + 2_000), t0 + 30_000);
+        assert!(!h.may_call(d, t0 + 29_999));
+        assert!(h.may_call(d, t0 + 30_000));
+        assert_eq!(h.on_rate_limited(d, t0, t0), t0 + 60_000);
+        assert_eq!(h.on_rate_limited(d, t0, t0), t0 + 120_000);
+        for _ in 0..10 {
+            h.on_rate_limited(d, t0, t0);
+        }
+        assert_eq!(h.retry_at_ms, t0 + DMS_BACKOFF_MAX_MS);
+        // the venue's own later retry time wins
+        assert_eq!(h.on_rate_limited(d, t0, t0 + 900_000), t0 + 900_000);
+        // the cap resets at 00:00Z: a new day may call at once
+        assert!(h.may_call("2026-10-15", t0 + 1));
+        // a success clears the streak and the wait
+        h.on_ok(d, t0 + 900_000, t0 + 900_000, t0 + 900_100);
+        assert_eq!(h.streak, 0);
+        assert!(h.may_call(d, t0 + 900_100));
+        assert_eq!(h.rate_limited, 14);
+    }
+
+    #[test]
+    fn dms_expiry_while_the_process_was_down_is_counted_after_restart() {
+        let d = "2026-10-14";
+        let mut h = DmsHealth::default();
+        h.on_ok(d, 10_000, 10_010, 10_050);
+        let saved: DmsHealth = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        // restart 90 s later: the runtime's own last-ok is gone, the saved one is not
+        let mut r = DmsHealth::restore(Some(saved.clone()), d);
+        assert!(r.note_attempt(d, 100_000, r.last_ok_ms, 60));
+        assert_eq!(r.suspected_fires, 1);
+        // a quick restart (within the deadline) is not a fire
+        let mut q = DmsHealth::restore(Some(saved.clone()), d);
+        assert!(!q.note_attempt(d, 40_000, q.last_ok_ms, 60));
+        // across midnight the baseline survives, the counters reset
+        let n = DmsHealth::restore(Some(saved), "2026-10-15");
+        assert_eq!(n.last_ok_ms, Some(10_000));
+        assert_eq!(n.suspected_fires, 0);
+    }
+
+    #[test]
+    fn a_confirmed_disarm_leaves_no_arm_to_lapse_after_a_restart() {
+        let d = "2026-10-14";
+        let mut h = DmsHealth::default();
+        h.on_ok(d, 10_000, 10_010, 10_050);
+        h.on_disarmed();
+        let saved: DmsHealth = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        let mut r = DmsHealth::restore(Some(saved), d);
+        assert_eq!(r.last_ok_ms, None);
+        assert!(
+            !r.note_attempt(d, 500_000, r.last_ok_ms, 60),
+            "planned restart: no fire"
+        );
+        assert_eq!(r.suspected_fires, 0);
+    }
+
+    #[test]
+    fn an_arm_counted_before_midnight_is_not_counted_again_after() {
+        let mut h = DmsHealth::default();
+        h.on_ok("2026-10-14", 86_300_000, 86_300_000, 86_300_010);
+        // expired and counted at 23:59:50, then capped (429) into the new day
+        assert!(h.note_attempt("2026-10-14", 86_390_000, Some(86_300_000), 60));
+        h.on_rate_limited("2026-10-14", 86_390_000, 86_390_000);
+        assert!(!h.note_attempt("2026-10-15", 86_420_000, Some(86_300_000), 60));
+        assert_eq!(h.suspected_fires, 0, "new day, nothing new fired");
+        // same across a restart at midnight
+        let saved: DmsHealth = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        let mut r = DmsHealth::restore(Some(saved), "2026-10-16");
+        assert!(!r.note_attempt("2026-10-16", 86_500_000, r.last_ok_ms, 60));
+        // a new arm that expires counts normally
+        r.on_ok("2026-10-16", 90_000_000, 90_000_000, 90_000_010);
+        assert!(r.note_attempt("2026-10-16", 90_100_000, Some(90_000_000), 60));
+    }
+
+    #[test]
+    fn emergency_pull_once_per_failure_episode() {
+        assert!(dms_emergency_pull(true, false));
+        assert!(!dms_emergency_pull(true, true));
+        assert!(!dms_emergency_pull(false, false));
+    }
+
+    #[test]
+    fn dms_health_survives_a_restart_within_the_day() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        h.note_attempt(d, 61_000, Some(0), 60);
+        h.note_attempt(d, 122_000, Some(61_000), 60);
+        assert!(h.take_alert(2));
+        let t = h.on_rate_limited(d, 200_000, 200_000);
+        let json = serde_json::to_string(&h).unwrap();
+        let back: DmsHealth = serde_json::from_str(&json).unwrap();
+        let r = DmsHealth::restore(Some(back.clone()), d);
+        assert_eq!(r, h);
+        assert_eq!(
+            r.retry_at_ms, t,
+            "the 429 back-off continues after a restart"
+        );
+        let mut r2 = r.clone();
+        assert!(
+            !r2.take_alert(2),
+            "no second alert the same day after a restart"
+        );
+        let fresh = DmsHealth::restore(Some(back), "2026-10-15");
+        assert_eq!(fresh.suspected_fires, 0);
+        assert_eq!(fresh.day, "2026-10-15");
+        assert_eq!(DmsHealth::restore(None, d).suspected_fires, 0);
+    }
+
+    #[test]
+    fn dms_fire_alert_fires_once_per_day() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        let mut ok = 0u64;
+        for i in 0..4u64 {
+            h.note_attempt(d, ok + 61_000, Some(ok), 60);
+            ok += 61_000;
+            assert_eq!(h.take_alert(3), i == 2, "alert exactly at the 3rd fire");
+        }
+        assert!(!h.take_alert(0), "0 disables the alert");
+        h.note_attempt("2026-10-15", ok + 61_000, Some(ok), 60);
+        assert_eq!(
+            h.suspected_fires, 1,
+            "new day: counters reset, this lapse counted"
+        );
+        assert!(h.take_alert(1), "the alert re-arms on a new UTC day");
+    }
+
     #[test]
     fn an_unconfirmed_shutdown_disarm_is_a_warning_about_this_market_only() {
         let n = dms_disarm_unconfirmed_note(
