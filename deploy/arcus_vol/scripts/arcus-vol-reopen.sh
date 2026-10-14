@@ -1,14 +1,23 @@
 #!/bin/bash
 # Pause / resume arcus-vol instances for a scheduled window (bot-strategy#1093):
-# weekday cash-open and Sunday-reopen blackouts (all running instances) and the
-# HOOD/SLV weekend pause (one named instance, own record).
+# weekday cash-open / evening and Sunday-reopen blackouts (all running instances)
+# and the SLV weekend pause (one named instance, own record).
 #   arcus-vol-reopen.sh pause  [--tag TAG] [NAME...]   NAMEs default to every ACTIVE instance
 #   arcus-vol-reopen.sh resume [--tag TAG]             resume what that TAG's pause recorded
 # TAG selects the record file /var/lib/arcus-vol-reopen/TAG (default: paused).
+# Pausing is in process (arcus-vol-pause.sh: KILL_SWITCH hold, no stop/start),
+# so the dead man's switch stays armed and a window costs no venue auto-fire.
 # Invariants
 #   1. Only ACTIVE instances are paused (a named one that is already stopped,
-#      e.g. by the operator before the weekend, is skipped and NOT recorded), so
-#      resume never starts a bot it did not stop.
+#      e.g. by the operator before the weekend, is skipped and NOT recorded).
+#      An instance that is already HELD (KILL_SWITCH present: another window's
+#      hold, e.g. SLV's weekend hold during the Sunday reopen blackout, or the
+#      operator's) is skipped and not newly recorded, so a window never
+#      releases a hold it did not create. (A hold left by a failed earlier
+#      pause of this TAG is still in this TAG's record and still released.)
+#      The claim itself is atomic (arcus-vol-pause.sh exit 7 = someone else's
+#      KILL_SWITCH appeared after this check): such a name is dropped from
+#      the record again unless an earlier pause of this TAG recorded it.
 #   2. If the active instances cannot be listed, the pause FAILS (exit 1).
 #   3. The record (every instance about to be paused) is written and synced
 #      BEFORE any pause starts; if that fails nothing is paused (exit 1).
@@ -40,7 +49,13 @@ case "$ACT" in
     else
       mapfile -t todo < <(printf '%s\n' "$active" | awk 'NF')
     fi
+    keep=(); for n in "${todo[@]}"; do
+      if "$PAUSE" held "$n" >/dev/null 2>&1; then
+        echo "$n already held (KILL_SWITCH present); skipped, not recorded"
+      else keep+=("$n"); fi
+    done; todo=("${keep[@]}")
     [ ${#todo[@]} -gt 0 ] || { echo "$TAG: nothing running to pause"; exit 0; }
+    pre=(); [ -f "$REC" ] && mapfile -t pre < "$REC"
     # record first, durably; no record → no pause
     if ! { mkdir -p "$DIR" \
            && { [ ! -f "$REC" ] || cat "$REC"; printf '%s\n' "${todo[@]}"; } > "$REC.new" \
@@ -48,10 +63,29 @@ case "$ACT" in
       rm -f "$REC.new" 2>/dev/null; err "cannot write record $REC; $TAG pause NOT applied (nothing paused)"; exit 1
     fi
     pids=(); for n in "${todo[@]}"; do "$PAUSE" pause "$n" & pids+=($!); done
+    notours=()
     for i in "${!pids[@]}"; do
-      wait "${pids[$i]}" || { r=$?; rc=1; err "pause ${todo[$i]} failed (exit $r); recorded for resume"; }
+      wait "${pids[$i]}"; r=$?
+      if [ "$r" = 7 ]; then
+        # a hold appeared between the check and the claim: not ours, never release it
+        notours+=("${todo[$i]}"); echo "${todo[$i]} held by someone else; dropped from $TAG record"
+      elif [ "$r" != 0 ]; then
+        rc=1; err "pause ${todo[$i]} failed (exit $r); recorded for resume"
+      fi
     done
-    echo "$TAG paused: $(sort -u "$REC" | tr '\n' ' ')" ;;
+    if [ ${#notours[@]} -gt 0 ]; then
+      # drop only names this run added; one already recorded by an earlier
+      # pause of this TAG is still this TAG's hold
+      drop=(); for n in "${notours[@]}"; do printf '%s\n' "${pre[@]:-}" | grep -qx "$n" || drop+=("$n"); done
+      if [ ${#drop[@]} -gt 0 ]; then
+        if ! { grep -vxF -f <(printf '%s\n' "${drop[@]}") "$REC" > "$REC.new" || true; } \
+             || ! { sync "$REC.new" && mv -f "$REC.new" "$REC" && sync "$DIR"; }; then
+          rc=1; err "cannot rewrite record $REC after an unclaimed hold"
+        fi
+        [ -s "$REC" ] || rm -f "$REC"
+      fi
+    fi
+    echo "$TAG paused: $( [ -f "$REC" ] && sort -u "$REC" | tr '\n' ' ')" ;;
   resume)
     [ $# -eq 0 ] || { echo "usage: $0 resume [--tag TAG]" >&2; exit 2; }
     [ -s "$REC" ] || { echo "$TAG: nothing to resume"; rm -f "$REC"; exit 0; }
