@@ -1,14 +1,17 @@
 #!/bin/bash
 # Pause / resume arcus-vol instances for a scheduled window (bot-strategy#1093):
-# weekday cash-open and Sunday-reopen blackouts (all running instances) and the
-# HOOD/SLV weekend pause (one named instance, own record).
+# weekday cash-open / evening and Sunday-reopen blackouts (all running instances)
+# and the SLV weekend pause (one named instance, own record).
 #   arcus-vol-reopen.sh pause  [--tag TAG] [NAME...]   NAMEs default to every ACTIVE instance
 #   arcus-vol-reopen.sh resume [--tag TAG]             resume what that TAG's pause recorded
 # TAG selects the record file /var/lib/arcus-vol-reopen/TAG (default: paused).
+# Pausing is in process (arcus-vol-pause.sh: KILL_SWITCH hold, no stop/start),
+# so the dead man's switch stays armed and a window costs no venue auto-fire.
 # Invariants
 #   1. Only ACTIVE instances are paused (a named one that is already stopped,
-#      e.g. by the operator before the weekend, is skipped and NOT recorded), so
-#      resume never starts a bot it did not stop.
+#      e.g. by the operator before the weekend, is skipped and NOT recorded).
+#      Resume never starts a unit; it only releases the KILL_SWITCH holds it
+#      recorded.
 #   2. If the active instances cannot be listed, the pause FAILS (exit 1).
 #   3. The record (every instance about to be paused) is written and synced
 #      BEFORE any pause starts; if that fails nothing is paused (exit 1).

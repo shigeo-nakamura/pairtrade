@@ -1,35 +1,42 @@
 #!/bin/bash
-# Pause / resume one arcus-vol instance without leaving inventory open (bot-strategy#1093).
+# Pause / resume one arcus-vol instance IN PROCESS (bot-strategy#1093).
 #   arcus-vol-pause.sh pause  <name>
 #   arcus-vol-pause.sh resume <name>
 # <name> = spy (unit debot-arcus-vol) or the suffix of debot-arcus-vol-<name>.
+#
+# The process is never stopped or started: a blackout / weekend pause holds the
+# running runtime in its KILL_SWITCH halt (quotes cancelled, inventory
+# flattened, no new quotes) and resume removes the sentinel. The runtime keeps
+# refreshing its per-market dead man's switch the whole time, so a pause costs
+# no venue auto-fire (Arcus caps those at 10 per UTC day per subaccount; a stop
+# that could not disarm the switch cost one — the 2026-10-14 incident).
 #
 # Invariants
 #   pause
 #   1. An instance that is not running is left alone (exit 0).
 #   2. KILL_SWITCH is touched, then the script waits for the runtime to
 #      ACKNOWLEDGE it: a status.json written AFTER the touch that shows a halt,
-#      no resting quote on either side, and zero inventory. A pre-touch "flat"
-#      status never counts (quotes could still be resting and fill during the
-#      shutdown, which does not flatten).
-#   3. No acknowledgement within the wait (or status.json unreadable): the
-#      service is NOT stopped — stopping would leave a position unmonitored for
-#      the whole blackout / weekend. It keeps running with KILL_SWITCH (quotes
-#      pulled, runtime keeps flattening); logged loudly; exit 3.
-#   4. KILL_SWITCH is removed only after `systemctl stop` succeeded AND the unit
-#      is no longer active. A failed / timed-out stop keeps it; exit 4.
+#      no resting quote on either side, and a flat inventory (venue dust counts
+#      as flat). A pre-touch "flat" status never counts.
+#   3. Acknowledged: exit 0, process left running, KILL_SWITCH kept (the hold).
+#      Not acknowledged within the wait (or status.json unreadable): KILL_SWITCH
+#      kept too (quotes stay pulled, the runtime keeps flattening), logged
+#      loudly, exit 3. Either way nothing is stopped.
 #   resume
-#   5. KILL_SWITCH is removed, the unit started; success only if the start
-#      succeeds and the unit is active after the settle time, else exit 5.
-#      (Starting an instance left running by invariant 3 is a no-op; removing
-#      KILL_SWITCH lets that runtime quote again.)
+#   4. A disabled/masked unit is an operator hold: KILL_SWITCH and unit left
+#      alone (exit 0). A failed is-enabled lookup is an error (exit 6).
+#   5. KILL_SWITCH is removed. A running instance must then show a status.json
+#      written after the removal whose halt is not kill_switch (it may still be
+#      halted by a daily/cum stop) within the settle time, else exit 5.
+#      An instance that is not running is NOT started (exit 0, logged loudly):
+#      starting units is the operator's call.
 set -uo pipefail
 ACT=${1:-}; NAME=${2:-}
 [ -n "$ACT" ] && [ -n "$NAME" ] || { echo "usage: $0 pause|resume <name>"; exit 2; }
 ROOT=${ARCUS_VOL_ROOT:-}                       # test hook: prefix for /etc and /var/lib
 SYSTEMCTL=${ARCUS_VOL_SYSTEMCTL:-systemctl}    # test hook
 WAIT_S=${ARCUS_VOL_PAUSE_WAIT_S:-180}; STEP_S=${ARCUS_VOL_PAUSE_STEP_S:-2}
-SETTLE_S=${ARCUS_VOL_RESUME_SETTLE_S:-20}
+SETTLE_S=${ARCUS_VOL_RESUME_SETTLE_S:-30}
 if [ "$NAME" = spy ]; then U=debot-arcus-vol; E=$ROOT/etc/debot-arcus-vol/config.env
 else U=debot-arcus-vol-$NAME; E=$ROOT/etc/debot-arcus-vol-$NAME/config.env; fi
 [ -f "$E" ] || { echo "ERROR no $E" >&2; exit 1; }
@@ -59,30 +66,35 @@ except Exception:
 sys.exit(0 if ok else 1)
 PY
 }
+# exit 0 iff status.json was written after $1 (epoch ms) and its halt is not kill_switch
+released() { python3 - "$C/status.json" "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1])); since = int(sys.argv[2])
+    ok = int(d["ts_ms"]) > since and d.get("halt") != "kill_switch"
+except Exception:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
 inv() { python3 -c "import json,sys
 try: print(json.load(open(sys.argv[1]))['inventory']['qty'])
 except Exception: print('unreadable')" "$C/status.json" 2>/dev/null; }
 case "$ACT" in
   pause)
-    $SYSTEMCTL is-active --quiet "$U" || { echo "$U already stopped"; exit 0; }
-    [ -d "$C" ] || { loud "no state dir $C; not stopping"; exit 3; }
+    $SYSTEMCTL is-active --quiet "$U" || { echo "$U not running; left alone"; exit 0; }
+    [ -d "$C" ] || { loud "no state dir $C; cannot pause"; exit 3; }
     since=$(date +%s%3N)
-    touch "$C/KILL_SWITCH" || { loud "cannot create KILL_SWITCH; not stopping"; exit 3; }
+    touch "$C/KILL_SWITCH" || { loud "cannot create KILL_SWITCH; NOT paused"; exit 3; }
     waited=0
     until acked "$since"; do
       if [ "$waited" -ge "$WAIT_S" ]; then
-        loud "no KILL_SWITCH acknowledgement (halt + no quotes + flat) within ${WAIT_S}s (inventory=$(inv)); NOT stopping — left running with KILL_SWITCH. Clear with: $0 resume $NAME"
+        loud "no KILL_SWITCH acknowledgement (halt + no quotes + flat) within ${WAIT_S}s (inventory=$(inv)); KILL_SWITCH kept, runtime keeps flattening. Clear with: $0 resume $NAME"
         exit 3
       fi
       sleep "$STEP_S"; waited=$((waited + STEP_S))
     done
-    echo "$U acknowledged KILL_SWITCH (flat, quotes pulled)"
-    if ! $SYSTEMCTL stop "$U" || $SYSTEMCTL is-active --quiet "$U"; then
-      loud "stop failed or unit still active; KILL_SWITCH kept"
-      exit 4
-    fi
-    rm -f "$C/KILL_SWITCH"
-    echo "$U paused (inactive)" ;;
+    echo "$U paused in process (KILL_SWITCH held; flat, quotes pulled)" ;;
   resume)
     # An operator who disabled the unit after the pause wants it to stay down
     # (e.g. a risk hold over the weekend): leave it — and any KILL_SWITCH — alone.
@@ -94,10 +106,20 @@ case "$ACT" in
       disabled|masked|masked-runtime) echo "$U is $en: not resuming (operator hold)"; exit 0 ;;
       *) loud "is-enabled lookup failed (${en:-no output}); not resuming"; exit 6 ;;
     esac
-    rm -f "$C/KILL_SWITCH"
-    if ! $SYSTEMCTL start "$U"; then loud "start failed"; exit 5; fi
-    sleep "$SETTLE_S"
-    if ! $SYSTEMCTL is-active --quiet "$U"; then loud "not active ${SETTLE_S}s after start"; exit 5; fi
-    echo "$U resumed (active)" ;;
+    since=$(date +%s%3N)
+    rm -f "$C/KILL_SWITCH" || { loud "cannot remove KILL_SWITCH"; exit 5; }
+    if ! $SYSTEMCTL is-active --quiet "$U"; then
+      loud "not running at resume; KILL_SWITCH cleared, unit NOT started (operator's call)"
+      exit 0
+    fi
+    waited=0
+    until released "$since"; do
+      if [ "$waited" -ge "$SETTLE_S" ]; then
+        loud "runtime did not leave the kill_switch halt within ${SETTLE_S}s after KILL_SWITCH removal"
+        exit 5
+      fi
+      sleep "$STEP_S"; waited=$((waited + STEP_S))
+    done
+    echo "$U resumed in process (KILL_SWITCH removed, kill halt released)" ;;
   *) echo "usage: $0 pause|resume <name>"; exit 2 ;;
 esac
