@@ -3,7 +3,7 @@
 `arcus_vol_runtime` quotes one Arcus Perps market on **subaccount 0** of the
 owner's wallet: post-only quotes resting `QUOTE_OFFSET_BPS` behind the touch
 (presence mode; `0` = at the touch), the inventory-reducing side at the touch,
-daily and cumulative stops, a 30 s per-market dead man's switch
+daily and cumulative stops, a 60 s per-market dead man's switch (units set ARCUS_VOL_DMS_SECS=60 since 2026-10-14; runtime default 30 s)
 (`scheduleCancel` with `marketId`, refreshed every 10 s). Binary: `src/bin/arcus_vol_runtime/` (module doc =
 design + invariants). Feature set: `--no-default-features --features
 arcus-sdk` (no lighter-sdk, no libsigner).
@@ -279,7 +279,7 @@ weekdays, `pre` 04:00–09:30, `cash` 09:30–16:00, `after` 16:00–20:00,
 ### What the dead man's switch means for manual trading
 
 The switch is **per-market** (`scheduleCancel` with `marketId`, dex-connector
-4.7.44+): if the host cannot reach the venue for ~30 s (or the runtime dies),
+4.7.44+): if the host cannot reach the venue for ~60 s (or the runtime dies),
 the venue cancels only the open orders **in the runtime's market**
 (`MARKET`, e.g. SPY-USD). Manual orders in other markets survive. Before
 dex-connector 4.7.44 the switch was account-wide and cancelled every open
@@ -298,7 +298,7 @@ order on subaccount 0 (a manual NEAR-USD limit was lost that way on
   the connector immediately disarms the account-wide switch again (the error
   line says whether that worked).
 - At shutdown an unconfirmed per-market disarm is only a WARN ("…switch may
-  still fire within 30s -- it only cancels SPY-USD orders, which are already
+  still fire within 60s -- it only cancels SPY-USD orders, which are already
   cancelled; exiting normally"): the quotes were cancelled and read back
   before the disarm.
 - Venue quotas: 10 auto-fires per UTC day per subaccount (shared by all of

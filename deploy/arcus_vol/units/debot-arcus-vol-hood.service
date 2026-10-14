@@ -16,8 +16,12 @@ WorkingDirectory=-/var/lib/debot-arcus-vol-hood
 # The launcher checks credentials, sentinels, the venue (flat, no open orders)
 # and sizes the quotes from free collateral, then execs the runtime, so the
 # runtime itself is the main process.
+# Per-market dead man's switch lead (bot-strategy#1093, 2026-10-14): 60 s instead of the
+# 30 s default (refresh stays 10 s). On 10-14 refreshes stuck behind slow venue REST calls
+# missed the 30 s deadline ~10x per wallet and exhausted the venue's 10 auto-fires/UTC day.
+Environment=ARCUS_VOL_DMS_SECS=60
 ExecStart=/bin/bash /opt/debot/scripts/debot-arcus-vol.sh
-# A crash is retried, slowly: the venue's dead man's switch (30 s) has already
+# A crash is retried, slowly: the venue's dead man's switch (60 s) has already
 # cancelled the quotes by then, and the runtime's startup reconcile cancels /
 # adopts whatever is left. A deliberate stop (KILL_SWITCH / HALT sentinel) makes
 # the launcher exit 0, which on-failure does not retry.
