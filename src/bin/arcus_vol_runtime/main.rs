@@ -81,13 +81,13 @@ use ledger::{
 };
 use logic::{
     book_depth, classify_error, count_position_stops, dms_armed, dms_disarm_unconfirmed_note,
-    flatten_halt_label, flatten_reason, flatten_steps, fresh_mark, market_position, may_disarm_dms,
-    own_displayed, plan_inputs, plan_quotes, position_check, position_gate_after,
-    position_stop_bps, quote_action, quote_dists, quote_pass, read_within, reconcile_cleared,
-    send_gated, shock, shutdown_steps, spill_rows, sweep_open_orders, tick_plan, ticker_read_due,
-    touches, BatchSink, DmsHealth, ErrorEffect, FlattenReason, PlanState, PosCheck, PricePlan,
-    QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep, SidePlan, Step, TickPlan,
-    VenueMin, PLACE_VISIBILITY_GRACE_MS,
+    dms_emergency_pull, flatten_halt_label, flatten_reason, flatten_steps, fresh_mark,
+    market_position, may_disarm_dms, own_displayed, plan_inputs, plan_quotes, position_check,
+    position_gate_after, position_stop_bps, quote_action, quote_dists, quote_pass, read_within,
+    reconcile_cleared, send_gated, shock, shutdown_steps, spill_rows, sweep_open_orders, tick_plan,
+    ticker_read_due, touches, BatchSink, DmsHealth, ErrorEffect, FlattenReason, PlanState,
+    PosCheck, PricePlan, QSide, QuoteAction, QuoteParams, QuoteTarget, Resting, ShutdownStep,
+    SidePlan, Step, TickPlan, VenueMin, PLACE_VISIBILITY_GRACE_MS,
 };
 use quote_gate::{GateOutput, QuoteGate};
 use rust_decimal::prelude::ToPrimitive;
@@ -249,6 +249,8 @@ struct Runtime {
     /// Refresh latency, suspected fires and 429 back-off of the switch.
     dms_health: DmsHealth,
     dms_health_path: PathBuf,
+    /// The market-wide emergency pull ran since the last failed arm/refresh.
+    dms_pulled: bool,
     last_reconcile_ms: u64,
     last_position_ms: u64,
     last_summary_ms: u64,
@@ -1799,6 +1801,27 @@ impl Runtime {
         }
     }
 
+    /// Market-wide cancel at the venue (bounded by the DMS call timeout).
+    async fn dms_emergency_cancel(&mut self) {
+        let limit = Duration::from_secs(self.cfg.dms_call_timeout_secs);
+        let market = self.cfg.market.clone();
+        match tokio::time::timeout(limit, self.dex.cancel_all_orders(Some(market))).await {
+            Ok(Ok(())) => {
+                self.resting.clear();
+                self.dms_pulled = true;
+                log::warn!(
+                    "[ARCUS_VOL] dead man's switch not armed: cancelled every {} order at the venue",
+                    self.cfg.market
+                );
+            }
+            Ok(Err(e)) => self.on_error("unarmed-DMS cancel_all (retried next tick)", &e),
+            Err(_) => log::warn!(
+                "[ARCUS_VOL] unarmed-DMS cancel_all timed out after {}s (retried next tick)",
+                self.cfg.dms_call_timeout_secs
+            ),
+        }
+    }
+
     async fn refresh_dms(&mut self, now: u64) {
         let due = self.dms_last_failed
             || self
@@ -1879,6 +1902,7 @@ impl Runtime {
                 let done = now_ms();
                 self.dms_last_ok_ms = Some(now);
                 self.dms_last_failed = false;
+                self.dms_pulled = false;
                 self.dms_health.on_ok(&day, now, sent, done);
                 // every success: the persisted last-ok dates the arm for a
                 // restart (tiny file, one write per refresh)
@@ -1916,11 +1940,13 @@ impl Runtime {
         // stall it past the deadline (bot-strategy#1093, 2026-10-14 incident).
         if !self.cfg.dry_run {
             self.refresh_dms(now).await;
-            // Unarmed: pull our resting quotes before this tick's other venue
-            // calls, which can stall past the previous arm's deadline (the plan
-            // pulls too, but only after them).
-            if self.dms_last_failed && !self.resting.is_empty() {
-                self.pull_quotes().await;
+            // Unarmed: pull every order of the market at the venue before this
+            // tick's other venue calls, which can stall past the previous arm's
+            // deadline (the plan pulls too, but only after them, and only the
+            // locally known quotes). Once per failure episode; retried each
+            // tick until it succeeds.
+            if dms_emergency_pull(self.dms_last_failed, self.dms_pulled) {
+                self.dms_emergency_cancel().await;
             }
         }
         self.read_book(now).await;
@@ -2435,19 +2461,29 @@ impl Runtime {
                         log::error!(
                             "[ARCUS_VOL] DMS LEFT ARMED (cancel_ok={cancel_ok}, open_after={open_after:?}); the venue cancels this market's orders when it fires"
                         );
-                    } else if let Err(e) = self
-                        .dex
-                        .schedule_cancel_market(&self.cfg.market, None)
-                        .await
-                    {
-                        log::warn!(
-                            "{}",
-                            dms_disarm_unconfirmed_note(
-                                &self.cfg.market,
-                                self.cfg.dms_secs,
-                                &e.to_string()
-                            )
-                        );
+                    } else {
+                        match self
+                            .dex
+                            .schedule_cancel_market(&self.cfg.market, None)
+                            .await
+                        {
+                            Ok(()) => {
+                                // nothing can fire now: a planned restart must not
+                                // count a lapse of this arm
+                                self.dms_health.on_disarmed();
+                                self.save_dms_health();
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "{}",
+                                    dms_disarm_unconfirmed_note(
+                                        &self.cfg.market,
+                                        self.cfg.dms_secs,
+                                        &e.to_string()
+                                    )
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2734,6 +2770,7 @@ async fn main() -> Result<()> {
             &ledger::utc_day_of(now_ms()),
         ),
         dms_health_path: cfg.state_dir.join("dms_health.json"),
+        dms_pulled: false,
         last_reconcile_ms: 0,
         last_position_ms: 0,
         last_summary_ms: 0,
