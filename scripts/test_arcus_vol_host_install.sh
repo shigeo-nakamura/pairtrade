@@ -128,6 +128,7 @@ up aapl; st aapl "$FUT" kill_switch 7.32;         pz aapl; rc=$?
 [ $rc = 3 ] && [ "$(act aapl)" = active ] && ks aapl && nocalls && ok "never flat: rc 3, KILL_SWITCH kept, nothing stopped" || bad "never-flat rc=$rc"
 up hood; st hood "$FUT" kill_switch 0; echo '{bad' > "$T/root/var/lib/debot-arcus-vol-hood/state/status.json"; pz hood; rc=$?
 [ $rc = 3 ] && ok "unreadable status.json: rc 3" || bad "unreadable rc=$rc"
+grep -qF 'sync "$C/KILL_SWITCH" "$C" ||' "$PS" && ok "KILL_SWITCH and its directory are fsynced before the hold is reported" || bad "KILL_SWITCH not fsynced"
 clr gld aapl hood; echo inactive > "$T/act/debot-arcus-vol-gld"; pz gld; rc=$?
 [ $rc = 0 ] && ! ks gld && nocalls && ok "not running: left alone, no KILL_SWITCH" || bad "not-running pause rc=$rc"
 

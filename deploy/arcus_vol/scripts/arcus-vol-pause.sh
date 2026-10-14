@@ -89,6 +89,9 @@ case "$ACT" in
     [ -d "$C" ] || { loud "no state dir $C; cannot pause"; exit 3; }
     since=$(date +%s%3N)
     touch "$C/KILL_SWITCH" || { loud "cannot create KILL_SWITCH; NOT paused"; exit 3; }
+    # durable before the hold is reported: a power loss must not drop the
+    # sentinel while the (synced) pause record survives
+    sync "$C/KILL_SWITCH" "$C" || { loud "cannot fsync KILL_SWITCH / $C; hold NOT confirmed"; exit 3; }
     waited=0
     until acked "$since"; do
       if [ "$waited" -ge "$WAIT_S" ]; then
