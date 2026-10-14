@@ -248,6 +248,7 @@ struct Runtime {
     legacy_dms_cleared: bool,
     /// Refresh latency, suspected fires and 429 back-off of the switch.
     dms_health: DmsHealth,
+    dms_health_path: PathBuf,
     last_reconcile_ms: u64,
     last_position_ms: u64,
     last_summary_ms: u64,
@@ -1785,6 +1786,19 @@ impl Runtime {
     /// failure retry every tick (no new quoting meanwhile, see `dms_armed` in
     /// the tick plan) — except after a 429, which backs off (`DmsHealth`).
     /// Every call is bounded by `dms_call_timeout_secs`.
+    /// Persist the day's switch health (counters, back-off, alert flag) so a
+    /// restart does not forget them: the venue's cap is per UTC day.
+    fn save_dms_health(&self) {
+        match serde_json::to_string(&self.dms_health) {
+            Ok(body) => {
+                if let Err(e) = debot::directional::atomic_write(&self.dms_health_path, &body) {
+                    log::warn!("[ARCUS_VOL] dms_health.json write failed: {e}");
+                }
+            }
+            Err(e) => log::warn!("[ARCUS_VOL] dms_health encode failed: {e}"),
+        }
+    }
+
     async fn refresh_dms(&mut self, now: u64) {
         let due = self.dms_last_failed
             || self
@@ -1840,10 +1854,11 @@ impl Runtime {
                 let done = now_ms();
                 self.dms_last_ok_ms = Some(now);
                 self.dms_last_failed = false;
-                if self
+                let had_streak = self.dms_health.streak > 0;
+                let lapsed = self
                     .dms_health
-                    .on_ok(&day, sent, done, prev_ok, self.cfg.dms_secs)
-                {
+                    .on_ok(&day, sent, done, prev_ok, self.cfg.dms_secs);
+                if lapsed {
                     log::warn!(
                         "[ARCUS_VOL] dead man's switch refreshed {}s after the previous one (deadline {}s): it most likely FIRED (Arcus caps fires at 10 per UTC day per subaccount); suspected fires today {}",
                         sent.saturating_sub(prev_ok.unwrap_or(sent)) / 1_000,
@@ -1851,7 +1866,11 @@ impl Runtime {
                         self.dms_health.suspected_fires
                     );
                 }
-                if self.dms_health.take_alert(self.cfg.dms_fire_alert) {
+                let alert = self.dms_health.take_alert(self.cfg.dms_fire_alert);
+                if lapsed || had_streak || alert {
+                    self.save_dms_health();
+                }
+                if alert {
                     log::error!(
                         "[ARCUS_VOL] {} suspected dead man's switch fires today on {} (Arcus allows 10 per UTC day per subaccount, shared by the wallet's markets); quoting stops for the day once the venue refuses to arm",
                         self.dms_health.suspected_fires,
@@ -1865,6 +1884,7 @@ impl Runtime {
                     self.apply_error(&e);
                     let venue_until = (until_unix.max(0) as u64) * 1_000;
                     let next = self.dms_health.on_rate_limited(&day, now, venue_until);
+                    self.save_dms_health();
                     log::warn!(
                         "[ARCUS_VOL] dead man's switch arm refused (429, #{} today; the daily fire cap if it persists): no new quotes, next attempt in {}s",
                         self.dms_health.rate_limited,
@@ -2695,7 +2715,13 @@ async fn main() -> Result<()> {
         dms_last_ok_ms: None,
         dms_last_failed: false,
         legacy_dms_cleared: false,
-        dms_health: DmsHealth::default(),
+        dms_health: DmsHealth::restore(
+            std::fs::read_to_string(cfg.state_dir.join("dms_health.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok()),
+            &ledger::utc_day_of(now_ms()),
+        ),
+        dms_health_path: cfg.state_dir.join("dms_health.json"),
         last_reconcile_ms: 0,
         last_position_ms: 0,
         last_summary_ms: 0,

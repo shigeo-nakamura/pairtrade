@@ -220,6 +220,17 @@ printf 'LEARNER=shadow\nLEARNER_ARMS=2,3,5,8,12\nLEARNER_HALF_LIFE_H=168\nLEARNE
 [ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_LEARNER=shadow "$T/env.out" && grep -qxF ARCUS_VOL_LEARNER_ARMS=2,3,5,8,12 "$T/env.out" \
     && grep -qxF ARCUS_VOL_LEARNER_HALF_LIFE_H=168 "$T/env.out" && grep -qxF ARCUS_VOL_LEARN_POINT_VALUE_PER_M=15 "$T/env.out" \
     && grep -qxF ARCUS_VOL_LEARNER_HISTORY=2026-10-05T10:19:00Z=2/5,2026-10-09T17:08:00Z=3/5 "$T/env.out" || fail "learner settings must reach the runtime: $OUT"
+# dead man's switch tuning (bot-strategy#1093): optional integers, passed through
+printf 'DMS_SECS=60\nDMS_CALL_TIMEOUT_SECS=4\nDMS_FIRE_ALERT=0\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_DMS_SECS=60 "$T/env.out" && grep -qxF ARCUS_VOL_DMS_CALL_TIMEOUT_SECS=4 "$T/env.out" \
+    && grep -qxF ARCUS_VOL_DMS_FIRE_ALERT=0 "$T/env.out" || fail "DMS settings must reach the runtime: $OUT"
+ok "DMS settings pass through config.env"
+printf 'DMS_FIRE_ALERT=x\n' > "$T/etc/config.env"; run
+[ "$RC" -ne 0 ] && grep -q "DMS_FIRE_ALERT must be" <<< "$OUT" || fail "a non-integer DMS setting must refuse the start: $OUT"
+ok "non-integer DMS setting refused"
+: > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && ! grep -q '^ARCUS_VOL_DMS_CALL_TIMEOUT_SECS\|^ARCUS_VOL_DMS_FIRE_ALERT' "$T/env.out" || fail "unset DMS settings must not be exported: $OUT"
+ok "unset DMS settings are not exported"
 printf 'LEARNER=live\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] && grep -q "LEARNER must be off|shadow" <<< "$OUT" || fail "learner live mode must refuse (shadow only)"
 printf 'LEARNER=shadow\nLEARNER_ARMS=2;3\n' > "$T/etc/config.env"; run

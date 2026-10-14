@@ -33,6 +33,10 @@
 #   off), LEARNER_ARMS, LEARNER_HALF_LIFE_H, LEARNER_POINT_VALUE_PER_M,
 #   LEARNER_HISTORY pass through as ARCUS_VOL_LEARNER*; shadow only records
 #   what it would choose (learner.jsonl, status.json) and never moves quotes.
+#   Optional dead man's switch tuning (bot-strategy#1093): DMS_SECS,
+#   DMS_CALL_TIMEOUT_SECS, DMS_FIRE_ALERT (integers) pass through as
+#   ARCUS_VOL_DMS_*; unset = the unit's Environment= / the runtime default (the
+#   runtime validates the combination).
 #
 # Operator quick reference (STATE_DIR, default /var/lib/debot-arcus-vol/state):
 #   touch KILL_SWITCH   runtime pulls quotes, flattens, halts; remove before
@@ -92,7 +96,7 @@ load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY DMS_SECS DMS_CALL_TIMEOUT_SECS DMS_FIRE_ALERT
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -175,6 +179,9 @@ for v in LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M; do
     [ -z "${!v:-}" ] || [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
 done
 LEARNER_HISTORY="${LEARNER_HISTORY:-}"
+for v in DMS_SECS DMS_CALL_TIMEOUT_SECS DMS_FIRE_ALERT; do
+    [ -z "${!v:-}" ] || [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a non-negative integer (got '${!v}')"
+done
 
 [ -x "$BIN" ] || die "binary missing or not executable: $BIN"
 if ldd "$BIN" 2>/dev/null | grep -q 'not found'; then die "unresolved shared libraries: $(ldd "$BIN" | grep 'not found' | tr '\n' ' ')"; fi
@@ -298,6 +305,9 @@ if [ "$LEARNER" = shadow ]; then
     [ -n "$LEARNER_HISTORY" ] && export ARCUS_VOL_LEARNER_HISTORY="$LEARNER_HISTORY"
 fi
 export ARCUS_VOL_DAILY_STOP_USD="$DAILY_STOP_USD"
+[ -n "${DMS_SECS:-}" ] && export ARCUS_VOL_DMS_SECS="$DMS_SECS"
+[ -n "${DMS_CALL_TIMEOUT_SECS:-}" ] && export ARCUS_VOL_DMS_CALL_TIMEOUT_SECS="$DMS_CALL_TIMEOUT_SECS"
+[ -n "${DMS_FIRE_ALERT:-}" ] && export ARCUS_VOL_DMS_FIRE_ALERT="$DMS_FIRE_ALERT"
 export ARCUS_VOL_CUM_STOP_USD="$CUM_STOP_USD"
 export ARCUS_WS_PRIVATE=1
 export RUST_LOG="${RUST_LOG:-info}"

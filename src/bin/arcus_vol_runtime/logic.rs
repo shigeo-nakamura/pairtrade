@@ -1164,7 +1164,7 @@ pub fn dms_armed(
 ///   429 up to 10 min (never earlier than the venue's own retry time), so a
 ///   capped day costs a few calls an hour instead of two a second. A new UTC
 ///   day (the cap's reset) clears the wait.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DmsHealth {
     /// UTC day the counters belong to.
     pub day: String,
@@ -1176,6 +1176,7 @@ pub struct DmsHealth {
     pub streak: u32,
     /// No arm/refresh attempt before this (epoch ms); 0 = none pending.
     pub retry_at_ms: u64,
+    #[serde(default)]
     alerted: bool,
 }
 
@@ -1183,6 +1184,19 @@ pub const DMS_BACKOFF_FIRST_MS: u64 = 30_000;
 pub const DMS_BACKOFF_MAX_MS: u64 = 600_000;
 
 impl DmsHealth {
+    /// The day's health survives a restart (counters, back-off, alert flag):
+    /// the venue's cap is per UTC day, not per process. A file from an
+    /// earlier day starts fresh.
+    pub fn restore(saved: Option<DmsHealth>, day: &str) -> DmsHealth {
+        match saved {
+            Some(h) if h.day == day => h,
+            _ => DmsHealth {
+                day: day.to_string(),
+                ..DmsHealth::default()
+            },
+        }
+    }
+
     fn roll(&mut self, day: &str) {
         if self.day != day {
             *self = DmsHealth {
@@ -1345,6 +1359,33 @@ mod tests {
         assert_eq!(h.streak, 0);
         assert!(h.may_call(d, t0 + 900_100));
         assert_eq!(h.rate_limited, 14);
+    }
+
+    #[test]
+    fn dms_health_survives_a_restart_within_the_day() {
+        let mut h = DmsHealth::default();
+        let d = "2026-10-14";
+        h.on_ok(d, 61_000, 61_010, Some(0), 60);
+        h.on_ok(d, 122_000, 122_010, Some(61_000), 60);
+        assert!(h.take_alert(2));
+        let t = h.on_rate_limited(d, 200_000, 200_000);
+        let json = serde_json::to_string(&h).unwrap();
+        let back: DmsHealth = serde_json::from_str(&json).unwrap();
+        let r = DmsHealth::restore(Some(back.clone()), d);
+        assert_eq!(r, h);
+        assert_eq!(
+            r.retry_at_ms, t,
+            "the 429 back-off continues after a restart"
+        );
+        let mut r2 = r.clone();
+        assert!(
+            !r2.take_alert(2),
+            "no second alert the same day after a restart"
+        );
+        let fresh = DmsHealth::restore(Some(back), "2026-10-15");
+        assert_eq!(fresh.suspected_fires, 0);
+        assert_eq!(fresh.day, "2026-10-15");
+        assert_eq!(DmsHealth::restore(None, d).suspected_fires, 0);
     }
 
     #[test]
