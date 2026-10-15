@@ -1,7 +1,0 @@
-[Unit]
-Description=arcus-vol weekend pause for slv (bot-strategy#1093)
-[Timer]
-OnCalendar=Sat *-*-* 00:00:00 UTC
-Persistent=false
-[Install]
-WantedBy=timers.target
