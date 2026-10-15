@@ -14,7 +14,6 @@ byte-for-byte from the host on 2026-10-12; `install_arcus_vol_host.sh
 | `config/qqq.config.retired` | — | QQQ retired 2026-10-10; host keeps `config.env.retired-*`, no `config.env` |
 | `scripts/arcus-vol-pause.sh` | `/opt/debot/scripts/` | IN PROCESS: pause = touch KILL_SWITCH → wait for the runtime's ack (halt, no quotes, flat) and keep the hold; resume = remove KILL_SWITCH → confirm the kill halt is released (starts the unit only if it died during the hold). Never stops a unit |
 | `scripts/arcus-vol-reopen.sh` | `/opt/debot/scripts/` | pause every ACTIVE instance not already held (records them), resume (release) only those; a window never takes over another window's or the operator's hold |
-| `units/arcus-vol-{pause,resume}-slv.*` | `/etc/systemd/system/` | SLV weekend pause (HOOD's removed 2026-10-13 with HOOD): Sat 00:00 UTC → Sun 20:10 New York (via `arcus-vol-reopen.sh --tag weekend-<m>`: the process stays up all weekend in its KILL_SWITCH hold; only a hold the pause recorded is released) |
 | `units/arcus-vol-reopen-{pause,resume}.*` | `/etc/systemd/system/` | Sunday reopen blackout 17:55–18:05 and 19:55–20:05 New York |
 | `units/arcus-vol-open-{pause,resume}.*` | `/etc/systemd/system/` | weekday cash-open blackout 09:28–09:35 New York |
 | `units/arcus-vol-evening-{pause,resume}.*` | `/etc/systemd/system/` | weekday overnight-session-start blackout 19:55–20:05 New York, Mon–Thu (Fri 20:00 is the weekend pause) |

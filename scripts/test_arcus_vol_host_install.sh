@@ -47,7 +47,7 @@ out=$(bash "$INST" --apply 2>&1); rc=$?
 [ -f "$T/sys/debot-arcus-vol-aapl.service" ] && [ -f "$T/sys/arcus-vol-open-pause.timer" ] && [ -f "$T/sys/debot-arcus-vol.service" ] && ok "units + timers installed" || bad "units"
 cmp -s "$T/root/etc/debot-arcus-vol-aapl/config.env" "$HERE/deploy/arcus_vol/config/aapl.config" && ok "missing config.env installed" || bad "config"
 [ ! -e "$T/root/etc/debot-arcus-vol-qqq/config.env" ] && ok "retired qqq gets no config.env" || bad "qqq config written"
-[ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-nvda)" = disabled ] && [ "$(cat "$T/en/debot-arcus-vol-slv")" = enabled ] && ok "enablement per instances.tsv" || bad "enablement"
+[ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-nvda)" = disabled ] && [ "$(cat "$T/en/debot-arcus-vol-aapl")" = enabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-slv)" = disabled ] && ok "enablement per instances.tsv" || bad "enablement"
 [ "$(cat "$T/act/arcus-vol-open-pause.timer")" = active ] && ok "timers enabled --now" || bad "timers"
 grep -qE "^(start|stop|restart|reload|try-restart|kill) " "$T/calls" && bad "apply started/stopped a unit" || ok "apply never starts/stops/restarts"
 grep -E "^enable --now" "$T/calls" | grep -qv "\.timer" && bad "enable --now on a non-timer" || ok "--now only for timers"
@@ -81,6 +81,8 @@ rm -f "$T/scripts/arcus-vol-pause.sh"; chmod 500 "$T/scripts"
 out=$(bash "$INST" --apply 2>&1); rc=$?; chmod 700 "$T/scripts"
 [ $rc = 4 ] && echo "$out" | grep -q "^FAIL install $T/scripts/arcus-vol-pause.sh" && ! echo "$out" | grep -q "apply done" && ok "install failure → exit 4, FAIL line, no 'apply done'" || { bad "failure not propagated rc=$rc"; echo "$out" | tail -3; }
 
+# slv is disabled in instances.tsv since 2026-10-15; the pause/resume logic tests below still use it as a live unit
+echo enabled > "$T/en/debot-arcus-vol-slv"
 # 8. pause / reopen scripts (fake systemctl, fake root) — IN PROCESS: never stop/start a unit
 PS="$HERE/deploy/arcus_vol/scripts/arcus-vol-pause.sh"; RS="$HERE/deploy/arcus_vol/scripts/arcus-vol-reopen.sh"
 export ARCUS_VOL_PAUSE_WAIT_S=3 ARCUS_VOL_PAUSE_STEP_S=1 ARCUS_VOL_RESUME_SETTLE_S=3 ARCUS_VOL_PAUSE_SCRIPT="$PS"
@@ -190,6 +192,7 @@ for f in "$T"/root/var/lib/debot-arcus-vol-*/state/KILL_SWITCH; do rm -f "$f"; d
 RD="$T/root/var/lib/arcus-vol-reopen"; rm -f "${RD:?}"/*
 # the tag/record logic is exercised on hood (disabled in instances.tsv since 2026-10-13): enable it in the stub
 echo enabled > "$T/en/debot-arcus-vol-hood"
+echo enabled > "$T/en/debot-arcus-vol-slv"   # slv is disabled in instances.tsv since 2026-10-15; the record logic still uses it
 # operator stopped HOOD before Saturday: weekend pause skips it, resume does nothing
 echo inactive > "$T/act/debot-arcus-vol-hood"; : > "$T/calls"
 bash "$RS" pause --tag weekend-hood hood >/dev/null 2>&1; rc=$?
@@ -269,21 +272,21 @@ for u in "$HERE"/deploy/arcus_vol/units/arcus-vol-*.service; do
   out=$(bash -c "$cmd" 2>&1); rc=$?; nexec=$((nexec + 1))
   [ $rc = 0 ] || bad "ExecStart of $(basename "$u") exits $rc: $out"
 done
-[ $nexec = 8 ] && ok "ran all 8 unit ExecStart lines" || bad "ran $nexec unit ExecStart lines, expected 8"
+[ $nexec = 6 ] && ok "ran all 6 unit ExecStart lines" || bad "ran $nexec unit ExecStart lines, expected 6"
 grep -qE "^(start|stop|restart) " "$T/calls" && bad "an idle ExecStart started/stopped a unit" || ok "idle ExecStart lines touch no unit"
-# and a recorded weekend round trip through the units' own command lines (fake runtime)
+# and a recorded blackout round trip through the evening units' own command lines (fake runtime)
 up slv; rt slv; sleep 0.3; : > "$T/calls"
 for a in pause resume; do
-  line=$(grep -E '^ExecStart=' "$HERE/deploy/arcus_vol/units/arcus-vol-$a-slv.service" | cut -d= -f2-)
-  bash -c "${line//\/opt\/debot\/scripts\//$HERE/deploy/arcus_vol/scripts/}" >/dev/null 2>&1 || bad "weekend $a unit command failed"
-  [ $a = pause ] && { [ "$(act slv)" = active ] && ks slv && ok "weekend pause unit holds SLV in process" || bad "weekend pause unit"; }
+  line=$(grep -E '^ExecStart=' "$HERE/deploy/arcus_vol/units/arcus-vol-evening-$a.service" | cut -d= -f2-)
+  bash -c "${line//\/opt\/debot\/scripts\//$HERE/deploy/arcus_vol/scripts/}" >/dev/null 2>&1 || bad "evening $a unit command failed"
+  [ $a = pause ] && { [ "$(act slv)" = active ] && ks slv && ok "evening pause unit holds the running bot in process" || bad "evening pause unit"; }
 done
-[ "$(act slv)" = active ] && ! ks slv && [ ! -e "$T/root/var/lib/arcus-vol-reopen/weekend-slv" ] && nocalls && ok "weekend resume unit releases what its pause held, no start/stop" || bad "weekend resume unit"
+[ "$(act slv)" = active ] && ! ks slv && [ ! -s "$T/root/var/lib/arcus-vol-reopen/paused" ] && nocalls && ok "evening resume unit releases what its pause held, no start/stop" || bad "evening resume unit"
 rt_off slv
 # evening blackout: Mon..Thu only (Friday 20:00 NY is the weekend pause), 19:55 / 20:05 New York
 for a in pause resume; do
   t="$HERE/deploy/arcus_vol/units/arcus-vol-evening-$a.timer"
   grep -qx "OnCalendar=Mon..Thu \*-\*-\* $([ $a = pause ] && echo 19:55 || echo 20:05):00 America/New_York" "$t" && ok "evening $a timer Mon..Thu" || bad "evening $a timer calendar"
 done
-[ ! -e "$HERE/deploy/arcus_vol/units/arcus-vol-pause-hood.timer" ] && ok "HOOD weekend timers removed" || bad "HOOD weekend timers still present"
+[ ! -e "$HERE/deploy/arcus_vol/units/arcus-vol-pause-hood.timer" ] && [ ! -e "$HERE/deploy/arcus_vol/units/arcus-vol-pause-slv.timer" ] && ok "HOOD/SLV weekend timers removed" || bad "weekend timers still present"
 exit $fail
