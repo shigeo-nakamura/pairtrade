@@ -103,15 +103,25 @@ class ProducerTests(unittest.TestCase):
         self.assertNotIn("scaled_from_gross_usd", sig["meta"])
         self.assertAlmostEqual(sig["weights"]["A"], 0.496)
 
+    def test_the_2026_10_16_book_is_scaled_not_refused(self):
+        """2026-10-16: carried legs marked up to $1021.16 (2.1 % over), past the old 2 %
+        bound; the producer refused and the live runtime skipped its second rebalance."""
+        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 85.0966666667} for i in range(12)}
+        row = {"type": "rebalance", "date": "2026-10-16", "book": legs}
+        sig = xp.build(row, 1000.0, datetime.now(timezone.utc))
+        self.assertAlmostEqual(sum(abs(x) for x in sig["weights"].values()), 1.0, places=9)
+        self.assertEqual(sig["meta"]["scaled_from_gross_usd"], 1021.16)
+
     def test_an_oversized_book_beyond_tolerance_is_still_refused(self):
-        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 103.0} for i in range(10)}  # $1030
+        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 151.0} for i in range(10)}  # $1510
         row = {"type": "rebalance", "date": "2026-10-11", "book": legs}
         with self.assertRaises(SystemExit):
             xp.build(row, 1000.0, datetime.now(timezone.utc))
-        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 102.0} for i in range(10)}  # $1020: edge
+        legs = {f"S{i}": {"side": 1 if i % 2 else -1, "notional": 150.0} for i in range(10)}  # $1500: edge
         row = dict(row, book=legs)
         sig = xp.build(row, 1000.0, datetime.now(timezone.utc))
-        self.assertEqual(sig["meta"]["scaled_from_gross_usd"], 1020.0)
+        self.assertEqual(sig["meta"]["scaled_from_gross_usd"], 1500.0)
+        self.assertAlmostEqual(sum(abs(x) for x in sig["weights"].values()), 1.0, places=9)
 
     def test_non_finite_metadata_is_refused(self):
         with self.assertRaises(SystemExit):

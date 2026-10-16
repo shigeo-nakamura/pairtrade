@@ -57,7 +57,11 @@ NET_TOLERANCE = 0.15
 # producer refused and the live runtime skipped that rebalance). Up to this
 # much over, every weight is scaled by 1/sum(|w|): the shadow's proportions are
 # kept and the live book is exactly the gross. Beyond it the book is refused.
-OVERSIZE_TOLERANCE = 0.02
+# Mark-to-market drift is not bounded by any small number (2026-10-16: $1021.16,
+# 2.1 % over the old 2 % bound, refused again and the live book skipped its second
+# rebalance), so the bound only rejects a book that cannot be the shadow's
+# (a double-counted leg or a wrong gross), not ordinary drift of carried legs.
+OVERSIZE_TOLERANCE = 0.5
 
 
 def on_grid(d: date, anchor: date = ANCHOR, every: int = EVERY_DAYS) -> bool:
