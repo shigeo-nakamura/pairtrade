@@ -752,6 +752,13 @@ impl Learner {
         });
         if let Some(c) = &current {
             if now.saturating_sub(c.decided_ms) < every && window_at(c.decided_ms) == w {
+                // A restart closed the log with a `None` boundary
+                // (`mark_process_start`) while this persisted choice is still
+                // quoted: reopen it so fills are attributed to the arm that
+                // is actually quoting (Codex P1, pairtrade#407).
+                if self.state.live_log.last().map(|(_, o)| *o) != Some(Some(c.offset_bps)) {
+                    self.state.live_log.push((now, Some(c.offset_bps)));
+                }
                 return Some(LiveDecision {
                     window: w,
                     offset_bps: c.offset_bps,
@@ -1682,6 +1689,29 @@ mod tests {
             !arms.contains_key("8"),
             "not the static history arm: {arms:?}"
         );
+    }
+
+    #[test]
+    fn a_restart_reopens_the_standing_live_arm_in_the_log() {
+        // Codex P1 (pairtrade#407): restart < decide interval after a live pick.
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
+        }
+        seed(&mut l, Window::Cash, 12.0, 100.0, 1_000.0, t0);
+        let d = l.live_decide(t0, Some(5.0)).expect("live");
+        let arm = d.offset_bps;
+        assert!(l.mark_process_start(t0 + 60_000));
+        assert_eq!(l.live_arm_at(t0 + 61_000), Some(None));
+        let d2 = l.live_decide(t0 + 120_000, Some(5.0)).expect("live");
+        assert_eq!(d2.reason, "standing");
+        assert_eq!(d2.offset_bps, arm);
+        assert_eq!(l.live_arm_at(t0 + 121_000), Some(Some(arm)));
+        // idempotent: a second standing tick does not append again
+        let n = l.state.live_log.len();
+        l.live_decide(t0 + 180_000, Some(5.0));
+        assert_eq!(l.state.live_log.len(), n);
     }
 
     #[test]
