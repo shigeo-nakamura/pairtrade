@@ -726,7 +726,14 @@ impl Learner {
         }
         let w = window_at(now);
         let every = self.settings.decide_every_ms;
-        let current = self.state.live.get(&w).cloned();
+        // A standing choice no longer among the live arms (operator changed
+        // LEARNER_LIVE_ARMS) is dropped: decide now (review P2, pairtrade#406).
+        let current = self.state.live.get(&w).cloned().filter(|c| {
+            self.settings
+                .live_arms
+                .iter()
+                .any(|a| (a - c.offset_bps).abs() < 1e-9)
+        });
         if let Some(c) = &current {
             if now.saturating_sub(c.decided_ms) < every && window_at(c.decided_ms) == w {
                 return Some(LiveDecision {
@@ -868,13 +875,18 @@ impl Learner {
         .collect()
     }
 
-    /// Replay journal rows (bootstrap / offline): arms from `history`.
+    /// Replay journal rows (bootstrap / offline): in LIVE the persisted
+    /// `live_log` says which arm was quoting (review P1, pairtrade#406), else
+    /// `history`.
     pub fn replay(&mut self, rows: &[Value], dust: DustRule) {
         for row in rows {
-            let arm = row
-                .get("ts_ms")
-                .and_then(Value::as_u64)
-                .and_then(|t| self.settings.history_arm(t));
+            let arm =
+                row.get("ts_ms")
+                    .and_then(Value::as_u64)
+                    .and_then(|t| match self.live_arm_at(t) {
+                        Some(Some(a)) => Some(a),
+                        _ => self.settings.history_arm(t),
+                    });
             self.ingest(row, arm, dust);
         }
     }
@@ -1608,6 +1620,53 @@ mod tests {
         )
         .unwrap();
         assert!(old.live.is_empty() && old.live_log.is_empty());
+    }
+
+    #[test]
+    fn live_replay_attributes_fills_to_the_logged_live_arm() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(
+            LearnerSettings {
+                history: LearnerSettings::parse_history("2026-10-01T00:00:00Z=5/8").unwrap(),
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        l.state.live_log.push((t0, Some(12.0)));
+        let rows = vec![
+            fill(1, t0 + 1_000, "1", "100", "0", "maker"),
+            fill(2, t0 + 2_000, "0", "100", "0.5", "maker"),
+        ];
+        l.replay(&rows, DustRule::from(1.0));
+        let arms = &l.state.contexts[&Window::Cash].arms;
+        assert!(arms.contains_key("12"), "{arms:?}");
+        assert!(
+            !arms.contains_key("8"),
+            "not the static history arm: {arms:?}"
+        );
+    }
+
+    #[test]
+    fn a_standing_choice_removed_from_the_live_arms_is_redecided() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(
+            LearnerSettings {
+                live_arms: vec![8.0, 12.0],
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        l.state.live.insert(
+            Window::Cash,
+            LiveChoice {
+                offset_bps: 5.0,
+                decided_ms: t0 - 60_000,
+                reason: "x".into(),
+            },
+        );
+        let d = l.live_decide(t0, Some(8.0)).unwrap();
+        assert_ne!(d.reason, "standing");
+        assert!(d.offset_bps >= 8.0, "{d:?}");
     }
 
     #[test]

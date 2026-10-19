@@ -584,6 +584,20 @@ impl Config {
                 );
             }
         }
+        if self.learner.mode == crate::offset_learner::LearnerMode::Live {
+            // LIVE substitutes only the offset; the configured band stays, so
+            // every live arm must exceed every band it can be paired with
+            // (the `0 < band < offset` invariant; Codex P1, pairtrade#406).
+            let bands = [Some(self.repeg_band_bps), self.session_band_bps];
+            for band in bands.into_iter().flatten() {
+                let b = rust_decimal::prelude::ToPrimitive::to_f64(&band).unwrap_or(f64::NAN);
+                for &a in &self.learner.live_arms {
+                    if a.is_nan() || b.is_nan() || a <= b {
+                        bail!("ARCUS_VOL_LEARNER_LIVE_ARMS: {a} bp is not above the repeg band {band} bp (band < offset)");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -858,6 +872,22 @@ pub(crate) mod tests {
         full.learner.arms = vec![7.0];
         let e = full.validate().unwrap_err().to_string();
         assert!(e.contains("is not one of ARCUS_VOL_LEARNER_ARMS"), "{e}");
+    }
+
+    #[test]
+    fn live_arms_must_exceed_every_configured_band() {
+        use crate::offset_learner::LearnerMode;
+        let mut cfg = test_config();
+        cfg.quote_offset_bps = Decimal::from(5);
+        cfg.repeg_band_bps = Decimal::from(1);
+        cfg.session_offset_bps = Some(Decimal::from(8));
+        cfg.session_band_bps = Some(Decimal::from(2));
+        cfg.learner.mode = LearnerMode::Live;
+        assert!(cfg.validate_learner_arms().is_ok(), "5/8/12 vs bands 1/2");
+        cfg.session_offset_bps = Some(Decimal::from(12));
+        cfg.session_band_bps = Some(Decimal::from(7));
+        let e = cfg.validate_learner_arms().unwrap_err().to_string();
+        assert!(e.contains("not above the repeg band 7"), "{e}");
     }
 
     #[test]

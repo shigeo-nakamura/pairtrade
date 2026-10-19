@@ -757,6 +757,11 @@ impl Runtime {
             Some(d) => match Decimal::from_f64(d.offset_bps) {
                 Some(o) if d.offset_bps >= offset_learner::LIVE_MIN_OFFSET_BPS => {
                     if d.changed || self.live_offset != Some(o) {
+                        // Persist the decision now, so a restart replays fills
+                        // under the arm that was quoting (Codex P1, #406).
+                        if let Err(e) = self.learner.save(&self.learner_state_path) {
+                            log::warn!("[ARCUS_VOL] learner state write failed: {e}");
+                        }
                         log::info!(
                             "[ARCUS_VOL] learner LIVE {:?}: offset {} bp ({}); next decision at {}",
                             d.window,
@@ -2886,20 +2891,28 @@ async fn main() -> Result<()> {
     rt.position_stops_day = rt.ledger.day.clone();
     rt.position_stops_today = count_position_stops(&journal_rows, &rt.ledger.day);
     if rt.learner.on() {
-        // Offset learner (bot-strategy#1093, shadow): saved state, then any
-        // journal rows after it (arms from ARCUS_VOL_LEARNER_HISTORY; rows
-        // with no known offset count as unknown trips).
+        // Offset learner (bot-strategy#1093): saved state, then any journal
+        // rows after it (arms from the persisted live_log in LIVE, else
+        // ARCUS_VOL_LEARNER_HISTORY; rows with no known offset count as
+        // unknown trips).
         let loaded = offset_learner::Learner::load(&rt.learner_state_path);
         let resumed = loaded.is_some();
         rt.learner.state = loaded.unwrap_or_default();
         let dust = rt.learner_dust_rule();
         rt.learner.replay(&journal_rows, dust);
         log::info!(
-            "[ARCUS_VOL] offset learner SHADOW ({}; arms {:?} bp, half-life {} h, point value ${}/1M): never changes the live offset",
+            "[ARCUS_VOL] offset learner {} ({}; arms {:?} bp, live arms {:?} bp, half-life {} h, point value ${}/1M){}",
+            if rt.learner.settings.mode == offset_learner::LearnerMode::Live { "LIVE" } else { "SHADOW" },
             if resumed { "state resumed" } else { "bootstrapped from the journal" },
             rt.learner.settings.arms,
+            rt.learner.settings.live_arms,
             rt.learner.settings.half_life_h,
-            rt.learner.settings.point_value_per_m
+            rt.learner.settings.point_value_per_m,
+            if rt.learner.settings.mode == offset_learner::LearnerMode::Live {
+                ": sets the quoting offset within the live arms"
+            } else {
+                ": never changes the live offset"
+            }
         );
     }
     for m in missing {
