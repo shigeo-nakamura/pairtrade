@@ -29,10 +29,14 @@
 #   off), GATE_MODEL=<model json>, GATE_FALLBACK, GATE_LOG_FEATURES,
 #   GATE_ENFORCE_CONFIRM in config.env pass through as ARCUS_VOL_GATE_*; shadow
 #   computes and logs only, enforce needs the runtime's confirm token.
-#   Optional offset learner (bot-strategy#1093): LEARNER=off|shadow (default
-#   off), LEARNER_ARMS, LEARNER_HALF_LIFE_H, LEARNER_POINT_VALUE_PER_M,
-#   LEARNER_HISTORY pass through as ARCUS_VOL_LEARNER*; shadow only records
-#   what it would choose (learner.jsonl, status.json) and never moves quotes.
+#   Optional offset learner (bot-strategy#1093): LEARNER=off|shadow|live
+#   (default off), LEARNER_ARMS, LEARNER_HALF_LIFE_H, LEARNER_POINT_VALUE_PER_M,
+#   LEARNER_HISTORY, LEARNER_LIVE_ARMS, LEARNER_DECIDE_MINUTES,
+#   LEARNER_HYSTERESIS_PER_H pass through as ARCUS_VOL_LEARNER*; shadow only
+#   records what it would choose (learner.jsonl, status.json); live sets the
+#   quoting offset among LEARNER_LIVE_ARMS (default 5,8,12, floor 5 bp) and
+#   needs LEARNER_POINT_VALUE_PER_M ($ per $1M volume, e.g. 39 = $1.5/pt at
+#   ~26 pt per $1M).
 #   Optional dead man's switch tuning (bot-strategy#1093): DMS_SECS,
 #   DMS_CALL_TIMEOUT_SECS, DMS_FIRE_ALERT (integers) pass through as
 #   ARCUS_VOL_DMS_*; unset = the unit's Environment= / the runtime default (the
@@ -96,7 +100,7 @@ load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY DMS_SECS DMS_CALL_TIMEOUT_SECS DMS_FIRE_ALERT
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY LEARNER_LIVE_ARMS LEARNER_DECIDE_MINUTES LEARNER_HYSTERESIS_PER_H DMS_SECS DMS_CALL_TIMEOUT_SECS DMS_FIRE_ALERT
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -170,12 +174,17 @@ if [ "$GATE_MODE" = enforce ]; then
     [ -n "$GATE_ENFORCE_CONFIRM" ] && [ -n "$GATE_MODEL" ] || die "GATE_MODE=enforce needs GATE_ENFORCE_CONFIRM and GATE_MODEL (shadow readout first, bot-strategy#1120)"
 fi
 
-# Offset learner (bot-strategy#1093), shadow only; independent of the gate.
+# Offset learner (bot-strategy#1093); independent of the gate.
 LEARNER="${LEARNER:-off}"
-case "$LEARNER" in off|shadow) ;; *) die "LEARNER must be off|shadow (got '$LEARNER')" ;; esac
+case "$LEARNER" in off|shadow|live) ;; *) die "LEARNER must be off|shadow|live (got '$LEARNER')" ;; esac
 LEARNER_ARMS="${LEARNER_ARMS:-}"
 [ -z "$LEARNER_ARMS" ] || [[ "$LEARNER_ARMS" =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || die "LEARNER_ARMS must be comma-separated bp numbers (got '$LEARNER_ARMS')"
-for v in LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M; do
+LEARNER_LIVE_ARMS="${LEARNER_LIVE_ARMS:-}"
+[ -z "$LEARNER_LIVE_ARMS" ] || [[ "$LEARNER_LIVE_ARMS" =~ ^[0-9]+(\.[0-9]+)?(,[0-9]+(\.[0-9]+)?)*$ ]] || die "LEARNER_LIVE_ARMS must be comma-separated bp numbers (got '$LEARNER_LIVE_ARMS')"
+if [ "$LEARNER" = live ] && [ -z "${LEARNER_POINT_VALUE_PER_M:-}" ]; then
+    die "LEARNER=live needs LEARNER_POINT_VALUE_PER_M (\$ per \$1M volume)"
+fi
+for v in LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_DECIDE_MINUTES LEARNER_HYSTERESIS_PER_H; do
     [ -z "${!v:-}" ] || [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$v must be a number (got '${!v}')"
 done
 LEARNER_HISTORY="${LEARNER_HISTORY:-}"
@@ -297,8 +306,11 @@ export ARCUS_VOL_GATE_MODE="$GATE_MODE"
 [ -n "$GATE_FALLBACK" ] && export ARCUS_VOL_GATE_FALLBACK="$GATE_FALLBACK"
 [ -n "$GATE_LOG_FEATURES" ] && export ARCUS_VOL_GATE_LOG_FEATURES="$GATE_LOG_FEATURES"
 [ -n "$GATE_ENFORCE_CONFIRM" ] && export ARCUS_VOL_GATE_ENFORCE_CONFIRM="$GATE_ENFORCE_CONFIRM"
-if [ "$LEARNER" = shadow ]; then
-    export ARCUS_VOL_LEARNER=shadow
+if [ "$LEARNER" = shadow ] || [ "$LEARNER" = live ]; then
+    export ARCUS_VOL_LEARNER="$LEARNER"
+    [ -n "$LEARNER_LIVE_ARMS" ] && export ARCUS_VOL_LEARNER_LIVE_ARMS="$LEARNER_LIVE_ARMS"
+    [ -n "${LEARNER_DECIDE_MINUTES:-}" ] && export ARCUS_VOL_LEARNER_DECIDE_MINUTES="$LEARNER_DECIDE_MINUTES"
+    [ -n "${LEARNER_HYSTERESIS_PER_H:-}" ] && export ARCUS_VOL_LEARNER_HYSTERESIS_PER_H="$LEARNER_HYSTERESIS_PER_H"
     [ -n "$LEARNER_ARMS" ] && export ARCUS_VOL_LEARNER_ARMS="$LEARNER_ARMS"
     [ -n "${LEARNER_HALF_LIFE_H:-}" ] && export ARCUS_VOL_LEARNER_HALF_LIFE_H="$LEARNER_HALF_LIFE_H"
     [ -n "${LEARNER_POINT_VALUE_PER_M:-}" ] && export ARCUS_VOL_LEARN_POINT_VALUE_PER_M="$LEARNER_POINT_VALUE_PER_M"

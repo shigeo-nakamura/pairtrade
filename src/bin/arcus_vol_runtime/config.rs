@@ -95,8 +95,8 @@ pub struct Config {
     /// and logs, never acts; `enforce` needs `GATE_ENFORCE_CONFIRM`.
     pub gate: GateSettings,
     /// Offset learner (bot-strategy#1093, `offset_learner`):
-    /// `ARCUS_VOL_LEARNER*`. `off` (default) or `shadow` (records what it
-    /// would choose; never changes the live offset).
+    /// `ARCUS_VOL_LEARNER*`. `off` (default), `shadow` (records what it
+    /// would choose) or `live` (sets the offset within `LIVE_ARMS`).
     pub learner: crate::offset_learner::LearnerSettings,
     pub state_dir: PathBuf,
     pub dry_run: bool,
@@ -182,7 +182,7 @@ pub fn parse_bool(name: &str, raw: Option<&str>, default: bool) -> Result<bool> 
     }
 }
 
-/// `ARCUS_VOL_LEARNER*` (bot-strategy#1093 offset learner, shadow only).
+/// `ARCUS_VOL_LEARNER*` (bot-strategy#1093 offset learner).
 pub(crate) fn learner_from_env() -> Result<crate::offset_learner::LearnerSettings> {
     use crate::offset_learner::{LearnerMode, LearnerSettings};
     let mut s = LearnerSettings::off();
@@ -231,7 +231,56 @@ pub(crate) fn learner_from_env() -> Result<crate::offset_learner::LearnerSetting
         s.history = LearnerSettings::parse_history(&raw)
             .map_err(|e| anyhow::anyhow!("ARCUS_VOL_LEARNER_HISTORY: {e}"))?;
     }
+    if let Some(raw) = var("ARCUS_VOL_LEARNER_LIVE_ARMS") {
+        let mut arms = Vec::new();
+        for a in raw.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            let v: f64 = a
+                .parse()
+                .map_err(|_| anyhow::anyhow!("ARCUS_VOL_LEARNER_LIVE_ARMS: {a} is not a number"))?;
+            arms.push(v);
+        }
+        arms.sort_by(f64::total_cmp);
+        arms.dedup();
+        s.live_arms = arms;
+    }
+    let minutes = f("ARCUS_VOL_LEARNER_DECIDE_MINUTES", 60.0)?;
+    if !(5.0..=24.0 * 60.0).contains(&minutes) {
+        bail!("ARCUS_VOL_LEARNER_DECIDE_MINUTES={minutes} is outside 5..=1440");
+    }
+    s.decide_every_ms = (minutes * 60_000.0) as u64;
+    s.hysteresis_per_h = f("ARCUS_VOL_LEARNER_HYSTERESIS_PER_H", s.hysteresis_per_h)?;
+    if !s.hysteresis_per_h.is_finite() || s.hysteresis_per_h < 0.0 {
+        bail!("ARCUS_VOL_LEARNER_HYSTERESIS_PER_H must be >= 0");
+    }
+    if s.mode == LearnerMode::Live {
+        // The point value decides how much bleed the learner buys volume
+        // with: LIVE refuses the shadow default and needs it stated.
+        if var("ARCUS_VOL_LEARN_POINT_VALUE_PER_M").is_none() {
+            bail!("ARCUS_VOL_LEARNER=live needs ARCUS_VOL_LEARN_POINT_VALUE_PER_M (config LEARNER_POINT_VALUE_PER_M, $ per $1M volume)");
+        }
+        validate_live_arms(&s)?;
+    }
     Ok(s)
+}
+
+/// LIVE arms: non-empty, each ≥ `LIVE_MIN_OFFSET_BPS` and one of `arms`.
+pub(crate) fn validate_live_arms(s: &crate::offset_learner::LearnerSettings) -> Result<()> {
+    use crate::offset_learner::LIVE_MIN_OFFSET_BPS;
+    if s.live_arms.is_empty() {
+        bail!("ARCUS_VOL_LEARNER_LIVE_ARMS is empty");
+    }
+    for &a in &s.live_arms {
+        if !a.is_finite() || a < LIVE_MIN_OFFSET_BPS {
+            bail!("ARCUS_VOL_LEARNER_LIVE_ARMS: {a} bp is below the live floor {LIVE_MIN_OFFSET_BPS} bp");
+        }
+        if !s.arms.iter().any(|x| (x - a).abs() < 1e-9) {
+            bail!(
+                "ARCUS_VOL_LEARNER_LIVE_ARMS: {a} is not one of ARCUS_VOL_LEARNER_ARMS {:?}",
+                s.arms
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `ARCUS_VOL_GATE_*` (bot-strategy#1120 design §6.3).
@@ -535,6 +584,20 @@ impl Config {
                 );
             }
         }
+        if self.learner.mode == crate::offset_learner::LearnerMode::Live {
+            // LIVE substitutes only the offset; the configured band stays, so
+            // every live arm must exceed every band it can be paired with
+            // (the `0 < band < offset` invariant; Codex P1, pairtrade#406).
+            let bands = [Some(self.repeg_band_bps), self.session_band_bps];
+            for band in bands.into_iter().flatten() {
+                let b = rust_decimal::prelude::ToPrimitive::to_f64(&band).unwrap_or(f64::NAN);
+                for &a in &self.learner.live_arms {
+                    if a.is_nan() || b.is_nan() || a <= b {
+                        bail!("ARCUS_VOL_LEARNER_LIVE_ARMS: {a} bp is not above the repeg band {band} bp (band < offset)");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -809,6 +872,40 @@ pub(crate) mod tests {
         full.learner.arms = vec![7.0];
         let e = full.validate().unwrap_err().to_string();
         assert!(e.contains("is not one of ARCUS_VOL_LEARNER_ARMS"), "{e}");
+    }
+
+    #[test]
+    fn live_arms_must_exceed_every_configured_band() {
+        use crate::offset_learner::LearnerMode;
+        let mut cfg = test_config();
+        cfg.quote_offset_bps = Decimal::from(5);
+        cfg.repeg_band_bps = Decimal::from(1);
+        cfg.session_offset_bps = Some(Decimal::from(8));
+        cfg.session_band_bps = Some(Decimal::from(2));
+        cfg.learner.mode = LearnerMode::Live;
+        assert!(cfg.validate_learner_arms().is_ok(), "5/8/12 vs bands 1/2");
+        cfg.session_offset_bps = Some(Decimal::from(12));
+        cfg.session_band_bps = Some(Decimal::from(7));
+        let e = cfg.validate_learner_arms().unwrap_err().to_string();
+        assert!(e.contains("not above the repeg band 7"), "{e}");
+    }
+
+    #[test]
+    fn live_arms_are_bounded_and_must_be_arms() {
+        use crate::offset_learner::{LearnerMode, LearnerSettings};
+        let mut s = LearnerSettings {
+            mode: LearnerMode::Live,
+            ..LearnerSettings::off()
+        };
+        assert!(super::validate_live_arms(&s).is_ok(), "default 5/8/12");
+        s.live_arms = vec![3.0, 5.0];
+        let e = super::validate_live_arms(&s).unwrap_err().to_string();
+        assert!(e.contains("below the live floor"), "{e}");
+        s.live_arms = vec![5.0, 7.0];
+        let e = super::validate_live_arms(&s).unwrap_err().to_string();
+        assert!(e.contains("is not one of ARCUS_VOL_LEARNER_ARMS"), "{e}");
+        s.live_arms = vec![];
+        assert!(super::validate_live_arms(&s).is_err());
     }
 
     #[test]

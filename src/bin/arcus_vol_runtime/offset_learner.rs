@@ -1,4 +1,5 @@
-//! Adaptive quote-distance learner, SHADOW MODE ONLY (bot-strategy#1093).
+//! Adaptive quote-distance learner (bot-strategy#1093): `shadow` records,
+//! `live` sets the quoting offset within bounded arms.
 //!
 //! Fixed offset rules overfit in the offline sim (`adapt_report.md`), so the
 //! runtime learns which quote distance pays best per market and per time
@@ -8,8 +9,18 @@
 //! `ARCUS_VOL_SESSION_OFFSET_BPS`; the learner's recommendation goes to the
 //! journal (`kind: "learner"`) and `status.json` only.
 //!
-//! TODO(bot-strategy#1093): a `live` mode that applies the recommendation
-//! (inside the existing stops) after the shadow readout. Out of scope here.
+//! LIVE mode (owner 2026-10-19, `ARCUS_VOL_LEARNER=live`): the learner's pick
+//! sets the offset for the current window, chosen only among
+//! `live_arms` (default 5/8/12 bp, never below `LIVE_MIN_OFFSET_BPS`), at most
+//! once per `decide_every_ms` per window, with a hysteresis so a marginally
+//! better arm does not flap the quotes. Untried live arms are explored first
+//! for `min_hours` quoting hours each; the markout guard (widen-only) and the
+//! stop exclusion apply as in shadow. Every decision is appended to
+//! `live_log`, which the runtime uses to attribute fills to the arm that was
+//! actually quoting. The runtime's stops, DMS, blackouts and KILL_SWITCH all
+//! take precedence (they pull quotes whatever the offset), and with no
+//! decision the configured offsets are used. Scores carry over from shadow
+//! (same `learner.json`), so live starts warm.
 //!
 //! Model
 //! - Context = time window of the market's day, in New York time (the
@@ -46,14 +57,22 @@ use crate::session::new_york_utc_offset_secs;
 pub enum LearnerMode {
     Off,
     Shadow,
+    Live,
 }
+
+/// The tightest offset a live arm may have (owner 2026-10-19: 2/3 bp cost too
+/// much per point).
+pub const LIVE_MIN_OFFSET_BPS: f64 = 5.0;
+/// Cap on `live_log` entries kept in the persisted state.
+const MAX_LIVE_LOG: usize = 5_000;
 
 impl LearnerMode {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
             "off" | "" => Ok(LearnerMode::Off),
             "shadow" => Ok(LearnerMode::Shadow),
-            other => Err(format!("{other} is not off|shadow")),
+            "live" => Ok(LearnerMode::Live),
+            other => Err(format!("{other} is not off|shadow|live")),
         }
     }
 }
@@ -78,6 +97,14 @@ pub struct LearnerSettings {
     /// Offsets that were live in the past, for attributing journal history:
     /// (from_ms, off-session offset, session offset), ascending.
     pub history: Vec<(u64, f64, f64)>,
+    /// LIVE: the arms the learner may quote with (a subset of `arms`, each
+    /// ≥ `LIVE_MIN_OFFSET_BPS`), ascending.
+    pub live_arms: Vec<f64>,
+    /// LIVE: minimum time between two decisions in one window.
+    pub decide_every_ms: u64,
+    /// LIVE: an exploiting switch needs the new arm's rate to beat the
+    /// current arm's by this many $ per quoting hour.
+    pub hysteresis_per_h: f64,
 }
 
 impl LearnerSettings {
@@ -94,6 +121,9 @@ impl LearnerSettings {
             guard_n: 20,
             breach_hours: 24.0,
             history: Vec::new(),
+            live_arms: vec![5.0, 8.0, 12.0],
+            decide_every_ms: 3_600_000,
+            hysteresis_per_h: 0.5,
         }
     }
 
@@ -297,6 +327,35 @@ pub struct LearnerState {
     pub last_emit_ms: u64,
     pub last_window: Option<Window>,
     pub breach_day: Option<String>,
+    /// The arm live at the previous tick: the interval up to this tick is
+    /// credited to it, not to an arm a decision just switched to (#406 P2).
+    #[serde(default)]
+    pub last_tick_arm: Option<f64>,
+    /// LIVE: the arm chosen per window and when.
+    #[serde(default)]
+    pub live: BTreeMap<Window, LiveChoice>,
+    /// LIVE: (from_ms, offset) for every decision, ascending, so fills are
+    /// attributed to the arm that was quoting at their timestamp. `None` =
+    /// the configured offset (no decision, e.g. after a fallback).
+    #[serde(default)]
+    pub live_log: Vec<(u64, Option<f64>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveChoice {
+    pub offset_bps: f64,
+    pub decided_ms: u64,
+    pub reason: String,
+}
+
+/// One LIVE decision: the offset to quote with in the current window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveDecision {
+    pub window: Window,
+    pub offset_bps: f64,
+    pub changed: bool,
+    pub reason: &'static str,
+    pub next_decision_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -453,7 +512,8 @@ impl Learner {
     }
 
     fn on_tick_gap(&mut self, now: u64, live: Option<f64>, quoting: bool, max_gap_ms: u64) {
-        if let (Some(prev), Some(a), true) = (self.state.last_tick_ms, live, quoting) {
+        let credited = self.state.last_tick_arm.or(live);
+        if let (Some(prev), Some(a), true) = (self.state.last_tick_ms, credited, quoting) {
             let dt = now.saturating_sub(prev);
             if dt > 0 && dt <= max_gap_ms {
                 let hl = self.settings.half_life_h;
@@ -470,6 +530,7 @@ impl Learner {
             }
         }
         self.state.last_tick_ms = Some(now);
+        self.state.last_tick_arm = live;
     }
 
     /// The daily stop tripped while `live` was quoting: exclude that arm in
@@ -494,14 +555,25 @@ impl Learner {
     }
 
     pub fn recommend_in(&self, window: Window, now: u64, live: Option<f64>) -> Recommendation {
+        self.recommend_among(window, now, live, &self.settings.arms)
+    }
+
+    /// `recommend_in` over the candidate offsets `candidates` only (LIVE
+    /// uses `live_arms`; shadow scores every arm).
+    pub fn recommend_among(
+        &self,
+        window: Window,
+        now: u64,
+        live: Option<f64>,
+        candidates: &[f64],
+    ) -> Recommendation {
         let s = &self.settings;
         let empty = ContextState::default();
         let ctx = self.state.contexts.get(&window).unwrap_or(&empty);
         let markout_mean = (ctx.markouts.len() >= 5)
             .then(|| ctx.markouts.iter().sum::<f64>() / ctx.markouts.len() as f64);
         let guard = markout_mean.is_some_and(|m| m < s.guard_bps);
-        let mut arms: Vec<ArmView> = s
-            .arms
+        let mut arms: Vec<ArmView> = candidates
             .iter()
             .map(|&a| {
                 let st = ctx
@@ -587,7 +659,7 @@ impl Learner {
             "kind": "learner",
             "ts_ms": now,
             "market": market,
-            "mode": "shadow",
+            "mode": self.mode_str(),
             "window": r.window,
             "live_offset_bps": r.live_offset_bps,
             "recommended_offset_bps": r.recommended_offset_bps,
@@ -599,17 +671,192 @@ impl Learner {
         }))
     }
 
+    fn mode_str(&self) -> &'static str {
+        match self.settings.mode {
+            LearnerMode::Off => "off",
+            LearnerMode::Shadow => "shadow",
+            LearnerMode::Live => "live",
+        }
+    }
+
     /// The `learner` block of status.json.
     pub fn status(&self, now: u64, live: Option<f64>) -> Value {
         let r = self.recommend(now, live);
-        json!({
-            "mode": "shadow",
+        let mut v = json!({
+            "mode": self.mode_str(),
             "context": r.window,
             "live_offset": r.live_offset_bps,
             "recommended_offset": r.recommended_offset_bps,
             "reason": r.reason,
             "trips_in_context": r.trips_in_context,
+        });
+        if self.settings.mode == LearnerMode::Live {
+            let choices: BTreeMap<String, Value> = self
+                .state
+                .live
+                .iter()
+                .map(|(w, c)| {
+                    (
+                        format!("{w:?}").to_lowercase(),
+                        json!({"offset_bps": c.offset_bps, "decided_ms": c.decided_ms, "reason": c.reason}),
+                    )
+                })
+                .collect();
+            let w = window_at(now);
+            let next = self
+                .state
+                .live
+                .get(&w)
+                .map(|c| c.decided_ms + self.settings.decide_every_ms);
+            let scores: Vec<Value> = self
+                .recommend_among(w, now, live, &self.settings.live_arms)
+                .arms
+                .into_iter()
+                .map(|a| json!({"offset_bps": a.offset_bps, "hours": a.hours, "rate": a.rate, "eligible": a.eligible}))
+                .collect();
+            v["live_arms"] = json!(self.settings.live_arms);
+            v["live_choices"] = json!(choices);
+            v["next_decision_ms"] = json!(next);
+            v["live_scores"] = json!(scores);
+        }
+        v
+    }
+
+    /// LIVE: the offset to quote with now. Decides at the first tick of a
+    /// window and then at most every `decide_every_ms`; otherwise returns the
+    /// standing choice. `fallback` is the configured offset for this tick
+    /// (used as the reference arm before any decision). `None` when not live.
+    pub fn live_decide(&mut self, now: u64, fallback: Option<f64>) -> Option<LiveDecision> {
+        if self.settings.mode != LearnerMode::Live || self.settings.live_arms.is_empty() {
+            return None;
+        }
+        let w = window_at(now);
+        let every = self.settings.decide_every_ms;
+        // A standing choice no longer among the live arms (operator changed
+        // LEARNER_LIVE_ARMS) is dropped: decide now (review P2, pairtrade#406).
+        // … and so is one whose arm has since been excluded by a stop breach
+        // (#406 P2): it is re-decided at once, not quoted to the interval end.
+        let breached = |o: f64| {
+            self.state
+                .contexts
+                .get(&w)
+                .and_then(|c| c.breaches.get(&arm_key(o)))
+                .is_some_and(|&u| u > now)
+        };
+        let current = self.state.live.get(&w).cloned().filter(|c| {
+            self.settings
+                .live_arms
+                .iter()
+                .any(|a| (a - c.offset_bps).abs() < 1e-9)
+                && !breached(c.offset_bps)
+        });
+        if let Some(c) = &current {
+            if now.saturating_sub(c.decided_ms) < every && window_at(c.decided_ms) == w {
+                return Some(LiveDecision {
+                    window: w,
+                    offset_bps: c.offset_bps,
+                    changed: false,
+                    reason: "standing",
+                    next_decision_ms: c.decided_ms + every,
+                });
+            }
+        }
+        let reference = current.as_ref().map(|c| c.offset_bps).or(fallback);
+        let arms = self.settings.live_arms.clone();
+        let r = self.recommend_among(w, now, reference, &arms);
+        let (mut pick, mut reason) = match r.recommended_offset_bps {
+            Some(p)
+                if r.reason != "no_eligible_arm" && arms.iter().any(|a| (a - p).abs() < 1e-9) =>
+            {
+                (p, r.reason)
+            }
+            // No eligible live arm (all excluded): the widest one.
+            _ => (*arms.last().expect("non-empty"), "widest_no_eligible"),
+        };
+        // Hysteresis: an exploiting switch must beat the standing arm clearly.
+        if matches!(reason, "best" | "best_widen_only") {
+            if let Some(cur) = reference {
+                let rate = |o: f64| {
+                    r.arms
+                        .iter()
+                        .find(|a| (a.offset_bps - o).abs() < 1e-9)
+                        .filter(|a| a.eligible)
+                        .and_then(|a| a.rate)
+                };
+                if let (Some(rc), Some(rp)) = (rate(cur), rate(pick)) {
+                    if (pick - cur).abs() > 1e-9 && rp - rc < self.settings.hysteresis_per_h {
+                        pick = cur;
+                        reason = "hold_hysteresis";
+                    }
+                }
+            }
+        }
+        let changed = reference.is_none_or(|c| (c - pick).abs() > 1e-9) || current.is_none();
+        self.state.live.insert(
+            w,
+            LiveChoice {
+                offset_bps: pick,
+                decided_ms: now,
+                reason: reason.to_string(),
+            },
+        );
+        if self.state.live_log.last().map(|(_, o)| *o) != Some(Some(pick)) {
+            self.state.live_log.push((now, Some(pick)));
+            if self.state.live_log.len() > MAX_LIVE_LOG {
+                let drop = self.state.live_log.len() - MAX_LIVE_LOG;
+                self.state.live_log.drain(..drop);
+            }
+        }
+        Some(LiveDecision {
+            window: w,
+            offset_bps: pick,
+            changed,
+            reason,
+            next_decision_ms: now + every,
         })
+    }
+
+    /// LIVE: the configured offset is back in force from `now` (learner
+    /// error / mode off): fills from here are attributed to the config arm.
+    pub fn live_fallback(&mut self, now: u64) {
+        if self.state.live_log.last().is_some_and(|(_, o)| o.is_some()) {
+            self.state.live_log.push((now, None));
+        }
+    }
+
+    /// Every process start (any mode, learner off included) closes the
+    /// previous process's live arm: from `start_ms` the configured offset is
+    /// in force until a new live decision. Returns whether a boundary was
+    /// added (the caller persists it).
+    pub fn mark_process_start(&mut self, start_ms: u64) -> bool {
+        if self.state.live_log.last().is_some_and(|(_, o)| o.is_some()) {
+            self.state.live_log.push((start_ms, None));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The arm that was quoting up to this tick (the previous tick's), which
+    /// a stop detected now is charged to (review P2 round 3, #406).
+    pub fn quoting_arm(&self, live: Option<f64>) -> Option<f64> {
+        self.state.last_tick_arm.or(live)
+    }
+
+    /// LIVE attribution: `Some(Some(arm))` = the learner was quoting `arm` at
+    /// `ts_ms`; `Some(None)` = the configured offset was in force; `None` =
+    /// before any live decision (use the shadow/history attribution).
+    ///
+    /// By the row's own timestamp, whatever the current mode: a restart into
+    /// shadow still replays earlier live fills under their learned arm
+    /// (review P1 round 3, pairtrade#406).
+    pub fn live_arm_at(&self, ts_ms: u64) -> Option<Option<f64>> {
+        self.state
+            .live_log
+            .iter()
+            .rev()
+            .find(|(from, _)| *from <= ts_ms)
+            .map(|(_, o)| *o)
     }
 
     pub fn load(path: &std::path::Path) -> Option<LearnerState> {
@@ -664,13 +911,18 @@ impl Learner {
         .collect()
     }
 
-    /// Replay journal rows (bootstrap / offline): arms from `history`.
+    /// Replay journal rows (bootstrap / offline): in LIVE the persisted
+    /// `live_log` says which arm was quoting (review P1, pairtrade#406), else
+    /// `history`.
     pub fn replay(&mut self, rows: &[Value], dust: DustRule) {
         for row in rows {
-            let arm = row
-                .get("ts_ms")
-                .and_then(Value::as_u64)
-                .and_then(|t| self.settings.history_arm(t));
+            let arm =
+                row.get("ts_ms")
+                    .and_then(Value::as_u64)
+                    .and_then(|t| match self.live_arm_at(t) {
+                        Some(Some(a)) => Some(a),
+                        _ => self.settings.history_arm(t),
+                    });
             self.ingest(row, arm, dust);
         }
     }
@@ -963,20 +1215,45 @@ mod tests {
     }
 
     #[test]
-    fn the_shadow_learner_cannot_reach_the_live_offset() {
+    fn the_learner_reaches_quoting_only_through_live_offset() {
         let main = include_str!("main.rs");
+        // LIVE (bot-strategy#1093): the only write path into quoting is
+        // `live_offset`, assigned only in `learner_live_step` (and its
+        // `None` initialiser), read only by `presence_now`.
+        let writes: Vec<&str> = main
+            .lines()
+            .filter(|l| l.contains("self.live_offset =") || l.contains("live_offset: "))
+            .collect();
+        for w in &writes {
+            let ok = main_body("learner_live_step").contains(w.trim())
+                || w.trim() == "live_offset: None,"
+                || w.trim().starts_with("live_offset: Option<");
+            assert!(ok, "live_offset written outside learner_live_step: {w}");
+        }
+        for line in main
+            .lines()
+            .filter(|l| l.contains("self.live_offset") && !l.contains("self.live_offset ="))
+        {
+            let ok = ["presence_now", "learner_live_step"]
+                .iter()
+                .any(|f| main_body(f).contains(line.trim()));
+            assert!(ok, "live_offset read outside presence_now: {line}");
+        }
         // Its recommendation is never read back into the runtime.
         assert!(!main.contains(".recommend("));
         assert!(!main.contains("recommended_offset_bps\"].as_f64"));
         // The quoting paths never touch the learner.
         // (`tick` only feeds it the markout rows it journals.)
         for f in ["tick", "send_places", "send_modifies"] {
-            let body = main_body(f).replace("self.learner_ingest(Some(&row));", "");
+            let body = main_body(f)
+                .replace("self.learner_ingest(Some(&row));", "")
+                .replace("self.learner_live_step(now);", "");
             assert!(!body.contains("learner"), "fn {f} uses the learner");
         }
         // Only these methods call into it.
         let allowed = [
             "learner_live_offset",
+            "learner_live_step",
             "learner_ingest",
             "learner_tick",
             "learner_arm_at",
@@ -1207,6 +1484,338 @@ mod tests {
         assert!(u.state.contexts[&Window::Pre].arms.is_empty());
     }
 
+    fn live() -> LearnerSettings {
+        LearnerSettings {
+            mode: LearnerMode::Live,
+            ..LearnerSettings::off()
+        }
+    }
+
+    /// Put decayed-free stats for `arm` into window `w` at `now`.
+    fn seed(l: &mut Learner, w: Window, arm: f64, hours: f64, net: f64, now: u64) {
+        let s = l
+            .state
+            .contexts
+            .entry(w)
+            .or_default()
+            .arms
+            .entry(arm_key(arm))
+            .or_default();
+        s.hours = hours;
+        s.net = net;
+        s.trips = hours;
+        s.last_ms = now;
+    }
+
+    #[test]
+    fn live_picks_only_live_arms_and_explores_untried_ones_first() {
+        let now = ms("2026-10-20T15:00:00Z"); // Tue cash
+        let mut l = Learner::new(live(), LearnerState::default());
+        // 2 and 3 bp look great in shadow history, but are not live arms.
+        seed(&mut l, Window::Cash, 2.0, 50.0, 500.0, now);
+        seed(&mut l, Window::Cash, 3.0, 50.0, 400.0, now);
+        seed(&mut l, Window::Cash, 8.0, 10.0, -5.0, now);
+        let d = l.live_decide(now, Some(8.0)).expect("live");
+        assert!(d.offset_bps >= LIVE_MIN_OFFSET_BPS, "{d:?}");
+        assert!([5.0, 8.0, 12.0].contains(&d.offset_bps), "{d:?}");
+        // 5 and 12 are untried: one of them is explored before exploiting 8.
+        assert_eq!(d.reason, "explore");
+        assert!(d.offset_bps == 5.0 || d.offset_bps == 12.0, "{d:?}");
+        assert_eq!(l.live_arm_at(now), Some(Some(d.offset_bps)));
+        assert_eq!(l.live_arm_at(now - 1), None, "before the first decision");
+    }
+
+    #[test]
+    fn live_holds_between_decisions_and_needs_a_clear_win_to_switch() {
+        let t0 = ms("2026-10-20T14:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
+        }
+        seed(&mut l, Window::Cash, 8.0, 100.0, 100.0, t0); // 8 bp: $1/h
+        let d0 = l.live_decide(t0, Some(5.0)).unwrap();
+        assert_eq!(d0.offset_bps, 8.0, "{d0:?}");
+        // 30 min later 12 bp looks far better, but no decision is due.
+        seed(&mut l, Window::Cash, 12.0, 100.0, 10_000.0, t0);
+        let d1 = l.live_decide(t0 + 1_800_000, Some(5.0)).unwrap();
+        assert_eq!(
+            (d1.offset_bps, d1.reason, d1.changed),
+            (8.0, "standing", false)
+        );
+        // After the interval: a marginal edge (< hysteresis) holds 8 bp …
+        let t2 = t0 + 3_600_000;
+        seed(&mut l, Window::Cash, 12.0, 100.0, 110.0, t2); // +$0.10/h
+        seed(&mut l, Window::Cash, 8.0, 100.0, 100.0, t2);
+        let d2 = l.live_decide(t2, Some(5.0)).unwrap();
+        assert_eq!(
+            (d2.offset_bps, d2.reason),
+            (8.0, "hold_hysteresis"),
+            "{d2:?}"
+        );
+        // … a clear one switches.
+        let t3 = t2 + 3_600_000;
+        seed(&mut l, Window::Cash, 12.0, 100.0, 400.0, t3); // +$3/h
+        seed(&mut l, Window::Cash, 8.0, 100.0, 100.0, t3);
+        let d3 = l.live_decide(t3, Some(5.0)).unwrap();
+        assert_eq!((d3.offset_bps, d3.changed), (12.0, true), "{d3:?}");
+        assert_eq!(l.live_arm_at(t3 - 1), Some(Some(8.0)));
+        assert_eq!(l.live_arm_at(t3), Some(Some(12.0)));
+    }
+
+    #[test]
+    fn live_respects_the_markout_guard_and_the_stop_exclusion() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
+        }
+        seed(&mut l, Window::Cash, 5.0, 100.0, 1_000.0, t0); // 5 bp looks best
+        l.state.live.insert(
+            Window::Cash,
+            LiveChoice {
+                offset_bps: 8.0,
+                decided_ms: t0 - 7_200_000,
+                reason: "x".into(),
+            },
+        );
+        // Adverse entry markouts: widen-only from the standing 8 bp.
+        let ctx = l.state.contexts.get_mut(&Window::Cash).unwrap();
+        ctx.markouts = std::iter::repeat_n(-3.0, 10).collect();
+        let d = l.live_decide(t0, Some(8.0)).unwrap();
+        assert!(d.offset_bps >= 8.0, "guard must not narrow: {d:?}");
+        // Stop exclusion: the arm live at a daily stop is not picked.
+        let mut l2 = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut l2, Window::Cash, a, 100.0, 0.0, t0);
+        }
+        seed(&mut l2, Window::Cash, 12.0, 100.0, 1_000.0, t0);
+        l2.note_breach(t0, Some(12.0), "2026-10-20");
+        let d2 = l2.live_decide(t0, Some(12.0)).unwrap();
+        assert_ne!(d2.offset_bps, 12.0, "{d2:?}");
+        // All live arms excluded: the widest is used, never something tighter.
+        let mut l3 = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            l3.state
+                .contexts
+                .entry(Window::Cash)
+                .or_default()
+                .breaches
+                .insert(arm_key(a), t0 + 1);
+        }
+        let d3 = l3.live_decide(t0, Some(5.0)).unwrap();
+        assert_eq!((d3.offset_bps, d3.reason), (12.0, "widest_no_eligible"));
+    }
+
+    #[test]
+    fn live_is_off_in_shadow_and_falls_back_cleanly() {
+        let now = ms("2026-10-20T15:00:00Z");
+        let mut sh = Learner::new(shadow(), LearnerState::default());
+        assert!(
+            sh.live_decide(now, Some(5.0)).is_none(),
+            "shadow never decides"
+        );
+        assert_eq!(sh.live_arm_at(now), None);
+        let mut l = Learner::new(live(), LearnerState::default());
+        let d = l.live_decide(now, Some(5.0)).unwrap();
+        l.live_fallback(now + 10);
+        l.live_fallback(now + 20); // idempotent
+        assert_eq!(l.live_arm_at(now + 5), Some(Some(d.offset_bps)));
+        assert_eq!(
+            l.live_arm_at(now + 15),
+            Some(None),
+            "config offset in force"
+        );
+        assert_eq!(l.state.live_log.len(), 2);
+        // Empty live arms = no decision (the runtime keeps the config).
+        let mut e = Learner::new(
+            LearnerSettings {
+                live_arms: vec![],
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        assert!(e.live_decide(now, Some(5.0)).is_none());
+    }
+
+    #[test]
+    fn live_starts_warm_from_the_shadow_state() {
+        let now = ms("2026-10-20T15:00:00Z");
+        // A shadow run saved its stats; the same state file loads into live.
+        let mut sh = Learner::new(shadow(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut sh, Window::Cash, a, 50.0, 0.0, now);
+        }
+        seed(&mut sh, Window::Cash, 8.0, 50.0, 200.0, now);
+        let raw = serde_json::to_string(&sh.state).unwrap();
+        let state: LearnerState = serde_json::from_str(&raw).unwrap();
+        let mut l = Learner::new(live(), state);
+        let d = l.live_decide(now, Some(5.0)).unwrap();
+        assert_eq!((d.offset_bps, d.reason), (8.0, "best"), "{d:?}");
+        // An old state file without the live fields still loads.
+        let old: LearnerState = serde_json::from_str(
+            &raw.replace(",\"live\":{}", "")
+                .replace(",\"live_log\":[]", ""),
+        )
+        .unwrap();
+        assert!(old.live.is_empty() && old.live_log.is_empty());
+    }
+
+    #[test]
+    fn live_replay_attributes_fills_to_the_logged_live_arm() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(
+            LearnerSettings {
+                history: LearnerSettings::parse_history("2026-10-01T00:00:00Z=5/8").unwrap(),
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        l.state.live_log.push((t0, Some(12.0)));
+        let rows = vec![
+            fill(1, t0 + 1_000, "1", "100", "0", "maker"),
+            fill(2, t0 + 2_000, "0", "100", "0.5", "maker"),
+        ];
+        l.replay(&rows, DustRule::from(1.0));
+        let arms = &l.state.contexts[&Window::Cash].arms;
+        assert!(arms.contains_key("12"), "{arms:?}");
+        assert!(
+            !arms.contains_key("8"),
+            "not the static history arm: {arms:?}"
+        );
+    }
+
+    #[test]
+    fn a_standing_choice_removed_from_the_live_arms_is_redecided() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(
+            LearnerSettings {
+                live_arms: vec![8.0, 12.0],
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        l.state.live.insert(
+            Window::Cash,
+            LiveChoice {
+                offset_bps: 5.0,
+                decided_ms: t0 - 60_000,
+                reason: "x".into(),
+            },
+        );
+        let d = l.live_decide(t0, Some(8.0)).unwrap();
+        assert_ne!(d.reason, "standing");
+        assert!(d.offset_bps >= 8.0, "{d:?}");
+    }
+
+    #[test]
+    fn quoting_time_goes_to_the_arm_that_was_quoting() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        l.on_tick(t0, Some(8.0), true);
+        // A decision switches to 12 bp; the 30 s since the last tick were
+        // quoted at 8 bp.
+        l.on_tick(t0 + 30_000, Some(12.0), true);
+        let arms = &l.state.contexts[&Window::Cash].arms;
+        assert!((arms["8"].hours - 30.0 / 3600.0).abs() < 1e-9, "{arms:?}");
+        assert!(
+            !arms.contains_key("12") || arms["12"].hours == 0.0,
+            "{arms:?}"
+        );
+        l.on_tick(t0 + 60_000, Some(12.0), true);
+        assert!((l.state.contexts[&Window::Cash].arms["12"].hours - 30.0 / 3600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_breached_standing_arm_is_redecided_at_once() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
+        }
+        seed(&mut l, Window::Cash, 8.0, 100.0, 1_000.0, t0);
+        let d0 = l.live_decide(t0, Some(5.0)).unwrap();
+        assert_eq!(d0.offset_bps, 8.0);
+        l.note_breach(t0 + 60_000, Some(8.0), "2026-10-20");
+        let d1 = l.live_decide(t0 + 120_000, Some(8.0)).unwrap();
+        assert_ne!(d1.reason, "standing");
+        assert_ne!(d1.offset_bps, 8.0, "{d1:?}");
+    }
+
+    #[test]
+    fn mode_changes_keep_attribution_by_timestamp() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let h = LearnerSettings::parse_history("2026-10-01T00:00:00Z=5/8").unwrap();
+        let hour = 3_600_000;
+        // live → shadow: a live process quoted 12 bp from t0; a shadow
+        // process starts at t0 + 1 h and replays the live rows.
+        let mut lv = Learner::new(
+            LearnerSettings {
+                history: h.clone(),
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        lv.state.live_log.push((t0, Some(12.0)));
+        let raw = serde_json::to_string(&lv.state).unwrap();
+        let mut sh = Learner::new(
+            LearnerSettings {
+                history: h.clone(),
+                ..shadow()
+            },
+            serde_json::from_str(&raw).unwrap(),
+        );
+        assert!(sh.mark_process_start(t0 + hour));
+        sh.replay(
+            &[
+                fill(1, t0 + 60_000, "1", "100", "0", "maker"),
+                fill(2, t0 + 120_000, "0", "100", "0", "maker"),
+            ],
+            DustRule::from(1.0),
+        );
+        assert!(
+            sh.state.contexts[&Window::Cash].arms.contains_key("12"),
+            "live rows keep 12 bp in shadow"
+        );
+        // Rows after the shadow start are the configured arm, not 12.
+        assert_eq!(sh.live_arm_at(t0 + hour + 1), Some(None));
+        // live → off → live: the off process (t0+1h) closes 12 bp; the next
+        // live process (t0+3h) replays the off-period rows as configured.
+        let mut l2 = Learner::new(
+            LearnerSettings {
+                history: h.clone(),
+                ..live()
+            },
+            serde_json::from_str(&raw).unwrap(),
+        );
+        assert!(l2.mark_process_start(t0 + hour)); // the off process
+        assert!(!l2.mark_process_start(t0 + 3 * hour)); // already closed
+        l2.replay(
+            &[
+                fill(1, t0 + 2 * hour, "1", "100", "0", "maker"),
+                fill(2, t0 + 2 * hour + 60_000, "0", "100", "0", "maker"),
+            ],
+            DustRule::from(1.0),
+        );
+        let arms = &l2.state.contexts[&Window::Cash].arms;
+        assert!(
+            arms.contains_key("8") && !arms.contains_key("12"),
+            "off-period rows: config arm, {arms:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_is_charged_to_the_arm_that_was_quoting() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        l.on_tick(t0, Some(8.0), true);
+        // A decision switched to 12 bp on the tick the stop is detected.
+        let arm = l.quoting_arm(Some(12.0));
+        assert_eq!(arm, Some(8.0));
+        l.note_breach(t0 + 1_000, arm, "2026-10-20");
+        let b = &l.state.contexts[&Window::Cash].breaches;
+        assert!(b.contains_key("8") && !b.contains_key("12"), "{b:?}");
+    }
+
     #[test]
     fn history_parses_and_rejects_garbage() {
         let h =
@@ -1214,6 +1823,7 @@ mod tests {
                 .unwrap();
         assert_eq!(h[0].1, 2.0); // sorted
         assert!(LearnerSettings::parse_history("2026-10-05=2").is_err());
-        assert!(LearnerMode::parse("live").is_err());
+        assert_eq!(LearnerMode::parse("live").unwrap(), LearnerMode::Live);
+        assert!(LearnerMode::parse("enforce").is_err());
     }
 }

@@ -232,7 +232,15 @@ ok "non-integer DMS setting refused"
 [ "$RC" -eq 0 ] && ! grep -q '^ARCUS_VOL_DMS_CALL_TIMEOUT_SECS\|^ARCUS_VOL_DMS_FIRE_ALERT' "$T/env.out" || fail "unset DMS settings must not be exported: $OUT"
 ok "unset DMS settings are not exported"
 printf 'LEARNER=live\n' > "$T/etc/config.env"; run
-[ "$RC" -eq 1 ] && grep -q "LEARNER must be off|shadow" <<< "$OUT" || fail "learner live mode must refuse (shadow only)"
+[ "$RC" -eq 1 ] && grep -q "LEARNER=live needs LEARNER_POINT_VALUE_PER_M" <<< "$OUT" || fail "learner live mode must refuse without an explicit point value: $OUT"
+printf 'LEARNER=live\nLEARNER_POINT_VALUE_PER_M=39\nLEARNER_LIVE_ARMS=5,8,12\nLEARNER_DECIDE_MINUTES=60\nLEARNER_HYSTERESIS_PER_H=0.5\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_LEARNER=live "$T/env.out" && grep -qxF ARCUS_VOL_LEARNER_LIVE_ARMS=5,8,12 "$T/env.out" \
+    && grep -qxF ARCUS_VOL_LEARNER_DECIDE_MINUTES=60 "$T/env.out" && grep -qxF ARCUS_VOL_LEARNER_HYSTERESIS_PER_H=0.5 "$T/env.out" \
+    && grep -qxF ARCUS_VOL_LEARN_POINT_VALUE_PER_M=39 "$T/env.out" || fail "learner live settings must reach the runtime: $OUT"
+printf 'LEARNER=live\nLEARNER_POINT_VALUE_PER_M=39\nLEARNER_LIVE_ARMS=5,,8\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "LEARNER_LIVE_ARMS must be" <<< "$OUT" || fail "bad live arms must refuse: $OUT"
+printf 'LEARNER=enforce\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "LEARNER must be off|shadow|live" <<< "$OUT" || fail "unknown learner mode must refuse"
 printf 'LEARNER=shadow\nLEARNER_ARMS=2;3\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 1 ] || fail "bad learner arms must refuse"
 rm -f "$T/etc/config.env"
