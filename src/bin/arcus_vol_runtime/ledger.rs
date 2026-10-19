@@ -1932,8 +1932,14 @@ mod tests {
             "self.quote_params()"
         ));
         let params = main_fn_body("quote_params");
-        assert!(params.contains("presence: self.cfg.presence_for(self.in_session)"));
+        assert!(params.contains("presence: self.presence_now()"));
         assert!(!params.contains("self.cfg.presence()"));
+        // presence_now = the session pair, with only the LIVE learner's offset
+        // substituted (bot-strategy#1093).
+        let now = main_fn_body("presence_now");
+        assert!(now.contains("self.cfg.presence_for(self.in_session)"));
+        assert!(now.contains("p.offset_bps = o"));
+        assert!(!now.contains("band_bps ="));
         // The read is skipped entirely when no session offset is configured.
         let read = main_fn_body("refresh_session");
         assert!(read.contains("!self.cfg.session_switching()"));

@@ -90,7 +90,7 @@ use logic::{
     SidePlan, Step, TickPlan, VenueMin, PLACE_VISIBILITY_GRACE_MS,
 };
 use quote_gate::{GateOutput, QuoteGate};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde_json::json;
 use sim::VirtualQuote;
@@ -306,10 +306,14 @@ struct Runtime {
     gate_off_path: PathBuf,
     /// The last quote cycle's gate output, taken by `finish_tick` for status.
     last_gate: Option<GateOutput>,
-    /// Offset learner (bot-strategy#1093), SHADOW ONLY: fed fills, markouts
-    /// and quoting time; its recommendation goes to `learner.jsonl` and
-    /// status.json and never to the quoting offset. Independent of the gate.
+    /// Offset learner (bot-strategy#1093): fed fills, markouts and quoting
+    /// time; in shadow its recommendation goes to `learner.jsonl` and
+    /// status.json only; in LIVE it sets `live_offset`. Independent of the gate.
     learner: offset_learner::Learner,
+    /// LIVE learner's offset for the current window (replaces the configured
+    /// offset in the presence parameters; the band stays the configured one).
+    /// `None` = the configured offset.
+    live_offset: Option<Decimal>,
     learner_state_path: PathBuf,
     learner_journal_path: PathBuf,
     /// Process start: fills stamped before it may have quoted under an
@@ -326,9 +330,19 @@ impl Runtime {
             cap_usd: self.cfg.quote_cap_usd(),
             min_quote_usd: self.cfg.min_quote_usd,
             qty_decimals: self.cfg.qty_decimals,
-            presence: self.cfg.presence_for(self.in_session),
+            presence: self.presence_now(),
             venue_min: self.venue_min,
         }
+    }
+
+    /// The presence parameters quoting with now: the configured pair for the
+    /// session, with the LIVE learner's offset when it has one.
+    fn presence_now(&self) -> crate::logic::Presence {
+        let mut p = self.cfg.presence_for(self.in_session);
+        if let Some(o) = self.live_offset {
+            p.offset_bps = o;
+        }
+        p
     }
 
     /// The price dust is judged at: the live mid, else the last mark, else
@@ -651,7 +665,7 @@ impl Runtime {
 
     /// The offset live now (what the learner attributes to), in bp.
     fn learner_live_offset(&self) -> Option<f64> {
-        self.cfg.presence_for(self.in_session).offset_bps.to_f64()
+        self.presence_now().offset_bps.to_f64()
     }
 
     /// The offset that was live at `ts_ms` (a fill's own timestamp, which
@@ -660,6 +674,10 @@ impl Runtime {
     /// by the market's trading hours at `ts_ms`; before this process
     /// started, `ARCUS_VOL_LEARNER_HISTORY` only (`None` = unknown trip).
     fn learner_arm_at(&self, ts_ms: u64) -> Option<f64> {
+        // LIVE: the arm the learner had set at that instant wins.
+        if let Some(Some(arm)) = self.learner.live_arm_at(ts_ms) {
+            return Some(arm);
+        }
         learner_arm_at(
             &self.cfg,
             &self.session,
@@ -680,7 +698,7 @@ impl Runtime {
     }
 
     /// Feed one journal row (a booked fill or a priced markout) to the
-    /// offset learner. Shadow only: never touches quoting (bot-strategy#1093).
+    /// offset learner (bot-strategy#1093).
     fn learner_ingest(&mut self, row: Option<&serde_json::Value>) {
         if !self.learner.on() {
             return;
@@ -698,11 +716,13 @@ impl Runtime {
 
     /// Per tick: quoting time, daily-stop breaches, the hourly `learner`
     /// row (own file `learner.jsonl`) and its persisted state. Returns the
-    /// status block. Shadow only (bot-strategy#1093).
+    /// status block. LIVE also decides the next ticks' offset here
+    /// (bot-strategy#1093).
     fn learner_tick(&mut self, now: u64) -> serde_json::Value {
         if !self.learner.on() {
             return serde_json::Value::Null;
         }
+        self.learner_live_step(now);
         let live = self.learner_live_offset();
         self.learner.on_tick(now, live, self.last_plan == "quote");
         if matches!(self.halt, Some(Halt::Day)) {
@@ -717,7 +737,8 @@ impl Runtime {
                 log::warn!("[ARCUS_VOL] learner state write failed: {e}");
             }
             log::info!(
-                "[ARCUS_VOL] learner (shadow) {} live {:?} → would pick {:?} ({}), {} trips",
+                "[ARCUS_VOL] learner ({}) {} live {:?} → picks {:?} ({}), {} trips",
+                row["mode"].as_str().unwrap_or("?"),
                 row["window"].as_str().unwrap_or("?"),
                 row["live_offset_bps"],
                 row["recommended_offset_bps"],
@@ -726,6 +747,41 @@ impl Runtime {
             );
         }
         self.learner.status(now, live)
+    }
+
+    /// LIVE: apply the learner's offset for the current window; on anything
+    /// unusable fall back to the configured offset. One INFO line per change.
+    fn learner_live_step(&mut self, now: u64) {
+        let fallback = self.cfg.presence_for(self.in_session).offset_bps.to_f64();
+        let next = match self.learner.live_decide(now, fallback) {
+            Some(d) => match Decimal::from_f64(d.offset_bps) {
+                Some(o) if d.offset_bps >= offset_learner::LIVE_MIN_OFFSET_BPS => {
+                    if d.changed || self.live_offset != Some(o) {
+                        log::info!(
+                            "[ARCUS_VOL] learner LIVE {:?}: offset {} bp ({}); next decision at {}",
+                            d.window,
+                            o,
+                            d.reason,
+                            d.next_decision_ms
+                        );
+                    }
+                    Some(o)
+                }
+                _ => {
+                    log::warn!(
+                        "[ARCUS_VOL] learner LIVE pick {} unusable: configured offset kept",
+                        d.offset_bps
+                    );
+                    self.learner.live_fallback(now);
+                    None
+                }
+            },
+            None => None,
+        };
+        if next.is_none() && self.live_offset.is_some() {
+            self.learner.live_fallback(now);
+        }
+        self.live_offset = next;
     }
 
     /// The quote gate decision in force for a fill (bot-strategy#1120,
@@ -2318,8 +2374,8 @@ impl Runtime {
             "market": self.cfg.market,
             "book": self.book.as_ref().map(|b| json!({"bid": b.bid.to_string(), "ask": b.ask.to_string()})),
             "quotes": {"bid": quote(QSide::Bid), "ask": quote(QSide::Ask)},
-            "quote_offset_bps": self.cfg.presence_for(self.in_session).offset_bps.to_string(),
-            "repeg_band_bps": self.cfg.presence_for(self.in_session).band_bps.to_string(),
+            "quote_offset_bps": self.presence_now().offset_bps.to_string(),
+            "repeg_band_bps": self.presence_now().band_bps.to_string(),
             "session": match self.in_session { Some(true) => Some("in"), Some(false) => Some("off"), None => None },
             "paper_tick": self.paper_tick.map(|t| t.to_string()),
             "inventory": {"qty": l.position.qty.to_string(),
@@ -2810,6 +2866,7 @@ async fn main() -> Result<()> {
         learner_state_path: cfg.state_dir.join("learner.json"),
         learner_journal_path: cfg.state_dir.join("learner.jsonl"),
         learner_started_ms: now_ms(),
+        live_offset: None,
         cfg,
     };
 
