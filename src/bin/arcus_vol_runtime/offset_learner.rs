@@ -755,7 +755,7 @@ impl Learner {
                 // A restart closed the log with a `None` boundary
                 // (`mark_process_start`) while this persisted choice is still
                 // quoted: reopen it so fills are attributed to the arm that
-                // is actually quoting (Codex P1, pairtrade#407).
+                // is actually quoting (review P1, pairtrade#407).
                 if self.state.live_log.last().map(|(_, o)| *o) != Some(Some(c.offset_bps)) {
                     self.state.live_log.push((now, Some(c.offset_bps)));
                 }
@@ -1693,7 +1693,7 @@ mod tests {
 
     #[test]
     fn a_restart_reopens_the_standing_live_arm_in_the_log() {
-        // Codex P1 (pairtrade#407): restart < decide interval after a live pick.
+        // review P1 (pairtrade#407): restart < decide interval after a live pick.
         let t0 = ms("2026-10-20T15:00:00Z");
         let mut l = Learner::new(live(), LearnerState::default());
         for a in [5.0, 8.0, 12.0] {
