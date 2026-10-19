@@ -1,8 +1,7 @@
 [Unit]
-Description=arcus-vol Sunday reopen blackout pause (bot-strategy#1093)
+Description=arcus-vol Sunday reopen blackout pause, 17:55 New York through the 20:00 overnight start (bot-strategy#1093)
 [Timer]
 OnCalendar=Sun *-*-* 17:55:00 America/New_York
-OnCalendar=Sun *-*-* 19:55:00 America/New_York
 Persistent=false
 [Install]
 WantedBy=timers.target

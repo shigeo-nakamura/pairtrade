@@ -1,7 +1,6 @@
 [Unit]
 Description=arcus-vol Sunday reopen blackout resume (bot-strategy#1093)
 [Timer]
-OnCalendar=Sun *-*-* 18:05:00 America/New_York
 OnCalendar=Sun *-*-* 20:05:00 America/New_York
 Persistent=false
 [Install]
