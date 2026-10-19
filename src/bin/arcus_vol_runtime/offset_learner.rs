@@ -327,6 +327,10 @@ pub struct LearnerState {
     pub last_emit_ms: u64,
     pub last_window: Option<Window>,
     pub breach_day: Option<String>,
+    /// The arm live at the previous tick: the interval up to this tick is
+    /// credited to it, not to an arm a decision just switched to (#406 P2).
+    #[serde(default)]
+    pub last_tick_arm: Option<f64>,
     /// LIVE: the arm chosen per window and when.
     #[serde(default)]
     pub live: BTreeMap<Window, LiveChoice>,
@@ -508,7 +512,8 @@ impl Learner {
     }
 
     fn on_tick_gap(&mut self, now: u64, live: Option<f64>, quoting: bool, max_gap_ms: u64) {
-        if let (Some(prev), Some(a), true) = (self.state.last_tick_ms, live, quoting) {
+        let credited = self.state.last_tick_arm.or(live);
+        if let (Some(prev), Some(a), true) = (self.state.last_tick_ms, credited, quoting) {
             let dt = now.saturating_sub(prev);
             if dt > 0 && dt <= max_gap_ms {
                 let hl = self.settings.half_life_h;
@@ -525,6 +530,7 @@ impl Learner {
             }
         }
         self.state.last_tick_ms = Some(now);
+        self.state.last_tick_arm = live;
     }
 
     /// The daily stop tripped while `live` was quoting: exclude that arm in
@@ -728,11 +734,21 @@ impl Learner {
         let every = self.settings.decide_every_ms;
         // A standing choice no longer among the live arms (operator changed
         // LEARNER_LIVE_ARMS) is dropped: decide now (review P2, pairtrade#406).
+        // … and so is one whose arm has since been excluded by a stop breach
+        // (#406 P2): it is re-decided at once, not quoted to the interval end.
+        let breached = |o: f64| {
+            self.state
+                .contexts
+                .get(&w)
+                .and_then(|c| c.breaches.get(&arm_key(o)))
+                .is_some_and(|&u| u > now)
+        };
         let current = self.state.live.get(&w).cloned().filter(|c| {
             self.settings
                 .live_arms
                 .iter()
                 .any(|a| (a - c.offset_bps).abs() < 1e-9)
+                && !breached(c.offset_bps)
         });
         if let Some(c) = &current {
             if now.saturating_sub(c.decided_ms) < every && window_at(c.decided_ms) == w {
@@ -1209,7 +1225,9 @@ mod tests {
         // The quoting paths never touch the learner.
         // (`tick` only feeds it the markout rows it journals.)
         for f in ["tick", "send_places", "send_modifies"] {
-            let body = main_body(f).replace("self.learner_ingest(Some(&row));", "");
+            let body = main_body(f)
+                .replace("self.learner_ingest(Some(&row));", "")
+                .replace("self.learner_live_step(now);", "");
             assert!(!body.contains("learner"), "fn {f} uses the learner");
         }
         // Only these methods call into it.
@@ -1667,6 +1685,40 @@ mod tests {
         let d = l.live_decide(t0, Some(8.0)).unwrap();
         assert_ne!(d.reason, "standing");
         assert!(d.offset_bps >= 8.0, "{d:?}");
+    }
+
+    #[test]
+    fn quoting_time_goes_to_the_arm_that_was_quoting() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        l.on_tick(t0, Some(8.0), true);
+        // A decision switches to 12 bp; the 30 s since the last tick were
+        // quoted at 8 bp.
+        l.on_tick(t0 + 30_000, Some(12.0), true);
+        let arms = &l.state.contexts[&Window::Cash].arms;
+        assert!((arms["8"].hours - 30.0 / 3600.0).abs() < 1e-9, "{arms:?}");
+        assert!(
+            !arms.contains_key("12") || arms["12"].hours == 0.0,
+            "{arms:?}"
+        );
+        l.on_tick(t0 + 60_000, Some(12.0), true);
+        assert!((l.state.contexts[&Window::Cash].arms["12"].hours - 30.0 / 3600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_breached_standing_arm_is_redecided_at_once() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        for a in [5.0, 8.0, 12.0] {
+            seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
+        }
+        seed(&mut l, Window::Cash, 8.0, 100.0, 1_000.0, t0);
+        let d0 = l.live_decide(t0, Some(5.0)).unwrap();
+        assert_eq!(d0.offset_bps, 8.0);
+        l.note_breach(t0 + 60_000, Some(8.0), "2026-10-20");
+        let d1 = l.live_decide(t0 + 120_000, Some(8.0)).unwrap();
+        assert_ne!(d1.reason, "standing");
+        assert_ne!(d1.offset_bps, 8.0, "{d1:?}");
     }
 
     #[test]

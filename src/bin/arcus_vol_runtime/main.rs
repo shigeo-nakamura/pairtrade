@@ -722,7 +722,6 @@ impl Runtime {
         if !self.learner.on() {
             return serde_json::Value::Null;
         }
-        self.learner_live_step(now);
         let live = self.learner_live_offset();
         self.learner.on_tick(now, live, self.last_plan == "quote");
         if matches!(self.halt, Some(Halt::Day)) {
@@ -752,6 +751,9 @@ impl Runtime {
     /// LIVE: apply the learner's offset for the current window; on anything
     /// unusable fall back to the configured offset. One INFO line per change.
     fn learner_live_step(&mut self, now: u64) {
+        if !self.learner.on() {
+            return;
+        }
         let fallback = self.cfg.presence_for(self.in_session).offset_bps.to_f64();
         let next = match self.learner.live_decide(now, fallback) {
             Some(d) => match Decimal::from_f64(d.offset_bps) {
@@ -2070,6 +2072,9 @@ impl Runtime {
         // (Codex P1, pairtrade#361).
         let now = now_ms();
         self.update_session(now);
+        // LIVE offset: decide before this tick plans its quotes, so a
+        // switch takes effect with the quotes it is attributed to (#406 P2).
+        self.learner_live_step(now);
         // Markouts only against a timestamp-fresh mid; late ones go missing
         // rather than price at a stale mid (Codex P2, pairtrade#361).
         let fresh_mid = fresh_mark(
