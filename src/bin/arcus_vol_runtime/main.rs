@@ -723,11 +723,14 @@ impl Runtime {
             return serde_json::Value::Null;
         }
         let live = self.learner_live_offset();
-        self.learner.on_tick(now, live, self.last_plan == "quote");
+        // A stop detected now was caused by the arm quoting up to this tick,
+        // not one a decision just switched to (review P2 round 3, #406).
+        let quoting = self.learner.quoting_arm(live);
         if matches!(self.halt, Some(Halt::Day)) {
             let day = self.ledger.day.clone();
-            self.learner.note_breach(now, live, &day);
+            self.learner.note_breach(now, quoting, &day);
         }
+        self.learner.on_tick(now, live, self.last_plan == "quote");
         if let Some(row) = self.learner.due_row(now, live, &self.cfg.market) {
             if let Err(e) = append_synced(&self.learner_journal_path, &row) {
                 log::warn!("[ARCUS_VOL] learner row append failed: {e}");
@@ -2903,6 +2906,13 @@ async fn main() -> Result<()> {
         let loaded = offset_learner::Learner::load(&rt.learner_state_path);
         let resumed = loaded.is_some();
         rt.learner.state = loaded.unwrap_or_default();
+        // Close the previous process's live arm at this start, so rows from
+        // here are not attributed to it (any mode; review P1 round 3, #406).
+        if rt.learner.mark_process_start(rt.learner_started_ms) {
+            if let Err(e) = rt.learner.save(&rt.learner_state_path) {
+                log::warn!("[ARCUS_VOL] learner state write failed: {e}");
+            }
+        }
         let dust = rt.learner_dust_rule();
         rt.learner.replay(&journal_rows, dust);
         log::info!(
@@ -2919,6 +2929,16 @@ async fn main() -> Result<()> {
                 ": never changes the live offset"
             }
         );
+    } else if let Some(state) = offset_learner::Learner::load(&rt.learner_state_path) {
+        // Learner off: still close a live arm left by an earlier live
+        // process, so a later live start does not credit this run's fills
+        // to it (review P1 round 3, #406). Nothing else is touched.
+        let mut l = offset_learner::Learner::new(rt.learner.settings.clone(), state);
+        if l.mark_process_start(rt.learner_started_ms) {
+            if let Err(e) = l.save(&rt.learner_state_path) {
+                log::warn!("[ARCUS_VOL] learner state write failed: {e}");
+            }
+        }
     }
     for m in missing {
         if let ledger::Markout::Missing {

@@ -824,13 +824,33 @@ impl Learner {
         }
     }
 
+    /// Every process start (any mode, learner off included) closes the
+    /// previous process's live arm: from `start_ms` the configured offset is
+    /// in force until a new live decision. Returns whether a boundary was
+    /// added (the caller persists it).
+    pub fn mark_process_start(&mut self, start_ms: u64) -> bool {
+        if self.state.live_log.last().is_some_and(|(_, o)| o.is_some()) {
+            self.state.live_log.push((start_ms, None));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The arm that was quoting up to this tick (the previous tick's), which
+    /// a stop detected now is charged to (review P2 round 3, #406).
+    pub fn quoting_arm(&self, live: Option<f64>) -> Option<f64> {
+        self.state.last_tick_arm.or(live)
+    }
+
     /// LIVE attribution: `Some(Some(arm))` = the learner was quoting `arm` at
     /// `ts_ms`; `Some(None)` = the configured offset was in force; `None` =
     /// before any live decision (use the shadow/history attribution).
+    ///
+    /// By the row's own timestamp, whatever the current mode: a restart into
+    /// shadow still replays earlier live fills under their learned arm
+    /// (review P1 round 3, pairtrade#406).
     pub fn live_arm_at(&self, ts_ms: u64) -> Option<Option<f64>> {
-        if self.settings.mode != LearnerMode::Live {
-            return None;
-        }
         self.state
             .live_log
             .iter()
@@ -1719,6 +1739,81 @@ mod tests {
         let d1 = l.live_decide(t0 + 120_000, Some(8.0)).unwrap();
         assert_ne!(d1.reason, "standing");
         assert_ne!(d1.offset_bps, 8.0, "{d1:?}");
+    }
+
+    #[test]
+    fn mode_changes_keep_attribution_by_timestamp() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let h = LearnerSettings::parse_history("2026-10-01T00:00:00Z=5/8").unwrap();
+        let hour = 3_600_000;
+        // live → shadow: a live process quoted 12 bp from t0; a shadow
+        // process starts at t0 + 1 h and replays the live rows.
+        let mut lv = Learner::new(
+            LearnerSettings {
+                history: h.clone(),
+                ..live()
+            },
+            LearnerState::default(),
+        );
+        lv.state.live_log.push((t0, Some(12.0)));
+        let raw = serde_json::to_string(&lv.state).unwrap();
+        let mut sh = Learner::new(
+            LearnerSettings {
+                history: h.clone(),
+                ..shadow()
+            },
+            serde_json::from_str(&raw).unwrap(),
+        );
+        assert!(sh.mark_process_start(t0 + hour));
+        sh.replay(
+            &[
+                fill(1, t0 + 60_000, "1", "100", "0", "maker"),
+                fill(2, t0 + 120_000, "0", "100", "0", "maker"),
+            ],
+            DustRule::from(1.0),
+        );
+        assert!(
+            sh.state.contexts[&Window::Cash].arms.contains_key("12"),
+            "live rows keep 12 bp in shadow"
+        );
+        // Rows after the shadow start are the configured arm, not 12.
+        assert_eq!(sh.live_arm_at(t0 + hour + 1), Some(None));
+        // live → off → live: the off process (t0+1h) closes 12 bp; the next
+        // live process (t0+3h) replays the off-period rows as configured.
+        let mut l2 = Learner::new(
+            LearnerSettings {
+                history: h.clone(),
+                ..live()
+            },
+            serde_json::from_str(&raw).unwrap(),
+        );
+        assert!(l2.mark_process_start(t0 + hour)); // the off process
+        assert!(!l2.mark_process_start(t0 + 3 * hour)); // already closed
+        l2.replay(
+            &[
+                fill(1, t0 + 2 * hour, "1", "100", "0", "maker"),
+                fill(2, t0 + 2 * hour + 60_000, "0", "100", "0", "maker"),
+            ],
+            DustRule::from(1.0),
+        );
+        let arms = &l2.state.contexts[&Window::Cash].arms;
+        assert!(
+            arms.contains_key("8") && !arms.contains_key("12"),
+            "off-period rows: config arm, {arms:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_is_charged_to_the_arm_that_was_quoting() {
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        l.on_tick(t0, Some(8.0), true);
+        // A decision switched to 12 bp on the tick the stop is detected.
+        let arm = l.quoting_arm(Some(12.0));
+        assert_eq!(arm, Some(8.0));
+        l.note_breach(t0 + 1_000, arm, "2026-10-20");
+        let b = &l.state.contexts[&Window::Cash].breaches;
+        assert!(b.contains_key("8") && !b.contains_key("12"), "{b:?}");
     }
 
     #[test]
