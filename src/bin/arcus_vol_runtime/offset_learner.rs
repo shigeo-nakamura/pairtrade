@@ -747,13 +747,22 @@ impl Learner {
         // re-decision can only land on the widest arm again; keep the standing
         // choice until its interval ends instead of re-deciding (and logging
         // + persisting) on every tick (bot-strategy#1093, AAPL 2026-10-20).
+        // Only the WIDEST arm may stand while everything is breached: a
+        // tighter excluded choice is re-decided at once (to the widest).
         let all_breached = self.settings.live_arms.iter().all(|&a| breached(a));
+        let widest = self
+            .settings
+            .live_arms
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         let current = self.state.live.get(&w).cloned().filter(|c| {
             self.settings
                 .live_arms
                 .iter()
                 .any(|a| (a - c.offset_bps).abs() < 1e-9)
-                && (!breached(c.offset_bps) || all_breached)
+                && (!breached(c.offset_bps)
+                    || (all_breached && (c.offset_bps - widest).abs() < 1e-9))
         });
         if let Some(c) = &current {
             if now.saturating_sub(c.decided_ms) < every && window_at(c.decided_ms) == w {
@@ -1726,7 +1735,9 @@ mod tests {
         for a in [5.0, 8.0, 12.0] {
             seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
         }
+        seed(&mut l, Window::Cash, 5.0, 100.0, 1_000.0, t0);
         let d0 = l.live_decide(t0, Some(8.0)).unwrap();
+        assert_eq!(d0.offset_bps, 5.0, "{d0:?}");
         // every live arm excluded in this window (breaches persist for
         // breach_hours, so several days' stops can cover all of them)
         for a in [5.0, 8.0, 12.0] {
@@ -1737,22 +1748,18 @@ mod tests {
                 .breaches
                 .insert(arm_key(a), t0 + 86_400_000);
         }
-        // the next ticks stand on the current choice: no new decision, no log growth
+        // a tighter excluded choice is moved to the widest at once …
+        let d1 = l.live_decide(t0 + 2_000, Some(8.0)).unwrap();
+        assert_eq!(d1.offset_bps, 12.0, "{d1:?} (was {d0:?})");
+        // … and the widest then stands: no new decision, no log growth
         let n = l.state.live_log.len();
         for k in 1..10u64 {
             let d = l.live_decide(t0 + 2_000 + k * 500, Some(8.0)).unwrap();
             assert_eq!(d.reason, "standing", "tick {k}: {d:?}");
-            assert_eq!(d.offset_bps, d0.offset_bps);
+            assert_eq!(d.offset_bps, 12.0);
             assert!(!d.changed);
         }
         assert_eq!(l.state.live_log.len(), n);
-        // at the interval end it re-decides once (widest, nothing eligible) and stands again
-        let t1 = d0.next_decision_ms;
-        let d2 = l.live_decide(t1, Some(8.0)).unwrap();
-        assert_eq!(d2.offset_bps, 12.0, "{d2:?}");
-        let d3 = l.live_decide(t1 + 500, Some(8.0)).unwrap();
-        assert_eq!(d3.reason, "standing", "{d3:?}");
-        assert_eq!(d3.offset_bps, 12.0);
     }
 
     #[test]
