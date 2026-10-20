@@ -1737,17 +1737,22 @@ mod tests {
                 .breaches
                 .insert(arm_key(a), t0 + 86_400_000);
         }
-        let d1 = l.live_decide(t0 + 2_000, Some(8.0)).unwrap();
-        assert_eq!(d1.offset_bps, 12.0, "{d1:?}");
-        // the next ticks stand on that choice: no new decision, no log growth
+        // the next ticks stand on the current choice: no new decision, no log growth
         let n = l.state.live_log.len();
         for k in 1..10u64 {
             let d = l.live_decide(t0 + 2_000 + k * 500, Some(8.0)).unwrap();
             assert_eq!(d.reason, "standing", "tick {k}: {d:?}");
+            assert_eq!(d.offset_bps, d0.offset_bps);
             assert!(!d.changed);
         }
         assert_eq!(l.state.live_log.len(), n);
-        let _ = d0;
+        // at the interval end it re-decides once (widest, nothing eligible) and stands again
+        let t1 = d0.next_decision_ms;
+        let d2 = l.live_decide(t1, Some(8.0)).unwrap();
+        assert_eq!(d2.offset_bps, 12.0, "{d2:?}");
+        let d3 = l.live_decide(t1 + 500, Some(8.0)).unwrap();
+        assert_eq!(d3.reason, "standing", "{d3:?}");
+        assert_eq!(d3.offset_bps, 12.0);
     }
 
     #[test]
