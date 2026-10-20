@@ -747,9 +747,12 @@ impl Learner {
         // re-decision can only land on the widest arm again; keep the standing
         // choice until its interval ends instead of re-deciding (and logging
         // + persisting) on every tick (bot-strategy#1093, AAPL 2026-10-20).
-        // Only the WIDEST arm may stand while everything is breached: a
-        // tighter excluded choice is re-decided at once (to the widest).
-        let all_breached = self.settings.live_arms.iter().all(|&a| breached(a));
+        // A "widest_no_eligible" choice (no live arm eligible, whether by stop
+        // exclusion or the widen-only guard) is already the safe fallback:
+        // it stands to its interval end even though its own arm is breached,
+        // instead of being re-decided to itself on every tick (AAPL
+        // 2026-10-20). Any other breached choice (e.g. a tighter arm) is
+        // re-decided at once.
         let widest = self
             .settings
             .live_arms
@@ -762,7 +765,7 @@ impl Learner {
                 .iter()
                 .any(|a| (a - c.offset_bps).abs() < 1e-9)
                 && (!breached(c.offset_bps)
-                    || (all_breached && (c.offset_bps - widest).abs() < 1e-9))
+                    || (c.reason == "widest_no_eligible" && (c.offset_bps - widest).abs() < 1e-9))
         });
         if let Some(c) = &current {
             if now.saturating_sub(c.decided_ms) < every && window_at(c.decided_ms) == w {
@@ -1760,6 +1763,30 @@ mod tests {
             assert!(!d.changed);
         }
         assert_eq!(l.state.live_log.len(), n);
+    }
+
+    #[test]
+    fn widest_no_eligible_stands_when_only_the_widest_is_breached() {
+        // AAPL 2026-10-20: 12 bp breached; 5/8 not breached but no arm eligible.
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut l = Learner::new(live(), LearnerState::default());
+        l.state.live.insert(
+            Window::Cash,
+            LiveChoice { offset_bps: 12.0, decided_ms: t0, reason: "widest_no_eligible".into() },
+        );
+        l.state
+            .contexts
+            .entry(Window::Cash)
+            .or_default()
+            .breaches
+            .insert(arm_key(12.0), t0 + 86_400_000);
+        let n = l.state.live_log.len();
+        for k in 1..10u64 {
+            let d = l.live_decide(t0 + k * 500, Some(8.0)).unwrap();
+            assert_eq!(d.reason, "standing", "tick {k}: {d:?}");
+            assert_eq!(d.offset_bps, 12.0);
+        }
+        assert!(l.state.live_log.len() <= n + 1);
     }
 
     #[test]
