@@ -1727,8 +1727,15 @@ mod tests {
             seed(&mut l, Window::Cash, a, 100.0, 0.0, t0);
         }
         let d0 = l.live_decide(t0, Some(8.0)).unwrap();
+        // every live arm excluded in this window (breaches persist for
+        // breach_hours, so several days' stops can cover all of them)
         for a in [5.0, 8.0, 12.0] {
-            l.note_breach(t0 + 1_000, Some(a), "2026-10-20");
+            l.state
+                .contexts
+                .entry(Window::Cash)
+                .or_default()
+                .breaches
+                .insert(arm_key(a), t0 + 86_400_000);
         }
         let d1 = l.live_decide(t0 + 2_000, Some(8.0)).unwrap();
         assert_eq!(d1.offset_bps, 12.0, "{d1:?}");
