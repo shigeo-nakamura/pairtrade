@@ -68,6 +68,7 @@ mod quote_gate;
 mod session;
 mod sim;
 mod tape;
+mod toxicity;
 
 use anyhow::{anyhow, Context, Result};
 use config::Config;
@@ -306,6 +307,10 @@ struct Runtime {
     gate_off_path: PathBuf,
     /// The last quote cycle's gate output, taken by `finish_tick` for status.
     last_gate: Option<GateOutput>,
+    /// Shadow toxicity feature log (bot-strategy#1093): records quote
+    /// placements and fills with their features; never read back by the
+    /// tick (`toxicity.rs`).
+    tox: toxicity::Toxicity,
     /// Offset learner (bot-strategy#1093): fed fills, markouts and quoting
     /// time; in shadow its recommendation goes to `learner.jsonl` and
     /// status.json only; in LIVE it sets `live_offset`. Independent of the gate.
@@ -333,6 +338,19 @@ impl Runtime {
             presence: self.presence_now(),
             venue_min: self.venue_min,
         }
+    }
+
+    /// Offset / band / session in force and the learner's arm at `t_ms`
+    /// (the attribution the learner itself credits fills with), for the
+    /// toxicity rows.
+    fn tox_context(&self, t_ms: u64) -> (Option<f64>, Option<f64>, Option<f64>, Option<bool>) {
+        let p = self.presence_now();
+        (
+            p.offset_bps.to_f64(),
+            self.learner_arm_at(t_ms),
+            p.band_bps.to_f64(),
+            self.in_session,
+        )
     }
 
     /// The presence parameters quoting with now: the configured pair for the
@@ -658,6 +676,7 @@ impl Runtime {
             );
             self.pending_markouts
                 .push(ledger::markouts_for(&fill, fill_ts));
+            self.tox_fill(&fill, fill_ts, now);
         }
         self.learner_ingest(booked_row.as_ref());
         Ok(outcome)
@@ -794,6 +813,28 @@ impl Runtime {
         self.live_offset = next;
     }
 
+    /// Toxicity log row for a booked fill (bot-strategy#1093).
+    fn tox_fill(&mut self, fill: &FillIn, fill_ts: u64, now: u64) {
+        if !self.tox.on() {
+            return;
+        }
+        let (offset, arm, band, in_s) = self.tox_context(fill_ts);
+        self.tox.log_fill(
+            fill_ts,
+            now,
+            &self.cfg.market,
+            &fill.trade_id,
+            fill.buy,
+            fill.maker,
+            fill.px,
+            fill.qty,
+            offset,
+            arm,
+            band,
+            in_s,
+        );
+    }
+
     /// The quote gate decision in force for a fill (bot-strategy#1120,
     /// design §7.2): the last gate cycle at or before `t_fill − cancel
     /// latency`, on the fill's side. `None` (row `gate: null`) with the
@@ -827,6 +868,13 @@ impl Runtime {
                             .on_own_trade(rx_ms, p.taker == OrderSide::Long, px, qty);
                     }
                 }
+            }
+        }
+        // The toxicity log's own-flow features (bot-strategy#1093), any mode.
+        if let tape::TapeEvent::Print(p) = &event {
+            if let (Some(px), Some(qty)) = (p.px.to_f64(), p.qty.to_f64()) {
+                self.tox
+                    .on_own_trade(rx_ms, p.taker == OrderSide::Long, px, qty);
             }
         }
         if !self.cfg.dry_run {
@@ -1405,6 +1453,7 @@ impl Runtime {
                 fill.fee.round_dp(4),
                 self.ledger.position.qty
             );
+            self.tox_fill(&fill, fill_ts, now);
             let (owed, missing) = ledger::late_markouts(&fill, fill_ts, now, MARKOUT_MAX_LATE_MS);
             if let Some(m) = owed {
                 self.pending_markouts.push(m);
@@ -1680,6 +1729,31 @@ impl Runtime {
         let mut places: Vec<QuoteTarget> = Vec::new();
         let mut modifies: Vec<(QSide, QuoteTarget, String)> = Vec::new();
         for (side, action) in plan {
+            // Toxicity log (bot-strategy#1093): every placement / re-peg /
+            // replacement, with the features at the decision time. Shadow:
+            // the action below is not changed by it.
+            if self.tox.on() {
+                let target = match &action {
+                    QuoteAction::Place(t) | QuoteAction::Modify(t) => Some(t),
+                    QuoteAction::Replace(Some(t)) => Some(t),
+                    _ => None,
+                };
+                if let Some(t) = target {
+                    let t_now = now_ms();
+                    let (offset, arm, band, in_s) = self.tox_context(t_now);
+                    self.tox.log_quote(
+                        t_now,
+                        &self.cfg.market,
+                        side,
+                        t.px,
+                        t.qty,
+                        offset,
+                        arm,
+                        band,
+                        in_s,
+                    );
+                }
+            }
             match action {
                 QuoteAction::Keep => {}
                 QuoteAction::Place(t) => places.push(t),
@@ -1822,15 +1896,20 @@ impl Runtime {
                     self.book = None;
                     return;
                 };
-                if self.gate.on() {
-                    // Own L1 / L2 for the gate features, stamped with the
-                    // time the read came back (bot-strategy#1120).
+                if self.gate.on() || self.tox.on() {
+                    // Own L1 / L2 for the gate / toxicity features, stamped
+                    // with the time the read came back (bot-strategy#1120).
                     let lv = |l: &[OrderBookLevel]| -> Vec<(f64, f64)> {
                         l.iter()
                             .filter_map(|x| Some((x.price.to_f64()?, x.size.to_f64()?)))
                             .collect()
                     };
-                    self.gate.on_own_book(now_ms(), &lv(&b.bids), &lv(&b.asks));
+                    let rx = now_ms();
+                    let (bids, asks) = (lv(&b.bids), lv(&b.asks));
+                    if self.gate.on() {
+                        self.gate.on_own_book(rx, &bids, &asks);
+                    }
+                    self.tox.on_own_book(rx, b.book_ts_ms, &bids, &asks);
                 }
                 self.book = Some(BookView {
                     bid: bid.price,
@@ -2120,6 +2199,11 @@ impl Runtime {
                 log::warn!("[ARCUS_VOL] markout append failed: {e}");
             }
         }
+
+        // Toxicity log markouts (bot-strategy#1093): 1 / 10 / 60 / 300 s
+        // against the own mid and the reference mid.
+        self.tox
+            .flush_markouts(now, fresh_mid.and_then(|m| m.to_f64()), &self.cfg.market);
 
         // Stops.
         let kill = self.kill_path.exists();
@@ -2419,6 +2503,7 @@ impl Runtime {
             "pending_unresolved": self.pending_unresolved,
             "gate": gate_status,
             "learner": learner_status,
+            "toxicity": self.tox.status(now),
             "dms": {"secs": self.cfg.dms_secs,
                     "armed": self.cfg.dry_run || self.dms_armed_now(),
                     "last_ok_ms": self.dms_last_ok_ms,
@@ -2875,6 +2960,7 @@ async fn main() -> Result<()> {
         gate,
         gate_off_path: cfg.state_dir.join("GATE_OFF"),
         last_gate: None,
+        tox: toxicity::Toxicity::new(cfg.toxicity.clone(), &cfg.state_dir),
         learner: offset_learner::Learner::new(cfg.learner.clone(), Default::default()),
         learner_state_path: cfg.state_dir.join("learner.json"),
         learner_journal_path: cfg.state_dir.join("learner.jsonl"),
@@ -2976,10 +3062,27 @@ async fn main() -> Result<()> {
             ));
         }
     }
+    // Shadow toxicity log (bot-strategy#1093): the Lighter reference feed
+    // (public order_book WebSocket) when a reference symbol is configured.
+    if let Some(shared) = rt.tox.shared() {
+        let s = rt.tox.settings().clone();
+        log::info!(
+            "[TOX] shadow toxicity log on: reference Lighter {} at {}; rows → toxicity_YYYYMMDD.jsonl (logging only, never read by the tick)",
+            s.ref_symbol.as_deref().unwrap_or("-"),
+            s.lighter_base
+        );
+        tokio::spawn(toxicity::run_lighter(
+            s.lighter_base,
+            s.ref_symbol.unwrap_or_default(),
+            shared,
+        ));
+    } else if rt.tox.on() {
+        log::info!("[TOX] shadow toxicity log on: no reference symbol (ref_* null); rows → toxicity_YYYYMMDD.jsonl");
+    }
     let (tx, mut rx) = mpsc::channel::<(u64, tape::TapeEvent)>(4_096);
-    // The public trades tape feeds the paper sim (DRY_RUN) and the quote
-    // gate's own-flow features (any mode with the gate on).
-    if rt.cfg.dry_run || rt.gate.on() {
+    // The public trades tape feeds the paper sim (DRY_RUN), the quote
+    // gate's own-flow features and the toxicity log (any mode with one on).
+    if rt.cfg.dry_run || rt.gate.on() || rt.tox.on() {
         tokio::spawn(tape::run(rt.cfg.ws_url.clone(), rt.cfg.market.clone(), tx));
     } else {
         drop(tx);

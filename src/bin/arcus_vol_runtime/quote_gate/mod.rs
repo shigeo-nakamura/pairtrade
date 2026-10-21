@@ -451,21 +451,35 @@ pub struct GateConfig {
 /// fsync (design D7). A failed write is warned once a minute, never fatal.
 pub struct GateLog {
     dir: PathBuf,
+    /// File-name prefix: `gate` (the gate), `toxicity` (the toxicity log).
+    prefix: String,
     open: Option<(String, std::fs::File)>,
     last_warn_ms: u64,
 }
 
 impl GateLog {
     pub fn new(dir: &Path) -> Self {
+        Self::with_prefix(dir, "gate")
+    }
+
+    /// The same day-rotated writer under another file-name prefix
+    /// (`<prefix>_YYYYMMDD.jsonl`), e.g. the toxicity log (bot-strategy#1093).
+    pub fn with_prefix(dir: &Path, prefix: &str) -> Self {
         GateLog {
             dir: dir.to_path_buf(),
+            prefix: prefix.to_string(),
             open: None,
             last_warn_ms: 0,
         }
     }
 
+    #[cfg(test)]
     pub fn path_for(dir: &Path, day: &str) -> PathBuf {
-        dir.join(format!("gate_{day}.jsonl"))
+        Self::path_for_prefixed(dir, "gate", day)
+    }
+
+    pub fn path_for_prefixed(dir: &Path, prefix: &str, day: &str) -> PathBuf {
+        dir.join(format!("{prefix}_{day}.jsonl"))
     }
 
     fn day_of(ts_ms: u64) -> String {
@@ -478,7 +492,7 @@ impl GateLog {
         use std::io::Write as _;
         let day = Self::day_of(ts_ms);
         if self.open.as_ref().is_none_or(|(d, _)| *d != day) {
-            let path = Self::path_for(&self.dir, &day);
+            let path = Self::path_for_prefixed(&self.dir, &self.prefix, &day);
             match std::fs::OpenOptions::new()
                 .append(true)
                 .create(true)
@@ -505,7 +519,7 @@ impl GateLog {
     fn warn(&mut self, now_ms: u64, what: &str) {
         if now_ms.saturating_sub(self.last_warn_ms) >= 60_000 {
             self.last_warn_ms = now_ms;
-            log::warn!("[GATE] gate.jsonl {what}");
+            log::warn!("[GATE] {}.jsonl {what}", self.prefix);
         }
     }
 }
