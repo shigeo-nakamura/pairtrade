@@ -100,7 +100,7 @@ load_kv "$LIVE_ENV" allow ARCUS_ADDRESS ARCUS_API_KEY ARCUS_ACCOUNT_INDEX ARCUS_
 [ -n "${ARCUS_ADDRESS:-}" ] && [ -n "${ARCUS_API_KEY:-}" ] || die "credentials incomplete in $LIVE_ENV (ARCUS_ADDRESS / ARCUS_API_KEY)"
 
 # ---- configuration (every value has a default) ----------------------------
-[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY LEARNER_LIVE_ARMS LEARNER_DECIDE_MINUTES LEARNER_HYSTERESIS_PER_H DMS_SECS DMS_CALL_TIMEOUT_SECS DMS_FIRE_ALERT
+[ -f "$CONFIG_ENV" ] && load_kv "$CONFIG_ENV" allow MARKET CLIP_MAX_USD QUOTE_OFFSET_BPS REPEG_BAND_BPS SESSION_OFFSET_BPS SESSION_BAND_BPS POSITION_STOP_BPS DAILY_STOP_USD CUM_STOP_USD LEVERAGE STATE_DIR LOCK_DIR ALLOW_PLAIN_KEY RUST_LOG GATE_MODE GATE_MODEL GATE_FALLBACK GATE_LOG_FEATURES GATE_ENFORCE_CONFIRM LEARNER LEARNER_ARMS LEARNER_HALF_LIFE_H LEARNER_POINT_VALUE_PER_M LEARNER_HISTORY LEARNER_LIVE_ARMS LEARNER_DECIDE_MINUTES LEARNER_HYSTERESIS_PER_H DMS_SECS DMS_CALL_TIMEOUT_SECS DMS_FIRE_ALERT TOXICITY_LOG TOXICITY_REF
 MARKET="${MARKET:-SPY-USD}"
 CLIP_MAX_USD="${CLIP_MAX_USD:-2500}"
 QUOTE_OFFSET_BPS="${QUOTE_OFFSET_BPS:-5}"
@@ -173,6 +173,15 @@ fi
 if [ "$GATE_MODE" = enforce ]; then
     [ -n "$GATE_ENFORCE_CONFIRM" ] && [ -n "$GATE_MODEL" ] || die "GATE_MODE=enforce needs GATE_ENFORCE_CONFIRM and GATE_MODEL (shadow readout first, bot-strategy#1120)"
 fi
+
+# Shadow toxicity feature log (bot-strategy#1093): TOXICITY_LOG=on|off (default
+# off) records quote placements / fills with their features + 1/10/60/300 s
+# markouts to toxicity_YYYYMMDD.jsonl; TOXICITY_REF = Lighter Core reference
+# symbol (default: MARKET without -USD; `none` = no reference). Logging only.
+TOXICITY_LOG="${TOXICITY_LOG:-off}"
+case "$TOXICITY_LOG" in on|off) ;; *) die "TOXICITY_LOG must be on|off (got '$TOXICITY_LOG')" ;; esac
+TOXICITY_REF="${TOXICITY_REF:-}"
+[ -z "$TOXICITY_REF" ] || [[ "$TOXICITY_REF" =~ ^[A-Za-z0-9._-]+$ ]] || die "TOXICITY_REF must be a symbol or none (got '$TOXICITY_REF')"
 
 # Offset learner (bot-strategy#1093); independent of the gate.
 LEARNER="${LEARNER:-off}"
@@ -278,6 +287,7 @@ PY
 log "signing key: $KEY_MODE"
 log "sizing: market $MARKET, clip \$$CLIP per side (max \$$CLIP_MAX_USD), inventory cap \$$CAP, margin \$$MARGIN at ${LEVERAGE}x (free collateral \$$FREE); presence offset ${QUOTE_OFFSET_BPS} bp +/- ${REPEG_BAND_BPS} bp${SESSION_OFFSET_BPS:+ (in session ${SESSION_OFFSET_BPS} bp +/- ${SESSION_BAND_BPS} bp)}; daily stop \$$DAILY_STOP_USD, cumulative stop \$$CUM_STOP_USD; state $STATE_DIR"
 log "quote gate: $GATE_MODE${GATE_MODEL:+ (model $GATE_MODEL)}${GATE_FALLBACK:+, fallback $GATE_FALLBACK}"
+log "toxicity log: $TOXICITY_LOG${TOXICITY_REF:+ (ref $TOXICITY_REF)}"
 log "offset learner: $LEARNER"
 
 # Everything from here on is the runtime's own process (systemd sees its pid).
@@ -301,6 +311,8 @@ fi
 if [ -n "$POSITION_STOP_BPS" ]; then
     export ARCUS_VOL_POSITION_STOP_BPS="$POSITION_STOP_BPS"
 fi
+export ARCUS_VOL_TOXICITY_LOG="$TOXICITY_LOG"
+[ -n "$TOXICITY_REF" ] && export ARCUS_VOL_TOXICITY_REF="$TOXICITY_REF"
 export ARCUS_VOL_GATE_MODE="$GATE_MODE"
 [ -n "$GATE_MODEL" ] && export ARCUS_VOL_GATE_MODEL="$GATE_MODEL"
 [ -n "$GATE_FALLBACK" ] && export ARCUS_VOL_GATE_FALLBACK="$GATE_FALLBACK"

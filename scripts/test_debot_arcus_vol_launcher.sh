@@ -221,6 +221,14 @@ printf 'LEARNER=shadow\nLEARNER_ARMS=2,3,5,8,12\nLEARNER_HALF_LIFE_H=168\nLEARNE
     && grep -qxF ARCUS_VOL_LEARNER_HALF_LIFE_H=168 "$T/env.out" && grep -qxF ARCUS_VOL_LEARN_POINT_VALUE_PER_M=15 "$T/env.out" \
     && grep -qxF ARCUS_VOL_LEARNER_HISTORY=2026-10-05T10:19:00Z=2/5,2026-10-09T17:08:00Z=3/5 "$T/env.out" || fail "learner settings must reach the runtime: $OUT"
 # dead man's switch tuning (bot-strategy#1093): optional integers, passed through
+# shadow toxicity log (bot-strategy#1093): off by default (exported as off, no ref), on + ref pass
+# through, a bad value refuses
+printf 'QUOTE_OFFSET_BPS=2\nREPEG_BAND_BPS=1\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_TOXICITY_LOG=off "$T/env.out" && ! grep -q '^ARCUS_VOL_TOXICITY_REF=' "$T/env.out" && grep -q "toxicity log: off" <<< "$OUT" || fail "toxicity log must default to off"
+printf 'TOXICITY_LOG=on\nTOXICITY_REF=XAU\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_TOXICITY_LOG=on "$T/env.out" && grep -qxF ARCUS_VOL_TOXICITY_REF=XAU "$T/env.out" && grep -q "toxicity log: on (ref XAU)" <<< "$OUT" || fail "toxicity settings must reach the runtime: $OUT"
+printf 'TOXICITY_LOG=yes\n' > "$T/etc/config.env"; run
+[ "$RC" -eq 1 ] && grep -q "TOXICITY_LOG must be on|off" <<< "$OUT" && [ ! -f "$T/env.out" ] || fail "bad toxicity value must refuse"
 printf 'DMS_SECS=60\nDMS_CALL_TIMEOUT_SECS=4\nDMS_FIRE_ALERT=0\n' > "$T/etc/config.env"; run
 [ "$RC" -eq 0 ] && grep -qxF ARCUS_VOL_DMS_SECS=60 "$T/env.out" && grep -qxF ARCUS_VOL_DMS_CALL_TIMEOUT_SECS=4 "$T/env.out" \
     && grep -qxF ARCUS_VOL_DMS_FIRE_ALERT=0 "$T/env.out" || fail "DMS settings must reach the runtime: $OUT"

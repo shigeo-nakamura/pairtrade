@@ -98,6 +98,9 @@ pub struct Config {
     /// `ARCUS_VOL_LEARNER*`. `off` (default), `shadow` (records what it
     /// would choose) or `live` (sets the offset within `LIVE_ARMS`).
     pub learner: crate::offset_learner::LearnerSettings,
+    /// Shadow toxicity feature log (bot-strategy#1093, `toxicity`):
+    /// `ARCUS_VOL_TOXICITY_*`. Off by default; on = log only, never acts.
+    pub toxicity: crate::toxicity::Settings,
     pub state_dir: PathBuf,
     pub dry_run: bool,
     pub live_confirm: String,
@@ -283,6 +286,33 @@ pub(crate) fn validate_live_arms(s: &crate::offset_learner::LearnerSettings) -> 
     Ok(())
 }
 
+/// `ARCUS_VOL_TOXICITY_*` (bot-strategy#1093 shadow toxicity log):
+/// `LOG` on|off (default off); `REF` = Lighter Core symbol of the reference
+/// book (default: the market without `-USD`; `none` = no reference);
+/// `LIGHTER_URL` = REST base (default mainnet).
+pub fn toxicity_from_env(market: &str) -> Result<crate::toxicity::Settings> {
+    use crate::toxicity::{default_ref_symbol, Settings, LIGHTER_MAINNET};
+    let on = match var("ARCUS_VOL_TOXICITY_LOG").as_deref().map(str::trim) {
+        None | Some("off") | Some("") => false,
+        Some("on") => true,
+        Some(other) => bail!("ARCUS_VOL_TOXICITY_LOG={other} is not on|off"),
+    };
+    let ref_symbol = match var("ARCUS_VOL_TOXICITY_REF").as_deref().map(str::trim) {
+        None | Some("") => Some(default_ref_symbol(market)),
+        Some("none") => None,
+        Some(s) => Some(s.to_ascii_uppercase()),
+    };
+    let lighter_base = var("ARCUS_VOL_TOXICITY_LIGHTER_URL")
+        .unwrap_or_else(|| LIGHTER_MAINNET.to_string())
+        .trim_end_matches('/')
+        .to_string();
+    Ok(Settings {
+        on,
+        ref_symbol,
+        lighter_base,
+    })
+}
+
 /// `ARCUS_VOL_GATE_*` (bot-strategy#1120 design §6.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateSettings {
@@ -390,8 +420,10 @@ pub fn gate_enforce_gate(
 impl Config {
     pub fn from_env() -> Result<Self> {
         let p = |k: &str| format!("ARCUS_VOL_{k}");
+        let market = var(&p("MARKET")).unwrap_or_else(|| "BTC-USD".to_string());
         let cfg = Config {
-            market: var(&p("MARKET")).unwrap_or_else(|| "BTC-USD".to_string()),
+            toxicity: toxicity_from_env(&market)?,
+            market,
             clip_usd: dec(&p("CLIP_USD"), "10000")?,
             skew_usd: dec(&p("SKEW_USD"), "10000")?,
             hard_cap_usd: dec(&p("HARD_CAP_USD"), "30000")?,
@@ -954,6 +986,7 @@ pub(crate) mod tests {
             position_stop_bps: None,
             gate: GateSettings::off(),
             learner: crate::offset_learner::LearnerSettings::off(),
+            toxicity: crate::toxicity::Settings::default(),
             state_dir: PathBuf::from("/tmp/unused"),
             dry_run: true,
             live_confirm: String::new(),

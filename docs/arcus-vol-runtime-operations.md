@@ -268,6 +268,17 @@ weekdays, `pre` 04:00–09:30, `cash` 09:30–16:00, `after` 16:00–20:00,
   gate first (pull or quote) and let the learner choose the offset only when
   the cycle quotes.
 
+### Shadow toxicity log (bot-strategy#1093)
+
+`TOXICITY_LOG=on` (default off) writes `toxicity_YYYYMMDD.jsonl` to the
+state dir: every quote placement / re-peg and every fill with the own-book,
+own-flow, session-boundary and Lighter-reference features at the decision
+time, plus 1 / 10 / 60 / 300 s markouts against the own mid and the
+reference mid (`markout_tox` rows). Logging only — quoting is unchanged.
+Schema, #1190 mapping and the enable steps: `docs/arcus-vol-toxicity-log.md`;
+pre-registered gate test: `deploy/arcus_vol/TOXICITY_PREREG.md`; evaluation:
+`scripts/arcus_vol_toxicity_eval.py`.
+
 ### Sentinels (in `STATE_DIR`)
 
 | file | meaning |

@@ -14,6 +14,7 @@ scripts/venv/
 !online_adaptation_plan.md
 !docs/*.md
 !deploy/arcus_vol/README.md
+!deploy/arcus_vol/TOXICITY_PREREG.md
 *.patch
 pairtrade_history.json
 *.swp
