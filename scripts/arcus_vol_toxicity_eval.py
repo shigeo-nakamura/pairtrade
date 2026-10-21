@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Evaluate the pre-registered toxicity gate rules (bot-strategy#1093).
 
-Joins `toxicity_*.jsonl` fill rows (features at the fill's venue time) with
+Joins `toxicity_*.jsonl` fill rows (features at τ = fill − 300 ms cancel
+latency, as the runtime stores them — never a feature observed after a gate
+could still have acted) with
 `fills.jsonl` `markout` rows (5/30/60 s, primary = 60 s) and the log's own
 `markout_tox` rows (1/10/60/300 s vs own mid and reference mid), then scores
 the rule grid frozen in `deploy/arcus_vol/TOXICITY_PREREG.md`.
@@ -230,6 +232,16 @@ def main():
         sel = eligible[0] if eligible else None
         with open(os.path.join(a.out, "is_table.json"), "w") as fh:
             json.dump(table, fh, indent=1)
+        # per-market tables (PREREG: reported alongside; selection is on the aggregate)
+        by_market = {}
+        for m in sorted({r.get("market") for _, r, _ in rows}):
+            mrows = [x for x in rows if x[1].get("market") == m]
+            by_market[m] = [dict(s, id=rid, label=label) for rid, label, pred in rules() for s in [score(mrows, pred, "markout60")] if s]
+            for s_ in sorted(by_market[m], key=lambda s: -s["delta_bp"])[:3]:
+                tt = "-" if s_["t"] is None else f"{s_['t']:.2f}"
+                print(f"  [{m}] {s_['id']:<22} keep {s_['keep']:.2f}  n {s_['n_kept']}/{s_['n_all']}  Δ {s_['delta_bp']:+.2f} bp  t {tt}")
+        with open(os.path.join(a.out, "is_table_by_market.json"), "w") as fh:
+            json.dump(by_market, fh, indent=1)
         with open(os.path.join(a.out, "is_selected.json"), "w") as fh:
             json.dump({"split": a.split, "oos_end": a.oos_end, "n_is": len(rows), "selected": sel, "verdict": "KILL (no rule passes IS)" if sel is None else "candidate"}, fh, indent=1)
         # side tables (no gate): other outcomes, per market
@@ -273,7 +285,10 @@ def main():
     verdict = "KILL"
     if s and s["delta_bp"] >= MIN_DELTA_OOS and s["t"] is not None and s["t"] >= MIN_T and s["keep"] >= MIN_KEEP:
         verdict = "PASS"
-    out = {"rule": sel["id"], "oos": s, "verdict": verdict}
+    by_market = {}
+    for m in sorted({r.get("market") for _, r, _ in rows}):
+        by_market[m] = score([x for x in rows if x[1].get("market") == m], pred, "markout60")
+    out = {"rule": sel["id"], "oos": s, "oos_by_market": by_market, "verdict": verdict}
     with open(os.path.join(a.out, "oos_verdict.json"), "w") as fh:
         json.dump(out, fh, indent=1)
     print(json.dumps(out, indent=1))

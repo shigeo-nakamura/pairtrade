@@ -58,7 +58,10 @@ bot-strategy#1120); it never adds one.
 | R5 | `abs(arc_flow_5s) ≥ f` in the direction that hits the quote (taker buys for an ask fill, taker sells for a bid fill) | f ∈ {$5k, $25k, $100k} |
 
 A fill with the rule's feature `null` is **not** flagged (the live gate would
-fall back to baseline, bot-strategy#1120 D6).
+fall back to baseline, bot-strategy#1120 D6). Every rule reads the features
+the runtime stored at **τ = fill time − 300 ms** (the cancel latency the quote
+gate stamps fills with): what moved in the last 300 ms before the fill could
+not have been acted on and is never credited.
 
 ## Metric and gates
 
@@ -78,7 +81,8 @@ window.
 - otherwise **KILL** — no re-sweep of the grid, no new rule on the same tapes.
 
 Reported alongside (no gate): the same table for `markout_ref_bps` at 60 s,
-`markout_mid_bps` at 1 / 10 / 300 s, and per market.
+`markout_mid_bps` at 1 / 10 / 300 s, and **per market** (`is_table_by_market.json`,
+`oos_by_market`); selection and the verdict are on the aggregate.
 
 ## After a PASS
 

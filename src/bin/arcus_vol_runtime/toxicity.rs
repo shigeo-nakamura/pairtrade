@@ -26,7 +26,7 @@
 
 use crate::logic::QSide;
 use crate::offset_learner::window_at;
-use crate::quote_gate::GateLog;
+use crate::quote_gate::{GateLog, CANCEL_LATENCY_MS};
 use crate::session::new_york_utc_offset_secs;
 use futures::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
@@ -200,6 +200,8 @@ pub struct RefShared {
     pub last_x_ms: Option<u64>,
     /// `(rx_ms, mid)` ring, newest last.
     pub mids: VecDeque<(u64, f64)>,
+    /// Outage epochs `(down_at_ms, up_again_at_ms)`; `None` = still down.
+    pub outages: VecDeque<(u64, Option<u64>)>,
     pub frames: u64,
     pub reconnects: u64,
 }
@@ -231,10 +233,42 @@ impl RefShared {
         }
     }
 
-    pub fn down(&mut self, why: &str) {
+    /// The feed went down at `now_ms` (socket lost, bad frame, unlisted …).
+    /// Opens an outage epoch; `fresh_mid` / `up_at` consult the epochs so a
+    /// row stamped at a historical `t` sees the feed's health AT `t`, not now.
+    pub fn down(&mut self, now_ms: u64, why: &str) {
+        if self.up {
+            self.outages.push_back((now_ms, None));
+            if self.outages.len() > 64 {
+                self.outages.pop_front();
+            }
+        }
         self.up = false;
         self.last_err = Some(why.to_string());
         self.top = None;
+    }
+
+    /// The feed is up again at `now_ms` (first frame after an outage).
+    pub fn up_again(&mut self, now_ms: u64) {
+        if let Some((_, end)) = self.outages.back_mut() {
+            if end.is_none() {
+                *end = Some(now_ms);
+            }
+        }
+        self.up = true;
+        self.last_err = None;
+    }
+
+    /// Whether the feed was up at `t`: at least one frame received at or
+    /// before `t`, and `t` not inside an outage epoch (an open one counts).
+    pub fn up_at(&self, t_ms: u64) -> bool {
+        if self.asof(t_ms).is_none() {
+            return false;
+        }
+        !self
+            .outages
+            .iter()
+            .any(|(start, end)| *start <= t_ms && end.is_none_or(|e| t_ms < e))
     }
 
     /// Mid as of `t` (last record with `rx <= t`).
@@ -253,10 +287,10 @@ impl RefShared {
         self.mids.iter().rev().find(|(rx, _)| *rx <= t_ms).copied()
     }
 
-    /// Fresh mid at `t`: the as-of record, if the feed is up and that record
-    /// is at most `REF_STALE_MS` old at `t`.
+    /// Fresh mid at `t`: the as-of record, if the feed was up at `t` and
+    /// that record is at most `REF_STALE_MS` old at `t`.
     pub fn fresh_mid(&self, t_ms: u64) -> Option<f64> {
-        if !self.up {
+        if !self.up_at(t_ms) {
             return None;
         }
         self.asof(t_ms)
@@ -432,7 +466,7 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                         shared
                             .lock()
                             .unwrap()
-                            .down(&format!("orderBookDetails: {e}"));
+                            .down(now_ms(), &format!("orderBookDetails: {e}"));
                         None
                     }
                 },
@@ -440,7 +474,7 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                     shared
                         .lock()
                         .unwrap()
-                        .down(&format!("orderBookDetails: {e}"));
+                        .down(now_ms(), &format!("orderBookDetails: {e}"));
                     None
                 }
             },
@@ -454,7 +488,7 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                         "[TOX] reference {symbol}: not listed on Lighter (orderBookDetails) — ref_* stays null"
                     );
                 }
-                s.down("unlisted or metadata unavailable");
+                s.down(now_ms(), "unlisted or metadata unavailable");
             }
             tokio::time::sleep(Duration::from_secs(3_600)).await;
             continue;
@@ -482,15 +516,15 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                         let msg = match next {
                             Ok(Some(Ok(m))) => m,
                             Ok(Some(Err(e))) => {
-                                shared.lock().unwrap().down(&format!("ws: {e}"));
+                                shared.lock().unwrap().down(now_ms(), &format!("ws: {e}"));
                                 break;
                             }
                             Ok(None) => {
-                                shared.lock().unwrap().down("ws closed");
+                                shared.lock().unwrap().down(now_ms(), "ws closed");
                                 break;
                             }
                             Err(_) => {
-                                shared.lock().unwrap().down("silent 60s");
+                                shared.lock().unwrap().down(now_ms(), "silent 60s");
                                 break;
                             }
                         };
@@ -501,8 +535,7 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                                     let rx = now_ms();
                                     let mut s = shared.lock().unwrap();
                                     if !s.up {
-                                        s.up = true;
-                                        s.last_err = None;
+                                        s.up_again(rx);
                                         backoff = Duration::from_secs(2);
                                         log::info!(
                                             "[TOX] reference {symbol} (Lighter market {market_id}) up"
@@ -514,7 +547,10 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
-                                    shared.lock().unwrap().down(&format!("bad frame: {e}"));
+                                    shared
+                                        .lock()
+                                        .unwrap()
+                                        .down(now_ms(), &format!("bad frame: {e}"));
                                     break;
                                 }
                             },
@@ -524,18 +560,24 @@ pub async fn run_lighter(base: String, symbol: String, shared: Arc<Mutex<RefShar
                                 }
                             }
                             Message::Close(_) => {
-                                shared.lock().unwrap().down("ws close frame");
+                                shared.lock().unwrap().down(now_ms(), "ws close frame");
                                 break;
                             }
                             _ => {}
                         }
                     }
                 } else {
-                    shared.lock().unwrap().down("subscribe send failed");
+                    shared
+                        .lock()
+                        .unwrap()
+                        .down(now_ms(), "subscribe send failed");
                 }
             }
             Err(e) => {
-                shared.lock().unwrap().down(&format!("connect: {e}"));
+                shared
+                    .lock()
+                    .unwrap()
+                    .down(now_ms(), &format!("connect: {e}"));
             }
         }
         {
@@ -758,21 +800,21 @@ impl Engine {
         );
         if let Some(r) = reference {
             row.insert("ref_symbol".into(), json!(r.symbol));
-            row.insert("ref_up".into(), json!(r.up));
+            row.insert("ref_up".into(), json!(r.up_at(t_ms)));
             let fresh = r.fresh_mid(t_ms);
             row.insert("ref_mid".into(), json!(fresh));
             let asof = r.asof(t_ms);
             row.insert(
                 "ref_lead_ms".into(),
-                json!(asof.filter(|_| r.up).map(|(rx, _)| t_ms as i64 - rx as i64)),
+                json!(asof
+                    .filter(|_| r.up_at(t_ms))
+                    .map(|(rx, _)| t_ms as i64 - rx as i64)),
             );
             row.insert("ref_t".into(), json!(asof.map(|(rx, _)| rx)));
             // The venue time is known for the latest frame only.
             row.insert(
                 "ref_x".into(),
-                json!(asof
-                    .filter(|(rx, _)| *rx == r.last_rx_ms)
-                    .and_then(|_| r.last_x_ms)),
+                json!(asof.filter(|(rx, _)| *rx == r.last_rx_ms).and(r.last_x_ms)),
             );
             if let (Some(arc), Some(rm)) = (
                 row.get("arc_mid").and_then(Value::as_f64),
@@ -781,7 +823,7 @@ impl Engine {
                 row.insert("ref_dev_bp".into(), json!((arc - rm) / rm * 1e4));
             }
             for h in [1u64, 5] {
-                let (ret, jump) = if r.up {
+                let (ret, jump) = if r.up_at(t_ms) {
                     r.ret_jump(t_ms, h * 1_000)
                 } else {
                     (None, None)
@@ -900,7 +942,7 @@ impl Toxicity {
                 continue;
             }
             let (Some(t), Some(px), Some(side)) = (
-                f.get("t").and_then(Value::as_u64),
+                f.get("t_fill").or(f.get("t")).and_then(Value::as_u64),
                 f.get("px")
                     .and_then(Value::as_str)
                     .and_then(|p| p.parse::<f64>().ok()),
@@ -1068,9 +1110,14 @@ impl Toxicity {
         }
         let side = if buy { QSide::Bid } else { QSide::Ask };
         let pxf = px.to_f64().unwrap_or(0.0);
+        // Features at τ = fill − cancel latency: the last instant a gate
+        // cycle could still have cancelled the quote (`quote_gate::
+        // CANCEL_LATENCY_MS`, the gate's own fill stamp). A move or flow
+        // inside the last 300 ms before the fill is not creditable.
+        let tau = fill_ts_ms.saturating_sub(CANCEL_LATENCY_MS);
         let mut row = self.base_row(
             "fill",
-            fill_ts_ms,
+            tau,
             Some(fill_ts_ms),
             market,
             side,
@@ -1079,6 +1126,8 @@ impl Toxicity {
             band_bps,
             in_session,
         );
+        row.insert("t_fill".into(), json!(fill_ts_ms));
+        row.insert("cancel_latency_ms".into(), json!(CANCEL_LATENCY_MS));
         row.insert("rx_t".into(), json!(rx_ms));
         row.insert("fill_id".into(), json!(fill_id));
         row.insert("role".into(), json!(if maker { "maker" } else { "taker" }));
@@ -1086,7 +1135,7 @@ impl Toxicity {
         row.insert("qty".into(), json!(qty.to_string()));
         row.insert(
             "dist_touch_bps".into(),
-            json!(self.engine.dist_touch_bps(fill_ts_ms, side, pxf)),
+            json!(self.engine.dist_touch_bps(tau, side, pxf)),
         );
         // As-of the fill's venue time and fresh then (a reference that was
         // down or quiet for > REF_STALE_MS gives no reference markouts).
@@ -1303,12 +1352,40 @@ mod tests {
         assert_eq!(row["ref_lead_ms"], json!(500));
         assert_eq!(row["ref_x"], json!(Value::Null)); // last frame had no venue time
         assert_eq!(row["ref_symbol"], json!("SPY"));
-        r.down("test");
+        // the feed goes down at t0+4.4 s: a row at t0+4.5 s is inside the outage
+        r.down(t0 + 4_400, "test");
         let mut row = serde_json::Map::new();
         e.features_at(t0 + 4_500, Some(&r), &mut row);
         assert_eq!(row["ref_up"], json!(false));
         assert_eq!(row["ref_mid"], json!(Value::Null));
         assert_eq!(row["ref_jump_5s"], json!(Value::Null));
+    }
+
+    #[test]
+    fn reference_health_is_evaluated_as_of_the_row_time() {
+        let mut r = RefShared::new("SPY");
+        let t0 = 1_000_000_000_000u64;
+        r.up_again(t0 - 10_000);
+        r.push_top(t0, None, 100.0, 100.02);
+        r.down(t0 + 2_000, "ws closed");
+        // a row stamped before the outage sees a fresh reference …
+        assert!(r.up_at(t0 + 1_000));
+        assert!((r.fresh_mid(t0 + 1_000).unwrap() - 100.01).abs() < 1e-9);
+        // … a row inside the outage does not, even though a pre-gap record exists
+        assert!(!r.up_at(t0 + 3_000));
+        assert_eq!(r.fresh_mid(t0 + 3_000), None);
+        // after the reconnect the pre-gap record is not reused across the gap
+        r.up_again(t0 + 8_000);
+        assert!(!r.up_at(t0 + 5_000));
+        r.push_top(t0 + 8_500, None, 100.2, 100.22);
+        assert!(r.up_at(t0 + 9_000));
+        assert!((r.fresh_mid(t0 + 9_000).unwrap() - 100.21).abs() < 1e-9);
+        // before the first frame: not up
+        assert!(!r.up_at(t0 - 20_000));
+        let mut row = serde_json::Map::new();
+        Engine::default().features_at(t0 + 3_000, Some(&r), &mut row);
+        assert_eq!(row["ref_up"], json!(false));
+        assert_eq!(row["ref_mid"], json!(Value::Null));
     }
 
     #[test]
@@ -1413,7 +1490,12 @@ mod tests {
         approx(&rows[0]["ref_dev_bp"], (200.0 - 200.01) / 200.01 * 1e4);
         assert_eq!(rows[1]["kind"], "fill");
         assert_eq!(rows[1]["fill_id"], "f-1");
-        assert_eq!(rows[1]["t"], json!(t0 + 1_000));
+        assert_eq!(
+            rows[1]["t"],
+            json!(t0 + 1_000 - CANCEL_LATENCY_MS),
+            "features at τ"
+        );
+        assert_eq!(rows[1]["t_fill"], json!(t0 + 1_000));
         assert_eq!(rows[1]["x"], json!(t0 + 1_000));
         assert_eq!(rows[1]["rx_t"], json!(t0 + 1_200));
         assert_eq!(rows[1]["role"], "maker");
@@ -1508,7 +1590,7 @@ mod tests {
         );
         {
             let sh = tox.shared().unwrap();
-            sh.lock().unwrap().down("test");
+            sh.lock().unwrap().down(t0 + 20_500, "test");
         }
         let before = std::fs::read_to_string(&path).unwrap().lines().count();
         tox.flush_markouts(t0 + 21_500, Some(200.1), "SPY-USD");

@@ -38,10 +38,13 @@ feature block.
 
 ### `fill` — one per booked fill (maker and taker; `role` says which)
 `fill_id` (join key to `fills.jsonl` `markout` rows and to `markout_tox`
-rows), `x` = the fill's venue time, `rx_t` = when the runtime received it,
-`px`, `qty`, `side`, `dist_touch_bps` (as of the own book ≤ fill time),
-`ref_mid_at_fill`, plus the feature block **as of the fill's venue time**
-(never a book read after it).
+rows), `t_fill` = `x` = the fill's venue time, `rx_t` = when the runtime
+received it, `px`, `qty`, `side`, `ref_mid_at_fill` (fresh as of the fill
+time), plus `dist_touch_bps` and the feature block **as of
+`t` = τ = `t_fill` − `cancel_latency_ms` (300 ms)** — the last instant a
+gate cycle could still have cancelled the quote (the quote gate's own
+fill-stamp convention). A move or flow inside the last 300 ms before the
+fill is therefore never credited to a rule.
 
 ### `markout_tox` — per fill, horizons 1 / 10 / 60 / 300 s
 `fill_id`, `horizon_s`, `markout_mid_bps` (own mid at `t` vs fill px, signed
@@ -70,7 +73,7 @@ true` on the ones already past their cutoff).
 | `arc_ret_1s`, `arc_ret_5s`, `arc_ret_30s` | own mid return (bp) from `t−h` to `t`, as-of |
 | `window` | `off` / `pre` / `cash` / `after` / `weekend` (learner's New York windows) |
 | `prev_boundary`, `secs_since_prev`, `next_boundary`, `secs_to_next` | nearest session edges: `cash_open_0930`, `cash_close_1600`, `overnight_start_2000` (Mon–Thu), `weekend_close_2000` (Fri), `sunday_reopen_1800`, `overnight_start_2000` (Sun) — New York clock, DST-aware |
-| `ref_symbol`, `ref_up` | reference symbol, feed up |
+| `ref_symbol`, `ref_up` | reference symbol, feed up **at `t`** (outage epochs are kept, so a row stamped before a disconnect still sees a fresh reference and a row inside an outage never reuses pre-gap data) |
 | `ref_mid` | reference mid if the last frame is ≤ 5 s old |
 | `ref_t`, `ref_x` | host receive / venue time of the last reference frame |
 | `ref_lead_ms` | `t` − `ref_t` (how long ago the reference last changed) |
