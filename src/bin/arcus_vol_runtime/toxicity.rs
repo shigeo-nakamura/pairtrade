@@ -56,9 +56,10 @@ const RETAIN_MS: u64 = 40_000;
 const REF_RETAIN_MS: u64 = 15_000;
 /// L2 imbalance depths.
 const IMB_LEVELS: [usize; 2] = [5, 10];
-/// Own-book ring retention (a fill's venue time precedes the read that
-/// follows it by at most a tick; 10 s is ample).
-const BOOK_RETAIN_MS: u64 = 10_000;
+/// Own-book ring retention: a fill booked after the fee wait (up to 30 s,
+/// `FEE_WAIT_SECS`) is logged as of its first-seen time, so the book as of
+/// then must still be here; 45 s covers it with slack (≈ 2 reads/s).
+const BOOK_RETAIN_MS: u64 = 45_000;
 
 pub const LIGHTER_MAINNET: &str = "https://mainnet.zklighter.elliot.ai";
 
@@ -102,6 +103,14 @@ pub fn ws_url(base: &str) -> String {
         .or_else(|| b.strip_prefix("http://").map(|r| format!("ws://{r}")))
         .unwrap_or_else(|| b.to_string());
     format!("{b}/stream")
+}
+
+/// The time a fill is logged at: the earliest of when the runtime first saw
+/// it (`first_seen`, the fee-wait map) and the booking time `fill_ts`. A fill
+/// whose fee arrives late is booked up to 30 s after it happened; its
+/// features and markout clocks must not move with the booking.
+pub fn fill_time(first_seen: Option<u64>, fill_ts: u64) -> u64 {
+    first_seen.map_or(fill_ts, |f| f.min(fill_ts))
 }
 
 // ------------------------------------------------------------- boundaries
@@ -259,6 +268,13 @@ impl RefShared {
         self.last_err = None;
     }
 
+    /// Whether an outage epoch intersects `(from, to]`.
+    pub fn outage_in(&self, from_ms: u64, to_ms: u64) -> bool {
+        self.outages
+            .iter()
+            .any(|(start, end)| *start <= to_ms && end.is_none_or(|e| e > from_ms))
+    }
+
     /// Whether the feed was up at `t`: at least one frame received at or
     /// before `t`, and `t` not inside an outage epoch (an open one counts).
     pub fn up_at(&self, t_ms: u64) -> bool {
@@ -301,6 +317,11 @@ impl RefShared {
     /// `ref_ret_h` (bp, signed) and `ref_jump_h` (bp, max |move| over the
     /// window) against the mid as of `t − h`.
     pub fn ret_jump(&self, t_ms: u64, h_ms: u64) -> (Option<f64>, Option<f64>) {
+        // No continuous reference over the window: a reconnect inside it would
+        // turn the gap across the blind interval into a fake move.
+        if self.outage_in(t_ms.saturating_sub(h_ms), t_ms) {
+            return (None, None);
+        }
         let Some(base) = self.mid_asof(t_ms.saturating_sub(h_ms)) else {
             return (None, None);
         };
@@ -1386,6 +1407,86 @@ mod tests {
         Engine::default().features_at(t0 + 3_000, Some(&r), &mut row);
         assert_eq!(row["ref_up"], json!(false));
         assert_eq!(row["ref_mid"], json!(Value::Null));
+    }
+
+    #[test]
+    fn a_reference_window_crossing_an_outage_gives_no_return_or_jump() {
+        let mut r = RefShared::new("SPY");
+        let t0 = 1_000_000_000_000u64;
+        r.up_again(t0 - 10_000);
+        r.push_top(t0, None, 100.0, 100.02);
+        r.down(t0 + 1_000, "ws closed");
+        r.up_again(t0 + 3_000);
+        r.push_top(t0 + 3_100, None, 101.0, 101.02); // +99 bp across the gap
+                                                     // 5 s window (t0-1.5s, t0+3.5s] crosses the outage: null
+        assert_eq!(r.ret_jump(t0 + 3_500, 5_000), (None, None));
+        // 1 s window after the reconnect, no outage inside: fine
+        r.push_top(t0 + 3_900, None, 101.1, 101.12);
+        let (ret, jump) = r.ret_jump(t0 + 4_000, 1_000);
+        assert!(ret.is_some() && jump.is_some());
+        // an open (still down) outage also blocks
+        r.down(t0 + 5_000, "again");
+        assert_eq!(r.ret_jump(t0 + 6_000, 5_000), (None, None));
+        assert!(r.outage_in(t0 + 5_500, t0 + 6_000));
+        assert!(!r.outage_in(t0 + 3_200, t0 + 4_000));
+    }
+
+    #[test]
+    fn a_fill_booked_late_keeps_its_first_seen_time() {
+        assert_eq!(fill_time(Some(10), 40), 10);
+        assert_eq!(fill_time(None, 40), 40);
+        assert_eq!(fill_time(Some(50), 40), 40, "never later than the booking");
+        // booked 30 s late: features at first_seen − 300 ms, markout clocks from first_seen
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let mut tox = Toxicity::new(
+            Settings {
+                on: true,
+                ..Default::default()
+            },
+            dir.path(),
+            t0,
+        );
+        tox.on_own_book(t0 - 1_000, None, &[(99.9, 1.0)], &[(100.1, 1.0)]);
+        tox.on_own_book(t0 + 20_000, None, &[(109.9, 1.0)], &[(110.1, 1.0)]); // after the fill
+        let booked = t0 + 30_000;
+        let ts = fill_time(Some(t0), booked);
+        tox.log_fill(
+            ts,
+            booked,
+            "SPY-USD",
+            "f-late",
+            true,
+            true,
+            Decimal::new(9990, 2),
+            Decimal::ONE,
+            None,
+            None,
+            None,
+            None,
+        );
+        tox.flush_markouts(booked + 500, Some(110.0), "SPY-USD");
+        let rows: Vec<Value> = std::fs::read_to_string(dir.path().join("toxicity_20261020.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows[0]["t_fill"], json!(t0));
+        assert_eq!(rows[0]["t"], json!(t0 - CANCEL_LATENCY_MS));
+        assert_eq!(rows[0]["rx_t"], json!(booked));
+        approx(&rows[0]["arc_mid"], 100.0); // the book as of the fill, not the later one
+                                            // 1 s and 10 s horizons are past their cutoff (clock started at t0): late
+        let late: Vec<u64> = rows
+            .iter()
+            .filter(|r| r["kind"] == "markout_tox" && r["late"] == true)
+            .map(|r| r["horizon_s"].as_u64().unwrap())
+            .collect();
+        assert_eq!(late, vec![1, 10]);
+        assert_eq!(
+            tox.status(booked + 500)["pending_markouts"],
+            1,
+            "60 s and 300 s still owed"
+        );
     }
 
     #[test]

@@ -818,6 +818,11 @@ impl Runtime {
         if !self.tox.on() {
             return;
         }
+        // A fill booked late (fee wait, up to FEE_WAIT_SECS) was first seen
+        // earlier: features and markout clocks use that time, never the
+        // booking time (review P1 round 3, pairtrade#412).
+        let fill_ts =
+            toxicity::fill_time(self.fee_wait_since.get(&fill.trade_id).copied(), fill_ts);
         let (offset, arm, band, in_s) = self.tox_context(fill_ts);
         self.tox.log_fill(
             fill_ts,

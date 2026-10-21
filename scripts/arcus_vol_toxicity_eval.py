@@ -163,6 +163,11 @@ def score(rows, pred, outcome):
     }
 
 
+def fill_t(r):
+    """The fill's own time: `t_fill` (features sit at `t` = t_fill − cancel latency)."""
+    return int(r.get("t_fill", r["t"]))
+
+
 def join(fills, mk, tmk, outcome, horizon):
     """Rows (day, fill_row, outcome) for maker fills with that outcome present."""
     rows = []
@@ -177,7 +182,7 @@ def join(fills, mk, tmk, outcome, horizon):
             o = tmk.get(fid, {}).get(horizon, (None, None))[1]
         if o is None:
             continue
-        rows.append((utc_day(int(r["t"])), r, float(o)))
+        rows.append((utc_day(fill_t(r)), r, float(o)))
     return rows
 
 
@@ -207,8 +212,8 @@ def main():
         fills.update(f)
         mk.update(m)
         tmk.update(t)
-    is_fills = {k: v for k, v in fills.items() if int(v["t"]) < split_ms}
-    oos_fills = {k: v for k, v in fills.items() if split_ms <= int(v["t"]) < end_ms}
+    is_fills = {k: v for k, v in fills.items() if fill_t(v) < split_ms}
+    oos_fills = {k: v for k, v in fills.items() if split_ms <= fill_t(v) < end_ms}
     print(f"fills: {len(fills)} total, {len(is_fills)} IS, {len(oos_fills)} OOS (to {a.oos_end}); markout60 rows {sum(1 for v in mk.values() if 60 in v)}")
 
     if not a.oos:
@@ -288,7 +293,11 @@ def main():
     by_market = {}
     for m in sorted({r.get("market") for _, r, _ in rows}):
         by_market[m] = score([x for x in rows if x[1].get("market") == m], pred, "markout60")
-    out = {"rule": sel["id"], "oos": s, "oos_by_market": by_market, "verdict": verdict}
+    # pre-registered side outcomes for the selected rule (reported, not gated)
+    side = {}
+    for outcome, h in [("markout_mid", 1), ("markout_mid", 10), ("markout_mid", 300), ("markout_ref", 60)]:
+        side[f"{outcome}_{h}"] = score(join(oos_fills, mk, tmk, outcome, h), pred, outcome)
+    out = {"rule": sel["id"], "oos": s, "oos_by_market": by_market, "oos_side_tables": side, "verdict": verdict}
     with open(os.path.join(a.out, "oos_verdict.json"), "w") as fh:
         json.dump(out, fh, indent=1)
     print(json.dumps(out, indent=1))

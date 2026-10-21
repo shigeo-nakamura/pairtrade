@@ -28,6 +28,8 @@ positive before points?
 
 ## Split (opened once)
 
+- Window membership and day clustering use the fill's own time `t_fill`
+  (the row's `t` is the feature cutoff 300 ms earlier).
 - In-sample (IS): fills from the first log row up to **2026-11-03 23:59:59Z**
   (two weeks of logging, assuming the switch-on by 10-22).
 - Out-of-sample (OOS): fills from **2026-11-04 00:00:00Z** to
@@ -80,9 +82,11 @@ window.
 - **PASS**: `Δ ≥ 1 bp`, `t ≥ 2`, `keep ≥ 0.5`.
 - otherwise **KILL** — no re-sweep of the grid, no new rule on the same tapes.
 
-Reported alongside (no gate): the same table for `markout_ref_bps` at 60 s,
-`markout_mid_bps` at 1 / 10 / 300 s, and **per market** (`is_table_by_market.json`,
-`oos_by_market`); selection and the verdict are on the aggregate.
+Reported alongside (no gate), on IS and on the single OOS look: the same
+table for `markout_ref_bps` at 60 s, `markout_mid_bps` at 1 / 10 / 300 s
+(`is_side_tables.json`, `oos_side_tables`), and **per market**
+(`is_table_by_market.json`, `oos_by_market`); selection and the verdict are
+on the aggregate.
 
 ## After a PASS
 
