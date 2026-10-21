@@ -1728,32 +1728,11 @@ impl Runtime {
     async fn live_quotes(&mut self, plan: Vec<(QSide, QuoteAction)>) {
         let mut places: Vec<QuoteTarget> = Vec::new();
         let mut modifies: Vec<(QSide, QuoteTarget, String)> = Vec::new();
+        // Toxicity log (bot-strategy#1093): a `quote` row for every side
+        // whose resting quote the venue ACCEPTED in this call (`resting` is
+        // only updated on an accepted place / modify), after the sends.
+        let resting_before = self.tox_resting_snapshot();
         for (side, action) in plan {
-            // Toxicity log (bot-strategy#1093): every placement / re-peg /
-            // replacement, with the features at the decision time. Shadow:
-            // the action below is not changed by it.
-            if self.tox.on() {
-                let target = match &action {
-                    QuoteAction::Place(t) | QuoteAction::Modify(t) => Some(t),
-                    QuoteAction::Replace(Some(t)) => Some(t),
-                    _ => None,
-                };
-                if let Some(t) = target {
-                    let t_now = now_ms();
-                    let (offset, arm, band, in_s) = self.tox_context(t_now);
-                    self.tox.log_quote(
-                        t_now,
-                        &self.cfg.market,
-                        side,
-                        t.px,
-                        t.qty,
-                        offset,
-                        arm,
-                        band,
-                        in_s,
-                    );
-                }
-            }
             match action {
                 QuoteAction::Keep => {}
                 QuoteAction::Place(t) => places.push(t),
@@ -1780,6 +1759,48 @@ impl Runtime {
             batches.push(QuoteBatch::Place(places));
         }
         send_gated(self, batches).await;
+        self.tox_log_resting_changes(&resting_before);
+    }
+
+    /// `(order_id, px, qty)` per side of the quotes we believe rest.
+    fn tox_resting_snapshot(&self) -> HashMap<QSide, (String, Decimal, Decimal)> {
+        if !self.tox.on() {
+            return HashMap::new();
+        }
+        self.resting
+            .iter()
+            .map(|(s, r)| (*s, (r.order_id.clone(), r.px, r.qty)))
+            .collect()
+    }
+
+    /// Toxicity `quote` rows for the sides whose resting quote changed
+    /// since `before` (a new order id, price or size = an accepted
+    /// placement / re-peg / replacement). Logging only.
+    fn tox_log_resting_changes(&mut self, before: &HashMap<QSide, (String, Decimal, Decimal)>) {
+        if !self.tox.on() {
+            return;
+        }
+        let t_now = now_ms();
+        let (offset, arm, band, in_s) = self.tox_context(t_now);
+        let changed: Vec<(QSide, Decimal, Decimal)> = self
+            .resting
+            .iter()
+            .filter(|(s, r)| before.get(s) != Some(&(r.order_id.clone(), r.px, r.qty)))
+            .map(|(s, r)| (*s, r.px, r.qty))
+            .collect();
+        for (side, px, qty) in changed {
+            self.tox.log_quote(
+                t_now,
+                &self.cfg.market,
+                side,
+                px,
+                qty,
+                offset,
+                arm,
+                band,
+                in_s,
+            );
+        }
     }
 
     async fn send_modifies(&mut self, modifies: Vec<(QSide, QuoteTarget, String)>) {
@@ -2960,7 +2981,7 @@ async fn main() -> Result<()> {
         gate,
         gate_off_path: cfg.state_dir.join("GATE_OFF"),
         last_gate: None,
-        tox: toxicity::Toxicity::new(cfg.toxicity.clone(), &cfg.state_dir),
+        tox: toxicity::Toxicity::new(cfg.toxicity.clone(), &cfg.state_dir, now_ms()),
         learner: offset_learner::Learner::new(cfg.learner.clone(), Default::default()),
         learner_state_path: cfg.state_dir.join("learner.json"),
         learner_journal_path: cfg.state_dir.join("learner.jsonl"),

@@ -246,16 +246,22 @@ impl RefShared {
             .map(|(_, m)| *m)
     }
 
-    /// Fresh mid at `t`: the last record, if the feed is up and it is at
-    /// most `REF_STALE_MS` old.
+    /// The last record received at or before `t` (as-of: a frame received
+    /// after `t` is never used, so fill rows stamped before the latest frame
+    /// stay look-ahead free).
+    pub fn asof(&self, t_ms: u64) -> Option<(u64, f64)> {
+        self.mids.iter().rev().find(|(rx, _)| *rx <= t_ms).copied()
+    }
+
+    /// Fresh mid at `t`: the as-of record, if the feed is up and that record
+    /// is at most `REF_STALE_MS` old at `t`.
     pub fn fresh_mid(&self, t_ms: u64) -> Option<f64> {
         if !self.up {
             return None;
         }
-        self.mids
-            .back()
+        self.asof(t_ms)
             .filter(|(rx, _)| t_ms.saturating_sub(*rx) <= REF_STALE_MS)
-            .map(|(_, m)| *m)
+            .map(|(_, m)| m)
     }
 
     /// `ref_ret_h` (bp, signed) and `ref_jump_h` (bp, max |move| over the
@@ -755,15 +761,19 @@ impl Engine {
             row.insert("ref_up".into(), json!(r.up));
             let fresh = r.fresh_mid(t_ms);
             row.insert("ref_mid".into(), json!(fresh));
+            let asof = r.asof(t_ms);
             row.insert(
                 "ref_lead_ms".into(),
-                json!((r.last_rx_ms > 0 && r.up).then_some(t_ms as i64 - r.last_rx_ms as i64)),
+                json!(asof.filter(|_| r.up).map(|(rx, _)| t_ms as i64 - rx as i64)),
             );
+            row.insert("ref_t".into(), json!(asof.map(|(rx, _)| rx)));
+            // The venue time is known for the latest frame only.
             row.insert(
-                "ref_t".into(),
-                json!((r.last_rx_ms > 0).then_some(r.last_rx_ms)),
+                "ref_x".into(),
+                json!(asof
+                    .filter(|(rx, _)| *rx == r.last_rx_ms)
+                    .and_then(|_| r.last_x_ms)),
             );
-            row.insert("ref_x".into(), json!(r.last_x_ms));
             if let (Some(arc), Some(rm)) = (
                 row.get("arc_mid").and_then(Value::as_f64),
                 fresh.filter(|m| *m > 0.0),
@@ -808,7 +818,10 @@ pub struct Toxicity {
 }
 
 impl Toxicity {
-    pub fn new(settings: Settings, state_dir: &Path) -> Self {
+    /// `now_ms`: the `markout_tox` rows still owed by fills logged on the
+    /// last two UTC days are rebuilt from the log (a restart must not lose
+    /// the 60 / 300 s horizons of the fills just before it).
+    pub fn new(settings: Settings, state_dir: &Path, now_ms: u64) -> Self {
         let reference = if settings.on {
             settings
                 .ref_symbol
@@ -822,7 +835,7 @@ impl Toxicity {
         } else {
             None
         };
-        Toxicity {
+        let mut t = Toxicity {
             settings,
             engine: Engine::default(),
             reference,
@@ -830,6 +843,109 @@ impl Toxicity {
             pending: Vec::new(),
             rows_today: 0,
             rows_day: String::new(),
+        };
+        if t.on() {
+            t.restore_pending(state_dir, now_ms);
+        }
+        t
+    }
+
+    /// Rebuild `pending` from the log of the last two UTC days: every
+    /// `fill` row's horizons without a `markout_tox` row. A horizon past
+    /// its lateness cutoff is written now as `late` with `restart: true`;
+    /// the others wait as usual.
+    fn restore_pending(&mut self, state_dir: &Path, now_ms: u64) {
+        let mut fills: BTreeMap<String, Value> = BTreeMap::new();
+        let mut done: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for back in [1u64, 0] {
+            let day = chrono::DateTime::from_timestamp_millis(
+                now_ms.saturating_sub(back * 86_400_000) as i64,
+            )
+            .map(|d| d.format("%Y%m%d").to_string())
+            .unwrap_or_default();
+            let Ok(text) =
+                std::fs::read_to_string(GateLog::path_for_prefixed(state_dir, "toxicity", &day))
+            else {
+                continue;
+            };
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let Some(id) = v.get("fill_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                match v.get("kind").and_then(Value::as_str) {
+                    Some("fill") => {
+                        fills.insert(id.to_string(), v);
+                    }
+                    Some("markout_tox") => {
+                        if let Some(h) = v.get("horizon_s").and_then(Value::as_u64) {
+                            done.entry(id.to_string()).or_default().push(h);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut late_rows = Vec::new();
+        let mut restored = 0usize;
+        for (id, f) in fills {
+            let owed: Vec<u64> = MARKOUT_HORIZONS_S
+                .iter()
+                .copied()
+                .filter(|h| !done.get(&id).is_some_and(|d| d.contains(h)))
+                .collect();
+            if owed.is_empty() {
+                continue;
+            }
+            let (Some(t), Some(px), Some(side)) = (
+                f.get("t").and_then(Value::as_u64),
+                f.get("px")
+                    .and_then(Value::as_str)
+                    .and_then(|p| p.parse::<f64>().ok()),
+                f.get("side").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let market = f
+                .get("market")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut horizons = Vec::new();
+            for h in owed {
+                if now_ms > t + h * 1_000 + MARKOUT_MAX_LATE_MS {
+                    late_rows.push(json!({
+                        "kind": "markout_tox", "t": now_ms, "market": market,
+                        "fill_id": id, "horizon_s": h, "late": true, "restart": true,
+                        "markout_mid_bps": Value::Null, "markout_ref_bps": Value::Null,
+                        "mid": Value::Null, "ref_mid": Value::Null,
+                    }));
+                } else {
+                    horizons.push(h);
+                }
+            }
+            if !horizons.is_empty() {
+                restored += 1;
+                self.pending.push(PendingTox {
+                    fill_id: id,
+                    fill_ts_ms: t,
+                    px,
+                    buy: side == "buy",
+                    ref_mid0: f.get("ref_mid_at_fill").and_then(Value::as_f64),
+                    horizons,
+                });
+            }
+        }
+        let n_late = late_rows.len();
+        for r in late_rows {
+            self.write(now_ms, r);
+        }
+        if restored > 0 || n_late > 0 {
+            log::info!(
+                "[TOX] markouts restored after restart: {restored} fill(s) pending, {n_late} horizon(s) late"
+            );
         }
     }
 
@@ -972,10 +1088,12 @@ impl Toxicity {
             "dist_touch_bps".into(),
             json!(self.engine.dist_touch_bps(fill_ts_ms, side, pxf)),
         );
+        // As-of the fill's venue time and fresh then (a reference that was
+        // down or quiet for > REF_STALE_MS gives no reference markouts).
         let ref_mid0 = self
             .reference
             .as_ref()
-            .and_then(|r| r.lock().unwrap().mid_asof(fill_ts_ms));
+            .and_then(|r| r.lock().unwrap().fresh_mid(fill_ts_ms));
         row.insert("ref_mid_at_fill".into(), json!(ref_mid0));
         self.write(fill_ts_ms, Value::Object(row));
         self.pending.push(PendingTox {
@@ -1022,8 +1140,12 @@ impl Toxicity {
                     .flatten()
                     .zip(p.ref_mid0.filter(|r| *r > 0.0))
                     .map(|(m, r0)| sign * (m - r0) / r0 * 1e4);
-                if !late && (mid_bps.is_none() && own_mid.is_none()) {
-                    // Nothing fresh yet: wait (up to MARKOUT_MAX_LATE_MS).
+                // Not late yet: wait (up to MARKOUT_MAX_LATE_MS) for every
+                // mid the row needs — the own mid, and the reference mid
+                // when the fill had one (a stale reference must not
+                // consume the horizon with `markout_ref_bps: null`).
+                let needs_ref = p.ref_mid0.is_some_and(|r| r > 0.0);
+                if !late && (own_mid.is_none() || (needs_ref && ref_mid.is_none())) {
                     keep.push(h);
                     continue;
                 }
@@ -1229,7 +1351,7 @@ mod tests {
             ref_symbol: Some("SPY".into()),
             lighter_base: LIGHTER_MAINNET.into(),
         };
-        let mut tox = Toxicity::new(settings, dir.path());
+        let mut tox = Toxicity::new(settings, dir.path(), 0);
         let t0 = ms("2026-10-20T15:00:00Z");
         {
             let sh = tox.shared().unwrap();
@@ -1317,9 +1439,177 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_reference_does_not_consume_a_horizon_before_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = ms("2026-10-20T15:00:00Z");
+        let settings = Settings {
+            on: true,
+            ref_symbol: Some("SPY".into()),
+            ..Default::default()
+        };
+        let mut tox = Toxicity::new(settings, dir.path(), t0);
+        {
+            let sh = tox.shared().unwrap();
+            let mut r = sh.lock().unwrap();
+            r.up = true;
+            r.push_top(t0 - 100, None, 200.0, 200.02);
+        }
+        tox.log_fill(
+            t0,
+            t0,
+            "SPY-USD",
+            "f-2",
+            true,
+            true,
+            Decimal::new(200, 0),
+            Decimal::ONE,
+            None,
+            None,
+            None,
+            None,
+        );
+        // 1 s due, own mid fresh, reference stale (> 5 s old): wait
+        tox.flush_markouts(t0 + 7_000, Some(200.1), "SPY-USD");
+        let path = dir.path().join("toxicity_20261020.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "fill row only"
+        );
+        // the reference recovers inside the grace period: both sides priced
+        {
+            let sh = tox.shared().unwrap();
+            sh.lock().unwrap().push_top(t0 + 9_000, None, 200.3, 200.32);
+        }
+        tox.flush_markouts(t0 + 9_500, Some(200.1), "SPY-USD");
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["horizon_s"], 1);
+        assert_eq!(rows[1]["late"], false);
+        assert!(rows[1]["markout_ref_bps"].as_f64().is_some());
+        // a fill without a reference mid does not wait for one
+        tox.log_fill(
+            t0 + 20_000,
+            t0 + 20_000,
+            "SPY-USD",
+            "f-3",
+            true,
+            true,
+            Decimal::new(200, 0),
+            Decimal::ONE,
+            None,
+            None,
+            None,
+            None,
+        );
+        {
+            let sh = tox.shared().unwrap();
+            sh.lock().unwrap().down("test");
+        }
+        let before = std::fs::read_to_string(&path).unwrap().lines().count();
+        tox.flush_markouts(t0 + 21_500, Some(200.1), "SPY-USD");
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // f-3's 1 s horizon is priced without a reference (ref null, not late);
+        // f-2's 10 s horizon, past its cutoff with the reference still down,
+        // is written late at the same flush.
+        let f3 = rows
+            .iter()
+            .find(|r| r["fill_id"] == "f-3" && r["kind"] == "markout_tox")
+            .unwrap();
+        assert_eq!(f3["horizon_s"], 1);
+        assert_eq!(f3["late"], false);
+        assert_eq!(f3["markout_ref_bps"], Value::Null);
+        let f2_10 = rows
+            .iter()
+            .find(|r| r["fill_id"] == "f-2" && r["horizon_s"] == 10)
+            .unwrap();
+        assert_eq!(f2_10["late"], true);
+        assert_eq!(rows.len(), before + 2);
+    }
+
+    #[test]
+    fn pending_markouts_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = ms("2026-10-20T23:59:30Z"); // fill just before the UTC day rolls
+        let s = Settings {
+            on: true,
+            ..Default::default()
+        };
+        let mut tox = Toxicity::new(s.clone(), dir.path(), t0);
+        tox.log_fill(
+            t0,
+            t0,
+            "SPY-USD",
+            "f-r",
+            false,
+            true,
+            Decimal::new(100, 0),
+            Decimal::ONE,
+            None,
+            None,
+            None,
+            None,
+        );
+        tox.flush_markouts(t0 + 1_500, Some(100.0), "SPY-USD"); // 1 s done
+        drop(tox);
+        // restart 45 s later (next UTC day): 10 s is past its cutoff, 60 s and 300 s still owed
+        let now = t0 + 45_000;
+        let mut tox = Toxicity::new(s, dir.path(), now);
+        assert_eq!(tox.status(now)["pending_markouts"], 1);
+        let day_old = "20261020";
+        let day_new = "20261021";
+        let late: Vec<Value> =
+            std::fs::read_to_string(dir.path().join(format!("toxicity_{day_new}.jsonl")))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0]["horizon_s"], 10);
+        assert_eq!(late[0]["restart"], true);
+        assert_eq!(late[0]["late"], true);
+        tox.flush_markouts(t0 + 61_000, Some(99.0), "SPY-USD");
+        let _ = day_old;
+        let rows: Vec<Value> =
+            std::fs::read_to_string(dir.path().join(format!("toxicity_{day_new}.jsonl")))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        let m60 = rows
+            .iter()
+            .find(|r| r["horizon_s"] == 60)
+            .expect("60 s written after restart");
+        assert_eq!(m60["fill_id"], "f-r");
+        assert!(
+            (m60["markout_mid_bps"].as_f64().unwrap() - 100.0).abs() < 1e-9,
+            "sell at 100, mid 99 = +100 bp"
+        );
+        assert_eq!(tox.status(now)["pending_markouts"], 1, "300 s still owed");
+        // a second restart with everything written restores nothing
+        let tox2 = Toxicity::new(
+            Settings {
+                on: true,
+                ..Default::default()
+            },
+            dir.path(),
+            now + 400_000,
+        );
+        assert_eq!(tox2.status(now + 400_000)["pending_markouts"], 0);
+    }
+
+    #[test]
     fn off_writes_nothing_and_a_sell_markout_is_signed_in_our_favour() {
         let dir = tempfile::tempdir().unwrap();
-        let mut off = Toxicity::new(Settings::default(), dir.path());
+        let mut off = Toxicity::new(Settings::default(), dir.path(), 0);
         off.log_quote(
             1,
             "SPY-USD",
@@ -1339,6 +1629,7 @@ mod tests {
                 ..Default::default()
             },
             dir.path(),
+            0,
         );
         let t0 = ms("2026-10-20T15:00:00Z");
         tox.log_fill(

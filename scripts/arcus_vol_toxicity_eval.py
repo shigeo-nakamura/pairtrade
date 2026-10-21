@@ -6,12 +6,13 @@ Joins `toxicity_*.jsonl` fill rows (features at the fill's venue time) with
 `markout_tox` rows (1/10/60/300 s vs own mid and reference mid), then scores
 the rule grid frozen in `deploy/arcus_vol/TOXICITY_PREREG.md`.
 
-    arcus_vol_toxicity_eval.py --state DIR [--state DIR ...] --split 2026-11-04 --out OUTDIR
+    arcus_vol_toxicity_eval.py --state DIR [--state DIR ...] --split 2026-11-04 --oos-end 2026-11-18 --out OUTDIR
     arcus_vol_toxicity_eval.py ... --oos --open-oos     # the ONE out-of-sample look
 
 `--state DIR` is an instance state dir holding `toxicity_*.jsonl` and
 `fills.jsonl` (several instances = several markets). IS = fills before the
-split date (UTC), OOS = from it. The OOS run needs `--open-oos`, which writes
+split date (UTC), OOS = from it up to (excluding) `--oos-end`, the
+pre-registered end; later fills are never scored. The OOS run needs `--open-oos`, which writes
 `OUTDIR/OOS_OPENED.json` and is refused when that file already exists. No
 model is fitted: the grid is the gate family; the IS run picks one rule, the
 OOS run scores only that rule (`OUTDIR/is_selected.json`).
@@ -34,6 +35,7 @@ MIN_KEEP = 0.5
 MIN_T = 2.0
 MIN_DELTA_OOS = 1.0
 MIN_DAYS = 5
+MIN_IS_FILLS = 150  # PREREG: fewer → extend the IS window by whole weeks (addendum), no selection
 MIN_FILLS_PER_DAY_GROUP = 3
 
 
@@ -185,12 +187,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--state", action="append", required=True, help="instance state dir (repeatable)")
     ap.add_argument("--split", required=True, help="OOS start date, UTC (YYYY-MM-DD)")
+    ap.add_argument("--oos-end", required=True, help="OOS end date, UTC, exclusive (YYYY-MM-DD), as pre-registered")
     ap.add_argument("--out", required=True, help="output dir")
     ap.add_argument("--oos", action="store_true", help="score the IS-selected rule on OOS (one look)")
     ap.add_argument("--open-oos", action="store_true", help="required with --oos; writes OOS_OPENED.json once")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     split_ms = int(datetime.strptime(a.split, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms = int(datetime.strptime(a.oos_end, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    if end_ms <= split_ms:
+        print("--oos-end must be after --split", file=sys.stderr)
+        return 2
 
     fills, mk, tmk = {}, {}, {}
     for d in a.state:
@@ -199,11 +206,16 @@ def main():
         mk.update(m)
         tmk.update(t)
     is_fills = {k: v for k, v in fills.items() if int(v["t"]) < split_ms}
-    oos_fills = {k: v for k, v in fills.items() if int(v["t"]) >= split_ms}
-    print(f"fills: {len(fills)} total, {len(is_fills)} IS, {len(oos_fills)} OOS; markout60 rows {sum(1 for v in mk.values() if 60 in v)}")
+    oos_fills = {k: v for k, v in fills.items() if split_ms <= int(v["t"]) < end_ms}
+    print(f"fills: {len(fills)} total, {len(is_fills)} IS, {len(oos_fills)} OOS (to {a.oos_end}); markout60 rows {sum(1 for v in mk.values() if 60 in v)}")
 
     if not a.oos:
         rows = join(is_fills, mk, tmk, "markout60", 60)
+        if len(rows) < MIN_IS_FILLS:
+            print(f"IS has {len(rows)} maker fills with a 60 s markout (< {MIN_IS_FILLS}): underpowered — extend the IS window by whole weeks (PREREG addendum) before selecting", file=sys.stderr)
+            with open(os.path.join(a.out, "is_selected.json"), "w") as fh:
+                json.dump({"split": a.split, "oos_end": a.oos_end, "selected": None, "verdict": f"underpowered ({len(rows)} < {MIN_IS_FILLS} IS fills)"}, fh, indent=1)
+            return 2
         table = []
         for rid, label, pred in rules():
             s = score(rows, pred, "markout60")
@@ -219,7 +231,7 @@ def main():
         with open(os.path.join(a.out, "is_table.json"), "w") as fh:
             json.dump(table, fh, indent=1)
         with open(os.path.join(a.out, "is_selected.json"), "w") as fh:
-            json.dump({"split": a.split, "selected": sel, "verdict": "KILL (no rule passes IS)" if sel is None else "candidate"}, fh, indent=1)
+            json.dump({"split": a.split, "oos_end": a.oos_end, "n_is": len(rows), "selected": sel, "verdict": "KILL (no rule passes IS)" if sel is None else "candidate"}, fh, indent=1)
         # side tables (no gate): other outcomes, per market
         side = {}
         for outcome, h in [("markout_mid", 1), ("markout_mid", 10), ("markout_mid", 300), ("markout_ref", 60)]:
@@ -235,7 +247,11 @@ def main():
     if not os.path.exists(sel_path):
         print("run the IS evaluation first (is_selected.json missing)", file=sys.stderr)
         return 2
-    sel = json.load(open(sel_path))["selected"]
+    selj = json.load(open(sel_path))
+    sel = selj["selected"]
+    if selj.get("split") != a.split or selj.get("oos_end") != a.oos_end:
+        print(f"IS selection was made for split {selj.get('split')} / end {selj.get('oos_end')}: pass the same dates", file=sys.stderr)
+        return 2
     if sel is None:
         print("IS selected no rule: KILL; OOS is not opened", file=sys.stderr)
         return 2
@@ -250,7 +266,7 @@ def main():
     for p in inputs:
         h.update(open(p, "rb").read())
     with open(marker, "w") as fh:
-        json.dump({"opened_at": datetime.now(timezone.utc).isoformat(), "split": a.split, "rule": sel["id"], "inputs_sha256": h.hexdigest(), "inputs": inputs}, fh, indent=1)
+        json.dump({"opened_at": datetime.now(timezone.utc).isoformat(), "split": a.split, "oos_end": a.oos_end, "rule": sel["id"], "inputs_sha256": h.hexdigest(), "inputs": inputs}, fh, indent=1)
     pred = next(p for rid, _, p in rules() if rid == sel["id"])
     rows = join(oos_fills, mk, tmk, "markout60", 60)
     s = score(rows, pred, "markout60")

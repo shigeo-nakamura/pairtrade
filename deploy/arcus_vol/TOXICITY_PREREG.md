@@ -32,12 +32,15 @@ positive before points?
   (two weeks of logging, assuming the switch-on by 10-22).
 - Out-of-sample (OOS): fills from **2026-11-04 00:00:00Z** to
   **2026-11-17 23:59:59Z**.
-- `scripts/arcus_vol_toxicity_eval.py --split 2026-11-04` evaluates IS; the OOS
-  run needs `--open-oos`, which writes `OOS_OPENED.json` into the output dir
-  and refuses a second opening. The OOS is read **once**, for the single rule
-  selected on IS. If fewer than 150 IS maker fills exist by 11-03, the IS
-  window extends by whole weeks until it has 150 (addendum with the new
-  dates, before any OOS row is read).
+- `scripts/arcus_vol_toxicity_eval.py --split 2026-11-04 --oos-end 2026-11-18`
+  evaluates IS (fills before the split) and refuses to select a rule with
+  fewer than 150 IS maker fills; the OOS run (`--oos`) scores only fills in
+  `[split, oos-end)` — later rows are never scored — and needs `--open-oos`,
+  which writes `OOS_OPENED.json` into the output dir and refuses a second
+  opening. The OOS is read **once**, for the single rule selected on IS. If
+  fewer than 150 IS maker fills exist by 11-03, the IS window extends by
+  whole weeks until it has 150 (addendum with the new split / end dates,
+  before any OOS row is read).
 
 ## Gate family (fixed now)
 

@@ -27,7 +27,9 @@ Every row: `kind`, `t` (host receive / decision time, ms), `x` (the venue's
 own time of the thing the row is about, ms, `null` when the venue gave none),
 `market`.
 
-### `quote` — one per placement / re-peg / replacement sent to the venue
+### `quote` — one per placement / re-peg / replacement the venue ACCEPTED
+Written after the batch returns, for each side whose resting quote (order
+id, price or size) changed; a rejected or DMS-blocked send leaves no row.
 `side` (`buy`/`sell`), `px`, `qty`, `dist_touch_bps` (behind the touch on
 our side, as of the last own-book read ≤ `t`), `offset_bps` (presence offset
 quoting with), `arm_bps` (the learner's arm at `t`, LIVE / HISTORY
@@ -46,7 +48,11 @@ rows), `x` = the fill's venue time, `rx_t` = when the runtime received it,
 in our favour: buy → up is positive), `markout_ref_bps` (reference mid at
 `t` vs `ref_mid_at_fill`, same sign), `late` (`true` when no fresh mid came
 within 10 s of the due time; both values `null` then), `mid`, `ref_mid`.
-`fills.jsonl`'s own 5 / 30 / 60 s `markout` rows are untouched.
+`fills.jsonl`'s own 5 / 30 / 60 s `markout` rows are untouched. A horizon
+waits for every mid it needs (the own mid, and the reference mid when the
+fill had one) until the cutoff. After a restart the horizons still owed by
+the fills of the last two UTC days are rebuilt from the log (`restart:
+true` on the ones already past their cutoff).
 
 ### Feature block (quote and fill rows)
 
