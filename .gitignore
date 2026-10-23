@@ -15,6 +15,7 @@ scripts/venv/
 !docs/*.md
 !deploy/arcus_vol/README.md
 !deploy/arcus_vol/TOXICITY_PREREG.md
+!deploy/xvenue_hedge_arcus/README.md
 *.patch
 pairtrade_history.json
 *.swp

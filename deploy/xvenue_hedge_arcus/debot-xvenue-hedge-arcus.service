@@ -1,0 +1,25 @@
+[Unit]
+Description="debot-xvenue-hedge-arcus (bot-strategy#1123/#1228: Arcus Perps long (wallet 0x812B) + Lighter Core short, operator-armed points hold test)"
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=-/opt/debot-hedge-arcus
+# One Arcus + one Lighter WS connection boot here; stagger behind the first
+# hedge holder (45 s) so the two never connect to Lighter Core together.
+ExecStartPre=/bin/sleep 75
+ExecStart=/bin/bash /opt/debot/scripts/debot-xvenue-hedge-arcus.sh
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+# A refused env (exit 64) is a config error: do not crash-loop on it.
+RestartPreventExitStatus=64
+TimeoutStartSec=300
+# The holder does NOT close on stop: both legs persist across restarts.
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
