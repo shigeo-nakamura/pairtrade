@@ -99,20 +99,26 @@ pub struct FeedHealth {
 const FEED_FALLBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Bookkeeping behind [`FeedHealth`]; pure so it is testable without a
-/// venue. `stale` is replaced on every `prices` call (the set of symbols
-/// that needed the fallback *this* tick), the fallback calls are a sliding
-/// 10-minute window.
+/// venue. `stale` is updated per *requested* symbol: a symbol enters when
+/// its WS mid was too old in a `prices` call and leaves when a later call
+/// that asked for it found it fresh -- a supplemental request for other
+/// symbols leaves it alone (Codex on pairtrade#417). The fallback calls
+/// are a sliding 10-minute window.
 #[derive(Debug, Default)]
 struct FeedStats {
-    stale: Vec<String>,
+    stale: std::collections::BTreeSet<String>,
     fallback_calls: std::collections::VecDeque<Instant>,
 }
 
 impl FeedStats {
-    fn set_stale(&mut self, mut symbols: Vec<String>) {
-        symbols.sort();
-        symbols.dedup();
-        self.stale = symbols;
+    fn update_stale(&mut self, requested: &[String], stale_now: &[String]) {
+        for s in requested {
+            if stale_now.contains(s) {
+                self.stale.insert(s.clone());
+            } else {
+                self.stale.remove(s);
+            }
+        }
     }
 
     fn record_fallback(&mut self, now: Instant, calls: usize) {
@@ -135,7 +141,7 @@ impl FeedStats {
     fn snapshot(&mut self, now: Instant) -> FeedHealth {
         self.prune(now);
         FeedHealth {
-            ws_stale_symbols: self.stale.clone(),
+            ws_stale_symbols: self.stale.iter().cloned().collect(),
             rest_fallback_calls_10m: self.fallback_calls.len() as u64,
         }
     }
@@ -775,7 +781,7 @@ impl Executor for LiveExecutor {
                 .feed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            feed.set_stale(stale_ws);
+            feed.update_stale(symbols, &stale_ws);
             feed.record_fallback(Instant::now(), needs_ticker.len());
         }
         if needs_ticker.is_empty() {
@@ -1100,7 +1106,11 @@ mod tests {
     fn feed_stats_track_stale_symbols_and_a_sliding_fallback_window() {
         let mut f = FeedStats::default();
         let t0 = Instant::now();
-        f.set_stale(vec!["ZRO".into(), "TRX".into(), "ZRO".into()]);
+        let all: Vec<String> = ["BTC", "TRX", "ZRO"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        f.update_stale(&all, &["ZRO".to_string(), "TRX".to_string()]);
         f.record_fallback(t0, 3);
         let h = f.snapshot(t0 + std::time::Duration::from_secs(1));
         assert_eq!(
@@ -1108,15 +1118,23 @@ mod tests {
             vec!["TRX".to_string(), "ZRO".to_string()]
         );
         assert_eq!(h.rest_fallback_calls_10m, 3);
-        // Calls older than 10 minutes fall out; the stale set is replaced,
-        // not accumulated, so a recovered symbol disappears.
+        // A supplemental request for other symbols (reconcile / admission)
+        // must not erase the outage seen by the full-universe request.
+        f.update_stale(&["SOL".to_string()], &[]);
+        let h = f.snapshot(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(
+            h.ws_stale_symbols,
+            vec!["TRX".to_string(), "ZRO".to_string()]
+        );
+        // A later full request that finds TRX fresh drops it; calls older
+        // than 10 minutes fall out of the window.
+        f.update_stale(&all, &["ZRO".to_string()]);
         f.record_fallback(
             t0 + FEED_FALLBACK_WINDOW + std::time::Duration::from_secs(1),
             2,
         );
-        f.set_stale(Vec::new());
         let h = f.snapshot(t0 + FEED_FALLBACK_WINDOW + std::time::Duration::from_secs(2));
-        assert!(h.ws_stale_symbols.is_empty());
+        assert_eq!(h.ws_stale_symbols, vec!["ZRO".to_string()]);
         assert_eq!(h.rest_fallback_calls_10m, 2);
         assert_eq!(
             FeedHealth::default(),
