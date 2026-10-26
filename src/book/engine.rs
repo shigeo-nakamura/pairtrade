@@ -2565,6 +2565,7 @@ impl BookEngine {
         let next = self.scheduler.next_after(now);
         let today_start = self.state.daily.start_equity;
         let trades = self.state.trades_closed;
+        let feed = self.exec.feed_health();
         let doc = StatusDoc {
             dashboard: DashboardStatus {
                 ts: now,
@@ -2645,6 +2646,8 @@ impl BookEngine {
                     "venue"
                 },
                 equity_ready: self.equity_ready,
+                ws_stale_symbols: feed.ws_stale_symbols,
+                rest_fallback_calls_10m: feed.rest_fallback_calls_10m,
             },
         };
         self.status.write(&doc);
