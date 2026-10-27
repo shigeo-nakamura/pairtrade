@@ -78,6 +78,73 @@ pub trait Executor: Send + Sync {
     /// retired the leg after its mark went dead, bot-strategy#937). A
     /// no-op on a real venue.
     async fn retire_paper_position(&self, _symbol: &str) {}
+    /// How the price feed is doing: the symbols whose WS mid was too old
+    /// at the last `prices` call and the REST ticker calls the fallback
+    /// made in the last 10 minutes (bot-strategy#1236). Paper executors
+    /// have no feed to report on.
+    fn feed_health(&self) -> FeedHealth {
+        FeedHealth::default()
+    }
+}
+
+/// Price-feed health for status.json (bot-strategy#1236): a dead WS
+/// channel shows up here as a symbol that keeps falling back to the
+/// ticker, instead of only as one WARN per tick in the journal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FeedHealth {
+    pub ws_stale_symbols: Vec<String>,
+    pub rest_fallback_calls_10m: u64,
+}
+
+const FEED_FALLBACK_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Bookkeeping behind [`FeedHealth`]; pure so it is testable without a
+/// venue. `stale` is updated per *requested* symbol: a symbol enters when
+/// its WS mid was too old in a `prices` call and leaves when a later call
+/// that asked for it found it fresh -- a supplemental request for other
+/// symbols leaves it alone (Codex on pairtrade#417). The fallback calls
+/// are a sliding 10-minute window.
+#[derive(Debug, Default)]
+struct FeedStats {
+    stale: std::collections::BTreeSet<String>,
+    fallback_calls: std::collections::VecDeque<Instant>,
+}
+
+impl FeedStats {
+    fn update_stale(&mut self, requested: &[String], stale_now: &[String]) {
+        for s in requested {
+            if stale_now.contains(s) {
+                self.stale.insert(s.clone());
+            } else {
+                self.stale.remove(s);
+            }
+        }
+    }
+
+    fn record_fallback(&mut self, now: Instant, calls: usize) {
+        for _ in 0..calls {
+            self.fallback_calls.push_back(now);
+        }
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(front) = self.fallback_calls.front() {
+            if now.duration_since(*front) > FEED_FALLBACK_WINDOW {
+                self.fallback_calls.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn snapshot(&mut self, now: Instant) -> FeedHealth {
+        self.prune(now);
+        FeedHealth {
+            ws_stale_symbols: self.stale.iter().cloned().collect(),
+            rest_fallback_calls_10m: self.fallback_calls.len() as u64,
+        }
+    }
 }
 
 // ---------------------------------------------------------------- paper
@@ -302,6 +369,9 @@ pub struct LiveExecutor {
     /// `FALLBACK_PRICE_TTL_SECS` so a reduce-only close of such a leg can
     /// always be priced without hammering the REST fallback.
     fallback_prices: RwLock<HashMap<String, (f64, Instant)>>,
+    /// Stale-symbol set and fallback-call window for `feed_health`
+    /// (bot-strategy#1236). Sync mutex, never held across an await.
+    feed: std::sync::Mutex<FeedStats>,
     fill_confirm_timeout_secs: i64,
     slippage_bps: u32,
     allow_venue_protection_fallback: bool,
@@ -442,6 +512,7 @@ impl LiveExecutor {
             connector,
             prices: RwLock::new(HashMap::new()),
             fallback_prices: RwLock::new(HashMap::new()),
+            feed: std::sync::Mutex::new(FeedStats::default()),
             fill_confirm_timeout_secs,
             slippage_bps,
             allow_venue_protection_fallback,
@@ -577,6 +648,10 @@ impl LiveExecutor {
                 return Some((px, None));
             }
         }
+        self.feed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_fallback(Instant::now(), 1);
         match self.connector.get_ticker(symbol, None).await {
             Ok(t) => {
                 let px = t.price.to_f64().filter(|p| *p > 0.0)?;
@@ -651,6 +726,12 @@ impl Executor for LiveExecutor {
     fn is_paper(&self) -> bool {
         false
     }
+    fn feed_health(&self) -> FeedHealth {
+        self.feed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(Instant::now())
+    }
 
     fn slippage_bound_bps(&self, reduce_only: bool) -> Option<f64> {
         live_worst_case_slippage_bps(
@@ -670,6 +751,7 @@ impl Executor for LiveExecutor {
         // and SIGTERM. Concurrent requests bound it to the slowest one.
         let mut out = HashMap::new();
         let mut needs_ticker: Vec<String> = Vec::new();
+        let mut stale_ws: Vec<String> = Vec::new();
         {
             let ws = self.prices.read().await;
             let fallback = self.fallback_prices.read().await;
@@ -683,6 +765,7 @@ impl Executor for LiveExecutor {
                         "[PRICE] WS mid for {s} is {}s old; falling back to the ticker",
                         q.at.elapsed().as_secs()
                     );
+                    stale_ws.push(s.clone());
                 }
                 if let Some((px, at)) = fallback.get(s) {
                     if at.elapsed().as_secs() < FALLBACK_PRICE_TTL_SECS {
@@ -692,6 +775,14 @@ impl Executor for LiveExecutor {
                 }
                 needs_ticker.push(s.clone());
             }
+        }
+        {
+            let mut feed = self
+                .feed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            feed.update_stale(symbols, &stale_ws);
+            feed.record_fallback(Instant::now(), needs_ticker.len());
         }
         if needs_ticker.is_empty() {
             return out;
@@ -1009,6 +1100,46 @@ mod tests {
             .execute(&intent("DOT", Side::Buy, 1.0, false))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn feed_stats_track_stale_symbols_and_a_sliding_fallback_window() {
+        let mut f = FeedStats::default();
+        let t0 = Instant::now();
+        let all: Vec<String> = ["BTC", "TRX", "ZRO"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        f.update_stale(&all, &["ZRO".to_string(), "TRX".to_string()]);
+        f.record_fallback(t0, 3);
+        let h = f.snapshot(t0 + std::time::Duration::from_secs(1));
+        assert_eq!(
+            h.ws_stale_symbols,
+            vec!["TRX".to_string(), "ZRO".to_string()]
+        );
+        assert_eq!(h.rest_fallback_calls_10m, 3);
+        // A supplemental request for other symbols (reconcile / admission)
+        // must not erase the outage seen by the full-universe request.
+        f.update_stale(&["SOL".to_string()], &[]);
+        let h = f.snapshot(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(
+            h.ws_stale_symbols,
+            vec!["TRX".to_string(), "ZRO".to_string()]
+        );
+        // A later full request that finds TRX fresh drops it; calls older
+        // than 10 minutes fall out of the window.
+        f.update_stale(&all, &["ZRO".to_string()]);
+        f.record_fallback(
+            t0 + FEED_FALLBACK_WINDOW + std::time::Duration::from_secs(1),
+            2,
+        );
+        let h = f.snapshot(t0 + FEED_FALLBACK_WINDOW + std::time::Duration::from_secs(2));
+        assert_eq!(h.ws_stale_symbols, vec!["ZRO".to_string()]);
+        assert_eq!(h.rest_fallback_calls_10m, 2);
+        assert_eq!(
+            FeedHealth::default(),
+            PaperExecutor::new(1.0, 0.0).feed_health()
+        );
     }
 
     #[tokio::test]

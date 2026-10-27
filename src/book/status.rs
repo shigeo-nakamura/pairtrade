@@ -76,6 +76,12 @@ pub struct BookBlock {
     pub pending_residual: bool,
     pub positions_source: &'static str,
     pub equity_ready: bool,
+    /// Symbols whose WS mid was too old at the last price read and were
+    /// served from the REST ticker instead (bot-strategy#1236); empty when
+    /// the feed is healthy or the book is paper.
+    pub ws_stale_symbols: Vec<String>,
+    /// REST ticker calls the price fallback made in the last 10 minutes.
+    pub rest_fallback_calls_10m: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
