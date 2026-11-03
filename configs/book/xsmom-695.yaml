@@ -33,6 +33,10 @@ universe:
   # Refresh with `scripts/xsmom_universe_pool.py --check` (exit 1 names
   # the missing symbols) after a Lighter listing; a delisted market can
   # stay listed here so a leg the book still holds keeps its price feed.
+  # Once no leg holds it, drop it: an inactive market has no WS book, so
+  # the fetcher falls back to REST for it on every poll (2026-11-03: DOLO,
+  # EDEN, EDGE, FOGO, MYX, PROVE, RESOLV dropped, PRL and QNT added;
+  # bot-strategy#1236).
   # `xsmom_signal_producer.py --config` still cross-checks against this
   # file and refuses to publish a signal the runtime would reject.
   symbols:
@@ -66,11 +70,8 @@ universe:
     - CTR
     - DASH
     - DOGE
-    - DOLO
     - DOT
     - DYDX
-    - EDEN
-    - EDGE
     - EIGEN
     - ENA
     - ETH
@@ -78,7 +79,6 @@ universe:
     - FARTCOIN
     - FF
     - FIL
-    - FOGO
     - FOLKS
     - GMX
     - GRAM
@@ -98,7 +98,6 @@ universe:
     - MET
     - MON
     - MORPHO
-    - MYX
     - NEAR
     - NMR
     - ONDO
@@ -109,10 +108,10 @@ universe:
     - POL
     - PONS
     - POPCAT
-    - PROVE
+    - PRL
     - PUMP
     - PYTH
-    - RESOLV
+    - QNT
     - RIVER
     - ROBO
     - S
