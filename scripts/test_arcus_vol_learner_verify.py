@@ -34,15 +34,59 @@ def fill(t, realized, notional):
     return {"kind": "fill", "mode": "live", "ts_ms": ms(t), "realized": str(realized), "fee": "0", "notional": str(notional)}
 
 
+def journal_rows(live_log, start, end, quoting):
+    """Hourly kind=learner rows as the runtime writes them: the current window's
+    arm hours, decayed with the half-life, +1 h on the live arm while quoting."""
+    hours, rows = {}, []
+    k = 0.5 ** (1 / v.HALF_LIFE_H)
+    for t in range(start, end, 3_600_000):
+        w = v.window_of(t)
+        arm = v.arm_at(live_log, t)
+        for key in hours:
+            hours[key] *= k
+        if arm is not None and quoting(t):
+            hours[(w, arm)] = hours.get((w, arm), 0.0) + 1.0
+        arms = [{"offset_bps": a, "hours": hours.get((w, a), 0.0)} for a in (2.0, 3.0, 5.0, 8.0, 12.0)]
+        rows.append({"kind": "learner", "mode": "live", "window": w, "ts_ms": t + 3_600_000, "arms": arms})
+    return rows
+
+
+class QuotingHours(unittest.TestCase):
+    H = 3_600_000
+
+    def row(self, t, window, hours, mode="live"):
+        return {"kind": "learner", "mode": mode, "window": window, "ts_ms": t,
+                "arms": [{"offset_bps": a, "hours": h} for a, h in hours.items()]}
+
+    def test_decay_alone_adds_nothing_and_quoting_adds_its_hours(self):
+        k = 0.5 ** (1 / v.HALF_LIFE_H)
+        rows = [self.row(0, "off", {3.0: 10.0, 5.0: 4.0}),
+                self.row(self.H, "off", {3.0: 10.0 * k + 1.0, 5.0: 4.0 * k})]
+        h = v.quoting_hours(rows, 0, 10 * self.H)
+        self.assertAlmostEqual(h[("off", 3.0)], 1.0)
+        self.assertNotIn(("off", 5.0), h)
+
+    def test_shadow_rows_and_window_changes_add_nothing(self):
+        rows = [self.row(0, "off", {3.0: 10.0}, mode="shadow"),
+                self.row(self.H, "off", {3.0: 11.0}, mode="shadow"),
+                self.row(2 * self.H, "off", {3.0: 1.0}),
+                self.row(3 * self.H, "pre", {3.0: 30.0})]  # another window's stats
+        self.assertEqual(v.quoting_hours(rows, 0, 10 * self.H), {})
+
+
 class Readout(unittest.TestCase):
-    def run_once(self, fills, live_log, t0, now):
+    def run_once(self, fills, live_log, t0, now, quoting=None):
+        """`quoting(ms) -> bool`: whether the runtime was quoting that hour (default: always)."""
         d = tempfile.mkdtemp()
-        f, l, out = os.path.join(d, "fills.jsonl"), os.path.join(d, "learner.json"), os.path.join(d, "out")
+        f, l, j, out = (os.path.join(d, x) for x in ("fills.jsonl", "learner.json", "learner.jsonl", "out"))
         with open(f, "w") as fh:
             fh.write("\n".join(json.dumps(r) for r in fills) + "\n")
         with open(l, "w") as fh:
             json.dump({"live_log": live_log}, fh)
-        args = ["--fills", f, "--learner", l, "--t0", t0, "--out", out, "--now", now]
+        with open(j, "w") as fh:
+            for r in journal_rows(live_log, ms(t0), ms(now), quoting or (lambda _: True)):
+                fh.write(json.dumps(r) + "\n")
+        args = ["--fills", f, "--learner", l, "--journal", j, "--t0", t0, "--out", out, "--now", now]
         return v.main(args), out, args
 
     def test_refused_before_the_test_period_ends_and_on_a_second_look(self):
@@ -80,6 +124,21 @@ class Readout(unittest.TestCase):
         rc, out, _ = self.run_once(base + bad, log, t0, "2026-11-21T00:00:00Z")
         r = json.load(open(os.path.join(out, "learner_verify.json")))
         self.assertEqual(r["verdict"], "MECHANICS_OK_ECONOMICS_NOT_BETTER")
+
+    def test_halted_arm_gets_no_exposure(self):
+        # 8 bp is selected but the runtime never quotes while it is live (halted /
+        # down): it must not be credited quoting hours (Codex P2 on pairtrade#422).
+        t0 = "2026-11-05T10:00:00Z"
+        log, t = [], ms(t0)
+        arms = [3.0, 5.0, 8.0]
+        for i in range(15 * 8):
+            log.append([t + i * 3 * 3_600_000, arms[i % 3]])
+        rc, out, _ = self.run_once([], log, t0, "2026-11-21T00:00:00Z",
+                                   quoting=lambda m: v.arm_at(log, m) != 8.0)
+        r = json.load(open(os.path.join(out, "learner_verify.json")))
+        self.assertEqual(r["M1_max_live_hours_per_arm"]["8.0"], 0.0)
+        self.assertFalse(r["M1_pass"])
+        self.assertEqual(r["verdict"], "BROKEN")
 
     def test_reward_uses_three_dollars_a_point(self):
         self.assertAlmostEqual(v.reward((-1.0, 1_000_000)), -1.0 + 72.0)

@@ -5,7 +5,7 @@ Scores the rules frozen in `deploy/arcus_vol/LEARNER_VERIFY_PREREG.md` from
 the instance's own state files (copied down from the host first):
 
     arcus_vol_learner_verify.py --fills fills.jsonl --learner learner.json \\
-        --t0 2026-11-05T10:00:00Z --out OUTDIR
+        --journal learner.jsonl --t0 2026-11-05T10:00:00Z --out OUTDIR
 
 `--t0` is the restart that put `LEARNER=live` in effect (the prereg addendum
 records it). The test period is the 14 whole UTC days after the day of t0;
@@ -33,6 +33,7 @@ M2_MIN_WINDOW_H = 10.0  # ... in a window with >= 10 live hours ...
 # ... while no fill was attributed to it = stuck without information
 M3_MAX_CHANGES_PER_DAY = 24.0
 NY = ZoneInfo("America/New_York")
+HALF_LIFE_H = 7.0 * 24.0  # offset_learner.rs LearnerSettings default (spy.config does not override it)
 
 
 def utc_day(ms):
@@ -94,18 +95,46 @@ def arm_at(live_log, ms):
     return cur
 
 
-def live_hours(live_log, start_ms, end_ms, step_ms=60_000):
-    """{(window, arm): hours} by sampling each minute in [start, end)."""
-    h = {}
-    log = sorted((int(t), o) for t, o in live_log)
-    i, cur = 0, None
-    for ms in range(start_ms, end_ms, step_ms):
-        while i < len(log) and log[i][0] <= ms:
-            cur = log[i][1]
-            i += 1
-        k = (window_of(ms), cur)
-        h[k] = h.get(k, 0.0) + step_ms / 3_600_000
+def quoting_hours(rows, start_ms, end_ms):
+    """{(window, arm): quoting hours} from the learner's own hourly journal rows.
+
+    The runtime credits an arm's `hours` only while it is actually quoting
+    (`last_plan == "quote"`, long tick gaps excluded), so halts, pauses and a
+    stopped process add nothing. Each row carries the current window's arm
+    hours decayed with `HALF_LIFE_H`; the quoting time added between two rows
+    of the same window is h_now - h_prev * 0.5^(dt / half-life). The first row
+    after a window change has no predecessor, so up to one emit interval per
+    window change is not counted (the same for every arm).
+    """
+    h, prev = {}, None
+    for r in rows:
+        t = int(r["ts_ms"])
+        if not (start_ms <= t < end_ms) or r.get("mode") != "live":
+            prev = None
+            continue
+        cur = {float(a["offset_bps"]): float(a.get("hours") or 0.0) for a in r.get("arms", [])}
+        if prev and prev[1] == r.get("window"):
+            k = 0.5 ** ((t - prev[0]) / 3_600_000 / HALF_LIFE_H)
+            for arm, hn in cur.items():
+                add = hn - prev[2].get(arm, 0.0) * k
+                if add > 1e-9:
+                    key = (r.get("window"), arm)
+                    h[key] = h.get(key, 0.0) + add
+        prev = (t, r.get("window"), cur)
     return h
+
+
+def load_journal(path):
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get("kind") == "learner" and "ts_ms" in r:
+                rows.append(r)
+    return sorted(rows, key=lambda r: int(r["ts_ms"]))
 
 
 def welch_t(a, b):
@@ -120,6 +149,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--fills", required=True)
     ap.add_argument("--learner", required=True, help="learner.json (holds live_log)")
+    ap.add_argument("--journal", required=True, help="learner.jsonl (hourly kind=learner rows: quoting hours per arm)")
     ap.add_argument("--t0", required=True, help="LIVE restart, UTC ISO (prereg addendum)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--now", default=None, help=argparse.SUPPRESS)  # tests only
@@ -143,8 +173,8 @@ def main(argv=None):
     s_ms, e_ms = int(start.timestamp() * 1000), int(end.timestamp() * 1000)
     test_days = [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(TEST_DAYS_N)]
 
-    # M1-M3: mechanics
-    hours = live_hours(live_log, s_ms, e_ms)
+    # M1-M3: mechanics (exposure = quoting hours as the runtime credits them)
+    hours = quoting_hours(load_journal(a.journal), s_ms, e_ms)
     fills_by = {}
     for r in fills:
         ms = int(r["ts_ms"])
