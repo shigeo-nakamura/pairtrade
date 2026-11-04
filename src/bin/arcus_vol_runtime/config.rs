@@ -930,7 +930,9 @@ pub(crate) mod tests {
             ..LearnerSettings::off()
         };
         assert!(super::validate_live_arms(&s).is_ok(), "default 5/8/12");
-        s.live_arms = vec![3.0, 5.0];
+        s.live_arms = vec![3.0, 5.0, 8.0];
+        assert!(super::validate_live_arms(&s).is_ok(), "3 bp is the live floor (owner 2026-11-04)");
+        s.live_arms = vec![2.0, 5.0];
         let e = super::validate_live_arms(&s).unwrap_err().to_string();
         assert!(e.contains("below the live floor"), "{e}");
         s.live_arms = vec![5.0, 7.0];
