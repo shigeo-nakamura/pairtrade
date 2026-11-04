@@ -43,6 +43,8 @@ jobs:
         run: |
           python3 -m pip install --quiet --disable-pip-version-check cryptography
           bash scripts/test_arcus_vol_encrypt_key.sh
+      - name: Run Arcus volume learner verification readout tests (bot-strategy#1093)
+        run: python3 scripts/test_arcus_vol_learner_verify.py
       - name: Install Engine B Phase 0 test dependency
         run: python3 -m pip install -r scripts/engine_b_phase0_requirements.txt
       - name: Run Engine B Phase 0 observer tests

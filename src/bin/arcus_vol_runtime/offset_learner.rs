@@ -11,7 +11,7 @@
 //!
 //! LIVE mode (owner 2026-10-19, `ARCUS_VOL_LEARNER=live`): the learner's pick
 //! sets the offset for the current window, chosen only among
-//! `live_arms` (default 5/8/12 bp, never below `LIVE_MIN_OFFSET_BPS`), at most
+//! `live_arms` (default 5/8/12 bp, never below `LIVE_MIN_OFFSET_BPS` = 3 bp), at most
 //! once per `decide_every_ms` per window, with a hysteresis so a marginally
 //! better arm does not flap the quotes. Untried live arms are explored first
 //! for `min_hours` quoting hours each; the markout guard (widen-only) and the
@@ -60,9 +60,11 @@ pub enum LearnerMode {
     Live,
 }
 
-/// The tightest offset a live arm may have (owner 2026-10-19: 2/3 bp cost too
-/// much per point).
-pub const LIVE_MIN_OFFSET_BPS: f64 = 5.0;
+/// The tightest offset a live arm may have. Owner 2026-10-19: 2/3 bp cost too
+/// much per point, so the floor was 5 bp; owner 2026-11-04: lowered to 3 bp
+/// for the learner verification (deploy/arcus_vol/LEARNER_VERIFY_PREREG.md),
+/// where 3 bp is the fixed off-hours offset SPY has quoted since 2026-10-26.
+pub const LIVE_MIN_OFFSET_BPS: f64 = 3.0;
 /// Cap on `live_log` entries kept in the persisted state.
 const MAX_LIVE_LOG: usize = 5_000;
 
