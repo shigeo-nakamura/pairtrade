@@ -16,8 +16,10 @@ History: #1123 ran QQQ $7.5k/leg 2026-10-04 → 10-07 (DISARMed, unit disabled).
 #1228 reuses it for the **one-week Arcus points hold test**: AAPL $20k/leg,
 ARM after the 2026-10-28 19:00Z points drop, DISARM after the 11-04 drop, with
 the AAPL `arcus-vol` instance on the same wallet disabled for the window
-(`deploy/arcus_vol/instances.tsv`).
+(`deploy/arcus_vol/instances.tsv`). The 11-04 drop was INCONCLUSIVE (3-10 pt band),
+so by the frozen rule the book runs **$40k/leg for one more week** (gate = the
+2026-11-11 19:00Z drop).
 
-Operator files under `/opt/debot-hedge-arcus/hedge/`: `ARM` (`AAPL 20000`),
+Operator files under `/opt/debot-hedge-arcus/hedge/`: `ARM` (`AAPL 40000` for the extension week),
 `DISARM` (close both legs, short first), `KILL_SWITCH` (no growth),
 `RISK_ACK` (clear a halt). The owner-run scripts for #1228 are listed on the issue.
