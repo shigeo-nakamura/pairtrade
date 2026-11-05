@@ -75,4 +75,13 @@ drops; those figures are supplied by the owner and are disclosure only.
 
 ## Addendum (filled at t0, nothing else)
 
-- t0: _pending owner-approved restart_
+- t0: **2026-11-05T17:20:59Z**, the owner-approved `systemctl restart debot-arcus-vol` (owner-run
+  `arcus_vol_422_go.sh`, binary 8c5c872 from deploy-arcus-vol.yml run 42071059063). Inventory was flat
+  before the restart (17:20:57Z, `live inv 0`). After the restart the bot logged `startup position
+  reconciled: flat` and `offset learner LIVE (state resumed; ... live arms [3.0, 5.0, 8.0] bp, half-life
+  168 h, point value $72/1M)`. The first live decision was `learner LIVE Cash: offset 3 bp (explore)` at
+  17:21:01Z.
+- Test period: UTC days 2026-11-06 … 2026-11-19. The readout is allowed from 2026-11-20T00:00Z.
+- Disclosure: at shutdown the old process logged `2 order(s) still resting after cancel_all` and left
+  the dead man's switch armed. The new process cancels stray SPY-USD orders at startup. No fill came
+  from them; the startup position was flat.
