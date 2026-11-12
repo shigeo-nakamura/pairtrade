@@ -24,6 +24,9 @@
 #   On a failed post-check the new unit is stopped again (DRY_RUN: nothing was traded).
 # It never starts, stops or restarts any OTHER unit, and refuses while a volume bot on the
 # same wallet (debot-arcus-vol / -gld) is enabled or active: the hold wallet is hold-only.
+# A re-run with an existing env only refreshes files: a running unit is never restarted, and
+# a stopped unit whose env is already LIVE (HEDGE_DRY_RUN != true or a confirm token) is never
+# started here — a live instance is restarted by the owner only (a persisted armed book resumes).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MODE=""; FRAGMENT=""
@@ -172,8 +175,12 @@ done
 [ ! -f "$SRC_BASE/PAIRTRADE_SHA" ] || cp -p "$SRC_BASE/PAIRTRADE_SHA" "$BASE/PAIRTRADE_SHA"
 [ $need_launcher = 0 ] || { install "${OWN[@]}" -m 0755 "$HERE/debot-xvenue-hedge-arcus.sh" "$LAUNCHER"; say "  installed $LAUNCHER (shared; the AAPL instance uses it at its next restart)"; }
 [ $need_unit = 0 ] || { install "${OWN[@]}" -m 0644 "$HERE/$UNIT.service" "$UNIT_FILE"; say "  installed $UNIT_FILE"; }
+env_live=0
 if [ -f "$ENVF" ]; then
   say "  $ENVF exists — kept (keys are written once; delete it to rebuild from live.env + fragment)"
+  # A kept env may already be the owner's LIVE flip: never auto-start that (a persisted armed
+  # book would resume and trade); the owner restarts a live instance.
+  { [ "$(kv_get "$ENVF" HEDGE_DRY_RUN)" = true ] && ! grep -qE '^export HEDGE_(ARCUS_)?LIVE_CONFIRM=' "$ENVF"; } || env_live=1
 else
   tmp=$(mktemp "$SCRIPTS/.$UNIT.env.XXXXXX"); chmod 600 "$tmp"
   while IFS= read -r line || [ -n "$line" ]; do
@@ -196,6 +203,9 @@ fi
 "$SYSTEMCTL" enable "$UNIT" >/dev/null 2>&1 || true
 if [ "$active_before" = active ]; then
   say "APPLY OK: files updated; $UNIT was already active and was not restarted (owner-run)"; exit 0
+fi
+if [ $env_live = 1 ]; then
+  say "APPLY OK: files updated; $ENVF is a LIVE configuration (HEDGE_DRY_RUN != true or a confirm token set) and $UNIT is stopped — NOT started: a live instance is restarted by the owner only"; exit 0
 fi
 T0=$(date +%s)
 "$SYSTEMCTL" start --no-block "$UNIT"

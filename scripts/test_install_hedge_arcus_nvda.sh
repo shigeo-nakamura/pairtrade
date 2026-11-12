@@ -133,6 +133,21 @@ out=$(bash "$INST" --verify 2>&1); rc=$?; [ $rc = 0 ] && echo "$out" | grep -q "
 [ $rc = 0 ] && echo "$out" | grep -q "was already active and was not restarted" && ok "re-apply on an active unit does not restart" || bad "re-apply rc=$rc: $out"
 [ "$(sha256sum "$E" | cut -c1-16)" = "$sha_before" ] && ok "re-apply keeps the env (keys written once)" || bad "re-apply rewrote the env"
 grep -qE '^(start|stop|restart)' "$ST/calls" && bad "re-apply started/stopped something" || ok "re-apply: no start/stop"
+# a stopped unit whose kept env is already LIVE is never started by a re-apply (Codex P1 on pairtrade#426)
+echo inactive > "$ST/act/$UNIT"
+sed -i 's/^export HEDGE_DRY_RUN=.*/export HEDGE_DRY_RUN="false"/; s/^# export HEDGE_LIVE_CONFIRM=/export HEDGE_LIVE_CONFIRM=/; s/^# export HEDGE_ARCUS_LIVE_CONFIRM=/export HEDGE_ARCUS_LIVE_CONFIRM=/' "$E"
+: > "$ST/calls"; out=$(bash "$INST" --apply --fragment "$T/fragment.env" 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -q "is a LIVE configuration" && echo "$out" | grep -q "NOT started" && ok "re-apply never starts a stopped LIVE instance" || bad "live env re-apply: rc=$rc $out"
+grep -qE '^(start|stop|restart)' "$ST/calls" && bad "live env re-apply touched the unit: $(grep -E '^(start|stop|restart)' "$ST/calls")" || ok "live env re-apply: no start/stop call"
+[ "$(cat "$ST/act/$UNIT")" = inactive ] && ok "live instance stays stopped" || bad "live instance was started"
+# a kept DRY_RUN env with only one token uncommented still counts as live
+sed -i 's/^export HEDGE_DRY_RUN=.*/export HEDGE_DRY_RUN="true"/; s/^export HEDGE_LIVE_CONFIRM=/# export HEDGE_LIVE_CONFIRM=/' "$E"
+: > "$ST/calls"; out=$(bash "$INST" --apply --fragment "$T/fragment.env" 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -q "NOT started" && ! grep -qE '^start' "$ST/calls" && ok "a lone confirm token also blocks the auto-start" || bad "lone token: rc=$rc $(grep -E '^start' "$ST/calls")"
+# back to a clean DRY_RUN env: a stopped DRY_RUN instance IS started again by re-apply
+sed -i 's/^export HEDGE_ARCUS_LIVE_CONFIRM=/# export HEDGE_ARCUS_LIVE_CONFIRM=/' "$E"
+: > "$ST/calls"; out=$(bash "$INST" --apply --fragment "$T/fragment.env" 2>&1); rc=$?
+[ $rc = 0 ] && echo "$out" | grep -q "INSTALL OK" && grep -q "^start --no-block $UNIT" "$ST/calls" && ok "re-apply starts a stopped DRY_RUN instance" || bad "dry re-apply: rc=$rc $out"
 # a changed launcher in the kit → re-apply installs it (the AAPL instance picks it up at its own restart)
 printf '# drifted\n' >> "$R/opt/debot/scripts/debot-xvenue-hedge-arcus.sh"
 out=$(bash "$INST" --verify 2>&1); rc=$?; [ $rc = 1 ] && echo "$out" | grep -q "DRIFT content $R/opt/debot/scripts/debot-xvenue-hedge-arcus.sh" && ok "verify reports a drifted launcher" || bad "launcher drift: $out"
