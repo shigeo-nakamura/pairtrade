@@ -47,12 +47,14 @@ out=$(bash "$INST" --apply 2>&1); rc=$?
 [ -f "$T/sys/debot-arcus-vol-aapl.service" ] && [ -f "$T/sys/arcus-vol-open-pause.timer" ] && [ -f "$T/sys/debot-arcus-vol.service" ] && ok "units + timers installed" || bad "units"
 cmp -s "$T/root/etc/debot-arcus-vol-aapl/config.env" "$HERE/deploy/arcus_vol/config/aapl.config" && ok "missing config.env installed" || bad "config"
 [ ! -e "$T/root/etc/debot-arcus-vol-qqq/config.env" ] && ok "retired qqq gets no config.env" || bad "qqq config written"
-[ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-nvda)" = disabled ] && [ "$(cat "$T/en/debot-arcus-vol")" = enabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-gld)" = disabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-slv)" = disabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-aapl)" = disabled ] && ok "enablement per instances.tsv" || bad "enablement"
+[ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-nvda)" = disabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol)" = disabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-gld)" = disabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-slv)" = disabled ] && [ "$("$T/bin/systemctl" is-enabled debot-arcus-vol-aapl)" = disabled ] && ok "enablement per instances.tsv" || bad "enablement"
 [ "$(cat "$T/act/arcus-vol-open-pause.timer")" = active ] && ok "timers enabled --now" || bad "timers"
 grep -qE "^(start|stop|restart|reload|try-restart|kill) " "$T/calls" && bad "apply started/stopped a unit" || ok "apply never starts/stops/restarts"
 grep -E "^enable --now" "$T/calls" | grep -qv "\.timer" && bad "enable --now on a non-timer" || ok "--now only for timers"
 [ -f "$T/bad" ] && bad "unexpected systemctl: $(cat "$T/bad")"
-echo "$out" | grep -qE "sudo systemctl try-restart debot-arcus-vol( |$)" && ok "try-restart hint for an enabled+active changed instance" || bad "no try-restart hint for spy"
+# spy is disabled since 2026-11-12 (bot-strategy#1093 → #1293); it is still marked active above, so this checks that a
+# disabled-but-running instance gets no try-restart hint. The positive hint path has no enabled instance to exercise it.
+echo "$out" | grep -qE "systemctl (try-)?restart debot-arcus-vol( |$)" && bad "restart hint for disabled spy" || ok "no hint for disabled (still active) spy"
 echo "$out" | grep -qE "systemctl (try-)?restart debot-arcus-vol-gld\b" && bad "restart hint for disabled gld" || ok "no hint for disabled gld"
 echo "$out" | grep -qE "systemctl (try-)?restart debot-arcus-vol-(nvda|qqq)\b" && bad "restart hint for a disabled/retired instance" || ok "no hint for disabled nvda / retired qqq"
 echo "$out" | grep -qE "systemctl (try-)?restart debot-arcus-vol-hood\b" && bad "restart hint for an inactive instance" || ok "no hint for an enabled but stopped instance"
