@@ -216,10 +216,12 @@ pc=0; pfail() { pc=1; say "POSTCHECK FAIL $*"; }
 "$SYSTEMCTL" is-active --quiet "$UNIT" && say "$UNIT: active" || pfail "$UNIT is not active"
 J=$("$JOURNALCTL" -u "$UNIT" --since "@$T0" --no-pager 2>/dev/null)
 printf '%s\n' "$J" | grep -E '\[(CONFIG|STARTUP)\]|ERROR|refusing' | tail -12 | cut -c1-300
-printf '%s\n' "$J" | grep -qE "\[CONFIG\] bot=xvenue_hedge_holder dry_run=true symbols=$SYMBOL:5(\.0+)?/3(\.0+)? long=arcus:arcus short=lighter:core " \
+# here-strings, not `printf | grep -q`: under pipefail a large journal (DEBUG lines) makes grep -q exit on the
+# first match while printf is still writing → SIGPIPE (141) → a false POSTCHECK FAIL (seen on the 11-13 install)
+grep -qE "\[CONFIG\] bot=xvenue_hedge_holder dry_run=true symbols=$SYMBOL:5(\.0+)?/3(\.0+)? long=arcus:arcus short=lighter:core " <<<"$J" \
   || pfail "no [CONFIG] line with dry_run=true symbols=$SYMBOL:5/3 long=arcus:arcus short=lighter:core"
-printf '%s\n' "$J" | grep -qE '\[STARTUP\] mode=Off ' || pfail "no [STARTUP] mode=Off line"
-printf '%s\n' "$J" | grep -qE '\[ERROR\]|refusing to start|init (long|short)-leg' && pfail "errors in the journal"
+grep -qE '\[STARTUP\] mode=Off ' <<<"$J" || pfail "no [STARTUP] mode=Off line"
+grep -qE '\[ERROR\]|refusing to start|init (long|short)-leg' <<<"$J" && pfail "errors in the journal"
 python3 - "$BASE/hedge" "$SYMBOL" <<'PY' || pfail "status/events check"
 import json, os, sys
 d, sym = sys.argv[1], sys.argv[2]
