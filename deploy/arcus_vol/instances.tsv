@@ -1,8 +1,8 @@
 # Arcus volume-bot instances on Tokyo debot-main (bot-strategy#1093).
 # name  unit                  etc_dir                    state_root                  enablement  wallet  note
-spy     debot-arcus-vol       /etc/debot-arcus-vol       /var/lib/debot-arcus-vol    enabled     0xA2C7  base unit = deploy/debot-arcus-vol.service
+spy     debot-arcus-vol       /etc/debot-arcus-vol       /var/lib/debot-arcus-vol    disabled    0xA2C7  base unit = deploy/debot-arcus-vol.service; stopped 2026-11-12 07:49Z (owner decision bot-strategy#1093: $9.7/pt vs $3/pt, alpha lever KILLED 11-04); state archived to s3://debot-dashboard/debot/archive/arcus-vol-spy-1093/stop-20261112T074905Z/; points via the held-OI allocation bot-strategy#1293
 gld     debot-arcus-vol-gld   /etc/debot-arcus-vol-gld   /var/lib/debot-arcus-vol-gld   disabled 0xA2C7  stopped 2026-10-29 (cum -21.32 > 20 sticky stop, flat); reconsider re-enabling (with nvda/hood/slv) once the offset learner is established
-aapl    debot-arcus-vol-aapl  /etc/debot-arcus-vol-aapl  /var/lib/debot-arcus-vol-aapl  disabled 0x812B  paused for the #1228 hold test 2026-10-28..11-04 (wallet hold-only); re-enable after the 11-04 readout
+aapl    debot-arcus-vol-aapl  /etc/debot-arcus-vol-aapl  /var/lib/debot-arcus-vol-aapl  disabled 0x812B  stopped 2026-10-25 for the #1228 hold test; stays off: the wallet is hold-only under bot-strategy#1293 (no volume on the hold wallet)
 hood    debot-arcus-vol-hood  /etc/debot-arcus-vol-hood  /var/lib/debot-arcus-vol-hood  disabled 0x812B  stopped 2026-10-13 (cum -19.50 of 20, markout60 -5.09 bp); weekend timers removed
 slv     debot-arcus-vol-slv   /etc/debot-arcus-vol-slv   /var/lib/debot-arcus-vol-slv   disabled 0x812B  stopped 2026-10-15 (cum -20.80 > 20 sticky stop); weekend timers removed
 nvda    debot-arcus-vol-nvda  /etc/debot-arcus-vol-nvda  /var/lib/debot-arcus-vol-nvda  disabled 0x812B  stopped 2026-10-12 (cum -29.59 of 30)
