@@ -153,6 +153,13 @@ printf '# drifted\n' >> "$R/opt/debot/scripts/debot-xvenue-hedge-arcus.sh"
 out=$(bash "$INST" --verify 2>&1); rc=$?; [ $rc = 1 ] && echo "$out" | grep -q "DRIFT content $R/opt/debot/scripts/debot-xvenue-hedge-arcus.sh" && ok "verify reports a drifted launcher" || bad "launcher drift: $out"
 out=$(bash "$INST" --apply --fragment "$T/fragment.env" 2>&1); cmp -s "$KIT/debot-xvenue-hedge-arcus.sh" "$R/opt/debot/scripts/debot-xvenue-hedge-arcus.sh" && ok "re-apply restores the launcher" || bad "launcher not restored"
 
+# 5b. a real journal is big (DEBUG lines): the post-check greps must not race printf under pipefail (11-13 false FAIL)
+setup; { for i in $(seq 1 4000); do echo "Nov 12 [DEBUG] tick $i filler-filler-filler-filler-filler-filler-filler-filler-filler-filler-filler-filler"; done
+  printf '%s\n' "$GOOD_JOURNAL"; for i in $(seq 1 4000); do echo "Nov 12 [DEBUG] tick after $i filler-filler-filler-filler-filler-filler-filler-filler-filler-filler"; done; } > "$ST/journal.txt"
+out=$(bash "$INST" --apply --fragment "$T/fragment.env" 2>&1); rc=$?
+[ $rc = 0 ] && ! echo "$out" | grep -q "POSTCHECK FAIL" && [ "$(cat "$ST/act/$UNIT")" = active ] && ok "post-check passes on a 1 MB journal" || bad "big journal: rc=$rc $(echo "$out" | grep POSTCHECK)"
+printf '%s\n' "$GOOD_JOURNAL" > "$ST/journal.txt"
+
 # 6. post-check failure: no [CONFIG] line → unit stopped again, exit 1
 setup; printf 'Nov 12 [STARTUP] mode=Off books=1\n' > "$ST/journal.txt"; out=$(bash "$INST" --apply --fragment "$T/fragment.env" 2>&1); rc=$?
 [ $rc = 1 ] && echo "$out" | grep -q "POSTCHECK FAIL no \[CONFIG\]" && grep -q "^stop $UNIT" "$ST/calls" && [ "$(cat "$ST/act/$UNIT")" = inactive ] && ok "missing [CONFIG] → postcheck fails and the unit is stopped" || bad "postcheck config: rc=$rc $out"
