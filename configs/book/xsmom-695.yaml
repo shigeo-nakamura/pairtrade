@@ -150,6 +150,12 @@ schedule:
   every_days: 5                    # hold 5 days (L28_H5_q20_riskadj)
   decision_time_utc: "00:30"
   signal_grace_secs: 5400
+  # bot-strategy#695 owner early stop 2026-11-14 (KILL): flatten the book 91 min
+  # after the next decision (00:30Z + 5460 s = 02:01Z) instead of waiting for
+  # the ~11-25 end of the 8-cycle plan. Must exceed signal_grace_secs (5400) and
+  # stay below the 5-day cadence. KILL_SWITCH is armed on the host, so the
+  # decision itself opens nothing; this only adds the fixed-window flatten.
+  flatten_after_secs: 5460
 
 signal:
   path: /var/lib/book-runtime/xsmom-695/signal.json
