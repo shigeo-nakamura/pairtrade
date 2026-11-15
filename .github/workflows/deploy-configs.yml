@@ -94,7 +94,6 @@ jobs:
           systemd-analyze verify debot/deploy/engine-b-phase0.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.service
           systemd-analyze verify debot/deploy/engine-b-phase0-archive.timer
-          systemd-analyze verify debot/deploy/book-signal-fetch-xsmom-695.timer
           systemd-analyze verify debot/deploy/book-signal-fetch-exdiv-lighter.timer
           systemd-analyze verify debot/deploy/robinhood-points-snapshot.service
           systemd-analyze verify debot/deploy/robinhood-points-snapshot.timer
@@ -165,8 +164,7 @@ jobs:
           # exdiv-lighter units are published and delivered to the host but
           # never installed or started by CI (bot-strategy#948): the manual
           # install after gate G1 reads them from /opt/debot/deploy.
-          for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer \
-                   book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do
+          for u in book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do
             aws s3 cp "debot/deploy/$u" "s3://${S3_BUCKET}/deploy/$u"
           done
           # Robinhood points snapshot units (bot-strategy#938): published and
@@ -232,23 +230,20 @@ jobs:
             "commands": [
               "set -e",
               "# Same reason as ci.yml: both staging dirs below are disposable once their installers have promoted them, and /tmp here is a ~900M tmpfs on a 1.8G host. A trap rather than a delete at the end, because `set -e` lets any step above abort the script and it was the failing runs that leaked.",
-              "trap 'rm -rf /tmp/book-units-__GITHUB_SHA__ /tmp/engine-b-phase0-__GITHUB_SHA__ || true' EXIT",
+              "trap 'rm -rf /tmp/engine-b-phase0-__GITHUB_SHA__ || true' EXIT",
               "# Before the downloads, for the same reason as ci.yml, and matching the whole generated shape so a hand-made /tmp/engine-b-phase0-remote-smoke or /tmp/book-units-backup is never a candidate.",
               "find /tmp -xdev -maxdepth 1 -type d -regextype posix-extended -regex '/tmp/(book-units|engine-b-phase0)-[0-9a-f]{40}' -mmin +60 -exec rm -rf {} + 2>/dev/null || true",
               "sudo install -d -o ec2-user -g ec2-user -m 0750 __INSTALL_DIR__ __INSTALL_DIR__/scripts __INSTALL_DIR__/configs __INSTALL_DIR__/deploy",
               "aws s3 sync s3://__S3_BUCKET__/debot/scripts __INSTALL_DIR__/scripts --exclude '*.env'",
               "aws s3 sync s3://__S3_BUCKET__/debot/configs __INSTALL_DIR__/configs",
               "sudo chmod 755 __INSTALL_DIR__/scripts/*.sh",
-              "install -d -m 0755 /tmp/book-units-__GITHUB_SHA__",
-              "for u in book-runtime-xsmom-695.service book-signal-fetch-xsmom-695.service book-signal-fetch-xsmom-695.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u /tmp/book-units-__GITHUB_SHA__/$u; done",
-              "# exdiv-lighter (bot-strategy#948): delivered to the persistent deploy dir that install_book_runtime.sh reads by default, so the post-G1 manual install has its units. NOT installed and NOT started here -- only xsmom-695 is installed below.",
+              "# exdiv-lighter (bot-strategy#948): delivered to the persistent deploy dir that install_book_runtime.sh reads by default, so the post-G1 manual install has its units. NOT installed and NOT started here (xsmom-695, the only book CI used to install, was retired 2026-11-15 after bot-strategy#695).",
               "for u in book-runtime-exdiv-lighter.service book-signal-fetch-exdiv-lighter.service book-signal-fetch-exdiv-lighter.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
               "# Robinhood points snapshot units (bot-strategy#938): delivered only; the owner installs the timer once with install_robinhood_points_snapshot.sh. The frozen pairtrade service is not involved.",
               "for u in robinhood-points-snapshot.service robinhood-points-snapshot.timer; do aws s3 cp s3://__S3_BUCKET__/deploy/$u __INSTALL_DIR__/deploy/$u; done",
               "# Both install paths stage everything from S3 into a per-run dir, so neither depends on the other having run first: ci.yml owns the binary object, this job owns the config and unit objects, and whichever installs last promotes the newest of both under install_book_runtime.sh's flock.",
               "install -d -m 0755 /tmp/engine-b-phase0-__GITHUB_SHA__",
               "aws s3 sync s3://__S3_BUCKET__/debot/engine-b-phase0/releases/__GITHUB_SHA__/ /tmp/engine-b-phase0-__GITHUB_SHA__/ --exact-timestamps",
-              "/bin/bash -lc 'set -e; d=/tmp/book-units-__GITHUB_SHA__; rc=0; bash __INSTALL_DIR__/scripts/fetch_book_bundle.sh __S3_BUCKET__ $d || rc=$?; if [ $rc -eq 10 ]; then echo \"book runtime bundle not published to S3 yet (ci.yml uploads it); skipping\"; elif [ $rc -ne 0 ]; then exit $rc; else sudo env BOOK_INSTANCE=xsmom-695 BOOK_BINARY_SOURCE=$d/book_runtime BOOK_LIBSIGNER_SOURCE=$d/libsigner.so BOOK_UNIT_SOURCE_DIR=$d bash __INSTALL_DIR__/scripts/install_book_runtime.sh; fi'",
               "sudo env ENGINE_B_PHASE0_CODE_COMMIT=__GITHUB_SHA__ ENGINE_B_PHASE0_REQUIREMENTS=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_requirements.txt ENGINE_B_PHASE0_OBSERVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0.py ENGINE_B_PHASE0_ARCHIVER_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/scripts/engine_b_phase0_archive.sh ENGINE_B_PHASE0_CONFIG_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/phase0.json ENGINE_B_PHASE0_CALENDAR_SOURCE=/tmp/engine-b-phase0-__GITHUB_SHA__/configs/trading_calendar.json ENGINE_B_PHASE0_UNIT_SOURCE_DIR=/tmp/engine-b-phase0-__GITHUB_SHA__/deploy bash /tmp/engine-b-phase0-__GITHUB_SHA__/scripts/install_engine_b_phase0.sh"
             ]
           }

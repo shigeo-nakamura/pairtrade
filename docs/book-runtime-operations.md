@@ -360,7 +360,7 @@ persisted and the next start resumes from it.
 - Daily halt (`max_daily_loss_bps: 500`): opens blocked until the next UTC
   day, no flatten.
 
-## Live transition (DONE 2026-10-08 for xsmom-695; kept for the next book)
+## Live transition (DONE 2026-10-08 for xsmom-695 — RETIRED 2026-11-15 after bot-strategy#695; kept for the next book)
 
 xsmom-695 went live on 2026-10-08 16:54Z after the #695 readout (owner
 decision; $1000 on Lighter sub-account 281474976624818, paper files
