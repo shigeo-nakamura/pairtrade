@@ -1,3 +1,6 @@
+# RETIRED 2026-11-15 (bot-strategy#695): owner early stop 2026-11-14 (KILL after 7 of 8 live cycles, final equity $913 of $1,000),
+# fixed-window flatten 2026-11-15T02:01Z, units removed from Tokyo. deploy-configs.yml no longer installs this book; the file stays
+# as the frozen record of the live configuration and for xsmom_signal_producer.py tests.
 # Book runtime config for XSMOM (bot-strategy#695 /
 # #937). Copy to the host as /opt/book-runtime/xsmom-695.yaml. Everything
 # here is reviewable in a PR diff; credentials never live in this file.
