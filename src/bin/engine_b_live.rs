@@ -6734,6 +6734,11 @@ struct PairsPlan {
     portfolio: PortfolioCfg,
     pairs: Vec<PairPlan>,
     disabled: Vec<String>,
+    /// The portfolio's own files under the process base dir; resolved
+    /// here so the collision check and `main` use the same paths.
+    portfolio_state_path: PathBuf,
+    portfolio_status_path: PathBuf,
+    portfolio_ack_path: PathBuf,
 }
 
 fn plan_pairs(
@@ -6867,6 +6872,32 @@ fn plan_pairs(
     }
     // Cross-pair refusals: anything two engines would fight over.
     let mut seen: HashMap<String, String> = HashMap::new();
+    let process_base =
+        process("ENGINE_B_LIVE_BASE_DIR").unwrap_or_else(|| "/var/lib/engine-b-live".to_string());
+    let portfolio_state_path = PathBuf::from(format!("{process_base}/portfolio_state.json"));
+    let portfolio_status_path = PathBuf::from(format!("{process_base}/portfolio_status.json"));
+    let portfolio_ack_path =
+        PathBuf::from(format!("{process_base}/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO"));
+    // Every file anything in this process writes, removes or treats as a
+    // switch, in ONE namespace whatever its role: a pair's status path
+    // naming the primary's state file (or the kill switch, or a portfolio
+    // file) would otherwise pass a per-role check and overwrite another
+    // component's durable state (pairtrade#430 Codex P2).
+    let mut owners: HashMap<PathBuf, String> = HashMap::new();
+    let mut claim = |path: &Path, owner: String| -> Result<()> {
+        let key: PathBuf = path.components().collect();
+        if let Some(prev) = owners.insert(key, owner.clone()) {
+            anyhow::bail!("{owner} and {prev} are the same file {}", path.display());
+        }
+        Ok(())
+    };
+    claim(
+        &primary_cfg.kill_switch_path,
+        "the process kill switch".to_string(),
+    )?;
+    claim(&portfolio_state_path, "the portfolio state".to_string())?;
+    claim(&portfolio_status_path, "the portfolio status".to_string())?;
+    claim(&portfolio_ack_path, "the portfolio RISK_ACK".to_string())?;
     for p in &pairs {
         let c = &p.cfg;
         c.validate()
@@ -6897,21 +6928,28 @@ fn plan_pairs(
         for (what, value) in [
             ("us_primary", c.us_primary_symbol.clone()),
             ("instance_id", c.instance_id.clone()),
-            ("risk_ack_path", c.risk_ack_path.display().to_string()),
-            ("state_path", c.state_path.display().to_string()),
-            ("status_path", c.status_path.display().to_string()),
-            ("pnl_log_path", c.pnl_log_path.display().to_string()),
-            ("fills_log_path", c.fills_log_path.display().to_string()),
         ] {
             if let Some(other) = seen.insert(format!("{what}={value}"), p.pair_id.clone()) {
                 anyhow::bail!("pairs {other} and {} share {what}={value}", p.pair_id);
             }
+        }
+        for (role, path) in [
+            ("risk_ack_path", &c.risk_ack_path),
+            ("state_path", &c.state_path),
+            ("status_path", &c.status_path),
+            ("pnl_log_path", &c.pnl_log_path),
+            ("fills_log_path", &c.fills_log_path),
+        ] {
+            claim(path, format!("pair {} {role}", p.pair_id))?;
         }
     }
     Ok(PairsPlan {
         portfolio: file.portfolio.clone(),
         pairs,
         disabled,
+        portfolio_state_path,
+        portfolio_status_path,
+        portfolio_ack_path,
     })
 }
 
@@ -7952,8 +7990,6 @@ async fn main() -> Result<()> {
             portfolio: None,
         },
         Some(plan) => {
-            let base_dir = std::env::var("ENGINE_B_LIVE_BASE_DIR")
-                .unwrap_or_else(|_| "/var/lib/engine-b-live".to_string());
             let mut primary = Some(primary);
             let mut engines = Vec::new();
             for pair in plan.pairs {
@@ -7999,7 +8035,7 @@ async fn main() -> Result<()> {
                 );
                 engines.push((pair, engine));
             }
-            let state_path = PathBuf::from(format!("{base_dir}/portfolio_state.json"));
+            let state_path = plan.portfolio_state_path.clone();
             let state: PortfolioState = match std::fs::read(&state_path) {
                 Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
                     format!(
@@ -8025,8 +8061,8 @@ async fn main() -> Result<()> {
                     cfg: plan.portfolio,
                     state,
                     state_path,
-                    status_path: PathBuf::from(format!("{base_dir}/portfolio_status.json")),
-                    ack_path: PathBuf::from(format!("{base_dir}/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO")),
+                    status_path: plan.portfolio_status_path,
+                    ack_path: plan.portfolio_ack_path,
                     disabled: plan.disabled,
                     last_status_write_us: 0,
                     write_pending: false,
@@ -15805,5 +15841,51 @@ mod tests {
             "MU (KR +6 %) before SNDK (KR +2.2 %) on the very first loop"
         );
         let _ = connector;
+    }
+
+    #[test]
+    fn writable_paths_share_one_namespace_across_roles_and_owners() {
+        let p = live_primary();
+        let refuse = |env: Vec<(&str, &str)>, needle: &str| {
+            let e = plan_pairs(&pairs_file(vec![pair_entry("mu", &env)]), &p, &process_env)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(needle), "expected {needle:?} in {e:?}");
+        };
+        // MU's status file is the primary's state file.
+        let mut env = mu_env();
+        env.push((
+            "ENGINE_B_LIVE_STATUS_PATH",
+            "/var/lib/engine-b-live/risk_state.json",
+        ));
+        refuse(env, "same file");
+        // ... or a portfolio file, or the kill switch.
+        let mut env = mu_env();
+        env.push((
+            "ENGINE_B_LIVE_FILLS_LOG_PATH",
+            "/var/lib/engine-b-live/portfolio_state.json",
+        ));
+        refuse(env, "the portfolio state");
+        let mut env = mu_env();
+        env.push((
+            "ENGINE_B_LIVE_PNL_LOG_PATH",
+            "/var/lib/engine-b-live/./KILL_SWITCH",
+        ));
+        refuse(env, "the process kill switch");
+        // Within one pair too.
+        let mut env = mu_env();
+        env.push(("ENGINE_B_LIVE_STATE_PATH", "/x/mu.json"));
+        env.push(("ENGINE_B_LIVE_STATUS_PATH", "/x/mu.json"));
+        refuse(env, "same file");
+        let plan = plan_pairs(
+            &pairs_file(vec![pair_entry("mu", &mu_env())]),
+            &p,
+            &process_env,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.portfolio_state_path,
+            PathBuf::from("/var/lib/engine-b-live/portfolio_state.json")
+        );
     }
 }
