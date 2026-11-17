@@ -5231,6 +5231,15 @@ impl EngineBLiveEngine {
                     self.now(),
                     portfolio.cfg.max_venue_equity_age_secs,
                 );
+                if !portfolio.unreconciled.is_empty() {
+                    log::warn!(
+                        "[PORTFOLIO] {} waiting for {:?} to reconcile against the exchange before \
+                         any portfolio entry",
+                        portfolio.pair_id,
+                        portfolio.unreconciled
+                    );
+                    return;
+                }
                 if let Some(equity) = portfolio.venue_equity_usd {
                     if let Some(why) = loss_limit_breach(
                         &portfolio.cfg,
@@ -6988,6 +6997,11 @@ struct PortfolioCtx {
     /// evaluated -- so the gate can re-apply the loss limits against the
     /// equity it reads at the send.
     losses: (f64, f64),
+    /// Counted sibling pairs that have not completed their startup
+    /// reconciliation: their exposure is not known yet, so no entry is
+    /// sent (deferred, not skipped) until every one has (pairtrade#430
+    /// Codex P2).
+    unreconciled: Vec<String>,
 }
 
 /// Admit, shrink or refuse one entry. Pure: every input is passed in, so
@@ -7603,6 +7617,13 @@ impl NightBridge {
             let paper = self.engines[idx].1.cfg.dry_run;
             let blocked = portfolio.evaluate(&today, &pnl, equity);
             let losses = portfolio.loss_sums(&pnl);
+            let unreconciled: Vec<String> = self
+                .engines
+                .iter()
+                .enumerate()
+                .filter(|(j, (_, e))| *j != idx && counts(e, paper) && !e.reconciled)
+                .map(|(_, (plan, _))| plan.pair_id.clone())
+                .collect();
             let others: Vec<PairExposure> = self
                 .engines
                 .iter()
@@ -7620,6 +7641,7 @@ impl NightBridge {
                 blocked,
                 own_pnl: (engine.state.realized_pnl_session, engine.state.pnl_today),
                 losses,
+                unreconciled,
             });
             engine.tick().await;
         }
@@ -14612,6 +14634,7 @@ mod tests {
             blocked: None,
             own_pnl: (0.0, 0.0),
             losses: (0.0, 0.0),
+            unreconciled: vec![],
         }
     }
 
@@ -15887,5 +15910,61 @@ mod tests {
             plan.portfolio_state_path,
             PathBuf::from("/var/lib/engine-b-live/portfolio_state.json")
         );
+    }
+
+    /// After a restart a later pair's exchange position is unknown until
+    /// it reconciles: an earlier pair waits for it (pairtrade#430 Codex P2).
+    #[tokio::test]
+    async fn no_entry_while_a_sibling_has_not_reconciled() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        fund(&a, "10000", T1_US);
+        b.engine.reconciled = false;
+        observe_pair(&mut a, T0_US, ("SKHY", 180.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, T0_US, ("SMSN", 50.0), ("MU", 100.0));
+        a.engine.maybe_capture_t0(T0_US);
+        let t1 = T1_US + 1_000_000;
+        observe_pair(&mut a, t1, ("SKHY", 190.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t1, ("SMSN", 50.0), ("MU", 100.0));
+        a.engine.day.eligibility_confirmed = true;
+        a.set_now(t1);
+        let mk = |id: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let (a_cfg, b_cfg) = (a.engine.cfg.clone(), b.engine.cfg.clone());
+        let connector = a.connector.clone();
+        let mut nb = NightBridge {
+            engines: vec![
+                (
+                    mk("sndk", &a_cfg),
+                    std::mem::replace(&mut a.engine, harness().engine),
+                ),
+                (
+                    mk("mu", &b_cfg),
+                    std::mem::replace(&mut b.engine, harness().engine),
+                ),
+            ],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        nb.tick().await;
+        assert_eq!(
+            connector.order_count(),
+            0,
+            "SNDK ticks first and must wait for MU"
+        );
+        assert!(
+            nb.engines[0].1.day.skip_reason.is_none(),
+            "deferred, not skipped"
+        );
+        assert!(nb.engines[1].1.reconciled, "MU reconciled on its own tick");
+        a.set_now(t1 + 5_000_000);
+        observe_pair(&mut a, t1 + 5_000_000, ("SKHY", 190.0), ("SNDK", 1700.0));
+        nb.tick().await;
+        assert_eq!(connector.order_count(), 1, "the next loop sends");
     }
 }
