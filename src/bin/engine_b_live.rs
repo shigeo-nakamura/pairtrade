@@ -5231,6 +5231,25 @@ impl EngineBLiveEngine {
                     self.now(),
                     portfolio.cfg.max_venue_equity_age_secs,
                 );
+                if let Some(equity) = portfolio.venue_equity_usd {
+                    if let Some(why) = loss_limit_breach(
+                        &portfolio.cfg,
+                        portfolio.losses.0,
+                        portfolio.losses.1,
+                        equity,
+                    ) {
+                        // Equity moved during this tick's awaits and the
+                        // booked losses now cross a limit at the equity
+                        // read here (pairtrade#430 Codex P2). Not sent;
+                        // the next loop's evaluation latches the halt.
+                        log::warn!(
+                            "[PORTFOLIO] {} loss limit crossed at send-time equity ({why}); not \
+                             sending",
+                            portfolio.pair_id
+                        );
+                        return;
+                    }
+                }
                 if (self.state.realized_pnl_session, self.state.pnl_today) != portfolio.own_pnl {
                     log::warn!(
                         "[PORTFOLIO] {} booked PnL moved during this tick ({:?} -> {:?}); not \
@@ -6927,6 +6946,10 @@ struct PortfolioCtx {
     /// This pair's `(realized_pnl_session, pnl_today)` when `blocked` was
     /// evaluated; the gate refuses to send if either moved since.
     own_pnl: (f64, f64),
+    /// `(today, total)` booked PnL since the portfolio baselines, as
+    /// evaluated -- so the gate can re-apply the loss limits against the
+    /// equity it reads at the send.
+    losses: (f64, f64),
 }
 
 /// Admit, shrink or refuse one entry. Pure: every input is passed in, so
@@ -7148,6 +7171,23 @@ fn tick_order(scores: &[Option<f64>]) -> Vec<usize> {
     order
 }
 
+/// The order this loop ticks the engines in. Every engine's day
+/// (window, restored t0, settled-day marker) is brought to `now`
+/// before the priorities are read: right after a restart inside the
+/// entry window each engine still has `window: None`, and the first
+/// loop would otherwise run in plain config order (pairtrade#430
+/// Codex P2). `tick` starts with the same call, which is then a no-op.
+fn tick_order_at(engines: &mut [(PairPlan, EngineBLiveEngine)], now: i64) -> Vec<usize> {
+    for (_, e) in engines.iter_mut() {
+        e.roll_day_if_needed(now);
+    }
+    let scores: Vec<Option<f64>> = engines
+        .iter()
+        .map(|(plan, e)| e.entry_priority_score(now, plan.epsilon_sigma))
+        .collect();
+    tick_order(&scores)
+}
+
 /// Durable portfolio-level state (`<base>/portfolio_state.json`).
 ///
 /// Losses are measured **per pair from a baseline** rather than as a sum
@@ -7332,6 +7372,36 @@ impl PortfolioRuntime {
         self.check_daily(today, pairs, equity)
     }
 
+    /// `(today, total)` booked PnL since the baselines. Call after
+    /// `evaluate` (which installs a baseline for every counted pair).
+    fn loss_sums(&self, pairs: &[PairPnl]) -> (f64, f64) {
+        let daily = pairs
+            .iter()
+            .map(|p| {
+                p.today
+                    - self
+                        .state
+                        .day_baselines
+                        .get(&p.pair_id)
+                        .copied()
+                        .unwrap_or(p.today)
+            })
+            .sum();
+        let total = pairs
+            .iter()
+            .map(|p| {
+                p.total
+                    - self
+                        .state
+                        .total_baselines
+                        .get(&p.pair_id)
+                        .copied()
+                        .unwrap_or(p.total)
+            })
+            .sum();
+        (daily, total)
+    }
+
     fn check_total(&mut self, pairs: &[PairPnl], equity: f64) -> Option<String> {
         let total: f64 = pairs
             .iter()
@@ -7410,6 +7480,27 @@ impl PortfolioRuntime {
     }
 }
 
+/// Whether booked losses since the baselines cross a loss limit at
+/// `equity`. The one predicate both the loop's evaluation and the
+/// send-time gate apply.
+fn loss_limit_breach(cfg: &PortfolioCfg, daily: f64, total: f64, equity: f64) -> Option<String> {
+    let total_limit = equity * cfg.total_net_loss_pct_of_venue_equity / 100.0;
+    if total <= -total_limit {
+        return Some(format!(
+            "total ${total:.2} <= -{:.2}% of ${equity:.2}",
+            cfg.total_net_loss_pct_of_venue_equity
+        ));
+    }
+    let daily_limit = equity * cfg.daily_net_loss_pct_of_venue_equity / 100.0;
+    if daily <= -daily_limit {
+        return Some(format!(
+            "daily ${daily:.2} <= -{:.2}% of ${equity:.2}",
+            cfg.daily_net_loss_pct_of_venue_equity
+        ));
+    }
+    None
+}
+
 /// Fresh venue equity for the portfolio gate, or `None`.
 fn fresh_venue_equity(cell: &VenueEquityCell, now_us: i64, max_age_secs: i64) -> Option<f64> {
     let reading = cell.reading?;
@@ -7447,12 +7538,7 @@ impl NightBridge {
         let process_dry_run = self.engines[0].1.cfg.dry_run;
         let counts =
             |e: &EngineBLiveEngine, for_paper: bool| for_paper || process_dry_run || !e.cfg.dry_run;
-        let scores: Vec<Option<f64>> = self
-            .engines
-            .iter()
-            .map(|(plan, e)| e.entry_priority_score(now, plan.epsilon_sigma))
-            .collect();
-        for idx in tick_order(&scores) {
+        for idx in tick_order_at(&mut self.engines, now) {
             // Rebuilt per engine, after every earlier engine's tick, so an
             // entry sent by a higher-priority pair in this loop is already
             // counted against the next.
@@ -7478,6 +7564,7 @@ impl NightBridge {
                 .collect();
             let paper = self.engines[idx].1.cfg.dry_run;
             let blocked = portfolio.evaluate(&today, &pnl, equity);
+            let losses = portfolio.loss_sums(&pnl);
             let others: Vec<PairExposure> = self
                 .engines
                 .iter()
@@ -7494,6 +7581,7 @@ impl NightBridge {
                 venue_equity_usd: equity,
                 blocked,
                 own_pnl: (engine.state.realized_pnl_session, engine.state.pnl_today),
+                losses,
             });
             engine.tick().await;
         }
@@ -7609,6 +7697,35 @@ fn load_calendar(cfg: &EngineBLiveConfig) -> Result<TradingCalendar> {
         calendar.calendar_version
     );
     Ok(calendar)
+}
+
+/// Create a non-primary pair's writable directories (`<base>/pairs/<id>/`
+/// by default) before its engine is built: every writer -- including the
+/// pre-send entry marker -- writes into an existing parent, and a pair
+/// whose files cannot be created must refuse the start, not fail at its
+/// first entry (pairtrade#430 Codex P2).
+fn provision_pair_dirs(cfg: &EngineBLiveConfig) -> Result<()> {
+    for path in [
+        &cfg.state_path,
+        &cfg.status_path,
+        &cfg.pnl_log_path,
+        &cfg.fills_log_path,
+        &cfg.risk_ack_path,
+    ] {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| {
+                format!("cannot create {} for {}", dir.display(), path.display())
+            })?;
+        }
+    }
+    let probe = cfg
+        .state_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(".write_probe.{}", std::process::id()));
+    std::fs::write(&probe, b"").with_context(|| format!("{} is not writable", probe.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Parse and resolve `ENGINE_B_LIVE_PAIRS_FILE` against the primary
@@ -7865,6 +7982,7 @@ async fn main() -> Result<()> {
                     .with_context(|| format!("pair {}", pair.pair_id))?;
                 let calendar =
                     load_calendar(&pair.cfg).with_context(|| format!("pair {}", pair.pair_id))?;
+                provision_pair_dirs(&pair.cfg).with_context(|| format!("pair {}", pair.pair_id))?;
                 let engine = build_engine(
                     pair.cfg.clone(),
                     calendar,
@@ -14457,6 +14575,7 @@ mod tests {
             venue_equity_usd: equity,
             blocked: None,
             own_pnl: (0.0, 0.0),
+            losses: (0.0, 0.0),
         }
     }
 
@@ -15571,5 +15690,120 @@ mod tests {
             lookup("ENGINE_B_LIVE_KILL_SWITCH_PATH").as_deref(),
             Some("/var/lib/engine-b-live/KILL_SWITCH")
         );
+    }
+
+    #[test]
+    fn a_pairs_writable_directories_are_provisioned_or_the_start_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = fixture_config();
+        let base = dir.path().join("pairs").join("mu");
+        cfg.state_path = base.join("risk_state.json");
+        cfg.status_path = base.join("status.json");
+        cfg.pnl_log_path = base.join("pnl.jsonl");
+        cfg.fills_log_path = base.join("fills.jsonl");
+        cfg.risk_ack_path = base.join("RISK_ACK_MU");
+        provision_pair_dirs(&cfg).expect("provisioned");
+        assert!(base.is_dir());
+        atomic_write_json_checked(&cfg.state_path, &RiskState::default())
+            .expect("the entry marker's writer now has its parent");
+        // A parent that cannot be a directory refuses the start.
+        std::fs::write(dir.path().join("blocked"), b"").unwrap();
+        cfg.state_path = dir.path().join("blocked").join("risk_state.json");
+        assert!(provision_pair_dirs(&cfg).is_err());
+    }
+
+    /// Booked losses that pass at the loop's equity but cross a limit at
+    /// the equity read at the send: not sent, day not spent
+    /// (pairtrade#430 Codex P2).
+    #[tokio::test]
+    async fn the_gate_reapplies_the_loss_limits_at_send_time_equity() {
+        let mut h = harness();
+        fund(&h, "900", T1_US);
+        primed_for_entry(&mut h);
+        let mut c = ctx(Some(1000.0), vec![]);
+        c.pair_id = "sndk".to_string();
+        // -$19 today: under 2 % of $1,000, over 2 % of $900.
+        c.losses = (-19.0, -19.0);
+        h.engine.portfolio = Some(c);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 0);
+        assert!(h.engine.day.skip_reason.is_none());
+        // Same losses, equity back at $1,000: the entry goes out.
+        fund(&h, "1000", T1_US);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[test]
+    fn loss_limit_breach_applies_both_limits_at_the_given_equity() {
+        let cfg = portfolio_cfg();
+        assert_eq!(loss_limit_breach(&cfg, -19.99, -19.99, 1000.0), None);
+        assert!(loss_limit_breach(&cfg, -20.0, 0.0, 1000.0)
+            .unwrap()
+            .starts_with("daily"));
+        assert!(loss_limit_breach(&cfg, 0.0, -50.0, 1000.0)
+            .unwrap()
+            .starts_with("total"));
+        assert!(loss_limit_breach(&cfg, -19.0, 0.0, 900.0).is_some());
+    }
+
+    /// Restarted inside the entry window: the first loop must already
+    /// tick the stronger pair first (pairtrade#430 Codex P2).
+    #[test]
+    fn after_a_restart_the_first_loop_already_orders_by_signal() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        fund(&a, "10000", T1_US);
+        // As `build_engine` leaves them: no date, no window, empty day --
+        // but each pair's t0 survived in its persisted state.
+        for (h, kr, us) in [
+            (&mut a, ("SKHY", 180.0), ("SNDK", 1700.0)),
+            (&mut b, ("SMSN", 50.0), ("MU", 100.0)),
+        ] {
+            h.engine.current_date = None;
+            h.engine.window = None;
+            h.engine.day = DaySnapshot::default();
+            h.engine.state.t0_snapshot_date = Some(TODAY.to_string());
+            h.engine.state.t0_prices = HashMap::from([
+                (kr.0.to_string(), kr.1),
+                (us.0.to_string(), us.1),
+                ("SOXL".to_string(), 100.0),
+                ("NVDA".to_string(), 200.0),
+            ]);
+        }
+        let t1 = T1_US + 1_000_000;
+        observe_pair(&mut a, t1, ("SKHY", 184.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t1, ("SMSN", 53.0), ("MU", 100.0));
+        a.set_now(t1);
+        let mk = |id: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let (a_cfg, b_cfg) = (a.engine.cfg.clone(), b.engine.cfg.clone());
+        let connector = a.connector.clone();
+        let mut nb = NightBridge {
+            engines: vec![
+                (
+                    mk("sndk", &a_cfg),
+                    std::mem::replace(&mut a.engine, harness().engine),
+                ),
+                (
+                    mk("mu", &b_cfg),
+                    std::mem::replace(&mut b.engine, harness().engine),
+                ),
+            ],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        let now = nb.engines[0].1.now();
+        assert_eq!(
+            tick_order_at(&mut nb.engines, now),
+            vec![1, 0],
+            "MU (KR +6 %) before SNDK (KR +2.2 %) on the very first loop"
+        );
+        let _ = connector;
     }
 }

@@ -667,7 +667,10 @@ task**, so no two pairs ever have a `sendTx` in flight at the same time.
   unchanged; `ENGINE_B_LIVE_KILL_SWITCH_PATH` cannot be set per pair.
 - **Exposure counted by the gate**: the tracked position; else a pending entry; else a full lot of unknown sign for an order of
   unknown outcome (in flight, or `position_unconfirmed`); else a persisted record not yet restored; plus every parked record.
-  Venue equity and the pair's own booked PnL are re-checked at the send itself.
+  Venue equity, the pair's own booked PnL and the loss limits (at that equity) are re-checked at the send itself; a moved
+  input defers the entry to the next loop rather than spending the day.
+- Non-primary pairs' writable directories (`<base>/pairs/<id>/` by default) are created at startup, or the start is refused.
+  The first loop after a restart already orders the pairs by signal (each engine's day is restored before the priorities).
 - **Priority** (owner-approved): when several pairs are due in one loop they are ticked in descending `|ε|/σ` (σ = the pair's
   frozen `epsilon_sigma`; while no pair has one, `|ε|/threshold` for all), ties in config order.
 - **Status**: `<base>/portfolio_status.json` (local, every 30 s): limits, venue equity, exposures, halts, per-pair summary and the
