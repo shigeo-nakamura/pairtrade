@@ -638,41 +638,42 @@ struct EngineBLiveConfig {
     fills_log_path: PathBuf,
 }
 
-fn env_string(name: &str, default: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| default.to_string())
+/// Where an `ENGINE_B_LIVE_*` key is read from: the process environment
+/// for the primary pair (today's only path), or a pair's own `env` map in
+/// the Night Bridge pairs file (bot-strategy#1345). One parser for both,
+/// so a key means the same thing wherever it is set.
+type ConfigLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn env_string(get: ConfigLookup, name: &str, default: &str) -> String {
+    get(name).unwrap_or_else(|| default.to_string())
 }
 
-fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
+fn env_f64(get: ConfigLookup, name: &str, default: f64) -> f64 {
+    get(name)
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
 }
 
-fn env_i64(name: &str, default: i64) -> i64 {
-    std::env::var(name)
-        .ok()
+fn env_i64(get: ConfigLookup, name: &str, default: i64) -> i64 {
+    get(name)
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(default)
 }
 
-fn env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
+fn env_u32(get: ConfigLookup, name: &str, default: u32) -> u32 {
+    get(name)
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(default)
 }
 
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
+fn env_bool(get: ConfigLookup, name: &str, default: bool) -> bool {
+    get(name)
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(default)
 }
 
-fn env_symbol_list(name: &str, default: &[&str]) -> Vec<String> {
-    std::env::var(name)
-        .ok()
+fn env_symbol_list(get: ConfigLookup, name: &str, default: &[&str]) -> Vec<String> {
+    get(name)
         .map(|v| {
             v.split(',')
                 .map(|s| s.trim().to_string())
@@ -684,43 +685,49 @@ fn env_symbol_list(name: &str, default: &[&str]) -> Vec<String> {
 
 impl EngineBLiveConfig {
     fn from_env() -> Self {
-        let instance_id = env_string("ENGINE_B_LIVE_INSTANCE_ID", "engine-b-live");
+        Self::from_lookup(&|name: &str| std::env::var(name).ok())
+    }
+
+    fn from_lookup(get: ConfigLookup) -> Self {
+        let instance_id = env_string(get, "ENGINE_B_LIVE_INSTANCE_ID", "engine-b-live");
         // Two distinct roots, matching engine-b-phase0's split: CODE_DIR is
         // root-owned/read-only (binary, trading_calendar.json, shipped by
         // the installer); STATE_DIR is this process's own writable area
         // (systemd StateDirectory=, /var/lib/... by convention). Mixing
         // writable state into the read-only code dir would force
         // ProtectSystem=full instead of the tighter =strict.
-        let code_dir = env_string("ENGINE_B_LIVE_CODE_DIR", "/opt/engine-b-live");
-        let base_dir = env_string("ENGINE_B_LIVE_BASE_DIR", "/var/lib/engine-b-live");
+        let code_dir = env_string(get, "ENGINE_B_LIVE_CODE_DIR", "/opt/engine-b-live");
+        let base_dir = env_string(get, "ENGINE_B_LIVE_BASE_DIR", "/var/lib/engine-b-live");
         EngineBLiveConfig {
-            dry_run: env_bool("ENGINE_B_LIVE_DRY_RUN", true),
-            kr_primary_symbol: env_string("ENGINE_B_LIVE_KR_PRIMARY", "SKHY"),
-            us_primary_symbol: env_string("ENGINE_B_LIVE_US_PRIMARY", "SNDK"),
+            dry_run: env_bool(get, "ENGINE_B_LIVE_DRY_RUN", true),
+            kr_primary_symbol: env_string(get, "ENGINE_B_LIVE_KR_PRIMARY", "SKHY"),
+            us_primary_symbol: env_string(get, "ENGINE_B_LIVE_US_PRIMARY", "SNDK"),
             control_symbols: env_symbol_list(
+                get,
                 "ENGINE_B_LIVE_CONTROL_SYMBOLS",
                 &["SOXL", "NVDA", "EWY", "USDKRW"],
             ),
-            lot_usd: env_f64("ENGINE_B_LIVE_LOT_USD", 100.0),
-            leverage: env_u32("ENGINE_B_LIVE_LEVERAGE", 2),
-            epsilon_threshold: env_f64("ENGINE_B_LIVE_EPSILON_THRESHOLD", 0.003),
-            direction_multiplier: env_f64("ENGINE_B_LIVE_DIRECTION_MULTIPLIER", 1.0),
-            signal_model: env_string("ENGINE_B_LIVE_SIGNAL_MODEL", "diff"),
-            entry_deadline_secs: env_i64("ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
-            exit_deadline_secs: env_i64("ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
-            fill_confirm_timeout_secs: env_i64("ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS", 15),
+            lot_usd: env_f64(get, "ENGINE_B_LIVE_LOT_USD", 100.0),
+            leverage: env_u32(get, "ENGINE_B_LIVE_LEVERAGE", 2),
+            epsilon_threshold: env_f64(get, "ENGINE_B_LIVE_EPSILON_THRESHOLD", 0.003),
+            direction_multiplier: env_f64(get, "ENGINE_B_LIVE_DIRECTION_MULTIPLIER", 1.0),
+            signal_model: env_string(get, "ENGINE_B_LIVE_SIGNAL_MODEL", "diff"),
+            entry_deadline_secs: env_i64(get, "ENGINE_B_LIVE_ENTRY_DEADLINE_SECS", 180),
+            exit_deadline_secs: env_i64(get, "ENGINE_B_LIVE_EXIT_DEADLINE_SECS", 900),
+            fill_confirm_timeout_secs: env_i64(get, "ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS", 15),
             // The requirements doc's marketable-limit bound (<=50 bps).
             // The 2026-09-05 feasibility study measured a round trip on
             // SNDK at 2.86-3.42 bps, so 50 bps is ~15x the observed cost
             // -- loose enough not to reject a normal fill, tight enough
             // that a torn book costs $0.50 on a $100 lot rather than $20.
-            slippage_bps: env_u32("ENGINE_B_LIVE_SLIPPAGE_BPS", 50),
+            slippage_bps: env_u32(get, "ENGINE_B_LIVE_SLIPPAGE_BPS", 50),
             // 30 s is the requirements doc's staleness bound for a
             // boundary price (bot-strategy#916).
-            max_price_staleness_secs: env_i64("ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS", 30),
-            max_eligibility_attempts: env_u32("ENGINE_B_LIVE_MAX_ELIGIBILITY_ATTEMPTS", 6),
-            t0_capture_grace_secs: env_i64("ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS", 300),
+            max_price_staleness_secs: env_i64(get, "ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS", 30),
+            max_eligibility_attempts: env_u32(get, "ENGINE_B_LIVE_MAX_ELIGIBILITY_ATTEMPTS", 6),
+            t0_capture_grace_secs: env_i64(get, "ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS", 300),
             lighter_rest_url: env_string(
+                get,
                 "ENGINE_B_LIVE_LIGHTER_REST_URL",
                 "https://mainnet.zklighter.elliot.ai",
             ),
@@ -728,39 +735,47 @@ impl EngineBLiveConfig {
             // MIN_DAILY_VOLUME_USD (TBD-9, bot-strategy#872) -- not yet
             // data-driven-frozen, just the same operator guess reused here
             // so the two eligibility checks agree until #872 freezes it.
-            min_daily_volume_usd: env_f64("ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD", 100_000.0),
-            equity_usd_reference: env_f64("ENGINE_B_LIVE_EQUITY_USD_REFERENCE", 1000.0),
-            max_session_loss_bps: env_f64("ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS", 500.0),
-            venue_equity_refresh_secs: env_i64("ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS", 300),
+            min_daily_volume_usd: env_f64(get, "ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD", 100_000.0),
+            equity_usd_reference: env_f64(get, "ENGINE_B_LIVE_EQUITY_USD_REFERENCE", 1000.0),
+            max_session_loss_bps: env_f64(get, "ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS", 500.0),
+            venue_equity_refresh_secs: env_i64(get, "ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS", 300),
             trading_calendar_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
                 &format!("{code_dir}/trading_calendar.json"),
             )),
             proxy_frozen_spec_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH",
                 &format!("{code_dir}/proxy_frozen.json"),
             )),
             kill_switch_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_KILL_SWITCH_PATH",
                 &format!("{base_dir}/KILL_SWITCH"),
             )),
             risk_ack_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_RISK_ACK_PATH",
                 &format!("{base_dir}/RISK_ACK_{}", instance_id.to_uppercase()),
             )),
             state_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_STATE_PATH",
                 &format!("{base_dir}/risk_state.json"),
             )),
             status_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_STATUS_PATH",
                 &format!("{base_dir}/status.json"),
             )),
             fills_log_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_FILLS_LOG_PATH",
                 &format!("{base_dir}/fills.jsonl"),
             )),
             pnl_log_path: PathBuf::from(env_string(
+                get,
                 "ENGINE_B_LIVE_PNL_LOG_PATH",
                 &format!("{base_dir}/pnl.jsonl"),
             )),
@@ -2317,6 +2332,11 @@ struct EngineBLiveEngine {
     /// so a fill that straggles in after the close still lands in the
     /// durable ledger with the right leg.
     fill_ledger_trade_open: bool,
+    /// The rest of the Night Bridge portfolio as of this tick
+    /// (bot-strategy#1345), installed by `NightBridge::tick` before each
+    /// engine's tick. `None` in single-pair mode -- the only mode without
+    /// `ENGINE_B_LIVE_PAIRS_FILE` -- where no portfolio gate exists.
+    portfolio: Option<PortfolioCtx>,
 }
 
 impl EngineBLiveEngine {
@@ -5080,7 +5100,10 @@ impl EngineBLiveEngine {
             OrderSide::Short
         };
         let notional_usd = self.cfg.lot_usd.min(self.cfg.max_notional_usd());
-        if notional_usd < self.cfg.lot_usd {
+        // In multi-pair mode the cap follows the venue's equity instead
+        // (`portfolio_admit`, bot-strategy#919/#1345), so this clamp and
+        // its warning describe single-pair mode only.
+        if notional_usd < self.cfg.lot_usd && self.portfolio.is_none() {
             log::warn!(
                 "[RISK_NOTIONAL_CAP] clamped lot ${:.0} -> ${:.0} (equity=${:.0} leverage={})",
                 self.cfg.lot_usd,
@@ -5181,6 +5204,33 @@ impl EngineBLiveEngine {
         // tick start can be past it by now (bot-strategy#916 "送信直前に
         // 鮮度を検査"; pairtrade#289 Codex review). Nothing below this
         // point awaits anything before `submit_order`.
+        //
+        // The Night Bridge portfolio gate (bot-strategy#1345) sits here,
+        // after every await of this tick, so the exposures it was handed
+        // are still every other pair's exposures when the order goes out:
+        // the engines tick sequentially and none of them runs while this
+        // one is between here and the send. Single-pair mode has no
+        // portfolio and keeps the lot sized above.
+        let notional_usd = match self.portfolio.as_ref() {
+            None => notional_usd,
+            Some(portfolio) => {
+                let sign: i8 = if side == OrderSide::Long { 1 } else { -1 };
+                let date = self.current_date.map(|d| d.to_string());
+                match portfolio_admit(
+                    portfolio,
+                    sign,
+                    date.as_deref(),
+                    self.cfg.lot_usd,
+                    self.cfg.leverage,
+                ) {
+                    Ok(n) => n,
+                    Err(reason) => {
+                        self.skip_day(reason);
+                        return;
+                    }
+                }
+            }
+        };
         let send_now_us = self.now();
         // The signal is only as good as the generation it was computed
         // on. Checking the US price alone is not enough: one US update
@@ -6396,6 +6446,1038 @@ fn send_notification(subject: impl Into<String>, body: impl Into<String>) {
     });
 }
 
+// ---------------------------------------------------------------------
+// Night Bridge multi-pair mode (bot-strategy#1345)
+//
+// One process, one connector, one nonce stream, N pairs. Owner decision
+// 2026-11-15: every pair trades from the same Lighter account and API
+// key, and two processes sharing one key race on the nonce stream. Each
+// pair is a full `EngineBLiveEngine` -- the state machine above, not a
+// copy of it -- and the engines are ticked **sequentially in one task**,
+// so no two pairs can ever have a `sendTx` in flight at the same time.
+//
+// Opt-in: none of this exists unless `ENGINE_B_LIVE_PAIRS_FILE` is set.
+// Without it `main` builds today's single engine with `portfolio: None`,
+// and every portfolio branch below is unreachable.
+// ---------------------------------------------------------------------
+
+/// The `ENGINE_B_LIVE_*` keys that describe *a pair* rather than the
+/// process. A non-primary pair never inherits these from the process
+/// environment: a missing `US_PRIMARY` silently reading the SNDK pair's
+/// value would put two engines on one market.
+const PAIR_SCOPED_KEYS: &[&str] = &[
+    "ENGINE_B_LIVE_INSTANCE_ID",
+    "ENGINE_B_LIVE_DRY_RUN",
+    "ENGINE_B_LIVE_KR_PRIMARY",
+    "ENGINE_B_LIVE_US_PRIMARY",
+    "ENGINE_B_LIVE_CONTROL_SYMBOLS",
+    "ENGINE_B_LIVE_LOT_USD",
+    "ENGINE_B_LIVE_EPSILON_THRESHOLD",
+    "ENGINE_B_LIVE_DIRECTION_MULTIPLIER",
+    "ENGINE_B_LIVE_SIGNAL_MODEL",
+    "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
+    "ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH",
+    "ENGINE_B_LIVE_BASE_DIR",
+    "ENGINE_B_LIVE_KILL_SWITCH_PATH",
+    "ENGINE_B_LIVE_RISK_ACK_PATH",
+    "ENGINE_B_LIVE_STATE_PATH",
+    "ENGINE_B_LIVE_STATUS_PATH",
+    "ENGINE_B_LIVE_PNL_LOG_PATH",
+    "ENGINE_B_LIVE_FILLS_LOG_PATH",
+];
+
+/// Keys a non-primary pair must set itself: there is no safe default
+/// for what it trades, on which signal, against which calendar.
+const PAIR_REQUIRED_KEYS: &[&str] = &[
+    "ENGINE_B_LIVE_KR_PRIMARY",
+    "ENGINE_B_LIVE_US_PRIMARY",
+    "ENGINE_B_LIVE_CONTROL_SYMBOLS",
+    "ENGINE_B_LIVE_LOT_USD",
+    "ENGINE_B_LIVE_EPSILON_THRESHOLD",
+    "ENGINE_B_LIVE_SIGNAL_MODEL",
+    "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
+];
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct PairsFile {
+    version: u32,
+    #[serde(default, rename = "_comment")]
+    _comment: Option<String>,
+    portfolio: PortfolioCfg,
+    pairs: Vec<PairEntry>,
+}
+
+/// Portfolio-level limits. **Every value is an owner decision** (#1345
+/// "Open decisions"); the shipped example carries proposals, labelled as
+/// such, and nothing here has a code default so a pairs file cannot be
+/// half-specified.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct PortfolioCfg {
+    #[serde(default, rename = "_comment")]
+    _comment: Option<String>,
+    /// Sum of every open, pending or in-flight Night Bridge notional,
+    /// this entry included, as a percentage of fresh venue equity.
+    aggregate_cap_pct_of_venue_equity: f64,
+    /// Same-cluster, same-sign entries on the same session date count as
+    /// one bet: their combined notional may not exceed this many lots
+    /// (the entering pair's lot).
+    cluster_cap_lot_multiple: f64,
+    /// Sum of today's booked PnL across pairs at or below minus this
+    /// percentage of venue equity blocks new entries for the rest of the
+    /// UTC day.
+    daily_net_loss_pct_of_venue_equity: f64,
+    /// Sum of booked PnL across pairs since the last portfolio
+    /// `RISK_ACK` at or below minus this percentage of venue equity is a
+    /// sticky halt for every pair.
+    total_net_loss_pct_of_venue_equity: f64,
+    /// A venue equity reading older than this (or a failing read) blocks
+    /// entries: every cap above is a fraction of a number we must know.
+    max_venue_equity_age_secs: i64,
+    /// A cap may shrink an entry, but never below this notional; below it
+    /// the entry is skipped instead.
+    min_entry_notional_usd: f64,
+    /// Only `"abs_epsilon_over_sigma"` (owner-approved 2026-11-17): when
+    /// several pairs are due in the same loop, the larger `|epsilon| /
+    /// sigma` is ticked first, `sigma` being each pair's frozen
+    /// residual standard deviation (`PairEntry::epsilon_sigma`); ties and
+    /// no-signal pairs keep config order. While no pair carries a frozen
+    /// sigma the score falls back to `|epsilon| / epsilon_threshold` for
+    /// every pair -- never a mix of the two units.
+    priority: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct PairEntry {
+    pair_id: String,
+    /// The pair whose config is the process environment -- today's
+    /// SNDK engine. Exactly one, enabled, with an empty `env`.
+    #[serde(default)]
+    primary: bool,
+    enabled: bool,
+    #[serde(default)]
+    cluster: Option<String>,
+    #[serde(default)]
+    prereg: Option<PreregRef>,
+    /// The pair's frozen residual standard deviation (same units as
+    /// epsilon), from its own PREREG fit -- the `sigma` of the
+    /// `|epsilon| / sigma` priority. Set on every enabled pair or on
+    /// none.
+    #[serde(default)]
+    epsilon_sigma: Option<f64>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
+    #[serde(default, rename = "_comment")]
+    _comment: Option<String>,
+}
+
+/// The study a pair's live trading rests on. A non-primary pair may run
+/// `DRY_RUN` without one; it may not trade without `readout_passed`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+struct PreregRef {
+    issue: u32,
+    sha256: String,
+    readout_passed: bool,
+}
+
+impl PortfolioCfg {
+    fn validate(&self) -> Result<()> {
+        let pct_ok = |v: f64| v.is_finite() && v > 0.0 && v <= 100.0;
+        if !pct_ok(self.aggregate_cap_pct_of_venue_equity)
+            || !pct_ok(self.daily_net_loss_pct_of_venue_equity)
+            || !pct_ok(self.total_net_loss_pct_of_venue_equity)
+        {
+            anyhow::bail!("portfolio percentages must be in (0, 100]: {self:?}");
+        }
+        if !(self.cluster_cap_lot_multiple.is_finite() && self.cluster_cap_lot_multiple >= 1.0) {
+            anyhow::bail!(
+                "cluster_cap_lot_multiple must be >= 1.0 (one lot always fits), got {}",
+                self.cluster_cap_lot_multiple
+            );
+        }
+        if self.max_venue_equity_age_secs <= 0 {
+            anyhow::bail!("max_venue_equity_age_secs must be > 0");
+        }
+        if !(self.min_entry_notional_usd.is_finite() && self.min_entry_notional_usd > 0.0) {
+            anyhow::bail!("min_entry_notional_usd must be > 0");
+        }
+        if self.priority != "abs_epsilon_over_sigma" {
+            anyhow::bail!(
+                "portfolio.priority={} is not implemented (abs_epsilon_over_sigma)",
+                self.priority
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The lookup a non-primary pair's config is parsed through: its own
+/// `env` first; pair-scoped keys never fall back to the process; the
+/// rest (venue URL, deadlines, staleness, slippage...) do. Files default
+/// under `<process base>/pairs/<pair_id>/`, and the kill switch is the
+/// process's, so one file stops every pair.
+fn pair_lookup<'a>(
+    entry: &'a PairEntry,
+    process: ConfigLookup<'_>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    let process_base =
+        process("ENGINE_B_LIVE_BASE_DIR").unwrap_or_else(|| "/var/lib/engine-b-live".to_string());
+    let kill_switch = process("ENGINE_B_LIVE_KILL_SWITCH_PATH")
+        .unwrap_or_else(|| format!("{process_base}/KILL_SWITCH"));
+    let base = format!("{process_base}/pairs/{}", entry.pair_id);
+    let instance = format!("engine-b-live-{}", entry.pair_id);
+    // Process-wide settings a pair inherits unless its env overrides
+    // them: venue, deadlines, staleness, slippage, risk-rail tuning.
+    let inherited: HashMap<String, Option<String>> = [
+        "ENGINE_B_LIVE_CODE_DIR",
+        "ENGINE_B_LIVE_ENTRY_DEADLINE_SECS",
+        "ENGINE_B_LIVE_EXIT_DEADLINE_SECS",
+        "ENGINE_B_LIVE_FILL_CONFIRM_TIMEOUT_SECS",
+        "ENGINE_B_LIVE_SLIPPAGE_BPS",
+        "ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS",
+        "ENGINE_B_LIVE_MAX_ELIGIBILITY_ATTEMPTS",
+        "ENGINE_B_LIVE_T0_CAPTURE_GRACE_SECS",
+        "ENGINE_B_LIVE_LIGHTER_REST_URL",
+        "ENGINE_B_LIVE_MIN_DAILY_VOLUME_USD",
+        "ENGINE_B_LIVE_LEVERAGE",
+        "ENGINE_B_LIVE_EQUITY_USD_REFERENCE",
+        "ENGINE_B_LIVE_MAX_SESSION_LOSS_BPS",
+        "ENGINE_B_LIVE_VENUE_EQUITY_REFRESH_SECS",
+    ]
+    .into_iter()
+    .map(|k| (k.to_string(), process(k)))
+    .collect();
+    move |name: &str| {
+        if let Some(v) = entry.env.get(name) {
+            return Some(v.clone());
+        }
+        match name {
+            "ENGINE_B_LIVE_BASE_DIR" => Some(base.clone()),
+            "ENGINE_B_LIVE_KILL_SWITCH_PATH" => Some(kill_switch.clone()),
+            "ENGINE_B_LIVE_INSTANCE_ID" => Some(instance.clone()),
+            // A new pair is paper until its own config says otherwise.
+            "ENGINE_B_LIVE_DRY_RUN" => Some("true".to_string()),
+            _ if PAIR_SCOPED_KEYS.contains(&name) => None,
+            _ => inherited.get(name).cloned().flatten(),
+        }
+    }
+}
+
+/// One pair, ready to be built into an engine.
+#[derive(Debug, Clone)]
+struct PairPlan {
+    pair_id: String,
+    primary: bool,
+    cluster: Option<String>,
+    prereg: Option<PreregRef>,
+    epsilon_sigma: Option<f64>,
+    cfg: EngineBLiveConfig,
+}
+
+/// What a pairs file resolves to: the pairs to run (primary first, then
+/// config order) and those listed but disabled (validated, reported,
+/// never instantiated).
+#[derive(Debug, Clone)]
+struct PairsPlan {
+    portfolio: PortfolioCfg,
+    pairs: Vec<PairPlan>,
+    disabled: Vec<String>,
+}
+
+fn plan_pairs(
+    file: &PairsFile,
+    primary_cfg: &EngineBLiveConfig,
+    process: ConfigLookup,
+) -> Result<PairsPlan> {
+    if file.version != 1 {
+        anyhow::bail!("pairs file version {} is not supported (1)", file.version);
+    }
+    file.portfolio.validate()?;
+    let primaries: Vec<&PairEntry> = file.pairs.iter().filter(|p| p.primary).collect();
+    if primaries.len() != 1 {
+        anyhow::bail!(
+            "pairs file needs exactly one primary pair (the process-env engine), found {}",
+            primaries.len()
+        );
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut pairs = Vec::new();
+    let mut disabled = Vec::new();
+    for entry in &file.pairs {
+        let id_ok = !entry.pair_id.is_empty()
+            && entry
+                .pair_id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !id_ok {
+            anyhow::bail!("pair_id {:?} must be [a-z0-9_-]+", entry.pair_id);
+        }
+        if !ids.insert(entry.pair_id.clone()) {
+            anyhow::bail!("duplicate pair_id {}", entry.pair_id);
+        }
+        if let Some(key) = entry.env.keys().find(|k| !k.starts_with("ENGINE_B_LIVE_")) {
+            anyhow::bail!(
+                "pair {}: env key {key} is not an ENGINE_B_LIVE_* key",
+                entry.pair_id
+            );
+        }
+        if entry.primary {
+            if !entry.enabled {
+                anyhow::bail!("the primary pair {} cannot be disabled", entry.pair_id);
+            }
+            if !entry.env.is_empty() {
+                anyhow::bail!(
+                    "the primary pair {} is configured by the process environment; its env map \
+                     must be empty",
+                    entry.pair_id
+                );
+            }
+            pairs.insert(
+                0,
+                PairPlan {
+                    pair_id: entry.pair_id.clone(),
+                    primary: true,
+                    cluster: entry.cluster.clone(),
+                    prereg: entry.prereg.clone(),
+                    epsilon_sigma: entry.epsilon_sigma,
+                    cfg: primary_cfg.clone(),
+                },
+            );
+            continue;
+        }
+        if entry
+            .env
+            .get("ENGINE_B_LIVE_SIGNAL_MODEL")
+            .map(String::as_str)
+            == Some("proxy_frozen")
+            && !entry
+                .env
+                .contains_key("ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH")
+        {
+            // The default path is the primary pair's spec.
+            anyhow::bail!(
+                "pair {}: proxy_frozen needs its own ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH",
+                entry.pair_id
+            );
+        }
+        if let Some(missing) = PAIR_REQUIRED_KEYS
+            .iter()
+            .find(|k| !entry.env.contains_key(**k))
+        {
+            anyhow::bail!("pair {}: {missing} must be set in its env", entry.pair_id);
+        }
+        let lookup = pair_lookup(entry, process);
+        let cfg = EngineBLiveConfig::from_lookup(&lookup);
+        if !cfg.dry_run {
+            match &entry.prereg {
+                Some(p) if p.readout_passed && p.issue > 0 && p.sha256.len() == 64 => {}
+                _ => anyhow::bail!(
+                    "pair {} is configured live but has no passed PREREG readout (prereg.issue, \
+                     prereg.sha256, prereg.readout_passed=true) -- run it DRY_RUN until it does",
+                    entry.pair_id
+                ),
+            }
+        }
+        let plan = PairPlan {
+            pair_id: entry.pair_id.clone(),
+            primary: false,
+            cluster: entry.cluster.clone(),
+            prereg: entry.prereg.clone(),
+            epsilon_sigma: entry.epsilon_sigma,
+            cfg,
+        };
+        if entry.enabled {
+            pairs.push(plan);
+        } else {
+            disabled.push(entry.pair_id.clone());
+        }
+    }
+    if let Some(p) = pairs
+        .iter()
+        .find(|p| p.epsilon_sigma.is_some_and(|s| !(s.is_finite() && s > 0.0)))
+    {
+        anyhow::bail!("pair {}: epsilon_sigma must be > 0", p.pair_id);
+    }
+    let with_sigma = pairs.iter().filter(|p| p.epsilon_sigma.is_some()).count();
+    if with_sigma != 0 && with_sigma != pairs.len() {
+        anyhow::bail!(
+            "epsilon_sigma is set on {with_sigma} of {} enabled pairs: set it on all or none, or \
+             the priority would compare |epsilon|/sigma against |epsilon|/threshold",
+            pairs.len()
+        );
+    }
+    // Cross-pair refusals: anything two engines would fight over.
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for p in &pairs {
+        let c = &p.cfg;
+        c.validate()
+            .with_context(|| format!("pair {}", p.pair_id))?;
+        if primary_cfg.dry_run && !c.dry_run {
+            anyhow::bail!(
+                "pair {} is live but the process (primary pair) runs DRY_RUN: the shared connector \
+                 cannot send for one pair and simulate for another",
+                p.pair_id
+            );
+        }
+        if c.max_price_staleness_secs != primary_cfg.max_price_staleness_secs {
+            anyhow::bail!(
+                "pair {}: MAX_PRICE_STALENESS_SECS must equal the primary's ({}): the price feed is \
+                 shared and validates every update against one bound",
+                p.pair_id,
+                primary_cfg.max_price_staleness_secs
+            );
+        }
+        for (what, value) in [
+            ("us_primary", c.us_primary_symbol.clone()),
+            ("instance_id", c.instance_id.clone()),
+            ("risk_ack_path", c.risk_ack_path.display().to_string()),
+            ("state_path", c.state_path.display().to_string()),
+            ("status_path", c.status_path.display().to_string()),
+            ("pnl_log_path", c.pnl_log_path.display().to_string()),
+            ("fills_log_path", c.fills_log_path.display().to_string()),
+        ] {
+            if let Some(other) = seen.insert(format!("{what}={value}"), p.pair_id.clone()) {
+                anyhow::bail!("pairs {other} and {} share {what}={value}", p.pair_id);
+            }
+        }
+    }
+    Ok(PairsPlan {
+        portfolio: file.portfolio.clone(),
+        pairs,
+        disabled,
+    })
+}
+
+/// One exposure a pair holds or may hold, as the portfolio gate counts it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct PairExposure {
+    pair_id: String,
+    cluster: Option<String>,
+    /// `Some(1)` long, `Some(-1)` short, `None` unknown (an in-flight
+    /// entry whose outcome is not established, or a parked record) --
+    /// counted against **both** signs of its cluster.
+    sign: Option<i8>,
+    notional_usd: f64,
+    session_date: Option<String>,
+}
+
+/// What one engine is told about the rest of the portfolio for the tick
+/// it is about to run. Rebuilt before every tick; engines never see
+/// each other directly.
+#[derive(Debug, Clone)]
+struct PortfolioCtx {
+    cfg: PortfolioCfg,
+    pair_id: String,
+    cluster: Option<String>,
+    /// Every other pair's exposures.
+    others: Vec<PairExposure>,
+    /// Fresh venue equity, or `None` when the reading is missing, failing
+    /// or older than `max_venue_equity_age_secs`.
+    venue_equity_usd: Option<f64>,
+    /// A portfolio-level halt (daily or total net loss) in force.
+    blocked: Option<String>,
+}
+
+/// Admit, shrink or refuse one entry. Pure: every input is passed in, so
+/// each limit is tested on its own.
+fn portfolio_admit(
+    ctx: &PortfolioCtx,
+    sign: i8,
+    session_date: Option<&str>,
+    lot_usd: f64,
+    leverage: u32,
+) -> std::result::Result<f64, String> {
+    if let Some(reason) = &ctx.blocked {
+        return Err(reason.clone());
+    }
+    let Some(equity) = ctx.venue_equity_usd else {
+        return Err(format!(
+            "portfolio_equity_stale: no venue equity reading newer than {}s; every portfolio cap \
+             is a fraction of it",
+            ctx.cfg.max_venue_equity_age_secs
+        ));
+    };
+    if !(equity.is_finite() && equity > 0.0) {
+        return Err(format!(
+            "portfolio_equity_stale: venue equity {equity} is not usable"
+        ));
+    }
+    let min = ctx.cfg.min_entry_notional_usd;
+    // #919: the hard notional cap follows the account, not the
+    // `equity_usd_reference` constant -- same equity * leverage * 0.9
+    // headroom formula as `max_notional_usd`.
+    let hard_cap = equity * leverage as f64 * 0.9;
+    let mut notional = lot_usd.min(hard_cap);
+    let mut notes = Vec::new();
+    if notional < lot_usd {
+        notes.push(format!("hard_cap ${hard_cap:.2}"));
+    }
+    let aggregate_used: f64 = ctx.others.iter().map(|e| e.notional_usd.abs()).sum();
+    let aggregate_cap = equity * ctx.cfg.aggregate_cap_pct_of_venue_equity / 100.0;
+    let aggregate_room = aggregate_cap - aggregate_used;
+    if aggregate_room < notional {
+        if aggregate_room < min {
+            return Err(format!(
+                "aggregate_cap: open ${aggregate_used:.2} of cap ${aggregate_cap:.2} \
+                 ({:.1}% of venue equity ${equity:.2}); room ${:.2} < min ${min:.2}",
+                ctx.cfg.aggregate_cap_pct_of_venue_equity,
+                aggregate_room.max(0.0)
+            ));
+        }
+        notional = aggregate_room;
+        notes.push(format!("aggregate_cap room ${aggregate_room:.2}"));
+    }
+    if let Some(cluster) = &ctx.cluster {
+        let cluster_used: f64 = ctx
+            .others
+            .iter()
+            .filter(|e| e.cluster.as_deref() == Some(cluster.as_str()))
+            .filter(|e| e.session_date.is_none() || e.session_date.as_deref() == session_date)
+            .filter(|e| e.sign.is_none() || e.sign == Some(sign))
+            .map(|e| e.notional_usd.abs())
+            .sum();
+        let cluster_cap = lot_usd * ctx.cfg.cluster_cap_lot_multiple;
+        let cluster_room = cluster_cap - cluster_used;
+        if cluster_room < notional {
+            if cluster_room < min {
+                return Err(format!(
+                    "cluster_cap: cluster {cluster} already holds ${cluster_used:.2} same-sign \
+                     this session of cap ${cluster_cap:.2} ({}x lot); room ${:.2} < min ${min:.2}",
+                    ctx.cfg.cluster_cap_lot_multiple,
+                    cluster_room.max(0.0)
+                ));
+            }
+            notional = cluster_room;
+            notes.push(format!("cluster_cap room ${cluster_room:.2}"));
+        }
+    }
+    if notional < min {
+        return Err(format!(
+            "portfolio_min_notional: capped entry ${notional:.2} < min ${min:.2} ({})",
+            notes.join(", ")
+        ));
+    }
+    if !notes.is_empty() {
+        log::warn!(
+            "[PORTFOLIO] {} entry shrunk ${lot_usd:.2} -> ${notional:.2} ({})",
+            ctx.pair_id,
+            notes.join(", ")
+        );
+    }
+    Ok(notional)
+}
+
+impl EngineBLiveEngine {
+    /// What this engine holds, or may hold, for the portfolio gate.
+    /// Conservative on purpose: an entry whose outcome is unknown counts
+    /// a full lot with an unknown sign, and a parked record counts at its
+    /// last known size -- the gate must never be the reason two
+    /// exposures exist where one was intended.
+    fn portfolio_exposures(&self, pair_id: &str, cluster: &Option<String>) -> Vec<PairExposure> {
+        let today = self.current_date.map(|d| d.to_string());
+        let mut out = Vec::new();
+        let mk = |sign: Option<i8>, notional_usd: f64, session_date: Option<String>| PairExposure {
+            pair_id: pair_id.to_string(),
+            cluster: cluster.clone(),
+            sign,
+            notional_usd,
+            session_date,
+        };
+        let side_sign = |side: OrderSide| -> i8 {
+            if side == OrderSide::Long {
+                1
+            } else {
+                -1
+            }
+        };
+        if let Some(pos) = &self.position {
+            let notional = if pos.entry_price_unknown || !(pos.entry_price > 0.0) {
+                self.cfg.lot_usd
+            } else {
+                pos.open_size.abs() * pos.entry_price
+            };
+            let session = self
+                .state
+                .open_position
+                .as_ref()
+                .map(|p| p.session_date.clone())
+                .or_else(|| today.clone());
+            out.push(mk(Some(side_sign(pos.side)), notional, session));
+        } else if let Some(PendingConfirm::Entry {
+            side, notional_usd, ..
+        }) = &self.pending
+        {
+            out.push(mk(Some(side_sign(*side)), *notional_usd, today.clone()));
+        } else if self.state.entry_in_flight.is_some() {
+            out.push(mk(None, self.cfg.lot_usd, None));
+        }
+        for p in &self.state.unmanaged_positions {
+            let notional = if p.entry_price_unknown || !(p.entry_price > 0.0) {
+                self.cfg.lot_usd
+            } else {
+                p.open_size.abs() * p.entry_price
+            };
+            out.push(mk(None, notional, None));
+        }
+        out
+    }
+
+    /// `|epsilon| / sigma` (or `/ epsilon_threshold` when no frozen sigma
+    /// is configured) of the signal this engine would act on now, or
+    /// `None` when no entry is due. A preview for ordering only: no state
+    /// is touched, and `maybe_enter` still computes and gates the real
+    /// signal itself.
+    fn entry_priority_score(&self, now_us: i64, sigma: Option<f64>) -> Option<f64> {
+        let (_t0, t1, _t2) = self.window?;
+        if self.day.entered || self.position.is_some() || self.pending.is_some() || now_us < t1 {
+            return None;
+        }
+        let t0_prices = self.day.t0_prices.as_ref()?;
+        let t1_prices = match &self.day.t1_prices {
+            Some(p) => p.clone(),
+            None => self.usable_prices(now_us),
+        };
+        let eps = match self.cfg.signal_model.as_str() {
+            "proxy_frozen" => self.proxy_frozen_epsilon(t0_prices, &t1_prices).ok()?.0,
+            model => compute_epsilon(
+                model,
+                &self.cfg.kr_primary_symbol,
+                &self.cfg.us_primary_symbol,
+                t0_prices,
+                &t1_prices,
+            )?,
+        };
+        if eps.abs() < self.cfg.epsilon_threshold {
+            return None;
+        }
+        let score = eps.abs() / sigma.unwrap_or(self.cfg.epsilon_threshold);
+        score.is_finite().then_some(score)
+    }
+
+    /// Today's booked PnL, or 0.0 when the record belongs to another day.
+    fn pnl_today_for(&self, date: &str) -> f64 {
+        if self.state.pnl_today_date.as_deref() == Some(date) {
+            self.state.pnl_today
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Tick order for one loop: descending priority score, then config
+/// order. Stable, so pairs with no due signal keep their place.
+fn tick_order(scores: &[Option<f64>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|a, b| {
+        let sa = scores[*a].unwrap_or(f64::NEG_INFINITY);
+        let sb = scores[*b].unwrap_or(f64::NEG_INFINITY);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order
+}
+
+/// Durable portfolio-level state: the sticky total-loss halt and the
+/// booked-PnL baseline it is measured from (rebased by the portfolio
+/// RISK_ACK).
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
+struct PortfolioState {
+    #[serde(default)]
+    baseline_total_pnl: Option<f64>,
+    #[serde(default)]
+    halted: bool,
+    #[serde(default)]
+    halt_reason: Option<String>,
+}
+
+struct PortfolioRuntime {
+    cfg: PortfolioCfg,
+    state: PortfolioState,
+    state_path: PathBuf,
+    status_path: PathBuf,
+    ack_path: PathBuf,
+    disabled: Vec<String>,
+    last_status_write_us: i64,
+}
+
+impl PortfolioRuntime {
+    /// The portfolio-level block for this loop, given every pair's booked
+    /// PnL. `None` = entries allowed.
+    fn evaluate(
+        &mut self,
+        today: &str,
+        pnl_today_sum: f64,
+        total_pnl_sum: f64,
+        venue_equity_usd: Option<f64>,
+    ) -> Option<String> {
+        if self.ack_path.exists() {
+            log::warn!(
+                "[PORTFOLIO] RISK_ACK at {}: clearing {:?}, baseline ${:.2} -> ${total_pnl_sum:.2}",
+                self.ack_path.display(),
+                self.state.halt_reason,
+                self.state.baseline_total_pnl.unwrap_or(0.0)
+            );
+            self.state.halted = false;
+            self.state.halt_reason = None;
+            self.state.baseline_total_pnl = Some(total_pnl_sum);
+            self.persist();
+            if let Err(e) = std::fs::remove_file(&self.ack_path) {
+                log::warn!(
+                    "[PORTFOLIO] could not remove {}: {e:?}",
+                    self.ack_path.display()
+                );
+            }
+        }
+        if self.state.baseline_total_pnl.is_none() {
+            // First run: losses are measured from what was already booked
+            // when portfolio mode started, not from the pairs' lifetimes.
+            self.state.baseline_total_pnl = Some(total_pnl_sum);
+            self.persist();
+        }
+        if self.state.halted {
+            return self.state.halt_reason.clone();
+        }
+        let equity = venue_equity_usd?;
+        let total = total_pnl_sum - self.state.baseline_total_pnl.unwrap_or(0.0);
+        let total_limit = equity * self.cfg.total_net_loss_pct_of_venue_equity / 100.0;
+        if total <= -total_limit {
+            let reason = format!(
+                "portfolio_total_loss: booked ${total:.2} since the last portfolio ack <= -{:.2}% of \
+                 venue equity ${equity:.2} -- clear via {}",
+                self.cfg.total_net_loss_pct_of_venue_equity,
+                self.ack_path.display()
+            );
+            log::error!("[PORTFOLIO] {reason}");
+            self.state.halted = true;
+            self.state.halt_reason = Some(reason.clone());
+            self.persist();
+            send_notification(
+                "Night Bridge PORTFOLIO HALT".to_string(),
+                format!("{reason}. New entries blocked for every pair."),
+            );
+            return Some(reason);
+        }
+        let daily_limit = equity * self.cfg.daily_net_loss_pct_of_venue_equity / 100.0;
+        if pnl_today_sum <= -daily_limit {
+            return Some(format!(
+                "portfolio_daily_loss: booked ${pnl_today_sum:.2} on {today} <= -{:.2}% of venue \
+                 equity ${equity:.2}; entries resume the next UTC day",
+                self.cfg.daily_net_loss_pct_of_venue_equity
+            ));
+        }
+        None
+    }
+
+    fn persist(&self) {
+        if let Err(e) = atomic_write_json_checked(&self.state_path, &self.state) {
+            log::error!(
+                "[PORTFOLIO] cannot persist {} ({e}); the halt still holds in memory",
+                self.state_path.display()
+            );
+        }
+    }
+}
+
+/// Fresh venue equity for the portfolio gate, or `None`.
+fn fresh_venue_equity(cell: &VenueEquityCell, now_us: i64, max_age_secs: i64) -> Option<f64> {
+    let reading = cell.reading?;
+    if cell.failing || now_us - reading.fetched_at_us > max_age_secs * 1_000_000 {
+        return None;
+    }
+    Some(reading.equity_usd)
+}
+
+/// The engines of one process and, in multi-pair mode, the portfolio
+/// that binds them.
+struct NightBridge {
+    engines: Vec<(PairPlan, EngineBLiveEngine)>,
+    portfolio: Option<PortfolioRuntime>,
+}
+
+impl NightBridge {
+    /// One loop. Single mode: exactly today's `engine.tick()`.
+    async fn tick(&mut self) {
+        let Some(portfolio) = self.portfolio.as_mut() else {
+            for (_, engine) in self.engines.iter_mut() {
+                engine.tick().await;
+            }
+            return;
+        };
+        let now = self.engines[0].1.now();
+        let today = DateTime::<Utc>::from_timestamp_micros(now)
+            .map(|d| d.date_naive().to_string())
+            .unwrap_or_default();
+        // A live process counts only its live pairs: a DRY_RUN pair's
+        // simulated position or paper loss must never shrink, refuse or
+        // halt a real order. Paper pairs see everything, so their
+        // simulated sizing is what live sizing would have been. (When the
+        // primary is DRY_RUN every pair is, and all count.)
+        let process_dry_run = self.engines[0].1.cfg.dry_run;
+        let counts =
+            |e: &EngineBLiveEngine, for_paper: bool| for_paper || process_dry_run || !e.cfg.dry_run;
+        let scores: Vec<Option<f64>> = self
+            .engines
+            .iter()
+            .map(|(plan, e)| e.entry_priority_score(now, plan.epsilon_sigma))
+            .collect();
+        for idx in tick_order(&scores) {
+            // Rebuilt per engine, after every earlier engine's tick, so an
+            // entry sent by a higher-priority pair in this loop is already
+            // counted against the next.
+            let equity = {
+                let cell = self.engines[idx]
+                    .1
+                    .venue_equity
+                    .lock()
+                    .expect("venue equity mutex");
+                fresh_venue_equity(&cell, now, portfolio.cfg.max_venue_equity_age_secs)
+            };
+            // Halts are measured on real money only (paper PnL never halts
+            // a live pair), and apply to every pair.
+            let pnl_today_sum: f64 = self
+                .engines
+                .iter()
+                .filter(|(_, e)| counts(e, false))
+                .map(|(_, e)| e.pnl_today_for(&today))
+                .sum();
+            let total_pnl_sum: f64 = self
+                .engines
+                .iter()
+                .filter(|(_, e)| counts(e, false))
+                .map(|(_, e)| e.state.realized_pnl_session)
+                .sum();
+            let paper = self.engines[idx].1.cfg.dry_run;
+            let blocked = portfolio.evaluate(&today, pnl_today_sum, total_pnl_sum, equity);
+            let others: Vec<PairExposure> = self
+                .engines
+                .iter()
+                .enumerate()
+                .filter(|(j, (_, e))| *j != idx && counts(e, paper))
+                .flat_map(|(_, (plan, e))| e.portfolio_exposures(&plan.pair_id, &plan.cluster))
+                .collect();
+            let (plan, engine) = &mut self.engines[idx];
+            engine.portfolio = Some(PortfolioCtx {
+                cfg: portfolio.cfg.clone(),
+                pair_id: plan.pair_id.clone(),
+                cluster: plan.cluster.clone(),
+                others,
+                venue_equity_usd: equity,
+                blocked,
+            });
+            engine.tick().await;
+        }
+        self.write_portfolio_status(now);
+    }
+
+    fn write_portfolio_status(&mut self, now_us: i64) {
+        let Some(portfolio) = self.portfolio.as_mut() else {
+            return;
+        };
+        if now_us - portfolio.last_status_write_us < 30_000_000 {
+            return;
+        }
+        portfolio.last_status_write_us = now_us;
+        let equity = {
+            let cell = self.engines[0]
+                .1
+                .venue_equity
+                .lock()
+                .expect("venue equity mutex");
+            fresh_venue_equity(&cell, now_us, portfolio.cfg.max_venue_equity_age_secs)
+        };
+        let exposures: Vec<PairExposure> = self
+            .engines
+            .iter()
+            .flat_map(|(plan, e)| e.portfolio_exposures(&plan.pair_id, &plan.cluster))
+            .collect();
+        let pairs: Vec<serde_json::Value> = self
+            .engines
+            .iter()
+            .map(|(plan, e)| {
+                serde_json::json!({
+                    "pair_id": plan.pair_id,
+                    "primary": plan.primary,
+                    "cluster": plan.cluster,
+                    "us_primary": e.cfg.us_primary_symbol,
+                    "dry_run": e.cfg.dry_run,
+                    "lot_usd": e.cfg.lot_usd,
+                    "prereg_issue": plan.prereg.as_ref().map(|p| p.issue),
+                    "session_halted": e.state.session_halted,
+                    "skip_reason": e.day.skip_reason,
+                    "status_path": e.cfg.status_path.display().to_string(),
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "ts_us": now_us,
+            "portfolio": portfolio.cfg,
+            "venue_equity_usd": equity,
+            "open_notional_usd": exposures.iter().map(|e| e.notional_usd.abs()).sum::<f64>(),
+            "aggregate_cap_usd": equity.map(|e| e * portfolio.cfg.aggregate_cap_pct_of_venue_equity / 100.0),
+            "exposures": exposures,
+            "halted": portfolio.state.halted,
+            "halt_reason": portfolio.state.halt_reason,
+            "pairs": pairs,
+            "disabled_pairs": portfolio.disabled,
+        });
+        if let Err(e) = atomic_write_json_checked(&portfolio.status_path, &body) {
+            log::warn!("[PORTFOLIO] status write failed: {e}");
+        }
+    }
+}
+
+/// The frozen proxy spec for `signal_model = "proxy_frozen"`, checked
+/// against the config it will run under; `None` for any other model.
+/// Moved out of `main` unchanged so every Night Bridge pair is loaded the
+/// same way (bot-strategy#1345).
+fn load_frozen_spec(cfg: &EngineBLiveConfig) -> Result<Option<ProxyFrozenSpec>> {
+    let frozen_spec = if cfg.signal_model == "proxy_frozen" {
+        let spec = ProxyFrozenSpec::load(&cfg.proxy_frozen_spec_path)
+            .context("failed to load the frozen proxy spec (signal_model=proxy_frozen)")?;
+        spec.check_against(cfg)?;
+        log::info!(
+            "[FROZEN_SPEC] path={} fp={} kr={} us={} alpha={} beta={} threshold={} source={:?}",
+            cfg.proxy_frozen_spec_path.display(),
+            spec.fingerprint,
+            spec.kr_primary,
+            spec.us_primary,
+            spec.alpha,
+            spec.beta,
+            spec.threshold,
+            spec.source
+        );
+        Some(spec)
+    } else {
+        None
+    };
+    Ok(frozen_spec)
+}
+
+/// direction_multiplier only ever means "same as epsilon's sign" (1.0)
+/// or "opposite" (-1.0) -- f64::signum() returns 1.0 for 0.0 (never
+/// 0.0), so a mistyped ENGINE_B_LIVE_DIRECTION_MULTIPLIER=0 would
+/// silently trade as if it were 1.0 instead of the operator's evident
+/// intent to disable directional bias. Reject anything else outright
+/// rather than guess.
+fn check_direction_multiplier(cfg: &EngineBLiveConfig) -> Result<()> {
+    if cfg.direction_multiplier != 1.0 && cfg.direction_multiplier != -1.0 {
+        anyhow::bail!(
+            "ENGINE_B_LIVE_DIRECTION_MULTIPLIER must be exactly 1.0 or -1.0, got {} \
+             (0.0 would silently behave as 1.0 via f64::signum(), not \"disabled\")",
+            cfg.direction_multiplier
+        );
+    }
+    Ok(())
+}
+
+fn load_calendar(cfg: &EngineBLiveConfig) -> Result<TradingCalendar> {
+    let calendar = TradingCalendar::load(&cfg.trading_calendar_path)
+        .context("failed to load trading calendar")?;
+    log::info!(
+        "[CALENDAR] loaded calendar_version={}",
+        calendar.calendar_version
+    );
+    Ok(calendar)
+}
+
+/// Parse and resolve `ENGINE_B_LIVE_PAIRS_FILE` against the primary
+/// pair's (process-env) config. Any problem refuses the start.
+fn load_pairs_plan(path: &Path, primary_cfg: &EngineBLiveConfig) -> Result<PairsPlan> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("cannot read ENGINE_B_LIVE_PAIRS_FILE {}", path.display()))?;
+    let file: PairsFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("cannot parse ENGINE_B_LIVE_PAIRS_FILE {}", path.display()))?;
+    use sha2::Digest as _;
+    let process = |name: &str| std::env::var(name).ok();
+    let plan = plan_pairs(&file, primary_cfg, &process)?;
+    log::info!(
+        "[PAIRS] {} sha256={} enabled={:?} disabled={:?}",
+        path.display(),
+        hex_prefix(&sha2::Sha256::digest(&bytes), 64),
+        plan.pairs
+            .iter()
+            .map(|p| p.pair_id.as_str())
+            .collect::<Vec<_>>(),
+        plan.disabled
+    );
+    Ok(plan)
+}
+
+/// One engine, exactly as `main` has always built it; the connector,
+/// price feed, clock and venue-equity cell are passed in so the Night
+/// Bridge pairs of one process share them (bot-strategy#1345).
+#[allow(clippy::too_many_arguments)]
+fn build_engine(
+    cfg: EngineBLiveConfig,
+    calendar: TradingCalendar,
+    frozen_spec: Option<ProxyFrozenSpec>,
+    connector: std::sync::Arc<dyn DexConnector + Send + Sync>,
+    feed: Arc<std::sync::Mutex<PriceFeed>>,
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    venue_equity: Arc<std::sync::Mutex<VenueEquityCell>>,
+    status_s3_mirror: Option<Arc<S3Mirror>>,
+) -> EngineBLiveEngine {
+    let mut state = load_state(&cfg.state_path);
+    if state.session_start_equity <= 0.0 {
+        state.session_start_equity = cfg.equity_usd_reference;
+        state.peak_equity = cfg.equity_usd_reference;
+    }
+    if state.session_halted {
+        log::warn!(
+            "[STARTUP] resuming with session_halted=true (reason: {:?}) -- new entries blocked until RISK_ACK at {}",
+            state.session_halt_reason,
+            cfg.risk_ack_path.display()
+        );
+    }
+
+    let engine = EngineBLiveEngine {
+        cfg,
+        connector,
+        calendar,
+        frozen_spec,
+        http_client: Client::new(),
+        feed,
+        clock,
+        current_date: None,
+        window: None,
+        day: DaySnapshot::default(),
+        position: None,
+        pending: None,
+        state,
+        // The first tick reconciles against the exchange before any entry
+        // is allowed (bot-strategy#917).
+        reconciled: false,
+        state_write_pending: false,
+        entry_marker_owned: false,
+        state_writes: 0,
+        last_status_write_us: 0,
+        status_s3_mirror,
+        venue_equity,
+        last_venue_equity_attempt_us: 0,
+        last_position_fingerprint: None,
+        entry_fills: LegFills::default(),
+        exit_fills: LegFills::default(),
+        seen_trade_ids: std::collections::HashSet::new(),
+        fill_ledger_entry_side: None,
+        fill_ledger_trade_open: false,
+        portfolio: None,
+    };
+    if let Some(p) = engine.state.open_position.as_ref() {
+        log::warn!(
+            "[STARTUP] persisted open position: {} {} size={:.6} (session {}, flatten_asap={}) -- \
+             reconciling against the exchange before any entry",
+            p.side,
+            p.symbol,
+            p.open_size,
+            p.session_date,
+            p.flatten_asap
+        );
+    }
+    engine
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logger();
@@ -6419,25 +7501,7 @@ async fn main() -> Result<()> {
         cfg.min_daily_volume_usd,
     );
     cfg.validate()?;
-    let frozen_spec = if cfg.signal_model == "proxy_frozen" {
-        let spec = ProxyFrozenSpec::load(&cfg.proxy_frozen_spec_path)
-            .context("failed to load the frozen proxy spec (signal_model=proxy_frozen)")?;
-        spec.check_against(&cfg)?;
-        log::info!(
-            "[FROZEN_SPEC] path={} fp={} kr={} us={} alpha={} beta={} threshold={} source={:?}",
-            cfg.proxy_frozen_spec_path.display(),
-            spec.fingerprint,
-            spec.kr_primary,
-            spec.us_primary,
-            spec.alpha,
-            spec.beta,
-            spec.threshold,
-            spec.source
-        );
-        Some(spec)
-    } else {
-        None
-    };
+    let frozen_spec = load_frozen_spec(&cfg)?;
 
     // Mirrors robinhood_dipgrid.rs's explicit live-refusal gate: flipping
     // ENGINE_B_LIVE_DRY_RUN=false alone is not enough. This prototype has
@@ -6471,28 +7535,29 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // direction_multiplier only ever means "same as epsilon's sign" (1.0)
-    // or "opposite" (-1.0) -- f64::signum() returns 1.0 for 0.0 (never
-    // 0.0), so a mistyped ENGINE_B_LIVE_DIRECTION_MULTIPLIER=0 would
-    // silently trade as if it were 1.0 instead of the operator's evident
-    // intent to disable directional bias. Reject anything else outright
-    // rather than guess.
-    if cfg.direction_multiplier != 1.0 && cfg.direction_multiplier != -1.0 {
-        anyhow::bail!(
-            "ENGINE_B_LIVE_DIRECTION_MULTIPLIER must be exactly 1.0 or -1.0, got {} \
-             (0.0 would silently behave as 1.0 via f64::signum(), not \"disabled\")",
-            cfg.direction_multiplier
-        );
+    check_direction_multiplier(&cfg)?;
+
+    let calendar = load_calendar(&cfg)?;
+
+    // Night Bridge multi-pair mode (bot-strategy#1345) only when a pairs
+    // file is named. Without one this process is exactly the single-pair
+    // engine it has always been.
+    let pairs_plan = match std::env::var("ENGINE_B_LIVE_PAIRS_FILE") {
+        Ok(path) if !path.trim().is_empty() => Some(load_pairs_plan(Path::new(path.trim()), &cfg)?),
+        _ => None,
+    };
+
+    let mut symbols = cfg.all_symbols();
+    if let Some(plan) = &pairs_plan {
+        // One connector, one WS session, one nonce stream for every pair.
+        for pair in plan.pairs.iter().filter(|p| !p.primary) {
+            for symbol in pair.cfg.all_symbols() {
+                if !symbols.contains(&symbol) {
+                    symbols.push(symbol);
+                }
+            }
+        }
     }
-
-    let calendar = TradingCalendar::load(&cfg.trading_calendar_path)
-        .context("failed to load trading calendar")?;
-    log::info!(
-        "[CALENDAR] loaded calendar_version={}",
-        calendar.calendar_version
-    );
-
-    let symbols = cfg.all_symbols();
     let connector = DexConnectorBox::create(
         "lighter",
         cfg.dry_run,
@@ -6511,61 +7576,116 @@ async fn main() -> Result<()> {
         .subscribe_price_updates()
         .context("subscribe_price_updates failed")?;
 
-    let mut state = load_state(&cfg.state_path);
-    if state.session_start_equity <= 0.0 {
-        state.session_start_equity = cfg.equity_usd_reference;
-        state.peak_equity = cfg.equity_usd_reference;
-    }
-    if state.session_halted {
-        log::warn!(
-            "[STARTUP] resuming with session_halted=true (reason: {:?}) -- new entries blocked until RISK_ACK at {}",
-            state.session_halt_reason,
-            cfg.risk_ack_path.display()
-        );
-    }
-
-    let mut engine = EngineBLiveEngine {
+    let feed = Arc::new(std::sync::Mutex::new(PriceFeed::default()));
+    let clock: Arc<dyn Fn() -> i64 + Send + Sync> = Arc::new(now_us);
+    let venue_equity = Arc::new(std::sync::Mutex::new(VenueEquityCell::default()));
+    let max_price_staleness_secs = cfg.max_price_staleness_secs;
+    let primary = build_engine(
         cfg,
-        connector,
         calendar,
         frozen_spec,
-        http_client: Client::new(),
-        feed: Arc::new(std::sync::Mutex::new(PriceFeed::default())),
-        clock: Arc::new(now_us),
-        current_date: None,
-        window: None,
-        day: DaySnapshot::default(),
-        position: None,
-        pending: None,
-        state,
-        // The first tick reconciles against the exchange before any entry
-        // is allowed (bot-strategy#917).
-        reconciled: false,
-        state_write_pending: false,
-        entry_marker_owned: false,
-        state_writes: 0,
-        last_status_write_us: 0,
-        status_s3_mirror: S3Mirror::from_env(),
-        venue_equity: Arc::new(std::sync::Mutex::new(VenueEquityCell::default())),
-        last_venue_equity_attempt_us: 0,
-        last_position_fingerprint: None,
-        entry_fills: LegFills::default(),
-        exit_fills: LegFills::default(),
-        seen_trade_ids: std::collections::HashSet::new(),
-        fill_ledger_entry_side: None,
-        fill_ledger_trade_open: false,
+        connector.clone(),
+        feed.clone(),
+        clock.clone(),
+        venue_equity.clone(),
+        S3Mirror::from_env(),
+    );
+    let mut night_bridge = match pairs_plan {
+        None => NightBridge {
+            engines: vec![(
+                PairPlan {
+                    pair_id: "primary".to_string(),
+                    primary: true,
+                    cluster: None,
+                    prereg: None,
+                    epsilon_sigma: None,
+                    cfg: primary.cfg.clone(),
+                },
+                primary,
+            )],
+            portfolio: None,
+        },
+        Some(plan) => {
+            let base_dir = std::env::var("ENGINE_B_LIVE_BASE_DIR")
+                .unwrap_or_else(|_| "/var/lib/engine-b-live".to_string());
+            let mut primary = Some(primary);
+            let mut engines = Vec::new();
+            for pair in plan.pairs {
+                if pair.primary {
+                    let engine = primary.take().expect("plan_pairs guarantees one primary");
+                    engines.push((pair, engine));
+                    continue;
+                }
+                log::info!(
+                    "[PAIR] {} instance={} dry_run={} kr_primary={} us_primary={} lot_usd=${:.0} \
+                     epsilon_threshold={:.5} signal_model={} cluster={:?} prereg={:?}",
+                    pair.pair_id,
+                    pair.cfg.instance_id,
+                    pair.cfg.dry_run,
+                    pair.cfg.kr_primary_symbol,
+                    pair.cfg.us_primary_symbol,
+                    pair.cfg.lot_usd,
+                    pair.cfg.epsilon_threshold,
+                    pair.cfg.signal_model,
+                    pair.cluster,
+                    pair.prereg.as_ref().map(|p| (p.issue, p.readout_passed))
+                );
+                check_direction_multiplier(&pair.cfg)
+                    .with_context(|| format!("pair {}", pair.pair_id))?;
+                let spec = load_frozen_spec(&pair.cfg)
+                    .with_context(|| format!("pair {}", pair.pair_id))?;
+                let calendar =
+                    load_calendar(&pair.cfg).with_context(|| format!("pair {}", pair.pair_id))?;
+                let engine = build_engine(
+                    pair.cfg.clone(),
+                    calendar,
+                    spec,
+                    connector.clone(),
+                    feed.clone(),
+                    clock.clone(),
+                    venue_equity.clone(),
+                    // Only the primary pair mirrors to S3: its status.json
+                    // (with the `han_bridge` block) is what debot-dashboard
+                    // renders. Other pairs' status stays on the host until
+                    // the coordinated Night Bridge rename.
+                    None,
+                );
+                engines.push((pair, engine));
+            }
+            let state_path = PathBuf::from(format!("{base_dir}/portfolio_state.json"));
+            let state: PortfolioState = match std::fs::read(&state_path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "{} is unreadable; refusing to start rather than forget a portfolio halt",
+                        state_path.display()
+                    )
+                })?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => PortfolioState::default(),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot read {}", state_path.display()))
+                }
+            };
+            log::info!(
+                "[PORTFOLIO] {} pairs in this process, disabled {:?}, limits {:?}, state {:?}",
+                engines.len(),
+                plan.disabled,
+                plan.portfolio,
+                state
+            );
+            NightBridge {
+                engines,
+                portfolio: Some(PortfolioRuntime {
+                    cfg: plan.portfolio,
+                    state,
+                    state_path,
+                    status_path: PathBuf::from(format!("{base_dir}/portfolio_status.json")),
+                    ack_path: PathBuf::from(format!("{base_dir}/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO")),
+                    disabled: plan.disabled,
+                    last_status_write_us: 0,
+                }),
+            }
+        }
     };
-    if let Some(p) = engine.state.open_position.as_ref() {
-        log::warn!(
-            "[STARTUP] persisted open position: {} {} size={:.6} (session {}, flatten_asap={}) -- \
-             reconciling against the exchange before any entry",
-            p.side,
-            p.symbol,
-            p.open_size,
-            p.session_date,
-            p.flatten_asap
-        );
-    }
 
     // The feed runs in its own task rather than as an arm of the tick
     // loop's `select!` (pairtrade#289 Codex round 4): `tick()` awaits the
@@ -6577,9 +7697,9 @@ async fn main() -> Result<()> {
     let feed_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_price_feed(
         price_rx,
-        engine.feed.clone(),
-        engine.clock.clone(),
-        engine.cfg.max_price_staleness_secs,
+        feed.clone(),
+        clock.clone(),
+        max_price_staleness_secs,
         feed_closed.clone(),
     );
 
@@ -6618,10 +7738,12 @@ async fn main() -> Result<()> {
                     log::error!("[WS] price feed closed, exiting");
                     break;
                 }
-                engine.tick().await;
+                night_bridge.tick().await;
             }
             Wake::Signal(signal) => {
-                let _ = engine.note_shutdown_signal(signal);
+                for (_, engine) in night_bridge.engines.iter_mut() {
+                    let _ = engine.note_shutdown_signal(signal);
+                }
                 break;
             }
         }
@@ -6634,7 +7756,9 @@ async fn main() -> Result<()> {
     // on restart the cache is gone and the row is unrecoverable,
     // leaving that trade permanently unsettled. One last read of an
     // in-memory cache on the way out.
-    engine.harvest_fills(engine.now()).await;
+    for (_, engine) in night_bridge.engines.iter_mut() {
+        engine.harvest_fills(engine.now()).await;
+    }
 
     Ok(())
 }
@@ -8113,6 +9237,7 @@ mod tests {
             seen_trade_ids: std::collections::HashSet::new(),
             fill_ledger_entry_side: None,
             fill_ledger_trade_open: false,
+            portfolio: None,
         };
         Harness {
             engine,
@@ -13056,5 +14181,888 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&h.engine.cfg.status_path).unwrap())
                 .unwrap();
         assert_eq!(v["han_bridge"]["prev_us_marks_ready"], false);
+    }
+
+    // -------------------------------------------------------------
+    // Night Bridge multi-pair mode (bot-strategy#1345)
+    // -------------------------------------------------------------
+
+    /// Owner-approved 2026-11-17 caps; the rest are the proposals in
+    /// `configs/engine-b/pairs.example.json`.
+    fn portfolio_cfg() -> PortfolioCfg {
+        PortfolioCfg {
+            _comment: None,
+            aggregate_cap_pct_of_venue_equity: 30.0,
+            cluster_cap_lot_multiple: 1.5,
+            daily_net_loss_pct_of_venue_equity: 2.0,
+            total_net_loss_pct_of_venue_equity: 5.0,
+            max_venue_equity_age_secs: 900,
+            min_entry_notional_usd: 10.0,
+            priority: "abs_epsilon_over_sigma".to_string(),
+        }
+    }
+
+    fn exposure(
+        pair: &str,
+        cluster: Option<&str>,
+        sign: Option<i8>,
+        notional: f64,
+        date: Option<&str>,
+    ) -> PairExposure {
+        PairExposure {
+            pair_id: pair.to_string(),
+            cluster: cluster.map(str::to_string),
+            sign,
+            notional_usd: notional,
+            session_date: date.map(str::to_string),
+        }
+    }
+
+    fn ctx(equity: Option<f64>, others: Vec<PairExposure>) -> PortfolioCtx {
+        PortfolioCtx {
+            cfg: portfolio_cfg(),
+            pair_id: "mu".to_string(),
+            cluster: Some("memory".to_string()),
+            others,
+            venue_equity_usd: equity,
+            blocked: None,
+        }
+    }
+
+    #[test]
+    fn portfolio_admits_the_full_lot_when_nothing_binds() {
+        assert_eq!(
+            portfolio_admit(&ctx(Some(1000.0), vec![]), 1, Some(TODAY), 100.0, 2),
+            Ok(100.0)
+        );
+    }
+
+    #[test]
+    fn portfolio_hard_cap_follows_venue_equity_not_the_reference() {
+        // #919: a $2,000 lot on a $5,000 account is not clipped to the
+        // $1,800 the `equity_usd_reference` constant would allow ...
+        let mut c = ctx(Some(5000.0), vec![]);
+        c.cfg.aggregate_cap_pct_of_venue_equity = 100.0;
+        c.cfg.cluster_cap_lot_multiple = 1.0;
+        assert_eq!(portfolio_admit(&c, 1, Some(TODAY), 2000.0, 2), Ok(2000.0));
+        // ... and a small account caps a lot it cannot carry (leverage
+        // 1, so the hard cap binds before the aggregate one does).
+        let mut c = ctx(Some(50.0), vec![]);
+        c.cfg.aggregate_cap_pct_of_venue_equity = 100.0;
+        assert_eq!(
+            portfolio_admit(&c, 1, Some(TODAY), 100.0, 1),
+            Ok(50.0 * 0.9)
+        );
+    }
+
+    #[test]
+    fn portfolio_refuses_without_fresh_equity_or_while_blocked() {
+        let e = portfolio_admit(&ctx(None, vec![]), 1, Some(TODAY), 100.0, 2).unwrap_err();
+        assert!(e.starts_with("portfolio_equity_stale"), "{e}");
+        let mut c = ctx(Some(1000.0), vec![]);
+        c.blocked = Some("portfolio_daily_loss: x".to_string());
+        assert_eq!(
+            portfolio_admit(&c, 1, Some(TODAY), 100.0, 2),
+            Err("portfolio_daily_loss: x".to_string())
+        );
+    }
+
+    #[test]
+    fn portfolio_aggregate_cap_shrinks_then_refuses() {
+        // Cap = 30 % of $1,000 = $300. Unrelated clusters so only the
+        // aggregate binds.
+        let others = vec![exposure("tsla", Some("ev"), Some(1), 250.0, Some(TODAY))];
+        assert_eq!(
+            portfolio_admit(&ctx(Some(1000.0), others), 1, Some(TODAY), 100.0, 2),
+            Ok(50.0)
+        );
+        let others = vec![
+            exposure("tsla", Some("ev"), Some(1), 250.0, Some(TODAY)),
+            exposure("aapl", None, Some(-1), 45.0, Some(TODAY)),
+        ];
+        let e = portfolio_admit(&ctx(Some(1000.0), others), 1, Some(TODAY), 100.0, 2).unwrap_err();
+        assert!(e.starts_with("aggregate_cap"), "{e}");
+    }
+
+    #[test]
+    fn portfolio_cluster_cap_counts_same_cluster_same_sign_same_session_only() {
+        // Cap = 1.5 x $100. SNDK long already holds a lot today.
+        let sndk_long = exposure("sndk", Some("memory"), Some(1), 100.0, Some(TODAY));
+        assert_eq!(
+            portfolio_admit(
+                &ctx(Some(10_000.0), vec![sndk_long.clone()]),
+                1,
+                Some(TODAY),
+                100.0,
+                2
+            ),
+            Ok(50.0),
+            "same cluster, same sign, same session: one bet of at most 1.5 lots"
+        );
+        assert_eq!(
+            portfolio_admit(
+                &ctx(Some(10_000.0), vec![sndk_long.clone()]),
+                -1,
+                Some(TODAY),
+                100.0,
+                2
+            ),
+            Ok(100.0),
+            "the opposite sign partly hedges and is not capped"
+        );
+        assert_eq!(
+            portfolio_admit(
+                &ctx(Some(10_000.0), vec![sndk_long.clone()]),
+                1,
+                Some("2026-09-09"),
+                100.0,
+                2
+            ),
+            Ok(100.0),
+            "another session date is another bet"
+        );
+        let other_cluster = exposure("tsla", Some("ev"), Some(1), 100.0, Some(TODAY));
+        assert_eq!(
+            portfolio_admit(
+                &ctx(Some(10_000.0), vec![other_cluster]),
+                1,
+                Some(TODAY),
+                100.0,
+                2
+            ),
+            Ok(100.0)
+        );
+        // An exposure of unknown sign or date counts against both.
+        let unknown = exposure("skhx", Some("memory"), None, 100.0, None);
+        assert_eq!(
+            portfolio_admit(
+                &ctx(Some(10_000.0), vec![unknown]),
+                -1,
+                Some(TODAY),
+                100.0,
+                2
+            ),
+            Ok(50.0)
+        );
+        let full = vec![
+            sndk_long,
+            exposure("smsn", Some("memory"), Some(1), 50.0, Some(TODAY)),
+        ];
+        let e = portfolio_admit(&ctx(Some(10_000.0), full), 1, Some(TODAY), 100.0, 2).unwrap_err();
+        assert!(e.starts_with("cluster_cap"), "{e}");
+    }
+
+    #[test]
+    fn tick_order_is_descending_score_then_config_order() {
+        assert_eq!(
+            tick_order(&[None, Some(2.0), Some(3.5), Some(2.0), None]),
+            vec![2, 1, 3, 0, 4]
+        );
+        assert_eq!(tick_order(&[None, None]), vec![0, 1]);
+    }
+
+    fn pair_entry(id: &str, env: &[(&str, &str)]) -> PairEntry {
+        PairEntry {
+            pair_id: id.to_string(),
+            primary: false,
+            enabled: true,
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            _comment: None,
+        }
+    }
+
+    fn mu_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("ENGINE_B_LIVE_KR_PRIMARY", "SKHYNIXUSD"),
+            ("ENGINE_B_LIVE_US_PRIMARY", "MU"),
+            ("ENGINE_B_LIVE_CONTROL_SYMBOLS", "SOXL"),
+            ("ENGINE_B_LIVE_LOT_USD", "100"),
+            ("ENGINE_B_LIVE_EPSILON_THRESHOLD", "0.02"),
+            ("ENGINE_B_LIVE_SIGNAL_MODEL", "diff"),
+            (
+                "ENGINE_B_LIVE_TRADING_CALENDAR_PATH",
+                "/opt/engine-b-live/pairs/mu/trading_calendar.json",
+            ),
+        ]
+    }
+
+    fn pairs_file(extra: Vec<PairEntry>) -> PairsFile {
+        let mut primary = pair_entry("sndk", &[]);
+        primary.primary = true;
+        let mut pairs = vec![primary];
+        pairs.extend(extra);
+        PairsFile {
+            version: 1,
+            _comment: None,
+            portfolio: portfolio_cfg(),
+            pairs,
+        }
+    }
+
+    /// The process env of a live SNDK primary, as a lookup.
+    fn process_env(name: &str) -> Option<String> {
+        match name {
+            "ENGINE_B_LIVE_BASE_DIR" => Some("/var/lib/engine-b-live".to_string()),
+            "ENGINE_B_LIVE_US_PRIMARY" => Some("SNDK".to_string()),
+            "ENGINE_B_LIVE_KR_PRIMARY" => Some("SKHYNIXUSD".to_string()),
+            "ENGINE_B_LIVE_STATE_PATH" => {
+                Some("/var/lib/engine-b-live/risk_state.json".to_string())
+            }
+            "ENGINE_B_LIVE_DRY_RUN" => Some("false".to_string()),
+            "ENGINE_B_LIVE_SLIPPAGE_BPS" => Some("40".to_string()),
+            _ => None,
+        }
+    }
+
+    fn live_primary() -> EngineBLiveConfig {
+        let mut cfg = EngineBLiveConfig::from_lookup(&process_env);
+        cfg.dry_run = false;
+        cfg
+    }
+
+    #[test]
+    fn a_pair_never_inherits_the_primary_pair_scoped_keys() {
+        let plan = plan_pairs(
+            &pairs_file(vec![pair_entry("mu", &mu_env())]),
+            &live_primary(),
+            &process_env,
+        )
+        .expect("valid");
+        assert_eq!(plan.pairs[0].pair_id, "sndk");
+        assert!(plan.pairs[0].primary);
+        let mu = &plan.pairs[1].cfg;
+        assert_eq!(mu.us_primary_symbol, "MU");
+        assert!(
+            mu.dry_run,
+            "a new pair is paper unless its own env says otherwise"
+        );
+        assert_eq!(mu.instance_id, "engine-b-live-mu");
+        assert_eq!(
+            mu.state_path,
+            PathBuf::from("/var/lib/engine-b-live/pairs/mu/risk_state.json"),
+            "never the primary's STATE_PATH"
+        );
+        assert_eq!(
+            mu.kill_switch_path,
+            PathBuf::from("/var/lib/engine-b-live/KILL_SWITCH"),
+            "one kill switch stops every pair"
+        );
+        assert_eq!(mu.slippage_bps, 40, "process-wide keys are inherited");
+    }
+
+    #[test]
+    fn plan_pairs_refuses_what_two_engines_would_fight_over() {
+        let p = live_primary();
+        let refuse = |file: PairsFile, needle: &str| {
+            let e = plan_pairs(&file, &p, &process_env).unwrap_err().to_string();
+            assert!(e.contains(needle), "expected {needle:?} in {e:?}");
+        };
+        // Same market twice.
+        let mut env = mu_env();
+        env[1] = ("ENGINE_B_LIVE_US_PRIMARY", "SNDK");
+        refuse(
+            pairs_file(vec![pair_entry("dup", &env)]),
+            "share us_primary=SNDK",
+        );
+        // No primary / two primaries / a primary with its own env.
+        let mut f = pairs_file(vec![]);
+        f.pairs[0].primary = false;
+        refuse(f, "exactly one primary");
+        let mut second = pair_entry("mu", &mu_env());
+        second.primary = true;
+        refuse(pairs_file(vec![second]), "exactly one primary");
+        let mut f = pairs_file(vec![]);
+        f.pairs[0]
+            .env
+            .insert("ENGINE_B_LIVE_LOT_USD".to_string(), "200".to_string());
+        refuse(f, "must be empty");
+        // A pair without the keys that say what it trades.
+        let env: Vec<_> = mu_env()
+            .into_iter()
+            .filter(|(k, _)| *k != "ENGINE_B_LIVE_US_PRIMARY")
+            .collect();
+        refuse(
+            pairs_file(vec![pair_entry("mu", &env)]),
+            "ENGINE_B_LIVE_US_PRIMARY must be set",
+        );
+        // Live without a passed readout.
+        let mut env = mu_env();
+        env.push(("ENGINE_B_LIVE_DRY_RUN", "false"));
+        refuse(
+            pairs_file(vec![pair_entry("mu", &env)]),
+            "no passed PREREG readout",
+        );
+        let mut failed = pair_entry("mu", &env);
+        failed.prereg = Some(PreregRef {
+            issue: 1344,
+            sha256: "a".repeat(64),
+            readout_passed: false,
+        });
+        refuse(pairs_file(vec![failed]), "no passed PREREG readout");
+        // Live pair under a DRY_RUN process.
+        let mut passed = pair_entry("mu", &env);
+        passed.prereg = Some(PreregRef {
+            issue: 1344,
+            sha256: "a".repeat(64),
+            readout_passed: true,
+        });
+        let mut dry_primary = live_primary();
+        dry_primary.dry_run = true;
+        let e = plan_pairs(
+            &pairs_file(vec![passed.clone()]),
+            &dry_primary,
+            &process_env,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("runs DRY_RUN"), "{e}");
+        assert!(
+            plan_pairs(&pairs_file(vec![passed]), &p, &process_env).is_ok(),
+            "passed + live process"
+        );
+        // Sigma on some pairs only.
+        let mut f = pairs_file(vec![pair_entry("mu", &mu_env())]);
+        f.pairs[1].epsilon_sigma = Some(0.01);
+        refuse(f, "set it on all or none");
+        // A pair whose staleness bound differs from the shared feed's.
+        let mut env = mu_env();
+        env.push(("ENGINE_B_LIVE_MAX_PRICE_STALENESS_SECS", "60"));
+        refuse(
+            pairs_file(vec![pair_entry("mu", &env)]),
+            "MAX_PRICE_STALENESS_SECS",
+        );
+        // A proxy_frozen pair without its own spec would read the primary's.
+        let mut env = mu_env();
+        env[5] = ("ENGINE_B_LIVE_SIGNAL_MODEL", "proxy_frozen");
+        refuse(
+            pairs_file(vec![pair_entry("mu", &env)]),
+            "needs its own ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH",
+        );
+        // Unknown priority / bad percentages.
+        let mut f = pairs_file(vec![]);
+        f.portfolio.priority = "fifo".to_string();
+        refuse(f, "not implemented");
+        let mut f = pairs_file(vec![]);
+        f.portfolio.aggregate_cap_pct_of_venue_equity = 0.0;
+        refuse(f, "percentages");
+    }
+
+    #[test]
+    fn a_disabled_pair_is_validated_but_never_run() {
+        let mut mu = pair_entry("mu", &mu_env());
+        mu.enabled = false;
+        let plan = plan_pairs(&pairs_file(vec![mu]), &live_primary(), &process_env).unwrap();
+        assert_eq!(plan.pairs.len(), 1);
+        assert_eq!(plan.disabled, vec!["mu".to_string()]);
+    }
+
+    #[test]
+    fn the_shipped_pairs_example_parses_and_enables_only_sndk() {
+        let raw = include_str!("../../configs/engine-b/pairs.example.json");
+        let file: PairsFile = serde_json::from_str(raw).expect("example parses");
+        let plan = plan_pairs(&file, &live_primary(), &process_env).expect("example is valid");
+        assert_eq!(
+            plan.pairs
+                .iter()
+                .map(|p| p.pair_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sndk"],
+            "every pair beyond SNDK ships disabled"
+        );
+        assert_eq!(plan.portfolio.aggregate_cap_pct_of_venue_equity, 30.0);
+        assert_eq!(plan.portfolio.cluster_cap_lot_multiple, 1.5);
+        assert_eq!(plan.portfolio.priority, "abs_epsilon_over_sigma");
+        assert!(!plan.disabled.is_empty());
+    }
+
+    fn runtime(dir: &std::path::Path) -> PortfolioRuntime {
+        PortfolioRuntime {
+            cfg: portfolio_cfg(),
+            state: PortfolioState::default(),
+            state_path: dir.join("portfolio_state.json"),
+            status_path: dir.join("portfolio_status.json"),
+            ack_path: dir.join("RISK_ACK_NIGHT_BRIDGE_PORTFOLIO"),
+            disabled: vec![],
+            last_status_write_us: 0,
+        }
+    }
+
+    #[test]
+    fn portfolio_daily_loss_blocks_for_the_day_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        // 2 % of $1,000 = $20.
+        assert_eq!(rt.evaluate(TODAY, -19.99, 0.0, Some(1000.0)), None);
+        let r = rt.evaluate(TODAY, -20.0, -20.0, Some(1000.0)).unwrap();
+        assert!(r.starts_with("portfolio_daily_loss"), "{r}");
+        assert!(!rt.state.halted, "not sticky");
+        assert_eq!(rt.evaluate("2026-09-09", 0.0, -20.0, Some(1000.0)), None);
+    }
+
+    #[tokio::test]
+    async fn portfolio_total_loss_is_sticky_durable_and_cleared_only_by_its_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        assert_eq!(rt.evaluate(TODAY, 0.0, 7.0, Some(1000.0)), None);
+        assert_eq!(
+            rt.state.baseline_total_pnl,
+            Some(7.0),
+            "measured from what was booked at start"
+        );
+        // 5 % of $1,000 = $50 below the baseline.
+        assert_eq!(rt.evaluate(TODAY, 0.0, -42.99, Some(1000.0)), None);
+        let r = rt.evaluate(TODAY, 0.0, -43.0, Some(1000.0)).unwrap();
+        assert!(r.starts_with("portfolio_total_loss"), "{r}");
+        let on_disk: PortfolioState =
+            serde_json::from_slice(&std::fs::read(&rt.state_path).unwrap()).unwrap();
+        assert!(on_disk.halted, "the halt survives a restart");
+        // A recovery does not lift it; a missing equity reading does not either.
+        assert!(rt
+            .evaluate("2026-09-09", 0.0, 100.0, Some(1000.0))
+            .is_some());
+        assert!(rt.evaluate("2026-09-09", 0.0, 100.0, None).is_some());
+        std::fs::write(&rt.ack_path, b"").unwrap();
+        assert_eq!(rt.evaluate("2026-09-09", 0.0, -43.0, Some(1000.0)), None);
+        assert!(!rt.ack_path.exists(), "the ack is consumed");
+        assert_eq!(
+            rt.state.baseline_total_pnl,
+            Some(-43.0),
+            "losses are re-measured from the ack"
+        );
+    }
+
+    #[test]
+    fn fresh_venue_equity_requires_a_recent_successful_read() {
+        let mut cell = VenueEquityCell::default();
+        assert_eq!(fresh_venue_equity(&cell, T1_US, 900), None);
+        cell.reading = Some(VenueEquity {
+            equity_usd: 1000.0,
+            available_usd: 900.0,
+            fetched_at_us: T1_US,
+        });
+        assert_eq!(
+            fresh_venue_equity(&cell, T1_US + 900_000_000, 900),
+            Some(1000.0)
+        );
+        assert_eq!(fresh_venue_equity(&cell, T1_US + 900_000_001, 900), None);
+        cell.failing = true;
+        assert_eq!(fresh_venue_equity(&cell, T1_US, 900), None);
+    }
+
+    #[tokio::test]
+    async fn exposures_count_positions_pending_entries_and_unknown_claims() {
+        let mut h = harness();
+        let cluster = Some("memory".to_string());
+        assert!(h.engine.portfolio_exposures("sndk", &cluster).is_empty());
+        h.engine.pending = Some(PendingConfirm::Entry {
+            side: OrderSide::Short,
+            requested: 0.05,
+            price: 1700.0,
+            epsilon: -0.03,
+            notional_usd: 85.0,
+            deadline_us: T1_US,
+            after_send_error: None,
+            saw_reading: false,
+        });
+        assert_eq!(
+            h.engine.portfolio_exposures("sndk", &cluster),
+            vec![exposure(
+                "sndk",
+                Some("memory"),
+                Some(-1),
+                85.0,
+                Some(TODAY)
+            )]
+        );
+        h.engine.pending = None;
+        h.engine.state.entry_in_flight = Some("SNDK".to_string());
+        assert_eq!(
+            h.engine.portfolio_exposures("sndk", &cluster),
+            vec![exposure("sndk", Some("memory"), None, 100.0, None)],
+            "an order of unknown outcome is a full lot of unknown sign"
+        );
+        h.engine.state.entry_in_flight = None;
+        open_short(&mut h, 0.05, 1700.0);
+        let e = h.engine.portfolio_exposures("sndk", &cluster);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].sign, Some(-1));
+        assert!((e[0].notional_usd - 85.0).abs() < 1e-9);
+    }
+
+    /// A second engine on the same connector, feed, clock and equity cell
+    /// as `h` -- one process, two pairs -- trading MU off SMSN.
+    fn sibling(h: &Harness, us: &str, kr: &str) -> Harness {
+        let mut s = harness();
+        s.engine.connector = h.connector.clone();
+        s.connector = h.connector.clone();
+        s.engine.feed = h.engine.feed.clone();
+        s.engine.clock = h.engine.clock.clone();
+        s.clock = h.clock.clone();
+        s.engine.venue_equity = h.engine.venue_equity.clone();
+        s.engine.cfg.us_primary_symbol = us.to_string();
+        s.engine.cfg.kr_primary_symbol = kr.to_string();
+        s.engine.cfg.instance_id = format!("test-{}", us.to_lowercase());
+        s
+    }
+
+    fn fund(h: &Harness, equity: &str, fetched_at_us: i64) {
+        *h.connector.balance.lock().unwrap() = Some((
+            Decimal::from_str(equity).unwrap(),
+            Decimal::from_str(equity).unwrap(),
+        ));
+        h.engine.venue_equity.lock().unwrap().reading = Some(VenueEquity {
+            equity_usd: equity.parse().unwrap(),
+            available_usd: equity.parse().unwrap(),
+            fetched_at_us,
+        });
+    }
+
+    fn observe_pair(h: &mut Harness, at: i64, kr: (&str, f64), us: (&str, f64)) {
+        let g = h.engine.feed_generation();
+        h.observe_at(kr.0, kr.1, at, g);
+        h.observe_at(us.0, us.1, at, g);
+        h.observe_at("SOXL", 100.0, at, g);
+        h.observe_at("NVDA", 200.0, at, g);
+    }
+
+    /// Two memory-cluster pairs fire long in the same loop. The stronger
+    /// signal is ticked first and gets the full lot; the weaker one gets
+    /// what the 1.5-lot cluster cap leaves. Both orders go through the
+    /// one shared connector, one after the other.
+    #[tokio::test]
+    async fn two_pairs_in_one_cluster_share_one_bet_strongest_first() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        fund(&a, "10000", T1_US);
+        let t0 = T0_US;
+        observe_pair(&mut a, t0, ("SKHY", 180.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t0, ("SMSN", 50.0), ("MU", 100.0));
+        a.engine.maybe_capture_t0(t0);
+        b.engine.maybe_capture_t0(t0);
+        let t1 = T1_US + 1_000_000;
+        // SNDK pair: KR +2.2 %; MU pair: KR +6 % -> MU is stronger.
+        observe_pair(&mut a, t1, ("SKHY", 184.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t1, ("SMSN", 53.0), ("MU", 100.0));
+        a.engine.day.eligibility_confirmed = true;
+        b.engine.day.eligibility_confirmed = true;
+        a.set_now(t1);
+        let mut nb = NightBridge {
+            engines: vec![],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        let plan = |id: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let a_cfg = a.engine.cfg.clone();
+        let b_cfg = b.engine.cfg.clone();
+        let connector = a.connector.clone();
+        let a_engine = std::mem::replace(&mut a.engine, harness().engine);
+        let b_engine = std::mem::replace(&mut b.engine, harness().engine);
+        nb.engines.push((plan("sndk", &a_cfg), a_engine));
+        nb.engines.push((plan("mu", &b_cfg), b_engine));
+        nb.tick().await;
+        let orders = connector.orders.lock().unwrap().clone();
+        assert_eq!(orders.len(), 2, "{orders:?}");
+        assert_eq!(
+            orders[0].0, "MU",
+            "the larger |epsilon|/threshold goes first"
+        );
+        assert_eq!(orders[1].0, "SNDK");
+        let mu_notional = orders[0].1.to_f64().unwrap() * 100.0;
+        let sndk_notional = orders[1].1.to_f64().unwrap() * 1700.0;
+        assert!((mu_notional - 100.0).abs() < 0.01, "{mu_notional}");
+        assert!(
+            (sndk_notional - 50.0).abs() < 0.01,
+            "the second same-sign memory entry gets the 0.5 lot the 1.5x cap leaves: {sndk_notional}"
+        );
+    }
+
+    /// The aggregate cap across pairs of different clusters: the second
+    /// entry is refused outright when the room left is below the minimum.
+    #[tokio::test]
+    async fn the_aggregate_cap_refuses_a_second_pair_when_the_account_is_full() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        fund(&a, "350", T1_US); // 30 % = $105: one $100 lot fits, a $5 remainder does not.
+        observe_pair(&mut a, T0_US, ("SKHY", 180.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, T0_US, ("SMSN", 50.0), ("MU", 100.0));
+        a.engine.maybe_capture_t0(T0_US);
+        b.engine.maybe_capture_t0(T0_US);
+        let t1 = T1_US + 1_000_000;
+        observe_pair(&mut a, t1, ("SKHY", 190.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t1, ("SMSN", 51.0), ("MU", 100.0));
+        a.engine.day.eligibility_confirmed = true;
+        b.engine.day.eligibility_confirmed = true;
+        a.set_now(t1);
+        let mut nb = NightBridge {
+            engines: vec![],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        let mk = |id: &str, cluster: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some(cluster.to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let (a_cfg, b_cfg) = (a.engine.cfg.clone(), b.engine.cfg.clone());
+        let connector = a.connector.clone();
+        nb.engines.push((
+            mk("sndk", "memory", &a_cfg),
+            std::mem::replace(&mut a.engine, harness().engine),
+        ));
+        nb.engines.push((
+            mk("mu", "other", &b_cfg),
+            std::mem::replace(&mut b.engine, harness().engine),
+        ));
+        nb.tick().await;
+        let orders = connector.orders.lock().unwrap().clone();
+        assert_eq!(orders.len(), 1, "{orders:?}");
+        assert_eq!(orders[0].0, "SNDK", "KR +5.6 % beats +2 %");
+        let skip = nb.engines[1].1.day.skip_reason.clone().unwrap_or_default();
+        assert!(skip.starts_with("aggregate_cap"), "{skip}");
+    }
+
+    /// Regression for the single-pair path (bot-strategy#1345 acceptance):
+    /// the same scripted session -- t0 capture, a t1 signal, the entry,
+    /// its confirmation, the t2 exit -- driven through (a) the bare
+    /// engine as `main` ran it before this change, (b) `NightBridge` in
+    /// single-pair mode, and (c) `NightBridge` in multi-pair mode with
+    /// SNDK as the only pair and caps that do not bind, must send the
+    /// same orders at the same limits and leave byte-identical
+    /// state/status/pnl/fills files.
+    #[tokio::test]
+    async fn one_sndk_pair_behaves_exactly_like_the_single_engine() {
+        #[derive(Clone, Copy)]
+        enum Driver {
+            Bare,
+            Single,
+            Portfolio,
+        }
+        async fn run(
+            driver: Driver,
+        ) -> (
+            Vec<(String, Decimal, OrderSide, bool)>,
+            Vec<Decimal>,
+            Vec<Vec<serde_json::Value>>,
+        ) {
+            let mut h = harness();
+            fund(&h, "1000", T0_US);
+            let dir = h._dir.path().to_path_buf();
+            let cfg = h.engine.cfg.clone();
+            let connector = h.connector.clone();
+            let clock = h.clock.clone();
+            let engine = std::mem::replace(&mut h.engine, harness().engine);
+            let mut nb = NightBridge {
+                engines: vec![(
+                    PairPlan {
+                        pair_id: "sndk".to_string(),
+                        primary: true,
+                        cluster: Some("memory".to_string()),
+                        prereg: None,
+                        epsilon_sigma: None,
+                        cfg,
+                    },
+                    engine,
+                )],
+                portfolio: match driver {
+                    Driver::Portfolio => Some(runtime(&dir)),
+                    _ => None,
+                },
+            };
+            let set = |t: i64| clock.store(t, std::sync::atomic::Ordering::SeqCst);
+            let observe = |nb: &mut NightBridge, at: i64, kr: f64, us: f64| {
+                let e = &nb.engines[0].1;
+                let g = e.feed_generation();
+                let mut feed = e.feed.lock().unwrap();
+                for (sym, mid) in [("SKHY", kr), ("SNDK", us), ("SOXL", 100.0), ("NVDA", 200.0)] {
+                    feed.latest.insert(
+                        sym.to_string(),
+                        PriceObs {
+                            mid,
+                            best_bid: mid * 0.999,
+                            best_ask: mid * 1.001,
+                            received_at_us: at,
+                            exchange_ts_us: Some(at),
+                            generation: g,
+                        },
+                    );
+                }
+            };
+            let steps: Vec<(i64, f64, f64)> = vec![
+                (T0_US, 180.0, 1700.0),
+                (T0_US + 60_000_000, 181.0, 1701.0),
+                (T1_US - 30_000_000, 189.0, 1702.0),
+                (T1_US + 1_000_000, 190.0, 1702.5),
+                (T1_US + 6_000_000, 190.0, 1703.0),
+                (T1_US + 40_000_000, 190.0, 1704.0),
+                (T2_US, 190.0, 1719.1),
+                (T2_US + 5_000_000, 190.0, 1719.0),
+                (T2_US + 40_000_000, 190.0, 1718.0),
+            ];
+            for (i, (t, kr, us)) in steps.into_iter().enumerate() {
+                set(t);
+                observe(&mut nb, t, kr, us);
+                if i == 3 {
+                    nb.engines[0].1.day.eligibility_confirmed = true;
+                }
+                // The venue confirms the entry after it went out, and the
+                // exit after it went out.
+                let sent = connector.order_count();
+                if sent == 1 && connector.positions.lock().unwrap().is_empty() && i < 6 {
+                    let size = connector.orders.lock().unwrap()[0].1.to_string();
+                    connector.positions.lock().unwrap().push(snap(
+                        "SNDK",
+                        &size,
+                        1,
+                        Some("1702.5"),
+                    ));
+                }
+                if sent == 2 {
+                    connector.positions.lock().unwrap().clear();
+                }
+                match driver {
+                    Driver::Bare => nb.engines[0].1.tick().await,
+                    Driver::Single | Driver::Portfolio => nb.tick().await,
+                }
+                // Let the spawned venue-equity read land, as the 5 s tick
+                // interval does in production.
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let files: Vec<Vec<serde_json::Value>> =
+                ["state.json", "status.json", "pnl.jsonl", "fills.jsonl"]
+                    .iter()
+                    .map(|f| {
+                        let raw = std::fs::read_to_string(dir.join(f))
+                            .unwrap_or_default()
+                            .replace(dir.to_str().unwrap(), "<DIR>");
+                        // Parsed, so a HashMap's iteration order is not a
+                        // difference; every value still is.
+                        if f.ends_with(".json") {
+                            let mut v: serde_json::Value =
+                                serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                            // The one wall-clock field (`Utc::now()` at the
+                            // write, not the engine's clock): it differs
+                            // between any two runs, two bare ones included.
+                            if let Some(m) = v.as_object_mut() {
+                                m.remove("updated_at");
+                            }
+                            vec![v]
+                        } else {
+                            raw.lines()
+                                .map(|l| serde_json::from_str(l).unwrap())
+                                .collect()
+                        }
+                    })
+                    .collect();
+            let orders = connector.orders.lock().unwrap().clone();
+            let limits = connector.taker_ioc_limits.lock().unwrap().clone();
+            (orders, limits, files)
+        }
+        let bare = run(Driver::Bare).await;
+        assert_eq!(
+            bare.0.len(),
+            2,
+            "the script must produce an entry and an exit: {:?}",
+            bare.0
+        );
+        assert!(!bare.0[0].3 && bare.0[1].3, "entry then reduce-only exit");
+        assert!(
+            (bare.0[0].1.to_f64().unwrap() * 1702.5 - 100.0).abs() < 0.01,
+            "today's $100 lot"
+        );
+        assert!(bare.2[1][0].is_object(), "status.json was written");
+        assert_eq!(bare.2[2].len(), 1, "one settled trade in pnl.jsonl");
+        for driver in [Driver::Single, Driver::Portfolio] {
+            let other = run(driver).await;
+            assert_eq!(other.0, bare.0, "orders");
+            assert_eq!(other.1, bare.1, "limits");
+            for (i, name) in ["state.json", "status.json", "pnl.jsonl", "fills.jsonl"]
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(other.2[i], bare.2[i], "{name} differs");
+            }
+        }
+    }
+
+    /// A paper (DRY_RUN) pair inside a live process: its simulated long in
+    /// the same cluster must not shrink the live pair's real order, and
+    /// its paper loss must not halt it.
+    #[tokio::test]
+    async fn a_paper_pair_never_consumes_live_capacity_or_halts_it() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        b.engine.cfg.dry_run = true;
+        fund(&a, "10000", T1_US);
+        // MU paper: a simulated long lot open today and a big paper loss.
+        b.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 100.0,
+            entry_price_estimated: false,
+            entry_price_unknown: false,
+            size: 1.0,
+            open_size: 1.0,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: false,
+            exit_deadline_us: Some(T2_US + 900_000_000),
+        });
+        b.engine.state.realized_pnl_session = -5000.0;
+        b.engine.state.pnl_today = -5000.0;
+        b.engine.state.pnl_today_date = Some(TODAY.to_string());
+        observe_pair(&mut a, T0_US, ("SKHY", 180.0), ("SNDK", 1700.0));
+        a.engine.maybe_capture_t0(T0_US);
+        let t1 = T1_US + 1_000_000;
+        observe_pair(&mut a, t1, ("SKHY", 190.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t1, ("SMSN", 50.0), ("MU", 100.0));
+        a.engine.day.eligibility_confirmed = true;
+        a.set_now(t1);
+        let mk = |id: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let (a_cfg, b_cfg) = (a.engine.cfg.clone(), b.engine.cfg.clone());
+        let connector = a.connector.clone();
+        let mut nb = NightBridge {
+            engines: vec![
+                (
+                    mk("sndk", &a_cfg),
+                    std::mem::replace(&mut a.engine, harness().engine),
+                ),
+                (
+                    mk("mu", &b_cfg),
+                    std::mem::replace(&mut b.engine, harness().engine),
+                ),
+            ],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        nb.tick().await;
+        let orders = connector.orders.lock().unwrap().clone();
+        let live: Vec<_> = orders.iter().filter(|o| o.0 == "SNDK").collect();
+        assert_eq!(live.len(), 1, "{orders:?}");
+        assert!(
+            (live[0].1.to_f64().unwrap() * 1700.0 - 100.0).abs() < 0.01,
+            "the full $100 lot: a paper position is not a real one"
+        );
+        assert!(!nb.portfolio.as_ref().unwrap().state.halted);
     }
 }
