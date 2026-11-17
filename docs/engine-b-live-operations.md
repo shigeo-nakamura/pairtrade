@@ -631,3 +631,53 @@ make the service fail to start (fail-closed, not a silent bad default).
   already acted on. After a restart mid-position, the `[RECONCILE]` line
   in the journal is the record of what the account actually held -- read
   it rather than assuming the state file alone was right.
+
+## Night Bridge multi-pair mode (bot-strategy#1345)
+
+**Off unless `ENGINE_B_LIVE_PAIRS_FILE` is set.** `configs/engine-b/live.json` does not set it, so the deployed unit runs the
+single SNDK engine exactly as before; the multi-pair code is unreachable in that mode (proven by the
+`one_sndk_pair_behaves_exactly_like_the_single_engine` test: same orders, limits, state/status/pnl/fills files).
+
+Why one process: every pair trades from the same Lighter account and API key, and two processes on one key race on the nonce
+stream (owner decision 2026-11-15). One connector, one WS session, one nonce stream; the engines are ticked **sequentially in one
+task**, so no two pairs ever have a `sendTx` in flight at the same time.
+
+- **Pairs file** (`configs/engine-b/pairs.example.json`): exactly one `primary` pair = the process environment (today's SNDK
+  engine, unchanged files and S3 status mirror, `han_bridge` block intact). Every other pair is configured by its own `env` map of
+  `ENGINE_B_LIVE_*` keys; pair-scoped keys (symbols, lot, threshold, signal model, spec, calendar, paths, instance id, DRY_RUN)
+  never fall back to the process env; files default to `<base>/pairs/<pair_id>/`; the kill switch is shared. A new pair is
+  DRY_RUN unless its env says otherwise, and may only be live with `prereg.readout_passed=true` (+ issue + sha256). Startup
+  refuses duplicate markets/ids/files, a live pair under a DRY_RUN primary, a staleness bound that differs from the primary's,
+  and `epsilon_sigma` set on only some pairs. `enabled: false` pairs are validated and listed, never run.
+- **Portfolio gate** (`portfolio_admit`, after every await of the entry tick, before the send):
+  hard notional cap = fresh venue equity × leverage × 0.9 (not `EQUITY_USD_REFERENCE`, #919);
+  aggregate cap = open + pending + in-flight Night Bridge notional ≤ `aggregate_cap_pct_of_venue_equity` (owner-approved 30 %);
+  cluster cap = same cluster, same sign, same session date ≤ `cluster_cap_lot_multiple` × lot (owner-approved 1.5; memory =
+  SNDK, MU, SAMSUNGUSD/SMSN, SKHX). A cap shrinks an entry down to `min_entry_notional_usd`, below that the day is skipped with
+  `skip_reason` `aggregate_cap` / `cluster_cap`. No fresh equity (missing, failing, older than `max_venue_equity_age_secs`) →
+  `portfolio_equity_stale` skip.
+- **Net-PnL halts across pairs** (proposals pending the owner), on live pairs only (paper PnL never halts a live pair), each
+  pair measured from its own baseline in `<base>/portfolio_state.json` (a pair that starts counting -- added, or flipped from
+  DRY_RUN to live -- is baselined at that moment, so its history neither halts nor masks): daily — Σ booked PnL since the start
+  of the UTC day ≤ −`daily_net_loss_pct` of equity **latches** for the rest of that UTC day whatever PnL or equity does next;
+  total — Σ booked PnL since the last portfolio ack ≤ −`total_net_loss_pct` is sticky. Both persist across restarts and are
+  cleared early only by `touch <base>/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO`, which also re-bases every pair. The total check runs
+  even while the daily halt is latched. If `portfolio_state.json` cannot be written, no entry is admitted
+  (`portfolio_state_unwritable`) and the write is retried every loop. Per-pair session-DD halts and RISK_ACK files are
+  unchanged; `ENGINE_B_LIVE_KILL_SWITCH_PATH` cannot be set per pair.
+- **Exposure counted by the gate**: the tracked position; else a pending entry; else a full lot of unknown sign for an order of
+  unknown outcome (in flight, or `position_unconfirmed` -- at most the order itself); else a persisted record not yet restored;
+  plus every parked record. Positions and records are valued at the larger of entry price and current mid; one whose size is
+  known but which has neither is **unbounded** and blocks every portfolio entry (`portfolio_exposure_unbounded`) until it can
+  be valued. A loop that began with any counted pair unreconciled sends no entry at all.
+  Venue equity, the pair's own booked PnL and the loss limits (at that equity) are re-checked at the send itself; a moved
+  input defers the entry to the next loop rather than spending the day.
+- Non-primary pairs' writable directories (`<base>/pairs/<id>/` by default) are created at startup, or the start is refused.
+  The first loop after a restart already orders the pairs by signal (each engine's day is restored before the priorities).
+- **Priority** (owner-approved): when several pairs are due in one loop they are ticked in descending `|ε|/σ` (σ = the pair's
+  frozen `epsilon_sigma`; while no pair has one, `|ε|/threshold` for all), ties in config order.
+- **Status**: `<base>/portfolio_status.json` (local, every 30 s): limits, venue equity, exposures, halts, per-pair summary and the
+  disabled pairs. Non-primary pairs write their own local `status.json`; only the primary mirrors to S3.
+
+Enabling it is an owner decision after the 2026-12-01 990-oos PROCEED: install the pairs file + each pair's frozen spec/calendar,
+set `ENGINE_B_LIVE_PAIRS_FILE` in `live.json`, and restart in the 13:30–24:00 UTC window while flat (owner-approved restart).

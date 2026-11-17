@@ -1,0 +1,59 @@
+{
+  "_comment": "Night Bridge multi-pair config (bot-strategy#1345). NOT loaded unless ENGINE_B_LIVE_PAIRS_FILE names it; the shipped engine-b-live unit does not, so production runs today's single SNDK engine. One process, one Lighter connector/nonce stream for every pair. The primary pair is the process environment (configs/engine-b/live.json); every other pair is configured by its own env map, never inherits pair-scoped keys, starts DRY_RUN, and may only trade live with prereg.readout_passed=true after its own readout and a separate owner approval. Enabling anything here requires the 2026-12-01 leadlag-kr-us-memory-990-oos PROCEED (#987) first.",
+  "version": 1,
+  "portfolio": {
+    "_comment": "OWNER-APPROVED 2026-11-17 (bot-strategy#1345 comment 6951939320): aggregate_cap_pct_of_venue_equity 30, cluster_cap_lot_multiple 1.5 (memory cluster = SNDK, MU, SAMSUNGUSD/SMSN, SKHX), priority abs_epsilon_over_sigma (ties by config order), per-pair lot unchanged. PROPOSALS, owner decision pending: daily_net_loss_pct_of_venue_equity 2, total_net_loss_pct_of_venue_equity 5 (= the per-pair 500 bps session-DD limit, applied to the sum), max_venue_equity_age_secs 900, min_entry_notional_usd 10.",
+    "aggregate_cap_pct_of_venue_equity": 30.0,
+    "cluster_cap_lot_multiple": 1.5,
+    "daily_net_loss_pct_of_venue_equity": 2.0,
+    "total_net_loss_pct_of_venue_equity": 5.0,
+    "max_venue_equity_age_secs": 900,
+    "min_entry_notional_usd": 10.0,
+    "priority": "abs_epsilon_over_sigma"
+  },
+  "pairs": [
+    {
+      "_comment": "Today's engine: SKHYNIXUSD -> SNDK proxy_frozen, $100 lot, configured by the process env (live.json). Live since 2026-09-10 under #866; its 990-oos readout is 2026-12-01. epsilon_sigma stays unset until a frozen residual sigma exists for every enabled pair (the priority then falls back to |epsilon|/threshold for all).",
+      "pair_id": "sndk",
+      "primary": true,
+      "enabled": true,
+      "cluster": "memory"
+    },
+    {
+      "_comment": "PLACEHOLDER (#1342 inventory row MU). No PREREG yet: needs its own frozen spec (proxy_frozen.json for MU), calendar and readout before enabled=true; then DRY_RUN for >= 5 sessions inside the live process, then live only with prereg.readout_passed=true and owner approval.",
+      "pair_id": "mu",
+      "enabled": false,
+      "cluster": "memory",
+      "env": {
+        "ENGINE_B_LIVE_KR_PRIMARY": "SKHYNIXUSD",
+        "ENGINE_B_LIVE_US_PRIMARY": "MU",
+        "ENGINE_B_LIVE_CONTROL_SYMBOLS": "SOXL,NVDA,EWY,USDKRW",
+        "ENGINE_B_LIVE_LOT_USD": "100",
+        "ENGINE_B_LIVE_EPSILON_THRESHOLD": "0.02",
+        "ENGINE_B_LIVE_SIGNAL_MODEL": "proxy_frozen",
+        "ENGINE_B_LIVE_PROXY_FROZEN_SPEC_PATH": "/opt/engine-b-live/pairs/mu/proxy_frozen.json",
+        "ENGINE_B_LIVE_TRADING_CALENDAR_PATH": "/opt/engine-b-live/pairs/mu/trading_calendar.json"
+      }
+    },
+    {
+      "_comment": "PLACEHOLDER (#1344, PREREG sha 47bab79f... in study dir 2026-11-15-engine-b-samsungusd). Its rule (sign of the KRX session, held on the Lighter SAMSUNGUSD perp id 162 to the US open) is not a signal model this binary implements yet: enabling it needs that model, its tape readout PASS (after the 12-01 PROCEED), DRY_RUN sessions, and owner approval. The env below only reserves its symbols and files.",
+      "pair_id": "samsungusd",
+      "enabled": false,
+      "cluster": "memory",
+      "prereg": {
+        "issue": 1344,
+        "sha256": "47bab79fbaeb62e1ed755ec4046464679d42bf865d11cb00936b8747890ec13b",
+        "readout_passed": false
+      },
+      "env": {
+        "ENGINE_B_LIVE_KR_PRIMARY": "SAMSUNGUSD",
+        "ENGINE_B_LIVE_US_PRIMARY": "SAMSUNGUSD",
+        "ENGINE_B_LIVE_CONTROL_SYMBOLS": "EWY,USDKRW",
+        "ENGINE_B_LIVE_LOT_USD": "100",
+        "ENGINE_B_LIVE_EPSILON_THRESHOLD": "0.02",
+        "ENGINE_B_LIVE_SIGNAL_MODEL": "diff",
+        "ENGINE_B_LIVE_TRADING_CALENDAR_PATH": "/opt/engine-b-live/pairs/samsungusd/trading_calendar.json"
+      }
+    }
+  ]
+}
