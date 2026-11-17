@@ -5216,8 +5216,33 @@ impl EngineBLiveEngine {
             Some(portfolio) => {
                 let sign: i8 = if side == OrderSide::Long { 1 } else { -1 };
                 let date = self.current_date.map(|d| d.to_string());
+                // The portfolio was evaluated before this tick's awaits.
+                // Two inputs can move during them and are re-read here,
+                // at the send (pairtrade#430 Codex P2): venue equity (the
+                // shared cell may have aged past its bound or turned
+                // failing), and this pair's own booked PnL (a
+                // reconciliation earlier in this tick may have booked a
+                // loss the portfolio halts were not evaluated on -- in
+                // that case wait for the next tick's evaluation rather
+                // than spend the day).
+                let mut portfolio = portfolio.clone();
+                portfolio.venue_equity_usd = fresh_venue_equity(
+                    &self.venue_equity.lock().expect("venue equity mutex"),
+                    self.now(),
+                    portfolio.cfg.max_venue_equity_age_secs,
+                );
+                if (self.state.realized_pnl_session, self.state.pnl_today) != portfolio.own_pnl {
+                    log::warn!(
+                        "[PORTFOLIO] {} booked PnL moved during this tick ({:?} -> {:?}); not \
+                         sending until the portfolio halts are re-evaluated next tick",
+                        portfolio.pair_id,
+                        portfolio.own_pnl,
+                        (self.state.realized_pnl_session, self.state.pnl_today)
+                    );
+                    return;
+                }
                 match portfolio_admit(
-                    portfolio,
+                    &portfolio,
                     sign,
                     date.as_deref(),
                     self.cfg.lot_usd,
@@ -6879,6 +6904,9 @@ struct PortfolioCtx {
     venue_equity_usd: Option<f64>,
     /// A portfolio-level halt (daily or total net loss) in force.
     blocked: Option<String>,
+    /// This pair's `(realized_pnl_session, pnl_today)` when `blocked` was
+    /// evaluated; the gate refuses to send if either moved since.
+    own_pnl: (f64, f64),
 }
 
 /// Admit, shrink or refuse one entry. Pure: every input is passed in, so
@@ -7011,8 +7039,29 @@ impl EngineBLiveEngine {
         }) = &self.pending
         {
             out.push(mk(Some(side_sign(*side)), *notional_usd, today.clone()));
-        } else if self.state.entry_in_flight.is_some() {
+        } else if self.state.entry_in_flight.is_some() || self.state.position_unconfirmed {
+            // An order whose outcome is unknown -- in flight, or its
+            // confirmation window ended without a readable account
+            // (`position_unconfirmed`, also what startup reconciliation
+            // turns a stale in-flight marker into). It may have filled;
+            // until it is adopted or acknowledged it holds a full lot of
+            // unknown sign (pairtrade#430 Codex P1).
             out.push(mk(None, self.cfg.lot_usd, None));
+        } else if let Some(record) = self.state.open_position.as_ref() {
+            // A persisted claim not (yet) restored into `position` -- the
+            // pre-reconciliation window, or a DRY_RUN record naming another
+            // symbol. The record is the claim; count it.
+            let notional = if record.entry_price_unknown || !(record.entry_price > 0.0) {
+                self.cfg.lot_usd
+            } else {
+                record.open_size.abs() * record.entry_price
+            };
+            let sign = if record.symbol == self.cfg.us_primary_symbol {
+                side_from_str(&record.side).map(side_sign)
+            } else {
+                None
+            };
+            out.push(mk(sign, notional, Some(record.session_date.clone())));
         }
         for p in &self.state.unmanaged_positions {
             let notional = if p.entry_price_unknown || !(p.entry_price > 0.0) {
@@ -7079,17 +7128,49 @@ fn tick_order(scores: &[Option<f64>]) -> Vec<usize> {
     order
 }
 
-/// Durable portfolio-level state: the sticky total-loss halt and the
-/// booked-PnL baseline it is measured from (rebased by the portfolio
-/// RISK_ACK).
+/// Durable portfolio-level state (`<base>/portfolio_state.json`).
+///
+/// Losses are measured **per pair from a baseline** rather than as a sum
+/// of lifetimes: a pair that starts counting (added to the file, or
+/// flipped from DRY_RUN to live) is baselined at its booked PnL at that
+/// moment, so its paper history or pre-portfolio record can neither halt
+/// nor mask anything; a pair that stops counting is dropped and
+/// re-baselined if it returns. The daily baselines are per UTC date.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 struct PortfolioState {
+    /// `realized_pnl_session` of each counted pair at its baseline.
     #[serde(default)]
-    baseline_total_pnl: Option<f64>,
+    total_baselines: std::collections::BTreeMap<String, f64>,
+    /// UTC date the `day_baselines` belong to.
+    #[serde(default)]
+    day: Option<String>,
+    /// Each counted pair's booked PnL for `day` at its baseline -- 0.0 for
+    /// a pair counted from the start of the day.
+    #[serde(default)]
+    day_baselines: std::collections::BTreeMap<String, f64>,
+    /// The daily limit was breached on this UTC date: entries stay blocked
+    /// for the rest of it whatever PnL or equity does next
+    /// (pairtrade#430 Codex P2).
+    #[serde(default)]
+    daily_halt_date: Option<String>,
+    #[serde(default)]
+    daily_halt_reason: Option<String>,
+    /// Sticky total-loss halt, cleared only by the portfolio RISK_ACK.
     #[serde(default)]
     halted: bool,
     #[serde(default)]
     halt_reason: Option<String>,
+}
+
+/// One counted pair's booked PnL as the portfolio halts see it.
+#[derive(Debug, Clone, PartialEq)]
+struct PairPnl {
+    pair_id: String,
+    /// `pnl_today` when it belongs to the evaluated date, else 0.0.
+    today: f64,
+    /// `realized_pnl_session`.
+    total: f64,
 }
 
 struct PortfolioRuntime {
@@ -7103,25 +7184,31 @@ struct PortfolioRuntime {
 }
 
 impl PortfolioRuntime {
-    /// The portfolio-level block for this loop, given every pair's booked
-    /// PnL. `None` = entries allowed.
+    /// The portfolio-level block for this loop, given every counted
+    /// pair's booked PnL. `None` = entries allowed.
     fn evaluate(
         &mut self,
         today: &str,
-        pnl_today_sum: f64,
-        total_pnl_sum: f64,
+        pairs: &[PairPnl],
         venue_equity_usd: Option<f64>,
     ) -> Option<String> {
+        let mut dirty = false;
         if self.ack_path.exists() {
             log::warn!(
-                "[PORTFOLIO] RISK_ACK at {}: clearing {:?}, baseline ${:.2} -> ${total_pnl_sum:.2}",
+                "[PORTFOLIO] RISK_ACK at {}: clearing total halt {:?} and daily halt {:?}; \
+                 losses are measured from now",
                 self.ack_path.display(),
                 self.state.halt_reason,
-                self.state.baseline_total_pnl.unwrap_or(0.0)
+                self.state.daily_halt_reason
             );
             self.state.halted = false;
             self.state.halt_reason = None;
-            self.state.baseline_total_pnl = Some(total_pnl_sum);
+            self.state.daily_halt_date = None;
+            self.state.daily_halt_reason = None;
+            self.state.total_baselines =
+                pairs.iter().map(|p| (p.pair_id.clone(), p.total)).collect();
+            self.state.day = Some(today.to_string());
+            self.state.day_baselines = pairs.iter().map(|p| (p.pair_id.clone(), p.today)).collect();
             self.persist();
             if let Err(e) = std::fs::remove_file(&self.ack_path) {
                 log::warn!(
@@ -7130,17 +7217,70 @@ impl PortfolioRuntime {
                 );
             }
         }
-        if self.state.baseline_total_pnl.is_none() {
-            // First run: losses are measured from what was already booked
-            // when portfolio mode started, not from the pairs' lifetimes.
-            self.state.baseline_total_pnl = Some(total_pnl_sum);
+        if self.state.day.as_deref() != Some(today) {
+            self.state.day = Some(today.to_string());
+            self.state.day_baselines.clear();
+            dirty = true;
+        }
+        if self
+            .state
+            .daily_halt_date
+            .as_deref()
+            .is_some_and(|d| d != today)
+        {
+            log::info!(
+                "[PORTFOLIO] daily halt of {:?} expired with the UTC date",
+                self.state.daily_halt_date
+            );
+            self.state.daily_halt_date = None;
+            self.state.daily_halt_reason = None;
+            dirty = true;
+        }
+        let ids: std::collections::BTreeSet<&str> =
+            pairs.iter().map(|p| p.pair_id.as_str()).collect();
+        let before = (
+            self.state.total_baselines.len(),
+            self.state.day_baselines.len(),
+        );
+        self.state
+            .total_baselines
+            .retain(|k, _| ids.contains(k.as_str()));
+        self.state
+            .day_baselines
+            .retain(|k, _| ids.contains(k.as_str()));
+        dirty |= before
+            != (
+                self.state.total_baselines.len(),
+                self.state.day_baselines.len(),
+            );
+        for p in pairs {
+            if !self.state.total_baselines.contains_key(&p.pair_id) {
+                self.state
+                    .total_baselines
+                    .insert(p.pair_id.clone(), p.total);
+                dirty = true;
+            }
+            if !self.state.day_baselines.contains_key(&p.pair_id) {
+                self.state.day_baselines.insert(p.pair_id.clone(), p.today);
+                dirty = true;
+            }
+        }
+        if dirty {
             self.persist();
         }
         if self.state.halted {
             return self.state.halt_reason.clone();
         }
+        if self.state.daily_halt_date.as_deref() == Some(today) {
+            return self.state.daily_halt_reason.clone();
+        }
+        // Without a fresh equity reading the limits cannot be computed;
+        // `portfolio_admit` refuses every entry in that state anyway.
         let equity = venue_equity_usd?;
-        let total = total_pnl_sum - self.state.baseline_total_pnl.unwrap_or(0.0);
+        let total: f64 = pairs
+            .iter()
+            .map(|p| p.total - self.state.total_baselines[&p.pair_id])
+            .sum();
         let total_limit = equity * self.cfg.total_net_loss_pct_of_venue_equity / 100.0;
         if total <= -total_limit {
             let reason = format!(
@@ -7159,13 +7299,28 @@ impl PortfolioRuntime {
             );
             return Some(reason);
         }
+        let daily: f64 = pairs
+            .iter()
+            .map(|p| p.today - self.state.day_baselines[&p.pair_id])
+            .sum();
         let daily_limit = equity * self.cfg.daily_net_loss_pct_of_venue_equity / 100.0;
-        if pnl_today_sum <= -daily_limit {
-            return Some(format!(
-                "portfolio_daily_loss: booked ${pnl_today_sum:.2} on {today} <= -{:.2}% of venue \
-                 equity ${equity:.2}; entries resume the next UTC day",
+        if daily <= -daily_limit {
+            let reason = format!(
+                "portfolio_daily_loss: booked ${daily:.2} on {today} <= -{:.2}% of venue equity \
+                 ${equity:.2}; entries resume the next UTC day",
                 self.cfg.daily_net_loss_pct_of_venue_equity
-            ));
+            );
+            log::error!("[PORTFOLIO] {reason}");
+            self.state.daily_halt_date = Some(today.to_string());
+            self.state.daily_halt_reason = Some(reason.clone());
+            self.persist();
+            send_notification(
+                "Night Bridge PORTFOLIO DAILY HALT".to_string(),
+                format!(
+                    "{reason}. New entries blocked for every pair for the rest of {today} UTC."
+                ),
+            );
+            return Some(reason);
         }
         None
     }
@@ -7236,20 +7391,18 @@ impl NightBridge {
             };
             // Halts are measured on real money only (paper PnL never halts
             // a live pair), and apply to every pair.
-            let pnl_today_sum: f64 = self
+            let pnl: Vec<PairPnl> = self
                 .engines
                 .iter()
                 .filter(|(_, e)| counts(e, false))
-                .map(|(_, e)| e.pnl_today_for(&today))
-                .sum();
-            let total_pnl_sum: f64 = self
-                .engines
-                .iter()
-                .filter(|(_, e)| counts(e, false))
-                .map(|(_, e)| e.state.realized_pnl_session)
-                .sum();
+                .map(|(plan, e)| PairPnl {
+                    pair_id: plan.pair_id.clone(),
+                    today: e.pnl_today_for(&today),
+                    total: e.state.realized_pnl_session,
+                })
+                .collect();
             let paper = self.engines[idx].1.cfg.dry_run;
-            let blocked = portfolio.evaluate(&today, pnl_today_sum, total_pnl_sum, equity);
+            let blocked = portfolio.evaluate(&today, &pnl, equity);
             let others: Vec<PairExposure> = self
                 .engines
                 .iter()
@@ -7265,6 +7418,7 @@ impl NightBridge {
                 others,
                 venue_equity_usd: equity,
                 blocked,
+                own_pnl: (engine.state.realized_pnl_session, engine.state.pnl_today),
             });
             engine.tick().await;
         }
@@ -14226,6 +14380,7 @@ mod tests {
             others,
             venue_equity_usd: equity,
             blocked: None,
+            own_pnl: (0.0, 0.0),
         }
     }
 
@@ -14593,48 +14748,151 @@ mod tests {
         }
     }
 
-    #[test]
-    fn portfolio_daily_loss_blocks_for_the_day_only() {
+    fn pnl(rows: &[(&str, f64, f64)]) -> Vec<PairPnl> {
+        rows.iter()
+            .map(|(id, today, total)| PairPnl {
+                pair_id: id.to_string(),
+                today: *today,
+                total: *total,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn portfolio_daily_loss_latches_for_the_rest_of_the_utc_day() {
         let dir = tempfile::tempdir().unwrap();
         let mut rt = runtime(dir.path());
-        // 2 % of $1,000 = $20.
-        assert_eq!(rt.evaluate(TODAY, -19.99, 0.0, Some(1000.0)), None);
-        let r = rt.evaluate(TODAY, -20.0, -20.0, Some(1000.0)).unwrap();
+        // 2 % of $1,000 = $20, measured from each pair's start-of-day 0.
+        assert_eq!(
+            rt.evaluate(TODAY, &pnl(&[("sndk", 0.0, 0.0)]), Some(1000.0)),
+            None
+        );
+        assert_eq!(
+            rt.evaluate(TODAY, &pnl(&[("sndk", -19.99, -19.99)]), Some(1000.0)),
+            None
+        );
+        let r = rt
+            .evaluate(TODAY, &pnl(&[("sndk", -20.0, -20.0)]), Some(1000.0))
+            .unwrap();
         assert!(r.starts_with("portfolio_daily_loss"), "{r}");
-        assert!(!rt.state.halted, "not sticky");
-        assert_eq!(rt.evaluate("2026-09-09", 0.0, -20.0, Some(1000.0)), None);
+        // Latched: neither a later profit on another pair nor a bigger
+        // account lifts it the same day (pairtrade#430 Codex P2) ...
+        assert!(rt
+            .evaluate(
+                TODAY,
+                &pnl(&[("sndk", -20.0, -20.0), ("mu", 50.0, 50.0)]),
+                Some(1e6)
+            )
+            .is_some());
+        // ... and it survives a restart.
+        let mut reloaded = runtime(dir.path());
+        reloaded.state = serde_json::from_slice(&std::fs::read(&rt.state_path).unwrap()).unwrap();
+        assert!(reloaded
+            .evaluate(TODAY, &pnl(&[("sndk", -20.0, -20.0)]), Some(1000.0))
+            .is_some());
+        assert!(
+            !rt.state.halted,
+            "the daily halt is not the sticky total halt"
+        );
+        // The next UTC day starts clean.
+        assert_eq!(
+            rt.evaluate("2026-09-09", &pnl(&[("sndk", 0.0, -20.0)]), Some(1000.0)),
+            None
+        );
     }
 
     #[tokio::test]
     async fn portfolio_total_loss_is_sticky_durable_and_cleared_only_by_its_ack() {
         let dir = tempfile::tempdir().unwrap();
         let mut rt = runtime(dir.path());
-        assert_eq!(rt.evaluate(TODAY, 0.0, 7.0, Some(1000.0)), None);
         assert_eq!(
-            rt.state.baseline_total_pnl,
-            Some(7.0),
-            "measured from what was booked at start"
+            rt.evaluate(TODAY, &pnl(&[("sndk", 0.0, 7.0)]), Some(1000.0)),
+            None
         );
-        // 5 % of $1,000 = $50 below the baseline.
-        assert_eq!(rt.evaluate(TODAY, 0.0, -42.99, Some(1000.0)), None);
-        let r = rt.evaluate(TODAY, 0.0, -43.0, Some(1000.0)).unwrap();
+        assert_eq!(
+            rt.state.total_baselines.get("sndk"),
+            Some(&7.0),
+            "measured from what was booked when portfolio mode started"
+        );
+        // 5 % of $1,000 = $50 below the baseline; daily kept out of the way.
+        let mut rt_day =
+            |d: &str, total: f64| rt.evaluate(d, &pnl(&[("sndk", 0.0, total)]), Some(1000.0));
+        assert_eq!(rt_day(TODAY, -42.99), None);
+        let r = rt_day(TODAY, -43.0).unwrap();
         assert!(r.starts_with("portfolio_total_loss"), "{r}");
+        assert!(
+            rt_day("2026-09-09", 100.0).is_some(),
+            "a recovery does not lift it"
+        );
         let on_disk: PortfolioState =
             serde_json::from_slice(&std::fs::read(&rt.state_path).unwrap()).unwrap();
         assert!(on_disk.halted, "the halt survives a restart");
-        // A recovery does not lift it; a missing equity reading does not either.
         assert!(rt
-            .evaluate("2026-09-09", 0.0, 100.0, Some(1000.0))
+            .evaluate("2026-09-09", &pnl(&[("sndk", 0.0, 100.0)]), None)
             .is_some());
-        assert!(rt.evaluate("2026-09-09", 0.0, 100.0, None).is_some());
         std::fs::write(&rt.ack_path, b"").unwrap();
-        assert_eq!(rt.evaluate("2026-09-09", 0.0, -43.0, Some(1000.0)), None);
+        assert_eq!(
+            rt.evaluate("2026-09-09", &pnl(&[("sndk", 0.0, -43.0)]), Some(1000.0)),
+            None
+        );
         assert!(!rt.ack_path.exists(), "the ack is consumed");
         assert_eq!(
-            rt.state.baseline_total_pnl,
-            Some(-43.0),
+            rt.state.total_baselines.get("sndk"),
+            Some(&-43.0),
             "losses are re-measured from the ack"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pair_that_starts_counting_is_baselined_not_summed_from_its_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        assert_eq!(
+            rt.evaluate(TODAY, &pnl(&[("sndk", 0.0, 0.0)]), Some(1000.0)),
+            None
+        );
+        // MU flips from DRY_RUN to live carrying -$400 of paper history,
+        // -$100 of it today: neither halts the portfolio.
+        let both =
+            |mu_today: f64, mu_total: f64| pnl(&[("sndk", 0.0, 0.0), ("mu", mu_today, mu_total)]);
+        assert_eq!(
+            rt.evaluate(TODAY, &both(-100.0, -400.0), Some(1000.0)),
+            None
+        );
+        // Its *new* losses do: -$20 more today trips the daily limit.
+        assert!(rt
+            .evaluate(TODAY, &both(-120.0, -420.0), Some(1000.0))
+            .unwrap()
+            .starts_with("portfolio_daily_loss"));
+        // A new UTC day measures from 0 again: yesterday's mid-day
+        // baseline must not mask today's losses.
+        let mut fresh = runtime(dir.path());
+        fresh.state = PortfolioState::default();
+        assert_eq!(
+            fresh.evaluate(TODAY, &both(-100.0, -400.0), Some(1000.0)),
+            None
+        );
+        // (The first evaluation of a day runs before any pair ticks, so
+        // it sees that day's PnL at 0.)
+        assert_eq!(
+            fresh.evaluate("2026-09-09", &both(0.0, -400.0), Some(1000.0)),
+            None
+        );
+        assert!(fresh
+            .evaluate("2026-09-09", &both(-20.0, -420.0), Some(1000.0))
+            .unwrap()
+            .starts_with("portfolio_daily_loss"));
+        // Dropped while not counted, re-baselined when it returns.
+        let mut rt = runtime(dir.path());
+        rt.state = PortfolioState::default();
+        assert_eq!(rt.evaluate(TODAY, &both(0.0, -400.0), Some(1000.0)), None);
+        assert_eq!(
+            rt.evaluate(TODAY, &pnl(&[("sndk", 0.0, 0.0)]), Some(1000.0)),
+            None
+        );
+        assert!(!rt.state.total_baselines.contains_key("mu"));
+        assert_eq!(rt.evaluate(TODAY, &both(0.0, -1000.0), Some(1000.0)), None);
+        assert_eq!(rt.state.total_baselines.get("mu"), Some(&-1000.0));
     }
 
     #[test]
@@ -15064,5 +15322,81 @@ mod tests {
             "the full $100 lot: a paper position is not a real one"
         );
         assert!(!nb.portfolio.as_ref().unwrap().state.halted);
+    }
+
+    #[tokio::test]
+    async fn unresolved_and_persisted_claims_hold_capacity_until_resolved() {
+        let mut h = harness();
+        let cluster = Some("memory".to_string());
+        // Confirmation window ended without a readable account: the order
+        // may have filled (pairtrade#430 Codex P1).
+        h.engine.state.position_unconfirmed = true;
+        assert_eq!(
+            h.engine.portfolio_exposures("sndk", &cluster),
+            vec![exposure("sndk", Some("memory"), None, 100.0, None)]
+        );
+        h.engine.state.position_unconfirmed = false;
+        // A persisted record before reconciliation restored it.
+        h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
+        let e = h.engine.portfolio_exposures("sndk", &cluster);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].sign, Some(1));
+        assert!((e[0].notional_usd - 0.057 * 1756.92).abs() < 1e-9);
+        assert_eq!(e[0].session_date.as_deref(), Some(TODAY));
+        // A record naming another symbol is a claim of unknown direction.
+        h.engine.state.open_position.as_mut().unwrap().symbol = "MU".to_string();
+        assert_eq!(h.engine.portfolio_exposures("sndk", &cluster)[0].sign, None);
+    }
+
+    fn primed_for_entry(h: &mut Harness) {
+        h.observe_all(T0_US, 180.0, 1700.0);
+        h.engine.maybe_capture_t0(T0_US);
+        h.observe_all(T1_US, 190.0, 1700.0);
+        h.engine.day.eligibility_confirmed = true;
+        h.set_now(T1_US + 1_000_000);
+    }
+
+    /// Equity fresh when the loop started, failing by the time the entry
+    /// reaches the send: the gate must re-read it (pairtrade#430 Codex P2).
+    #[tokio::test]
+    async fn the_gate_rereads_venue_equity_at_the_send() {
+        let mut h = harness();
+        fund(&h, "1000", T1_US);
+        primed_for_entry(&mut h);
+        let cell = h.engine.venue_equity.clone();
+        *h.connector.on_get_positions.lock().unwrap() = Some(Box::new(move || {
+            cell.lock().unwrap().failing = true;
+        }));
+        let mut c = ctx(Some(1000.0), vec![]);
+        c.pair_id = "sndk".to_string();
+        h.engine.portfolio = Some(c);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 0);
+        let skip = h.engine.day.skip_reason.clone().unwrap_or_default();
+        assert!(skip.starts_with("portfolio_equity_stale"), "{skip}");
+    }
+
+    /// The pair's own booked PnL moved after the halts were evaluated: no
+    /// send this tick, and the day is not spent.
+    #[tokio::test]
+    async fn the_gate_waits_when_own_pnl_moved_after_evaluation() {
+        let mut h = harness();
+        fund(&h, "1000", T1_US);
+        primed_for_entry(&mut h);
+        let mut c = ctx(Some(1000.0), vec![]);
+        c.pair_id = "sndk".to_string();
+        c.own_pnl = (0.0, 0.0);
+        h.engine.portfolio = Some(c);
+        h.engine.state.realized_pnl_session = -30.0;
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 0);
+        assert!(
+            h.engine.day.skip_reason.is_none(),
+            "retried next tick, not skipped"
+        );
+        // Re-evaluated on the moved PnL, the entry proceeds.
+        h.engine.portfolio.as_mut().unwrap().own_pnl = (-30.0, 0.0);
+        h.engine.maybe_enter(T1_US + 1_000_000).await;
+        assert_eq!(h.connector.order_count(), 1);
     }
 }

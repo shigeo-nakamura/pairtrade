@@ -656,10 +656,16 @@ task**, so no two pairs ever have a `sendTx` in flight at the same time.
   SNDK, MU, SAMSUNGUSD/SMSN, SKHX). A cap shrinks an entry down to `min_entry_notional_usd`, below that the day is skipped with
   `skip_reason` `aggregate_cap` / `cluster_cap`. No fresh equity (missing, failing, older than `max_venue_equity_age_secs`) →
   `portfolio_equity_stale` skip.
-- **Net-PnL halts across pairs** (proposals pending the owner): daily — Σ today's booked PnL ≤ −`daily_net_loss_pct` of equity
-  blocks entries for the rest of the UTC day; total — Σ booked PnL since the last portfolio ack ≤ −`total_net_loss_pct` is a
-  sticky halt persisted in `<base>/portfolio_state.json`, cleared only by `touch <base>/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO`
-  (which also re-bases the loss measurement). Per-pair session-DD halts and RISK_ACK files are unchanged.
+- **Net-PnL halts across pairs** (proposals pending the owner), on live pairs only (paper PnL never halts a live pair), each
+  pair measured from its own baseline in `<base>/portfolio_state.json` (a pair that starts counting -- added, or flipped from
+  DRY_RUN to live -- is baselined at that moment, so its history neither halts nor masks): daily — Σ booked PnL since the start
+  of the UTC day ≤ −`daily_net_loss_pct` of equity **latches** for the rest of that UTC day whatever PnL or equity does next;
+  total — Σ booked PnL since the last portfolio ack ≤ −`total_net_loss_pct` is sticky. Both persist across restarts and are
+  cleared early only by `touch <base>/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO`, which also re-bases every pair. Per-pair session-DD
+  halts and RISK_ACK files are unchanged.
+- **Exposure counted by the gate**: the tracked position; else a pending entry; else a full lot of unknown sign for an order of
+  unknown outcome (in flight, or `position_unconfirmed`); else a persisted record not yet restored; plus every parked record.
+  Venue equity and the pair's own booked PnL are re-checked at the send itself.
 - **Priority** (owner-approved): when several pairs are due in one loop they are ticked in descending `|ε|/σ` (σ = the pair's
   frozen `epsilon_sigma`; while no pair has one, `|ε|/threshold` for all), ties in config order.
 - **Status**: `<base>/portfolio_status.json` (local, every 30 s): limits, venue equity, exposures, halts, per-pair summary and the
