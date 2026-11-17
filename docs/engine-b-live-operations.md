@@ -666,7 +666,10 @@ task**, so no two pairs ever have a `sendTx` in flight at the same time.
   (`portfolio_state_unwritable`) and the write is retried every loop. Per-pair session-DD halts and RISK_ACK files are
   unchanged; `ENGINE_B_LIVE_KILL_SWITCH_PATH` cannot be set per pair.
 - **Exposure counted by the gate**: the tracked position; else a pending entry; else a full lot of unknown sign for an order of
-  unknown outcome (in flight, or `position_unconfirmed`); else a persisted record not yet restored; plus every parked record.
+  unknown outcome (in flight, or `position_unconfirmed` -- at most the order itself); else a persisted record not yet restored;
+  plus every parked record. Positions and records are valued at the larger of entry price and current mid; one whose size is
+  known but which has neither is **unbounded** and blocks every portfolio entry (`portfolio_exposure_unbounded`) until it can
+  be valued. A loop that began with any counted pair unreconciled sends no entry at all.
   Venue equity, the pair's own booked PnL and the loss limits (at that equity) are re-checked at the send itself; a moved
   input defers the entry to the next loop rather than spending the day.
 - Non-primary pairs' writable directories (`<base>/pairs/<id>/` by default) are created at startup, or the start is refused.

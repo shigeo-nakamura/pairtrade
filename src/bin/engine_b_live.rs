@@ -5231,6 +5231,10 @@ impl EngineBLiveEngine {
                     self.now(),
                     portfolio.cfg.max_venue_equity_age_secs,
                 );
+                if let Some(why) = &portfolio.unbounded {
+                    log::warn!("[PORTFOLIO] {} not sending: {why}", portfolio.pair_id);
+                    return;
+                }
                 if !portfolio.unreconciled.is_empty() {
                     log::warn!(
                         "[PORTFOLIO] {} waiting for {:?} to reconcile against the exchange before \
@@ -6997,11 +7001,16 @@ struct PortfolioCtx {
     /// evaluated -- so the gate can re-apply the loss limits against the
     /// equity it reads at the send.
     losses: (f64, f64),
-    /// Counted sibling pairs that have not completed their startup
-    /// reconciliation: their exposure is not known yet, so no entry is
-    /// sent (deferred, not skipped) until every one has (pairtrade#430
-    /// Codex P2).
+    /// Counted pairs (this one included) that had not completed their
+    /// startup reconciliation when this loop began: their exposure is not
+    /// known yet, so no entry is sent anywhere in the loop (deferred, not
+    /// skipped). Taken at loop start, not per engine, so a weaker pair
+    /// that reconciles late in the loop cannot enter ahead of a stronger
+    /// one that already waited (pairtrade#430 Codex P2).
     unreconciled: Vec<String>,
+    /// Some counted sibling's exposure cannot be bounded: no entry
+    /// (deferred, not skipped) until it can.
+    unbounded: Option<String>,
 }
 
 /// Admit, shrink or refuse one entry. Pure: every input is passed in, so
@@ -7094,12 +7103,21 @@ fn portfolio_admit(
 }
 
 impl EngineBLiveEngine {
-    /// What this engine holds, or may hold, for the portfolio gate.
-    /// Conservative on purpose: an entry whose outcome is unknown counts
-    /// a full lot with an unknown sign, and a parked record counts at its
-    /// last known size -- the gate must never be the reason two
-    /// exposures exist where one was intended.
-    fn portfolio_exposures(&self, pair_id: &str, cluster: &Option<String>) -> Vec<PairExposure> {
+    /// What this engine holds, or may hold, for the portfolio gate --
+    /// or `Err` when some exposure cannot be bounded, which blocks every
+    /// portfolio entry until it can (pairtrade#430 Codex P2: one lot is
+    /// not an upper bound for a position of known size and unknown
+    /// price). Every exposure is either
+    /// - a position or record of known size, valued at the larger of its
+    ///   entry price and the current mid (whichever exist), or
+    /// - an order of unknown outcome (pending, in flight, or
+    ///   `position_unconfirmed`): at most the order itself, which is at
+    ///   most one lot, of unknown sign unless the send is known.
+    fn portfolio_exposures(
+        &self,
+        pair_id: &str,
+        cluster: &Option<String>,
+    ) -> std::result::Result<Vec<PairExposure>, String> {
         let today = self.current_date.map(|d| d.to_string());
         let mut out = Vec::new();
         let mk = |sign: Option<i8>, notional_usd: f64, session_date: Option<String>| PairExposure {
@@ -7116,12 +7134,28 @@ impl EngineBLiveEngine {
                 -1
             }
         };
+        let value = |symbol: &str, size: f64, entry: f64, entry_unknown: bool| {
+            let entry = (!entry_unknown && entry.is_finite() && entry > 0.0).then_some(entry);
+            let mark = self
+                .exit_accounting_price(symbol)
+                .map(|(mid, _)| mid)
+                .filter(|m| m.is_finite() && *m > 0.0);
+            match (entry, mark) {
+                (Some(e), Some(m)) => Ok(size.abs() * e.max(m)),
+                (Some(p), None) | (None, Some(p)) => Ok(size.abs() * p),
+                (None, None) => Err(format!(
+                    "portfolio_exposure_unbounded: pair {pair_id} holds {size} {symbol} with no \
+                     entry price and no mid to value it"
+                )),
+            }
+        };
         if let Some(pos) = &self.position {
-            let notional = if pos.entry_price_unknown || !(pos.entry_price > 0.0) {
-                self.cfg.lot_usd
-            } else {
-                pos.open_size.abs() * pos.entry_price
-            };
+            let notional = value(
+                &self.cfg.us_primary_symbol,
+                pos.open_size,
+                pos.entry_price,
+                pos.entry_price_unknown,
+            )?;
             let session = self
                 .state
                 .open_position
@@ -7146,11 +7180,12 @@ impl EngineBLiveEngine {
             // A persisted claim not (yet) restored into `position` -- the
             // pre-reconciliation window, or a DRY_RUN record naming another
             // symbol. The record is the claim; count it.
-            let notional = if record.entry_price_unknown || !(record.entry_price > 0.0) {
-                self.cfg.lot_usd
-            } else {
-                record.open_size.abs() * record.entry_price
-            };
+            let notional = value(
+                &record.symbol,
+                record.open_size,
+                record.entry_price,
+                record.entry_price_unknown,
+            )?;
             let sign = if record.symbol == self.cfg.us_primary_symbol {
                 side_from_str(&record.side).map(side_sign)
             } else {
@@ -7159,14 +7194,10 @@ impl EngineBLiveEngine {
             out.push(mk(sign, notional, Some(record.session_date.clone())));
         }
         for p in &self.state.unmanaged_positions {
-            let notional = if p.entry_price_unknown || !(p.entry_price > 0.0) {
-                self.cfg.lot_usd
-            } else {
-                p.open_size.abs() * p.entry_price
-            };
+            let notional = value(&p.symbol, p.open_size, p.entry_price, p.entry_price_unknown)?;
             out.push(mk(None, notional, None));
         }
-        out
+        Ok(out)
     }
 
     /// `|epsilon| / sigma` (or `/ epsilon_threshold` when no frozen sigma
@@ -7590,7 +7621,10 @@ impl NightBridge {
         let process_dry_run = self.engines[0].1.cfg.dry_run;
         let counts =
             |e: &EngineBLiveEngine, for_paper: bool| for_paper || process_dry_run || !e.cfg.dry_run;
-        for idx in tick_order_at(&mut self.engines, now) {
+        let order = tick_order_at(&mut self.engines, now);
+        let reconciled_at_start: Vec<bool> =
+            self.engines.iter().map(|(_, e)| e.reconciled).collect();
+        for idx in order {
             // Rebuilt per engine, after every earlier engine's tick, so an
             // entry sent by a higher-priority pair in this loop is already
             // counted against the next.
@@ -7621,16 +7655,22 @@ impl NightBridge {
                 .engines
                 .iter()
                 .enumerate()
-                .filter(|(j, (_, e))| *j != idx && counts(e, paper) && !e.reconciled)
+                .filter(|(j, (_, e))| (*j == idx || counts(e, paper)) && !reconciled_at_start[*j])
                 .map(|(_, (plan, _))| plan.pair_id.clone())
                 .collect();
-            let others: Vec<PairExposure> = self
-                .engines
-                .iter()
-                .enumerate()
-                .filter(|(j, (_, e))| *j != idx && counts(e, paper))
-                .flat_map(|(_, (plan, e))| e.portfolio_exposures(&plan.pair_id, &plan.cluster))
-                .collect();
+            let mut others: Vec<PairExposure> = Vec::new();
+            let mut unbounded: Option<String> = None;
+            for (j, (plan, e)) in self.engines.iter().enumerate() {
+                if j == idx || !counts(e, paper) {
+                    continue;
+                }
+                match e.portfolio_exposures(&plan.pair_id, &plan.cluster) {
+                    Ok(v) => others.extend(v),
+                    Err(why) => {
+                        unbounded.get_or_insert(why);
+                    }
+                }
+            }
             let (plan, engine) = &mut self.engines[idx];
             engine.portfolio = Some(PortfolioCtx {
                 cfg: portfolio.cfg.clone(),
@@ -7642,6 +7682,7 @@ impl NightBridge {
                 own_pnl: (engine.state.realized_pnl_session, engine.state.pnl_today),
                 losses,
                 unreconciled,
+                unbounded,
             });
             engine.tick().await;
         }
@@ -7664,11 +7705,14 @@ impl NightBridge {
                 .expect("venue equity mutex");
             fresh_venue_equity(&cell, now_us, portfolio.cfg.max_venue_equity_age_secs)
         };
-        let exposures: Vec<PairExposure> = self
-            .engines
-            .iter()
-            .flat_map(|(plan, e)| e.portfolio_exposures(&plan.pair_id, &plan.cluster))
-            .collect();
+        let mut exposures: Vec<PairExposure> = Vec::new();
+        let mut unbounded: Vec<String> = Vec::new();
+        for (plan, e) in &self.engines {
+            match e.portfolio_exposures(&plan.pair_id, &plan.cluster) {
+                Ok(v) => exposures.extend(v),
+                Err(why) => unbounded.push(why),
+            }
+        }
         let pairs: Vec<serde_json::Value> = self
             .engines
             .iter()
@@ -7694,6 +7738,7 @@ impl NightBridge {
             "open_notional_usd": exposures.iter().map(|e| e.notional_usd.abs()).sum::<f64>(),
             "aggregate_cap_usd": equity.map(|e| e * portfolio.cfg.aggregate_cap_pct_of_venue_equity / 100.0),
             "exposures": exposures,
+            "unbounded_exposures": unbounded,
             "halted": portfolio.state.halted,
             "halt_reason": portfolio.state.halt_reason,
             "pairs": pairs,
@@ -14635,6 +14680,7 @@ mod tests {
             own_pnl: (0.0, 0.0),
             losses: (0.0, 0.0),
             unreconciled: vec![],
+            unbounded: None,
         }
     }
 
@@ -15181,7 +15227,11 @@ mod tests {
     async fn exposures_count_positions_pending_entries_and_unknown_claims() {
         let mut h = harness();
         let cluster = Some("memory".to_string());
-        assert!(h.engine.portfolio_exposures("sndk", &cluster).is_empty());
+        assert!(h
+            .engine
+            .portfolio_exposures("sndk", &cluster)
+            .unwrap()
+            .is_empty());
         h.engine.pending = Some(PendingConfirm::Entry {
             side: OrderSide::Short,
             requested: 0.05,
@@ -15193,7 +15243,7 @@ mod tests {
             saw_reading: false,
         });
         assert_eq!(
-            h.engine.portfolio_exposures("sndk", &cluster),
+            h.engine.portfolio_exposures("sndk", &cluster).unwrap(),
             vec![exposure(
                 "sndk",
                 Some("memory"),
@@ -15205,13 +15255,13 @@ mod tests {
         h.engine.pending = None;
         h.engine.state.entry_in_flight = Some("SNDK".to_string());
         assert_eq!(
-            h.engine.portfolio_exposures("sndk", &cluster),
+            h.engine.portfolio_exposures("sndk", &cluster).unwrap(),
             vec![exposure("sndk", Some("memory"), None, 100.0, None)],
             "an order of unknown outcome is a full lot of unknown sign"
         );
         h.engine.state.entry_in_flight = None;
         open_short(&mut h, 0.05, 1700.0);
-        let e = h.engine.portfolio_exposures("sndk", &cluster);
+        let e = h.engine.portfolio_exposures("sndk", &cluster).unwrap();
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].sign, Some(-1));
         assert!((e[0].notional_usd - 85.0).abs() < 1e-9);
@@ -15596,20 +15646,23 @@ mod tests {
         // may have filled (pairtrade#430 Codex P1).
         h.engine.state.position_unconfirmed = true;
         assert_eq!(
-            h.engine.portfolio_exposures("sndk", &cluster),
+            h.engine.portfolio_exposures("sndk", &cluster).unwrap(),
             vec![exposure("sndk", Some("memory"), None, 100.0, None)]
         );
         h.engine.state.position_unconfirmed = false;
         // A persisted record before reconciliation restored it.
         h.engine.state.open_position = Some(persisted_long(0.057, TODAY));
-        let e = h.engine.portfolio_exposures("sndk", &cluster);
+        let e = h.engine.portfolio_exposures("sndk", &cluster).unwrap();
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].sign, Some(1));
         assert!((e[0].notional_usd - 0.057 * 1756.92).abs() < 1e-9);
         assert_eq!(e[0].session_date.as_deref(), Some(TODAY));
         // A record naming another symbol is a claim of unknown direction.
         h.engine.state.open_position.as_mut().unwrap().symbol = "MU".to_string();
-        assert_eq!(h.engine.portfolio_exposures("sndk", &cluster)[0].sign, None);
+        assert_eq!(
+            h.engine.portfolio_exposures("sndk", &cluster).unwrap()[0].sign,
+            None
+        );
     }
 
     fn primed_for_entry(h: &mut Harness) {
@@ -15966,5 +16019,176 @@ mod tests {
         observe_pair(&mut a, t1 + 5_000_000, ("SKHY", 190.0), ("SNDK", 1700.0));
         nb.tick().await;
         assert_eq!(connector.order_count(), 1, "the next loop sends");
+    }
+
+    #[tokio::test]
+    async fn an_exposure_of_known_size_and_no_price_blocks_instead_of_counting_a_lot() {
+        let mut h = harness();
+        let cluster = Some("memory".to_string());
+        let mut pos = OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 0.0,
+            entry_price_estimated: false,
+            entry_price_unknown: true,
+            size: 0.5,
+            open_size: 0.5,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        };
+        h.engine.position = Some(pos.clone());
+        let e = h.engine.portfolio_exposures("sndk", &cluster).unwrap_err();
+        assert!(e.starts_with("portfolio_exposure_unbounded"), "{e}");
+        // A mid bounds it: 0.5 x 1700, far more than one $100 lot.
+        h.observe_at("SNDK", 1700.0, T1_US, h.engine.feed_generation());
+        let v = h.engine.portfolio_exposures("sndk", &cluster).unwrap();
+        assert!((v[0].notional_usd - 850.0).abs() < 1e-9);
+        // With both, the larger of entry and mark.
+        pos.entry_price_unknown = false;
+        pos.entry_price = 1800.0;
+        h.engine.position = Some(pos.clone());
+        let v = h.engine.portfolio_exposures("sndk", &cluster).unwrap();
+        assert!(
+            (v[0].notional_usd - 900.0).abs() < 1e-9,
+            "entry above the mark"
+        );
+        pos.entry_price = 1600.0;
+        h.engine.position = Some(pos);
+        let v = h.engine.portfolio_exposures("sndk", &cluster).unwrap();
+        assert!(
+            (v[0].notional_usd - 850.0).abs() < 1e-9,
+            "mark above the entry"
+        );
+        // The parked-record branch fails closed the same way.
+        h.engine.position = None;
+        let mut rec = persisted_long(0.5, TODAY);
+        rec.symbol = "IREN".to_string();
+        rec.entry_price_unknown = true;
+        h.engine.state.unmanaged_positions = vec![rec];
+        assert!(h.engine.portfolio_exposures("sndk", &cluster).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_sibling_exposure_defers_every_entry() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        fund(&a, "10000", T1_US);
+        // MU adopted a position it cannot value (no entry price, MU never
+        // quoted on the shared feed).
+        b.engine.position = Some(OpenPosition {
+            side: OrderSide::Long,
+            entry_price: 0.0,
+            entry_price_estimated: false,
+            entry_price_unknown: true,
+            size: 7.0,
+            open_size: 7.0,
+            realized_partial_pnl: 0.0,
+            entered_at_us: T1_US,
+            flatten_asap: true,
+            exit_deadline_us: None,
+        });
+        observe_pair(&mut a, T0_US, ("SKHY", 180.0), ("SNDK", 1700.0));
+        a.engine.maybe_capture_t0(T0_US);
+        let t1 = T1_US + 1_000_000;
+        observe_pair(&mut a, t1, ("SKHY", 190.0), ("SNDK", 1700.0));
+        a.engine.feed.lock().unwrap().latest.remove("MU");
+        a.engine.day.eligibility_confirmed = true;
+        a.set_now(t1);
+        let mk = |id: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let (a_cfg, b_cfg) = (a.engine.cfg.clone(), b.engine.cfg.clone());
+        let connector = a.connector.clone();
+        let mut nb = NightBridge {
+            engines: vec![
+                (
+                    mk("sndk", &a_cfg),
+                    std::mem::replace(&mut a.engine, harness().engine),
+                ),
+                (
+                    mk("mu", &b_cfg),
+                    std::mem::replace(&mut b.engine, harness().engine),
+                ),
+            ],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        nb.tick().await;
+        let sndk: Vec<_> = connector
+            .orders
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.0 == "SNDK")
+            .cloned()
+            .collect();
+        assert!(sndk.is_empty(), "{sndk:?}");
+        assert!(
+            nb.engines[0].1.day.skip_reason.is_none(),
+            "deferred, not skipped"
+        );
+    }
+
+    /// The strongest pair defers on an unreconciled sibling; that weaker
+    /// sibling must not then reconcile and enter ahead of it in the same
+    /// loop (pairtrade#430 Codex P2).
+    #[tokio::test]
+    async fn a_loop_that_began_unreconciled_sends_nothing() {
+        let mut a = harness();
+        let mut b = sibling(&a, "MU", "SMSN");
+        fund(&a, "10000", T1_US);
+        b.engine.reconciled = false;
+        observe_pair(&mut a, T0_US, ("SKHY", 180.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, T0_US, ("SMSN", 50.0), ("MU", 100.0));
+        a.engine.maybe_capture_t0(T0_US);
+        b.engine.maybe_capture_t0(T0_US);
+        let t1 = T1_US + 1_000_000;
+        // SNDK +5.6 % (stronger), MU +2 %.
+        observe_pair(&mut a, t1, ("SKHY", 190.0), ("SNDK", 1700.0));
+        observe_pair(&mut b, t1, ("SMSN", 51.0), ("MU", 100.0));
+        a.engine.day.eligibility_confirmed = true;
+        b.engine.day.eligibility_confirmed = true;
+        a.set_now(t1);
+        let mk = |id: &str, cfg: &EngineBLiveConfig| PairPlan {
+            pair_id: id.to_string(),
+            primary: id == "sndk",
+            cluster: Some("memory".to_string()),
+            prereg: None,
+            epsilon_sigma: None,
+            cfg: cfg.clone(),
+        };
+        let (a_cfg, b_cfg) = (a.engine.cfg.clone(), b.engine.cfg.clone());
+        let connector = a.connector.clone();
+        let mut nb = NightBridge {
+            engines: vec![
+                (
+                    mk("sndk", &a_cfg),
+                    std::mem::replace(&mut a.engine, harness().engine),
+                ),
+                (
+                    mk("mu", &b_cfg),
+                    std::mem::replace(&mut b.engine, harness().engine),
+                ),
+            ],
+            portfolio: Some(runtime(a._dir.path())),
+        };
+        nb.tick().await;
+        assert_eq!(
+            connector.order_count(),
+            0,
+            "nobody enters in a loop that began unreconciled"
+        );
+        assert!(nb.engines[1].1.reconciled);
+        a.set_now(t1 + 5_000_000);
+        nb.tick().await;
+        let orders = connector.orders.lock().unwrap().clone();
+        assert_eq!(orders.len(), 2, "{orders:?}");
+        assert_eq!(orders[0].0, "SNDK", "the stronger pair keeps its place");
+        assert!((orders[0].1.to_f64().unwrap() * 1700.0 - 100.0).abs() < 0.01);
     }
 }
