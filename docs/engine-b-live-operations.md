@@ -661,8 +661,10 @@ task**, so no two pairs ever have a `sendTx` in flight at the same time.
   DRY_RUN to live -- is baselined at that moment, so its history neither halts nor masks): daily — Σ booked PnL since the start
   of the UTC day ≤ −`daily_net_loss_pct` of equity **latches** for the rest of that UTC day whatever PnL or equity does next;
   total — Σ booked PnL since the last portfolio ack ≤ −`total_net_loss_pct` is sticky. Both persist across restarts and are
-  cleared early only by `touch <base>/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO`, which also re-bases every pair. Per-pair session-DD
-  halts and RISK_ACK files are unchanged.
+  cleared early only by `touch <base>/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO`, which also re-bases every pair. The total check runs
+  even while the daily halt is latched. If `portfolio_state.json` cannot be written, no entry is admitted
+  (`portfolio_state_unwritable`) and the write is retried every loop. Per-pair session-DD halts and RISK_ACK files are
+  unchanged; `ENGINE_B_LIVE_KILL_SWITCH_PATH` cannot be set per pair.
 - **Exposure counted by the gate**: the tracked position; else a pending entry; else a full lot of unknown sign for an order of
   unknown outcome (in flight, or `position_unconfirmed`); else a persisted record not yet restored; plus every parked record.
   Venue equity and the pair's own booked PnL are re-checked at the send itself.

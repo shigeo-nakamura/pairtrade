@@ -6676,12 +6676,17 @@ fn pair_lookup<'a>(
     .map(|k| (k.to_string(), process(k)))
     .collect();
     move |name: &str| {
+        // One kill switch for the process: resolved before the pair's own
+        // env, so no override can leave a pair outside it (pairtrade#430
+        // Codex P2; `plan_pairs` also refuses the key outright).
+        if name == "ENGINE_B_LIVE_KILL_SWITCH_PATH" {
+            return Some(kill_switch.clone());
+        }
         if let Some(v) = entry.env.get(name) {
             return Some(v.clone());
         }
         match name {
             "ENGINE_B_LIVE_BASE_DIR" => Some(base.clone()),
-            "ENGINE_B_LIVE_KILL_SWITCH_PATH" => Some(kill_switch.clone()),
             "ENGINE_B_LIVE_INSTANCE_ID" => Some(instance.clone()),
             // A new pair is paper until its own config says otherwise.
             "ENGINE_B_LIVE_DRY_RUN" => Some("true".to_string()),
@@ -6742,6 +6747,13 @@ fn plan_pairs(
         }
         if !ids.insert(entry.pair_id.clone()) {
             anyhow::bail!("duplicate pair_id {}", entry.pair_id);
+        }
+        if entry.env.contains_key("ENGINE_B_LIVE_KILL_SWITCH_PATH") {
+            anyhow::bail!(
+                "pair {}: ENGINE_B_LIVE_KILL_SWITCH_PATH cannot be set per pair -- the process kill \
+                 switch stops every pair",
+                entry.pair_id
+            );
         }
         if let Some(key) = entry.env.keys().find(|k| !k.starts_with("ENGINE_B_LIVE_")) {
             anyhow::bail!(
@@ -6845,6 +6857,14 @@ fn plan_pairs(
                 "pair {} is live but the process (primary pair) runs DRY_RUN: the shared connector \
                  cannot send for one pair and simulate for another",
                 p.pair_id
+            );
+        }
+        if c.kill_switch_path != primary_cfg.kill_switch_path {
+            anyhow::bail!(
+                "pair {}: kill switch {} is not the process's {}",
+                p.pair_id,
+                c.kill_switch_path.display(),
+                primary_cfg.kill_switch_path.display()
             );
         }
         if c.max_price_staleness_secs != primary_cfg.max_price_staleness_secs {
@@ -7181,6 +7201,11 @@ struct PortfolioRuntime {
     ack_path: PathBuf,
     disabled: Vec<String>,
     last_status_write_us: i64,
+    /// The last `persist` failed: retried on every evaluation, and no
+    /// entry is admitted until it succeeds -- a halt or baseline that only
+    /// lives in memory would be forgotten by a restart (pairtrade#430
+    /// Codex P2).
+    write_pending: bool,
 }
 
 impl PortfolioRuntime {
@@ -7265,11 +7290,38 @@ impl PortfolioRuntime {
                 dirty = true;
             }
         }
-        if dirty {
+        if dirty || self.write_pending {
             self.persist();
         }
+        let verdict = self.limits(today, pairs, venue_equity_usd);
+        if self.write_pending {
+            return Some(format!(
+                "portfolio_state_unwritable: {} could not be written; no entry until the portfolio \
+                 halts and baselines are durable{}",
+                self.state_path.display(),
+                verdict.map(|r| format!(" (also: {r})")).unwrap_or_default()
+            ));
+        }
+        verdict
+    }
+
+    /// The halts themselves. The sticky total check runs **before** the
+    /// daily latch is honoured, so a day that already latched cannot hide
+    /// a later total breach from the halt that needs an ack
+    /// (pairtrade#430 Codex P2).
+    fn limits(
+        &mut self,
+        today: &str,
+        pairs: &[PairPnl],
+        venue_equity_usd: Option<f64>,
+    ) -> Option<String> {
         if self.state.halted {
             return self.state.halt_reason.clone();
+        }
+        if let Some(equity) = venue_equity_usd {
+            if let Some(reason) = self.check_total(pairs, equity) {
+                return Some(reason);
+            }
         }
         if self.state.daily_halt_date.as_deref() == Some(today) {
             return self.state.daily_halt_reason.clone();
@@ -7277,6 +7329,10 @@ impl PortfolioRuntime {
         // Without a fresh equity reading the limits cannot be computed;
         // `portfolio_admit` refuses every entry in that state anyway.
         let equity = venue_equity_usd?;
+        self.check_daily(today, pairs, equity)
+    }
+
+    fn check_total(&mut self, pairs: &[PairPnl], equity: f64) -> Option<String> {
         let total: f64 = pairs
             .iter()
             .map(|p| p.total - self.state.total_baselines[&p.pair_id])
@@ -7299,6 +7355,10 @@ impl PortfolioRuntime {
             );
             return Some(reason);
         }
+        None
+    }
+
+    fn check_daily(&mut self, today: &str, pairs: &[PairPnl], equity: f64) -> Option<String> {
         let daily: f64 = pairs
             .iter()
             .map(|p| p.today - self.state.day_baselines[&p.pair_id])
@@ -7325,12 +7385,27 @@ impl PortfolioRuntime {
         None
     }
 
-    fn persist(&self) {
-        if let Err(e) = atomic_write_json_checked(&self.state_path, &self.state) {
-            log::error!(
-                "[PORTFOLIO] cannot persist {} ({e}); the halt still holds in memory",
-                self.state_path.display()
-            );
+    fn persist(&mut self) {
+        match atomic_write_json_checked(&self.state_path, &self.state) {
+            Ok(()) => {
+                if self.write_pending {
+                    log::warn!(
+                        "[PORTFOLIO] {} written again; entries no longer blocked on it",
+                        self.state_path.display()
+                    );
+                }
+                self.write_pending = false;
+            }
+            Err(e) => {
+                if !self.write_pending {
+                    log::error!(
+                        "[PORTFOLIO] cannot persist {} ({e}); entries blocked and the write \
+                         retried every loop -- the halt still holds in memory",
+                        self.state_path.display()
+                    );
+                }
+                self.write_pending = true;
+            }
         }
     }
 }
@@ -7836,6 +7911,7 @@ async fn main() -> Result<()> {
                     ack_path: PathBuf::from(format!("{base_dir}/RISK_ACK_NIGHT_BRIDGE_PORTFOLIO")),
                     disabled: plan.disabled,
                     last_status_write_us: 0,
+                    write_pending: false,
                 }),
             }
         }
@@ -14745,6 +14821,7 @@ mod tests {
             ack_path: dir.join("RISK_ACK_NIGHT_BRIDGE_PORTFOLIO"),
             disabled: vec![],
             last_status_write_us: 0,
+            write_pending: false,
         }
     }
 
@@ -14793,6 +14870,15 @@ mod tests {
         assert!(
             !rt.state.halted,
             "the daily halt is not the sticky total halt"
+        );
+        // The portfolio RISK_ACK is the one early way out, same day.
+        let mut acked = runtime(dir.path());
+        acked.state = serde_json::from_slice(&std::fs::read(&rt.state_path).unwrap()).unwrap();
+        std::fs::write(&acked.ack_path, b"").unwrap();
+        assert_eq!(
+            acked.evaluate(TODAY, &pnl(&[("sndk", -20.0, -20.0)]), Some(1000.0)),
+            None,
+            "ack clears the latch and re-bases the day"
         );
         // The next UTC day starts clean.
         assert_eq!(
@@ -15398,5 +15484,92 @@ mod tests {
         h.engine.portfolio.as_mut().unwrap().own_pnl = (-30.0, 0.0);
         h.engine.maybe_enter(T1_US + 1_000_000).await;
         assert_eq!(h.connector.order_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_total_breach_is_recorded_even_while_the_daily_halt_is_latched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        assert_eq!(
+            rt.evaluate(TODAY, &pnl(&[("sndk", 0.0, 0.0)]), Some(1000.0)),
+            None
+        );
+        assert!(rt
+            .evaluate(TODAY, &pnl(&[("sndk", -20.0, -20.0)]), Some(1000.0))
+            .unwrap()
+            .starts_with("portfolio_daily_loss"));
+        // Open positions keep booking: -$60 total crosses the $50 limit.
+        let r = rt
+            .evaluate(TODAY, &pnl(&[("sndk", -60.0, -60.0)]), Some(1000.0))
+            .unwrap();
+        assert!(r.starts_with("portfolio_total_loss"), "{r}");
+        assert!(
+            rt.state.halted,
+            "recorded as the sticky halt (pairtrade#430 Codex P2)"
+        );
+        // A recovery before midnight and a new day do not lift it.
+        assert!(rt
+            .evaluate("2026-09-09", &pnl(&[("sndk", 0.0, 10.0)]), Some(1000.0))
+            .unwrap()
+            .starts_with("portfolio_total_loss"));
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_portfolio_state_blocks_entries_and_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime(dir.path());
+        rt.state_path = dir.path().join("missing").join("portfolio_state.json");
+        let r = rt
+            .evaluate(TODAY, &pnl(&[("sndk", 0.0, 0.0)]), Some(1000.0))
+            .unwrap();
+        assert!(
+            r.starts_with("portfolio_state_unwritable"),
+            "baselines not durable: {r}"
+        );
+        let r = rt
+            .evaluate(TODAY, &pnl(&[("sndk", -20.0, -20.0)]), Some(1000.0))
+            .unwrap();
+        assert!(r.starts_with("portfolio_state_unwritable"), "{r}");
+        assert!(
+            r.contains("portfolio_daily_loss"),
+            "the latched halt is still reported: {r}"
+        );
+        assert!(rt.write_pending);
+        // Storage comes back: the next evaluation writes the latch itself,
+        // with nothing new to persist.
+        std::fs::create_dir_all(dir.path().join("missing")).unwrap();
+        let r = rt
+            .evaluate(TODAY, &pnl(&[("sndk", -20.0, -20.0)]), Some(1000.0))
+            .unwrap();
+        assert!(r.starts_with("portfolio_daily_loss"), "{r}");
+        assert!(!rt.write_pending);
+        let on_disk: PortfolioState =
+            serde_json::from_slice(&std::fs::read(&rt.state_path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.daily_halt_date.as_deref(),
+            Some(TODAY),
+            "the latch is durable now"
+        );
+    }
+
+    #[test]
+    fn no_pair_can_leave_the_process_kill_switch() {
+        let mut env = mu_env();
+        env.push(("ENGINE_B_LIVE_KILL_SWITCH_PATH", "/tmp/elsewhere"));
+        let e = plan_pairs(
+            &pairs_file(vec![pair_entry("mu", &env)]),
+            &live_primary(),
+            &process_env,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("cannot be set per pair"), "{e}");
+        // And the lookup never hands a pair anything but the process path.
+        let entry = pair_entry("mu", &env);
+        let lookup = pair_lookup(&entry, &process_env);
+        assert_eq!(
+            lookup("ENGINE_B_LIVE_KILL_SWITCH_PATH").as_deref(),
+            Some("/var/lib/engine-b-live/KILL_SWITCH")
+        );
     }
 }
