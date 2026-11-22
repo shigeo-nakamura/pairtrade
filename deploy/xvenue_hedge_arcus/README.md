@@ -7,14 +7,14 @@ are the **#1293 standing Arcus points holds** (held OI earns the weekly drop; th
 volume bots on both wallets are stopped). One market per wallet, never the same
 market on both wallets.
 
-| instance (launcher argument) | unit | market | Arcus wallet (sub 0) | Lighter Core sub-account | state / status |
+| instance (launcher argument) | unit | market | Arcus wallet (sub 0) | Lighter short leg (instance: account) | state / status |
 |---|---|---|---|---|---|
-| (none) | `debot-xvenue-hedge-arcus` | AAPL $40k/leg | 0x812B…DF05 | 281474976574527 | `/opt/debot-hedge-arcus`, `…/xvenue-hedge-arcus.json` |
+| (none) | `debot-xvenue-hedge-arcus` | AAPL $25k/leg | 0x812B…DF05 | Robinhood Lighter `rh`: 3209 (Core 281474976574527 until 2026-11-22) | `/opt/debot-hedge-arcus`, `…/xvenue-hedge-arcus.json` |
 | `nvda` | `debot-xvenue-hedge-arcus-nvda` | NVDA $20k/leg | 0xA2C7…66d6 (the retired #1093 SPY wallet) | 281474976624889 | `/opt/debot-hedge-arcus-nvda`, `…/xvenue-hedge-arcus-nvda.json` |
 
 | file | host path |
 |---|---|
-| `debot-xvenue-hedge-arcus.sh` | `/opt/debot/scripts/debot-xvenue-hedge-arcus.sh` — shared launcher; the instance table above is hard-coded in it and it refuses any env whose wallet, Core sub-account, market, status object or roll setting does not match the instance (exit 64, no crash loop) |
+| `debot-xvenue-hedge-arcus.sh` | `/opt/debot/scripts/debot-xvenue-hedge-arcus.sh` — shared launcher; the instance table above is hard-coded in it and it refuses any env whose wallet, short-leg instance / Lighter account / REST + WS host, market, status object or roll setting does not match the instance (exit 64, no crash loop) |
 | `debot-xvenue-hedge-arcus.service` | `/etc/systemd/system/debot-xvenue-hedge-arcus.service` (75 s start stagger behind the first holder) |
 | `debot-xvenue-hedge-arcus-nvda.service` | `/etc/systemd/system/debot-xvenue-hedge-arcus-nvda.service` (105 s stagger; `ExecStart … debot-xvenue-hedge-arcus.sh nvda`) |
 | `debot-xvenue-hedge-arcus.env.example` | `/opt/debot/scripts/debot-xvenue-hedge-arcus.env` (root 0600; key lines stay host-only ciphertext) |

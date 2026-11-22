@@ -2,12 +2,12 @@
 # Launch wrapper for the Arcus-long / Lighter-Core-short hedge-holder instances
 # (bot-strategy#1123 → #1228 → #1293). One file, one instance per argument:
 #
-#   argument  unit                           market  Arcus wallet (sub 0)  Lighter Core sub-account
-#   (none)    debot-xvenue-hedge-arcus       AAPL    0x812B…DF05           281474976574527   (#1293 standing hold)
-#   nvda      debot-xvenue-hedge-arcus-nvda  NVDA    0xA2C7…66d6           281474976624889   (#1293 second hold)
+#   argument  unit                           market  Arcus wallet (sub 0)  Lighter short leg
+#   (none)    debot-xvenue-hedge-arcus       AAPL    0x812B…DF05           Robinhood Lighter 3209 (instance rh; #1293, moved off Core 574527 2026-11-22)
+#   nvda      debot-xvenue-hedge-arcus-nvda  NVDA    0xA2C7…66d6           Core 281474976624889   (instance core; #1293 second hold, retired 11-21)
 #
 # Each instance has its own env file (/opt/debot/scripts/<unit>.env), /opt state
-# dir and S3 status object. The table pins which wallet, Core sub-account and
+# dir and S3 status object. The table pins which wallet, Lighter venue + account and
 # market every instance may touch, so a mis-edited env can never point one at
 # another bot's account or put the same market on both wallets (#1093 rule).
 # The symbol and size still come from the env (HEDGE_SYMBOLS / HEDGE_TARGET_NOTIONAL_USD).
@@ -32,13 +32,17 @@ case "$INSTANCE" in
         UNIT=debot-xvenue-hedge-arcus
         SYMBOL=AAPL
         WALLET=0x812b6a6da8e0df1fbca7939ae32089cf85c5df05
-        CORE_ACCOUNT=281474976574527
+        SHORT_INSTANCE=rh
+        SHORT_ACCOUNT=3209
+        SHORT_HOST=api.rh.lighter.xyz
         ;;
     nvda)
         UNIT=debot-xvenue-hedge-arcus-nvda
         SYMBOL=NVDA
         WALLET=0xa2c78e14dfd5586444ce4fe28fc4e36308a066d6
-        CORE_ACCOUNT=281474976624889
+        SHORT_INSTANCE=core
+        SHORT_ACCOUNT=281474976624889
+        SHORT_HOST=mainnet.zklighter.elliot.ai
         ;;
     *) fail "unknown instance '$INSTANCE' (expected no argument or 'nvda')";;
 esac
@@ -69,12 +73,17 @@ source "$ENV_DIR/$UNIT.env"
 [ "${HEDGE_LONG_VENUE:-}" = arcus ] || fail "HEDGE_LONG_VENUE must be arcus"
 [ "${HEDGE_LONG_INSTANCE:-}" = arcus ] || fail "HEDGE_LONG_INSTANCE must be arcus"
 [ "${HEDGE_SHORT_VENUE:-}" = lighter ] || fail "HEDGE_SHORT_VENUE must be lighter"
-[ "${HEDGE_SHORT_INSTANCE:-}" = core ] || fail "HEDGE_SHORT_INSTANCE must be core"
+[ "${HEDGE_SHORT_INSTANCE:-}" = "$SHORT_INSTANCE" ] || fail "HEDGE_SHORT_INSTANCE must be $SHORT_INSTANCE"
 [ "${ARCUS_ACCOUNT_INDEX_ARCUS:-}" = 0 ] || fail "ARCUS_ACCOUNT_INDEX_ARCUS must be 0 (the dedicated wallet's subaccount 0)"
 [ "$(printf '%s' "${ARCUS_ADDRESS_ARCUS:-}" | tr 'A-F' 'a-f')" = "$WALLET" ] \
     || fail "ARCUS_ADDRESS_ARCUS must be this instance's wallet $WALLET"
-[ "${LIGHTER_ACCOUNT_INDEX_CORE:-}" = "$CORE_ACCOUNT" ] \
-    || fail "LIGHTER_ACCOUNT_INDEX_CORE must be $CORE_ACCOUNT (this instance's Core sub-account)"
+# The short leg's account and venue host come from the table, read through the instance suffix.
+SFX=$(printf '%s' "$SHORT_INSTANCE" | tr 'a-z' 'A-Z')
+ACCT_VAR="LIGHTER_ACCOUNT_INDEX_$SFX"; REST_VAR="REST_ENDPOINT_$SFX"; WS_VAR="WEB_SOCKET_ENDPOINT_$SFX"
+[ "${!ACCT_VAR:-}" = "$SHORT_ACCOUNT" ] \
+    || fail "$ACCT_VAR must be $SHORT_ACCOUNT (this instance's Lighter account)"
+[ "${!REST_VAR:-}" = "https://$SHORT_HOST" ] || fail "$REST_VAR must be https://$SHORT_HOST"
+[ "${!WS_VAR:-}" = "wss://$SHORT_HOST/stream" ] || fail "$WS_VAR must be wss://$SHORT_HOST/stream"
 # Exactly one book, and only this instance's market: `SYMBOL:LONG_MMR/SHORT_MMR`.
 case "${HEDGE_SYMBOLS:-}" in
     "$SYMBOL:"*) case "$HEDGE_SYMBOLS" in *,*) fail "HEDGE_SYMBOLS must list only $SYMBOL";; esac;;

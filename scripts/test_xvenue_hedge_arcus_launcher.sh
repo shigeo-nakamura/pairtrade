@@ -26,20 +26,23 @@ printf 'export LIGHTER_ACCOUNT_INDEX="3209"\nexport ARCUS_ADDRESS="0x00000000000
 A812=0x812B6A6da8E0dF1fBCA7939ae32089Cf85c5DF05
 A2C7=0xa2c78e14dfd5586444ce4fe28fc4e36308a066d6
 S3=s3://debot-dashboard/debot/status/robinhood-lighter
-# write_env UNIT WALLET CORE SYMBOLS STATUS [extra lines...]
+# write_env UNIT WALLET SHORT_INSTANCE SHORT_ACCOUNT SHORT_HOST SYMBOLS STATUS [extra lines...]
 write_env() {
-  local unit=$1 wallet=$2 core=$3 syms=$4 status=$5; shift 5
+  local unit=$1 wallet=$2 inst=$3 acct=$4 host=$5 syms=$6 status=$7; shift 7
+  local sfx; sfx=$(printf '%s' "$inst" | tr 'a-z' 'A-Z')
   { printf 'export HEDGE_DRY_RUN="true"\nexport HEDGE_LONG_VENUE="arcus"\nexport HEDGE_LONG_INSTANCE="arcus"\n'
-    printf 'export HEDGE_SHORT_VENUE="lighter"\nexport HEDGE_SHORT_INSTANCE="core"\n'
+    printf 'export HEDGE_SHORT_VENUE="lighter"\nexport HEDGE_SHORT_INSTANCE="%s"\n' "$inst"
     printf 'export HEDGE_SYMBOLS="%s"\nexport HEDGE_TARGET_NOTIONAL_USD="20000"\nexport HEDGE_ROLL_ENABLED="false"\n' "$syms"
     printf 'export HEDGE_STATUS_S3_URI="%s"\n' "$status"
     printf 'export ARCUS_ADDRESS_ARCUS="%s"\nexport ARCUS_ACCOUNT_INDEX_ARCUS="0"\nexport ARCUS_API_KEY_ARCUS="ab"\nexport ARCUS_API_PRIVATE_KEY_ARCUS="Y2lwaGVy"\n' "$wallet"
-    printf 'export LIGHTER_ACCOUNT_INDEX_CORE="%s"\nexport LIGHTER_API_KEY_INDEX_CORE="24"\nexport LIGHTER_PUBLIC_API_KEY_CORE="Y2lwaGVy"\nexport LIGHTER_PRIVATE_API_KEY_CORE="Y2lwaGVy"\n' "$core"
+    printf 'export REST_ENDPOINT_%s="https://%s"\nexport WEB_SOCKET_ENDPOINT_%s="wss://%s/stream"\n' "$sfx" "$host" "$sfx" "$host"
+    printf 'export LIGHTER_ACCOUNT_INDEX_%s="%s"\nexport LIGHTER_API_KEY_INDEX_%s="24"\nexport LIGHTER_PUBLIC_API_KEY_%s="Y2lwaGVy"\nexport LIGHTER_PRIVATE_API_KEY_%s="Y2lwaGVy"\n' "$sfx" "$acct" "$sfx" "$sfx" "$sfx"
     for l in "$@"; do printf '%s\n' "$l"; done
   } > "$T/env/$unit.env"
 }
-aapl_env() { write_env debot-xvenue-hedge-arcus "$A812" 281474976574527 "AAPL:5/3" "$S3/xvenue-hedge-arcus.json" "$@"; }
-nvda_env() { write_env debot-xvenue-hedge-arcus-nvda "$A2C7" 281474976624889 "NVDA:5/3" "$S3/xvenue-hedge-arcus-nvda.json" "$@"; }
+RH_HOST=api.rh.lighter.xyz; CORE_HOST=mainnet.zklighter.elliot.ai
+aapl_env() { write_env debot-xvenue-hedge-arcus "$A812" rh 3209 "$RH_HOST" "AAPL:5/3" "$S3/xvenue-hedge-arcus.json" "$@"; }
+nvda_env() { write_env debot-xvenue-hedge-arcus-nvda "$A2C7" core 281474976624889 "$CORE_HOST" "NVDA:5/3" "$S3/xvenue-hedge-arcus-nvda.json" "$@"; }
 run() { rm -f "$T/env.out"; OUT=$(DEBOT_ENV_DIR="$T/env" DEBOT_HEDGE_ARCUS_ROOT="$T" bash "$L" "$@" 2>&1); RC=$?; }
 refused() { # DESC -- expects exit 64 and the message fragment $1
   [ "$RC" = 64 ] && echo "$OUT" | grep -qF "$1" && [ ! -e "$T/env.out" ] && ok "refused: $2" \
@@ -52,7 +55,9 @@ grep -q "^HEDGE_BASE_DIR=$T/opt/debot-hedge-arcus$" "$T/env.out" && ok "AAPL sta
 grep -q "^LIGHTER_GO_PATH=$T/opt/debot-hedge-arcus/lib$" "$T/env.out" && grep -q "^LD_LIBRARY_PATH=$T/opt/debot-hedge-arcus/lib:" "$T/env.out" \
   && ok "AAPL libsigner path exported" || bad "AAPL libsigner path"
 grep -qE '^(LIGHTER_ACCOUNT_INDEX|ARCUS_ADDRESS)=' "$T/env.out" && bad "unsuffixed venue vars from debot.env leaked" || ok "unsuffixed venue vars dropped"
-grep -q "^ARCUS_ADDRESS_ARCUS=$A812$" "$T/env.out" && grep -q '^LIGHTER_ACCOUNT_INDEX_CORE=281474976574527$' "$T/env.out" && ok "AAPL suffixed vars passed" || bad "AAPL suffixed vars"
+grep -q "^ARCUS_ADDRESS_ARCUS=$A812$" "$T/env.out" && grep -q '^LIGHTER_ACCOUNT_INDEX_RH=3209$' "$T/env.out" \
+  && grep -q "^REST_ENDPOINT_RH=https://$RH_HOST$" "$T/env.out" && grep -q '^HEDGE_SHORT_INSTANCE=rh$' "$T/env.out" \
+  && ok "AAPL suffixed vars passed (short leg on Robinhood Lighter 3209)" || bad "AAPL suffixed vars"
 
 # 2. nvda instance
 run nvda
@@ -75,8 +80,16 @@ aapl_env; sed -i 's/^export ARCUS_ADDRESS_ARCUS=.*/export ARCUS_ADDRESS_ARCUS=""
 refused "ARCUS_ADDRESS_ARCUS must be" "empty wallet"
 nvda_env; sed -i 's/^export LIGHTER_ACCOUNT_INDEX_CORE=.*/export LIGHTER_ACCOUNT_INDEX_CORE="281474976574527"/' "$T/env/debot-xvenue-hedge-arcus-nvda.env"; run nvda
 refused "LIGHTER_ACCOUNT_INDEX_CORE must be 281474976624889" "nvda env on the AAPL Core sub-account"
-aapl_env; sed -i 's/^export LIGHTER_ACCOUNT_INDEX_CORE=.*/export LIGHTER_ACCOUNT_INDEX_CORE="281474976624819"/' "$T/env/debot-xvenue-hedge-arcus.env"; run
-refused "LIGHTER_ACCOUNT_INDEX_CORE must be 281474976574527" "AAPL env on the #1046 Core account"
+aapl_env; sed -i 's/^export LIGHTER_ACCOUNT_INDEX_RH=.*/export LIGHTER_ACCOUNT_INDEX_RH="281474976710500"/' "$T/env/debot-xvenue-hedge-arcus.env"; run
+refused "LIGHTER_ACCOUNT_INDEX_RH must be 3209" "AAPL env on another Robinhood account"
+write_env debot-xvenue-hedge-arcus "$A812" core 281474976574527 "$CORE_HOST" "AAPL:5/3" "$S3/xvenue-hedge-arcus.json"; run
+refused "HEDGE_SHORT_INSTANCE must be rh" "AAPL env still on the old Core short leg"
+aapl_env; sed -i "s#^export REST_ENDPOINT_RH=.*#export REST_ENDPOINT_RH=\"https://$CORE_HOST\"#" "$T/env/debot-xvenue-hedge-arcus.env"; run
+refused "REST_ENDPOINT_RH must be https://$RH_HOST" "AAPL rh instance pointed at the Core REST host"
+aapl_env; sed -i "s#^export WEB_SOCKET_ENDPOINT_RH=.*#export WEB_SOCKET_ENDPOINT_RH=\"wss://$CORE_HOST/stream\"#" "$T/env/debot-xvenue-hedge-arcus.env"; run
+refused "WEB_SOCKET_ENDPOINT_RH must be wss://$RH_HOST/stream" "AAPL rh instance pointed at the Core websocket"
+nvda_env; sed -i "s#^export REST_ENDPOINT_CORE=.*#export REST_ENDPOINT_CORE=\"https://$RH_HOST\"#" "$T/env/debot-xvenue-hedge-arcus-nvda.env"; run nvda
+refused "REST_ENDPOINT_CORE must be https://$CORE_HOST" "nvda core instance pointed at the Robinhood host"
 nvda_env; sed -i 's/^export HEDGE_SYMBOLS=.*/export HEDGE_SYMBOLS="AAPL:5\/3"/' "$T/env/debot-xvenue-hedge-arcus-nvda.env"; run nvda
 refused "HEDGE_SYMBOLS must be 'NVDA:<mmr>'" "nvda env holding AAPL (same market on both wallets)"
 nvda_env; sed -i 's/^export HEDGE_SYMBOLS=.*/export HEDGE_SYMBOLS="NVDA:5\/3,AAPL:5\/3"/' "$T/env/debot-xvenue-hedge-arcus-nvda.env"; run nvda
